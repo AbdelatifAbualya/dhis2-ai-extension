@@ -249,4 +249,4 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 [MIT](LICENSE) — free to use, fork, modify, and redistribute. Built for the DHIS2 community.
 
-Contributions welcome. The extension's continuous-improvement protocol lives in `.claude/skills/dhis2-extension/SKILL.md` and reads: **"never weaken capability to gain speed."** Every change must be Pareto — faster OR stronger, never weaker.
+
