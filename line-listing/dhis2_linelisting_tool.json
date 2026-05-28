@@ -1,0 +1,431 @@
+{
+  "tool_name": "dhis2_line_listing_assistant",
+  "version": "1.0.0",
+  "description": "Helps DHIS2 users navigate the Line Listing app via text questions or screenshot analysis. Routes to the minimal relevant instruction block to preserve context window.",
+
+  "routing_instructions": "IMPORTANT: Do NOT read this entire tool on every call. Use the ROUTER below to jump directly to the needed block. Only load the block(s) that match the user's intent.",
+
+  "router": {
+    "description": "Match the user's question or screenshot to ONE OR MORE block IDs. Load ONLY those blocks.",
+    "rules": [
+      {
+        "trigger": "User asks what the Line Listing app is, or seems confused about its purpose",
+        "load": ["B00"]
+      },
+      {
+        "trigger": "User has a blank screen or just opened the app. No program selected yet.",
+        "load": ["B01"]
+      },
+      {
+        "trigger": "User asks how to display/show specific data elements or columns",
+        "load": ["B02"]
+      },
+      {
+        "trigger": "User asks about organisation units, selecting facilities, districts, or levels",
+        "load": ["B03"]
+      },
+      {
+        "trigger": "User asks about time periods, dates, filtering by month/year/quarter",
+        "load": ["B04"]
+      },
+      {
+        "trigger": "User asks how to filter data, add conditions, narrow results",
+        "load": ["B05"]
+      },
+      {
+        "trigger": "User asks about enrollment, cross-stage data, seeing data from multiple stages",
+        "load": ["B06"]
+      },
+      {
+        "trigger": "User asks about repeated/repeatable events or showing multiple visits",
+        "load": ["B07"]
+      },
+      {
+        "trigger": "User asks about colors, legends, scorecard styling, or visual formatting",
+        "load": ["B08"]
+      },
+      {
+        "trigger": "User asks about saving, downloading, exporting, or sharing",
+        "load": ["B09"]
+      },
+      {
+        "trigger": "User asks about options/settings like rounding, hierarchy display, digit separators",
+        "load": ["B10"]
+      },
+      {
+        "trigger": "User has an empty table, error, missing data, or something isn't working",
+        "load": ["B11"]
+      },
+      {
+        "trigger": "User sends a screenshot. LLM needs to identify what is on screen before answering.",
+        "load": ["B12", "then route to the relevant action block"]
+      },
+      {
+        "trigger": "User asks a complex question combining multiple topics (e.g., display X for org Y with filter Z)",
+        "load": ["B01", "B02", "B03", "B04", "B05"]
+      },
+      {
+        "trigger": "User asks about data types, boolean display, option sets, or what operators are available",
+        "load": ["B13"]
+      }
+    ]
+  },
+
+  "blocks": {
+
+    "B00": {
+      "id": "B00",
+      "title": "What is the Line Listing App?",
+      "content": "The Line Listing app creates tabular lists of individual-level records from DHIS2 Event and Tracker programs. Each row = one event or one enrollment. It is NOT for aggregated pivot tables (use Event Reports or Data Visualizer for those). Introduced in DHIS2 v2.38, installed separately via the App Hub. It replaced the line-listing feature of the old Event Reports app. Key capability: display raw record-level data with custom columns, filters, org unit selections, and time periods."
+    },
+
+    "B01": {
+      "id": "B01",
+      "title": "Starting a New Line List (From Blank Screen)",
+      "when_to_use": "User just opened the app, screen is blank, or no program is selected yet.",
+      "steps": [
+        "1. You should be in the LEFT SIDEBAR on the 'Input' tab (it's the default tab when the app opens).",
+        "2. Choose the INPUT TYPE at the top of the sidebar:",
+        "   → 'Event' = one row per individual event (works for both Event programs and single Tracker stages)",
+        "   → 'Enrollment' = one row per enrollment, can pull data from multiple Tracker stages",
+        "   → For most basic use cases, choose 'Event'.",
+        "3. Click the 'Program' dropdown → search or scroll → select your program.",
+        "4. IF you chose 'Event' AND the program is a Tracker program: a 'Stage' dropdown appears → select the stage.",
+        "5. The left sidebar now populates with available dimensions. Switch to the 'Program Dimensions' tab to see them.",
+        "6. You are now ready to add columns (→ see B02), org units (→ see B03), and time periods (→ see B04)."
+      ]
+    },
+
+    "B02": {
+      "id": "B02",
+      "title": "Adding Columns (Displaying Data Elements)",
+      "when_to_use": "User asks 'how do I display X' or 'how do I add columns for X, Y, Z'.",
+      "prerequisite": "A program must be selected first (see B01).",
+      "steps": [
+        "1. Click the 'Program Dimensions' tab in the left sidebar.",
+        "2. You will see a list of all available dimensions: data elements, tracked entity attributes, and program indicators.",
+        "3. To add an item as a TABLE COLUMN (3 methods, any one works):",
+        "   → METHOD A: Hover over the item → a '+' icon appears → click it.",
+        "   → METHOD B: Drag the item from the sidebar and drop it on the 'Columns' area (horizontal bar above the table).",
+        "   → METHOD C: Click the item → in the dialog, choose 'Add to Column'.",
+        "4. The item appears as a chip/tag in the Columns bar.",
+        "5. Repeat for every data field you want visible.",
+        "6. To REORDER columns: drag the chips left/right in the Columns bar.",
+        "7. To REMOVE a column: click the '×' on the chip.",
+        "8. Click 'Update' to generate/refresh the table."
+      ]
+    },
+
+    "B03": {
+      "id": "B03",
+      "title": "Selecting Organisation Units",
+      "when_to_use": "User asks about selecting facilities, districts, regions, or any org unit.",
+      "prerequisite": "A program must be selected first (see B01).",
+      "steps": [
+        "1. In the 'Program Dimensions' tab, find and click 'Organisation Unit'.",
+        "2. A dialog opens. Choose ONE of these methods:",
+        "",
+        "   METHOD A — EXPLICIT (pick specific org units):",
+        "   → Browse the org unit tree → check the boxes next to the org units you want.",
+        "   → TIP: Right-click any org unit → 'Select all below' to include its entire sub-hierarchy.",
+        "",
+        "   METHOD B — BY LEVEL (all org units at a hierarchy level):",
+        "   → Use the 'Level' dropdown → select a level (e.g., 'District' or 'Facility').",
+        "   → Optionally select a boundary org unit in the tree to limit which org units at that level are included.",
+        "",
+        "   METHOD C — BY GROUP (all org units in an org unit group):",
+        "   → Use the 'Group' dropdown → select a group (e.g., 'Hospitals', 'Health Centers').",
+        "   → Optionally select a boundary org unit in the tree.",
+        "",
+        "   METHOD D — USER-RELATIVE (dynamic, based on logged-in user):",
+        "   → 'User organisation unit' = the user's assigned org unit.",
+        "   → 'User sub-units' = all org units one level below the user's org unit.",
+        "   → 'User sub-x2-units' = two levels below.",
+        "",
+        "3. Click 'Update' or 'Confirm' in the dialog.",
+        "4. IMPORTANT: Once a Level or Group is selected, the org unit tree becomes a BOUNDARY — it limits results to the tree selection."
+      ]
+    },
+
+    "B04": {
+      "id": "B04",
+      "title": "Selecting Time Periods",
+      "when_to_use": "User asks about filtering by date, month, year, quarter, or any time period.",
+      "prerequisite": "A program must be selected first (see B01).",
+      "steps": [
+        "1. In the 'Program Dimensions' tab, find the time dimension(s). Common ones:",
+        "   → 'Event date' (when the event happened)",
+        "   → 'Enrollment date' (when enrollment started)",
+        "   → 'Incident date' (when the case was identified)",
+        "   → 'Scheduled date', 'Last updated on', 'Created date'",
+        "2. Click the time dimension you want to use.",
+        "3. A period selection dialog opens with THREE options:",
+        "",
+        "   OPTION A — RELATIVE PERIODS:",
+        "   → Scroll down to the relative periods section.",
+        "   → Check desired options: 'Last 12 months', 'This year', 'Last quarter', etc.",
+        "",
+        "   OPTION B — FIXED PERIODS:",
+        "   → Select a 'Period type' (Monthly, Quarterly, Yearly, etc.).",
+        "   → Check specific periods from the list (e.g., 'January 2024', 'Q1 2024').",
+        "",
+        "   OPTION C — START/END DATES:",
+        "   → Enter a start date and an end date for a custom range.",
+        "",
+        "4. COMBINATION RULES:",
+        "   → ✅ Relative + Fixed periods CAN be combined.",
+        "   → ❌ Relative/Fixed CANNOT be combined with Start/End dates.",
+        "   → Overlapping periods are auto-deduplicated.",
+        "5. Click 'Update' or 'Confirm'."
+      ]
+    },
+
+    "B05": {
+      "id": "B05",
+      "title": "Adding Filters and Conditions",
+      "when_to_use": "User asks how to filter, narrow down, show only specific values, or add conditions.",
+      "prerequisite": "A program must be selected first (see B01).",
+      "steps": [
+        "1. In the 'Program Dimensions' tab, find the data element you want to filter by.",
+        "2. Add it to the FILTER area (not Columns):",
+        "   → Click on the item → choose 'Add to Filter'",
+        "   → OR drag the item to the 'Filter' bar above the table.",
+        "3. Click on the filter chip in the Filter bar to set the condition:",
+        "",
+        "   FOR OPTION SETS (e.g., Gender, Diagnosis):",
+        "   → Check/uncheck the values you want to include.",
+        "",
+        "   FOR NUMERIC fields (e.g., Age, Weight):",
+        "   → Select an operator: = (equals), != (not equal), > (greater than), >= (greater or equal), < (less than), <= (less or equal).",
+        "   → Enter the comparison value.",
+        "   → You can add MULTIPLE conditions (all must be true / AND logic).",
+        "",
+        "   FOR TEXT fields (e.g., Name, Notes):",
+        "   → Select operator: contains, equals, starts with, ends with.",
+        "   → Enter the text to match.",
+        "",
+        "   FOR BOOLEAN fields (e.g., Yes/No questions):",
+        "   → Select 'Yes', 'No', or 'Not answered'.",
+        "",
+        "   SPECIAL: 'is empty' and 'is not empty' are available for all types.",
+        "",
+        "4. Click 'Update' to apply the filter.",
+        "",
+        "INLINE FILTERING (after table is generated):",
+        "   → Click any column header directly in the output table.",
+        "   → A filter dialog opens for that column.",
+        "   → Set condition → Click 'Update'."
+      ]
+    },
+
+    "B06": {
+      "id": "B06",
+      "title": "Cross-Stage Data (Enrollment Mode)",
+      "when_to_use": "User wants data from multiple Tracker program stages in one row, or asks about enrollment-level data.",
+      "steps": [
+        "1. In the 'Input' tab (left sidebar), select 'Enrollment' as the input type.",
+        "2. Select the Tracker program from the 'Program' dropdown.",
+        "   → NOTE: No stage dropdown appears — Enrollment mode accesses ALL stages.",
+        "3. Switch to 'Program Dimensions' tab.",
+        "4. Data elements are now GROUPED BY STAGE. You can add items from different stages as columns.",
+        "5. Each row in the output = one enrollment (one tracked entity). Data from different stages is combined into the same row.",
+        "6. Add org units (→ B03), time periods (→ B04), and filters (→ B05) as usual.",
+        "7. Click 'Update'."
+      ]
+    },
+
+    "B07": {
+      "id": "B07",
+      "title": "Repeated/Repeatable Events",
+      "when_to_use": "User has a repeatable program stage and wants to see multiple visits/events per entity.",
+      "prerequisite": "Must be in Enrollment mode (see B06). Stage must be marked as repeatable.",
+      "steps": [
+        "1. Set up an Enrollment-type line list (see B06).",
+        "2. In 'Program Dimensions', click on a data element from the REPEATABLE stage.",
+        "3. In the dialog that opens, look for the 'Repeated event' tab at the top.",
+        "4. In the Repeated event tab:",
+        "   → Set 'Most recent events' = how many of the newest events to show.",
+        "   → Set 'Oldest events' = how many of the oldest events to show.",
+        "5. Click 'Update'.",
+        "6. Each repeated event appears as a SEPARATE COLUMN (e.g., 'Weight [1]', 'Weight [2]', etc.)."
+      ]
+    },
+
+    "B08": {
+      "id": "B08",
+      "title": "Legends and Color Coding",
+      "when_to_use": "User asks about colors, scorecard styling, highlighting values, or legends.",
+      "steps": [
+        "1. Click the 'Options' button (gear icon or three-dot menu, top area of the app).",
+        "2. Go to the 'Legend' tab.",
+        "3. Choose the legend source:",
+        "   → 'Use pre-defined legend per data item' = uses legends assigned to each data element in the Maintenance app.",
+        "   → 'Select a single legend for entire visualization' = pick one legend from the dropdown for all items.",
+        "4. Choose the display style:",
+        "   → 'Text color' = colors the text.",
+        "   → 'Background color' = colors the cell background (best for scorecards).",
+        "5. Optionally toggle 'Show legend key' to display a key explaining the colors.",
+        "6. Click 'Update'.",
+        "",
+        "NOTE: Legends must be configured in the Maintenance app first. If no legends exist, this feature has no effect."
+      ]
+    },
+
+    "B09": {
+      "id": "B09",
+      "title": "Saving, Downloading, and Sharing",
+      "when_to_use": "User asks about saving, exporting, downloading, sharing, or getting a link.",
+      "steps": [
+        "SAVING:",
+        "→ Click 'File' menu (top-left) → 'Save'.",
+        "→ Enter a name and optional description → Confirm.",
+        "→ To create a copy: 'File' → 'Save As'.",
+        "→ NOTE: If the line list was originally from Event Reports, 'Save' is greyed out. Use 'Save As'.",
+        "",
+        "DOWNLOADING/EXPORTING:",
+        "→ Click the Download button (download icon, top-right area).",
+        "→ Choose format: 'Plain data source' (CSV/Excel) or 'Table layout' (visual format).",
+        "",
+        "SHARING:",
+        "→ After saving, click 'File' → 'Share'.",
+        "→ Set read/write permissions for specific users or groups.",
+        "",
+        "GET LINK:",
+        "→ 'File' → 'Get Link' → copies a direct URL to the clipboard."
+      ]
+    },
+
+    "B10": {
+      "id": "B10",
+      "title": "Display Options (Rounding, Hierarchy, Style)",
+      "when_to_use": "User asks about decimal places, org unit hierarchy display, number formatting, or full-screen mode.",
+      "steps": [
+        "ACCESS OPTIONS: Click 'Options' (gear icon or menu).",
+        "",
+        "SKIP ROUNDING (show all decimals):",
+        "→ Options → 'Data' tab → toggle ON 'Skip rounding' → Update.",
+        "",
+        "SHOW ORG UNIT HIERARCHY (full path):",
+        "→ Options → 'Style' tab → toggle ON 'Show organisation unit hierarchy' → Update.",
+        "→ Result: org unit column shows 'Country / Region / District / Facility'.",
+        "",
+        "DIGIT GROUP SEPARATOR:",
+        "→ Options → 'Style' tab → choose comma, space, or none.",
+        "",
+        "FULL-SCREEN MODE (more table space):",
+        "→ Click the full-screen button in the title bar → hides left sidebar and layout panel.",
+        "→ To hide the interpretations panel (right side): click the 'Interpretations' button below the user menu."
+      ]
+    },
+
+    "B11": {
+      "id": "B11",
+      "title": "Troubleshooting (Empty Table, Errors, Missing Data)",
+      "when_to_use": "User reports an empty table, error, missing data, or something not working.",
+      "checklist": [
+        "CHECK 1: Is a program selected? → Input tab → look for a program name in the dropdown. If blank, select one.",
+        "CHECK 2: Are organisation units selected? → Program Dimensions → click Organisation Unit → verify selections.",
+        "CHECK 3: Is a time period selected? → Program Dimensions → click the time dimension → verify at least one period is checked.",
+        "CHECK 4: Are filters too restrictive? → Look at the Filter bar above the table → click each filter chip → widen or remove conditions.",
+        "CHECK 5: Is input type correct? → If showing Tracker data, does the user need 'Event' (single stage) or 'Enrollment' (multi-stage)?",
+        "CHECK 6: Analytics tables up to date? → An admin must run analytics. If data was recently entered, it won't appear until analytics runs.",
+        "CHECK 7: User permissions? → The user needs the Line Listing app authority AND data read access for the selected org units.",
+        "CHECK 8: App version? → Some features only work in newer versions. Check App Hub for updates.",
+        "CHECK 9: 'Save' greyed out? → The line list is from Event Reports. Use 'File' → 'Save As' instead.",
+        "CHECK 10: Program indicators missing? → PIs with analytics_period_start/end dates do NOT appear in Line Listing."
+      ]
+    },
+
+    "B12": {
+      "id": "B12",
+      "title": "Screenshot Analysis Guide",
+      "when_to_use": "User sent a screenshot. Use this to identify the current state, then route to the correct action block.",
+      "identification_map": {
+        "screen_states": [
+          {
+            "visual_clue": "Blank white center area, no table visible",
+            "meaning": "App is open but no line list generated yet",
+            "next_step": "Check if program is selected (Input tab). If not → B01. If yes → user needs to add columns (B02) and click Update."
+          },
+          {
+            "visual_clue": "'Input' tab highlighted in left sidebar",
+            "meaning": "User is on the Input tab — this is where you select Event/Enrollment and Program",
+            "next_step": "Guide them through B01."
+          },
+          {
+            "visual_clue": "'Program Dimensions' tab highlighted in left sidebar, list of items visible",
+            "meaning": "Program is selected, user is browsing available dimensions",
+            "next_step": "Guide them to add columns (B02), org units (B03), or periods (B04)."
+          },
+          {
+            "visual_clue": "Chips/tags in a horizontal bar labeled 'Columns' above the table area",
+            "meaning": "Dimensions have been added as columns",
+            "next_step": "If table is empty → user may need to click Update or check B11."
+          },
+          {
+            "visual_clue": "Chips/tags in a row labeled 'Filter'",
+            "meaning": "Filters are applied",
+            "next_step": "If user wants to change filters → B05."
+          },
+          {
+            "visual_clue": "A populated data table with rows and columns",
+            "meaning": "Line list is generated and displaying data",
+            "next_step": "User likely wants to modify, filter, export, or format. Ask what they need."
+          },
+          {
+            "visual_clue": "A popup/dialog with an org unit tree (checkboxes on nodes)",
+            "meaning": "Organisation unit selection dialog is open",
+            "next_step": "Guide through B03."
+          },
+          {
+            "visual_clue": "A popup/dialog with period options (relative periods, fixed periods, date fields)",
+            "meaning": "Period/time dimension selection dialog is open",
+            "next_step": "Guide through B04."
+          },
+          {
+            "visual_clue": "A popup/dialog with filter operators (equals, greater than, contains, checkboxes)",
+            "meaning": "A filter condition dialog is open",
+            "next_step": "Guide through B05."
+          },
+          {
+            "visual_clue": "Options panel open showing Legend/Style/Data tabs",
+            "meaning": "User is in the Options settings",
+            "next_step": "For legends → B08. For display settings → B10."
+          },
+          {
+            "visual_clue": "'Save' button greyed out in File menu",
+            "meaning": "Line list was created in Event Reports — cannot overwrite",
+            "next_step": "Tell user to use 'File' → 'Save As' to create a new copy."
+          }
+        ],
+        "element_glossary": {
+          "chip_with_x": "A dimension added to Columns or Filter. The × removes it.",
+          "plus_icon_on_hover": "Appears when hovering a dimension in Program Dimensions — adds it as a column.",
+          "drag_handle_dots": "Indicates a draggable item. Drag to Columns or Filter area.",
+          "blue_highlighted_item": "Currently selected or active item.",
+          "arrow_on_column_header": "Sort indicator. Up = ascending, down = descending.",
+          "gear_icon": "Opens the Options menu (Legend, Style, Data settings).",
+          "download_icon": "Export/download button.",
+          "full_screen_icon": "Hides sidebars for more table space.",
+          "search_box_in_sidebar": "Filters the dimension list by name — useful for programs with many data elements."
+        }
+      }
+    },
+
+    "B13": {
+      "id": "B13",
+      "title": "Data Types and Filter Operators Reference",
+      "when_to_use": "User asks what operators are available, how booleans display, or about specific data type behaviors.",
+      "reference": [
+        {"type": "TEXT", "display": "Text string", "operators": "contains, equals, starts with, ends with, is empty, is not empty"},
+        {"type": "NUMBER / INTEGER", "display": "Numeric value", "operators": "=, !=, >, >=, <, <=, is empty, is not empty"},
+        {"type": "BOOLEAN", "display": "'Yes', 'No', 'Not answered' (not 0/1)", "operators": "Select from Yes/No/Not answered"},
+        {"type": "TRUE_ONLY", "display": "'Yes' or blank", "operators": "Select Yes or empty"},
+        {"type": "DATE", "display": "Formatted date", "operators": "before, after, between, is empty, is not empty"},
+        {"type": "OPTION SET", "display": "Option label text", "operators": "'in' criteria — select one or more options from list"},
+        {"type": "ORGANISATION UNIT", "display": "Org unit name", "operators": "Select from org unit tree"},
+        {"type": "PROGRAM INDICATOR", "display": "Calculated numeric value", "operators": "Same as NUMBER (may not be usable as filter in some cases)"}
+      ]
+    }
+  }
+}

@@ -1,0 +1,121 @@
+name: Publish to Chrome Web Store
+
+# Packs the extension (the folder containing manifest.json) into a zip and
+# uploads it to the Chrome Web Store, then submits it for review.
+#
+# Trigger it either by:
+#   • pushing a git tag like v2.1.8  (recommended — keep the tag in sync with
+#     the "version" in manifest.json), or
+#   • running it manually from the Actions tab (workflow_dispatch).
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   CHROME_EXTENSION_ID   – the item ID from the Web Store dashboard URL
+#   CHROME_CLIENT_ID      – OAuth2 client ID  (Google Cloud Console)
+#   CHROME_CLIENT_SECRET  – OAuth2 client secret
+#   CHROME_REFRESH_TOKEN  – OAuth2 refresh token for the Web Store API
+# See the notes at the bottom of this file for how to mint those.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Submit for review after upload (false = upload draft only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate the extension (find manifest.json)
+        id: locate
+        run: |
+          set -euo pipefail
+          MANIFEST="$(find . -name manifest.json -not -path '*/node_modules/*' -not -path '*/.git/*' | head -n1)"
+          if [ -z "$MANIFEST" ]; then
+            echo "::error::No manifest.json found in the repository."
+            exit 1
+          fi
+          EXT_DIR="$(dirname "$MANIFEST")"
+          VERSION="$(jq -r '.version' "$MANIFEST")"
+          echo "ext_dir=$EXT_DIR" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Extension dir: $EXT_DIR"
+          echo "manifest version: $VERSION"
+
+      - name: Sanity-check the manifest
+        run: |
+          set -euo pipefail
+          EXT_DIR='${{ steps.locate.outputs.ext_dir }}'
+          # Fail early if the manifest is not valid JSON.
+          jq empty "$EXT_DIR/manifest.json"
+          # Guard against shipping the rejected-permission setup again.
+          if jq -e '.optional_permissions // [] | index("debugger")' "$EXT_DIR/manifest.json" >/dev/null; then
+            echo "::error::'debugger' cannot be an optional permission — the Web Store will reject this."
+            exit 1
+          fi
+
+      - name: Build extension.zip
+        run: |
+          set -euo pipefail
+          EXT_DIR='${{ steps.locate.outputs.ext_dir }}'
+          ZIP="$GITHUB_WORKSPACE/extension.zip"
+          rm -f "$ZIP"
+          cd "$EXT_DIR"
+          # Ship only runtime assets — exclude VCS, CI, deps, docs, and dev helpers.
+          zip -r -FS "$ZIP" . \
+            -x '.git/*' \
+            -x '.github/*' \
+            -x '.claude/*' \
+            -x 'node_modules/*' \
+            -x '*/node_modules/*' \
+            -x '*.md' \
+            -x 'generate-icons.js' \
+            -x 'screenshot.png' \
+            -x '*.zip'
+          echo "Packed contents:"
+          unzip -l "$ZIP"
+          # manifest.json MUST sit at the zip root or Chrome rejects the package.
+          unzip -l "$ZIP" | grep -q ' manifest.json$' || {
+            echo "::error::manifest.json is not at the root of the zip."; exit 1; }
+
+      - name: Upload & publish to Chrome Web Store
+        uses: mnao305/chrome-extension-upload@v5.0.0
+        with:
+          file-path: extension.zip
+          extension-id: ${{ secrets.CHROME_EXTENSION_ID }}
+          client-id: ${{ secrets.CHROME_CLIENT_ID }}
+          client-secret: ${{ secrets.CHROME_CLIENT_SECRET }}
+          refresh-token: ${{ secrets.CHROME_REFRESH_TOKEN }}
+          # On a tag push always submit for review; on manual runs honour the input.
+          publish: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+
+      - name: Upload zip as build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-${{ steps.locate.outputs.version }}
+          path: extension.zip
+          if-no-files-found: error
+
+# ── How to get the OAuth2 credentials (one-time setup) ───────────────────────
+# 1. Create a Web Store developer account and upload the extension manually ONCE
+#    so it has an item ID (the CHROME_EXTENSION_ID).
+# 2. In Google Cloud Console: enable the "Chrome Web Store API", create an
+#    OAuth client of type "Desktop app" → gives CLIENT_ID + CLIENT_SECRET.
+# 3. Mint a refresh token for the scope
+#    https://www.googleapis.com/auth/chromewebstore  (e.g. with the
+#    chrome-webstore-upload-keys helper, or Google's OAuth Playground).
+# 4. Add all four values as repository Actions secrets (names listed at the top).
+#
+# IMPORTANT: every publish needs a higher "version" in manifest.json than the
+# live one, or the Web Store API returns an "version already exists" error.
