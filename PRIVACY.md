@@ -42,10 +42,13 @@ This information is **never transmitted to the developer** and is removed if you
 
 ## Health and personal information
 
-DHIS2 systems often contain health-related and personally identifiable information. When you ask the assistant about such data, the data needed to answer **may be included in the prompt sent to the AI provider you have configured**. Please keep this in mind when choosing a provider:
+DHIS2 systems often contain health-related and personally identifiable information. This build is deliberately limited to reduce exposure of individual people's identities:
 
-- Using the **local Ollama** default keeps all such data on your own machine.
-- Using a **cloud provider** means the data is processed by that third party under their policies.
+- **Patient identity lookup is disabled.** The extension has no feature to retrieve a tracked entity (patient) record, and it will not fetch a person's identifying attributes — such as name, age, or gender — even when a tracked-entity ID is present in the page URL. If you ask about "this person/patient," the assistant declines and offers program-level alternatives.
+- **It primarily works with** metadata (programs, data elements, rules, indicators), aggregate analytics, and counts.
+- **Some operational diagnostics may read enrollment- and event-level records** (for example, detecting abnormal enrollments reads enrollment dates, statuses, and event data values). Any such data needed to answer is processed only by the AI provider you have configured.
+
+With the default **local Ollama** model, none of this data leaves your machine. Using a **cloud provider** means the data needed to answer is processed by that third party under their own policies. Choose your provider accordingly when working with sensitive data.
 
 The developer never receives, stores, or has access to this data in any configuration.
 
