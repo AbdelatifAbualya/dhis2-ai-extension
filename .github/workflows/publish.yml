@@ -13,7 +13,8 @@ name: Publish to Chrome Web Store
 #   CHROME_CLIENT_ID      – OAuth2 client ID  (Google Cloud Console)
 #   CHROME_CLIENT_SECRET  – OAuth2 client secret
 #   CHROME_REFRESH_TOKEN  – OAuth2 refresh token for the Web Store API
-# See the notes at the bottom of this file for how to mint those.
+# Tip: mint the refresh token with `npx chrome-webstore-upload-keys`.
+# Every publish also needs a higher "version" in manifest.json than the live one.
 
 on:
   push:
@@ -106,16 +107,3 @@ jobs:
           name: extension-${{ steps.locate.outputs.version }}
           path: extension.zip
           if-no-files-found: error
-
-# ── How to get the OAuth2 credentials (one-time setup) ───────────────────────
-# 1. Create a Web Store developer account and upload the extension manually ONCE
-#    so it has an item ID (the CHROME_EXTENSION_ID).
-# 2. In Google Cloud Console: enable the "Chrome Web Store API", create an
-#    OAuth client of type "Desktop app" → gives CLIENT_ID + CLIENT_SECRET.
-# 3. Mint a refresh token for the scope
-#    https://www.googleapis.com/auth/chromewebstore  (e.g. with the
-#    chrome-webstore-upload-keys helper, or Google's OAuth Playground).
-# 4. Add all four values as repository Actions secrets (names listed at the top).
-#
-# IMPORTANT: every publish needs a higher "version" in manifest.json than the
-# live one, or the Web Store API returns an "version already exists" error.
