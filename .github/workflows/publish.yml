@@ -1,21 +1,5 @@
 name: Publish to Chrome Web Store
 
-# Packs the extension (the folder containing manifest.json) into a zip and
-# uploads it to the Chrome Web Store, then submits it for review.
-#
-# Trigger it either by:
-#   • pushing a git tag like v2.1.8  (recommended — keep the tag in sync with
-#     the "version" in manifest.json), or
-#   • running it manually from the Actions tab (workflow_dispatch).
-#
-# Required repository secrets (Settings → Secrets and variables → Actions):
-#   CHROME_EXTENSION_ID   – the item ID from the Web Store dashboard URL
-#   CHROME_CLIENT_ID      – OAuth2 client ID  (Google Cloud Console)
-#   CHROME_CLIENT_SECRET  – OAuth2 client secret
-#   CHROME_REFRESH_TOKEN  – OAuth2 refresh token for the Web Store API
-# Tip: mint the refresh token with `npx chrome-webstore-upload-keys`.
-# Every publish also needs a higher "version" in manifest.json than the live one.
-
 on:
   push:
     tags:
