@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "DHIS2 AI Assistant",
   "version": "2.1.7",
-  "description": "AI analytics assistant for DHIS2. Runs locally on Ollama by default, or any OpenAI-compatible provider (OpenAI, Anthropic, etc.).",
+  "description": "AI analytics assistant for DHIS2. Runs locally on Ollama by default, or connects to any OpenAI-compatible AI endpoint.",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
