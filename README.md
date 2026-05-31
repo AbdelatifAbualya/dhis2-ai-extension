@@ -164,12 +164,11 @@ Two-step: image → vision model description → text-model context. If `visionM
 | Permission | Why |
 |-----------|-----|
 | `sidePanel` | Side-panel chat UI |
-| `storage` | Conversation state, settings, provider config |
-| `activeTab` | Proxy DHIS2 calls through the active tab's session |
-| `tabs` | Detect tab-active / window-focus changes for cross-server sync |
-| `webNavigation` | Detect DHIS2 navigations |
-| `scripting` | Inject content script + execute writes through the DHIS2 tab so MV3 doesn't drop POST/PATCH bodies |
-| `<all_urls>` | Proxy DHIS2 calls regardless of host (your DHIS2 may live anywhere) |
+| `storage` | Conversation state, settings, and provider config (stored locally) |
+| `tabs` | Read the active tab's URL to detect the DHIS2 server/page and keep in sync across tabs and instances |
+| `webNavigation` | Detect in-app (SPA) DHIS2 navigations to refresh page context |
+| `scripting` | Register the URL-monitor on granted DHIS2 sites, and execute writes through the DHIS2 tab so MV3 doesn't drop POST/PATCH bodies |
+| Host access (per DHIS2 server) | Requested **at runtime, per server**, through Chrome's standard prompt the first time you use the extension on that server. The extension calls your DHIS2 server's Web API using your existing session. There is no broad `<all_urls>` access. |
 
 The extension never stores DHIS2 usernames or passwords. Authentication is the existing browser session of your DHIS2 tab.
 
