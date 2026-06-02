@@ -3882,11 +3882,27 @@ If user enabled web browsing from UI, this tool should usually be called before 
                     },
                     required: ['name', 'value_type']
                   }
+                },
+                sections: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      name: { type: 'string', description: 'Section display name shown in the form.' },
+                      data_element_names: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Names of data elements (from this stage\'s data_elements[]) to group in this section. Every DE in the stage must appear in exactly one section.'
+                      }
+                    },
+                    required: ['name', 'data_element_names']
+                  },
+                  description: 'Named groups of data elements within this stage (programStageSections). When provided the stage formType is set to SECTION automatically and the sections are created atomically. Required for HIDESECTION program rules — the tool returns section IDs in the summary. Every DE in the stage should appear in exactly one section; ungrouped DEs are placed in a catch-all section.'
                 }
               },
               required: ['name', 'data_elements']
             },
-            description: 'Stages with data elements (for create_program)'
+            description: 'Stages with data elements (for create_program). Add sections[] to each stage to create programStageSections (required for HIDESECTION rules).'
           },
           program_rules: {
             type: 'array',
@@ -3904,7 +3920,9 @@ If user enabled web browsing from UI, this tool should usually be called before 
                       type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages).' },
                       data_element_name: { type: 'string', description: 'Target DE name (resolved to ID automatically)' },
                       tracked_entity_attribute_name: { type: 'string', description: 'Target TEA name for HIDEFIELD on a tracked entity attribute (resolved to ID automatically)' },
-                      program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE)' },
+                      program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE). Use the stage UID returned in summary.stages[].id after create_program.' },
+                      program_stage_section_name: { type: 'string', description: 'Target section name (for HIDESECTION). Resolved to section ID automatically using the sections created in stages[].sections. Use this instead of program_stage_section_id when the section is defined inline in this same create_program call.' },
+                      program_stage_section_id: { type: 'string', description: 'Target section UID (for HIDESECTION). Use this when the section already exists and its ID is known. For sections defined inline in this call, use program_stage_section_name instead — section IDs are auto-resolved.' },
                       content: { type: 'string', description: 'Static message text for SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/DISPLAYTEXT. Variables in content are shown literally — use the data field for dynamic refs.' },
                       data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: target value. SHOWWARNING/SHOWERROR/etc: dynamic content appended after the static content prefix (e.g. data="#{my_de}" or data="d2:concatenate(\\"X=\\", #{a})").' },
                       exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE).' }
@@ -3959,9 +3977,25 @@ If user enabled web browsing from UI, this tool should usually be called before 
                   },
                   required: ['name', 'value_type']
                 }
+              },
+              sections: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', description: 'Section display name.' },
+                    data_element_names: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'Names of data elements in this stage to include in this section.'
+                    }
+                  },
+                  required: ['name', 'data_element_names']
+                },
+                description: 'Named groups of data elements (programStageSections). Triggers formType=SECTION. Section IDs are returned in the summary for use in HIDESECTION rules.'
               }
             },
-            description: 'Single stage object (for add_stage)'
+            description: 'Single stage object (for add_stage). Provide sections[] to create programStageSections.'
           },
           data_elements: {
             type: 'array',
@@ -5603,7 +5637,7 @@ It also auto-checks for duplicate option sets, data elements, TEAs, and options 
 3. **Verify** with architect_metadata(action=verify) after creation
 
 **Internal dependency order** the tool enforces in the atomic payload (you never build this yourself — it's here so you understand recovery):
-Options → OptionSets → TrackedEntityAttributes → DataElements → Program + ProgramStages (stages carry programStageDataElements) → ProgramRuleVariables → ProgramRuleActions → ProgramRules → (follow-up POST) ProgramIndicators. Sharing attaches to Program/Stage in full; DE/OS/TEA/PI get metadata-only. OrgUnit assignment rides inside the Program object.
+Options → OptionSets → TrackedEntityAttributes → DataElements → Program + ProgramStages (stages carry programStageDataElements) → ProgramStageSections → ProgramRuleVariables → ProgramRuleActions → ProgramRules → (follow-up POST) ProgramIndicators. Sharing attaches to Program/Stage in full; DE/OS/TEA/PI get metadata-only. OrgUnit assignment rides inside the Program object.
 
 **If create_program returns \`success: false\`, read \`errors[]\`:**
 - "Data sharing is not enabled for X" → the tool now strips data bits itself; if you still see this, a custom class changed — retry with \`sharing.apply_to_children: false\` and then run \`manage_metadata(action=update_sharing)\` per object.
@@ -5634,7 +5668,12 @@ Never retry by looping through children one-at-a-time when the single atomic ret
 - **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
 - **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
 - **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
-- HIDEPROGRAMSTAGE hides an entire stage tab (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section.
+- HIDEPROGRAMSTAGE hides an entire stage tab (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section within a stage.
+- **HIDESECTION workflow** — sections must exist BEFORE they can be hidden:
+  1. In \`create_program\`, add \`sections: [{name, data_element_names:[...]}]\` to each stage that needs them. The tool auto-sets \`formType: SECTION\` and returns section UIDs in \`summary.stages[i].sections\` and the flat \`summary.programStageSections\` list.
+  2. Reference sections in inline \`program_rules[].actions\` using \`program_stage_section_name: "Section Name"\` (resolved to UID automatically) or \`program_stage_section_id: "<uid>"\`.
+  3. For programs already created, use \`manage_program_rules(action=create, program_id=..., rule={..., actions:[{type:"HIDESECTION", program_stage_section_id:"<id from summary>"}]})\`.
+  ⚠ HIDESECTION with a non-existent or wrong section UID silently does nothing in Capture — always verify the section ID comes from summary.programStageSections or a prior get/list call.
 - BOOLEAN / TRUE_ONLY: compare against unquoted \`true\` / \`false\`. Canonical forms:
   • is Yes: \`#{flag} == true\`
   • is empty or No: \`!d2:hasValue(#{flag}) || #{flag} != true\`
@@ -11629,6 +11668,9 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const stageObjects = [];
   const stageUids = [];
   const stageRenames = []; // summary for caller: [{original, final}] when renamed
+  const allProgramStageSections = []; // sections for all stages
+  // sectionNameMap: "<stageIdx>:<sectionName>" → uid — for resolving HIDESECTION rule actions
+  const sectionNameMap = {};
 
   for (let i = 0; i < stages.length; i++) {
     const stage = stages[i];
@@ -11643,6 +11685,49 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       sortOrder: j + 1,
     }));
 
+    // Build programStageSections if specified
+    const stageSections = stage.sections || [];
+    const stageSectionRefs = [];
+    if (stageSections.length > 0) {
+      // Track which DEs are assigned to a section to detect ungrouped DEs
+      const assignedDeNames = new Set();
+      for (let si = 0; si < stageSections.length; si++) {
+        const sec = stageSections[si];
+        const secUid = generateDhis2Uid();
+        const secDeIds = (sec.data_element_names || [])
+          .filter(n => deUidMap[n])
+          .map(n => { assignedDeNames.add(n); return { id: deUidMap[n] }; });
+        const section = {
+          id: secUid,
+          name: sec.name,
+          programStage: { id: stageUid },
+          dataElements: secDeIds,
+          sortOrder: si + 1,
+        };
+        allProgramStageSections.push(section);
+        stageSectionRefs.push({ id: secUid });
+        // Register by name for HIDESECTION rule resolution (indexed by both stage index and stage name)
+        sectionNameMap[`${i}:${sec.name}`] = secUid;
+        sectionNameMap[`${stage.name}:${sec.name}`] = secUid;
+        sectionNameMap[`${finalStageName}:${sec.name}`] = secUid;
+        // Also register just by section name (unique lookup — last writer wins on name collision across stages)
+        sectionNameMap[sec.name] = secUid;
+      }
+      // Catch-all section for any ungrouped DEs
+      const ungrouped = (stage.data_elements || []).filter(de => !assignedDeNames.has(de.name));
+      if (ungrouped.length > 0) {
+        const catchUid = generateDhis2Uid();
+        allProgramStageSections.push({
+          id: catchUid,
+          name: 'Other',
+          programStage: { id: stageUid },
+          dataElements: ungrouped.map(de => ({ id: deUidMap[de.name] })),
+          sortOrder: stageSections.length + 1,
+        });
+        stageSectionRefs.push({ id: catchUid });
+      }
+    }
+
     const stageObj = {
       id: stageUid,
       name: finalStageName,
@@ -11651,6 +11736,10 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       repeatable: stage.repeatable || false,
       programStageDataElements: psdes,
     };
+    if (stageSections.length > 0) {
+      stageObj.formType = 'SECTION';
+      stageObj.programStageSections = stageSectionRefs;
+    }
     if (sharingBlock && applySharingToChildren) {
       stageObj.sharing = sharingBlock;
       stageObj.publicAccess = sharingBlock.public;
@@ -11763,19 +11852,16 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       for (const deName of referencedDEs) {
         if (!prvCreated[deName]) {
           const prvUid = generateDhis2Uid();
-          let sourceStageId = null;
-          for (let si = 0; si < stages.length; si++) {
-            if ((stages[si].data_elements || []).some(d => d.name === deName)) {
-              sourceStageId = stageUids[si]; break;
-            }
-          }
+          const deObj = allDataElements.find(d => d.name === deName);
+          const hasOptionSet = !!(deObj?.optionSet);
           allProgramRuleVariables.push({
             id: prvUid,
             name: sanitizeVariableName(deName),
             program: { id: programUid },
             dataElement: { id: deUidMap[deName] },
             programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
-            ...(sourceStageId ? { programStage: { id: sourceStageId } } : {}),
+            valueType: deObj?.valueType || 'TEXT',
+            useCodeForOptionSet: hasOptionSet,
           });
           prvCreated[deName] = prvUid;
         }
@@ -11792,7 +11878,8 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
             program: { id: programUid },
             trackedEntityAttribute: { id: teaUidMap[teaName] },
             programRuleVariableSourceType: 'TEI_ATTRIBUTE',
-            useCodeForOptionSet: !!teaObj?.optionSet,
+            valueType: teaObj?.valueType || 'TEXT',
+            useCodeForOptionSet: !!(teaObj?.optionSet),
           });
           prvCreated[teaName] = prvUid;
         }
@@ -11819,7 +11906,12 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           pra.trackedEntityAttribute = { id: teaUidMap[act.tracked_entity_attribute_name] };
         }
         if (act.program_stage_id) pra.programStage = { id: act.program_stage_id };
-        if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
+        // Resolve section by name (preferred for inline create_program) or by ID
+        if (act.program_stage_section_name && sectionNameMap[act.program_stage_section_name]) {
+          pra.programStageSection = { id: sectionNameMap[act.program_stage_section_name] };
+        } else if (act.program_stage_section_id) {
+          pra.programStageSection = { id: act.program_stage_section_id };
+        }
         allProgramRuleActions.push(pra);
       }
 
@@ -11842,6 +11934,9 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   if (filteredDataElements.length) payload.dataElements = filteredDataElements;
   payload.programs = [program];
   if (stageObjects.length) payload.programStages = stageObjects;
+  // programStageSections must follow programStages in the payload so DHIS2's
+  // metadata import handler resolves the programStage back-reference correctly.
+  if (allProgramStageSections.length) payload.programStageSections = allProgramStageSections;
   if (allProgramRuleVariables.length) payload.programRuleVariables = allProgramRuleVariables;
   if (allProgramRuleActions.length) payload.programRuleActions = allProgramRuleActions;
   if (allProgramRules.length) payload.programRules = allProgramRules;
@@ -11915,6 +12010,10 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       name: resolvedStageNames[i],
       originalName: s.name,
       dataElements: (s.data_elements || []).length,
+      // Include section IDs so HIDESECTION rule actions can reference them
+      sections: allProgramStageSections
+        .filter(sec => sec.programStage.id === stageUids[i])
+        .map(sec => ({ id: sec.id, name: sec.name })),
     })),
     stageRenames: stageRenames.length ? stageRenames : undefined,
     trackedEntityAttributes: Object.entries(teaUidMap).map(([name, id]) => ({ name, id })),
@@ -11923,6 +12022,15 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     programRules: allProgramRules.map(r => ({ id: r.id, name: r.name })),
     programIndicators: indicatorResults,
     orgUnits: orgUnitIds,
+    // Flat section list with stage context — useful for building HIDESECTION rules
+    ...(allProgramStageSections.length ? {
+      programStageSections: allProgramStageSections.map(sec => ({
+        id: sec.id,
+        name: sec.name,
+        stageId: sec.programStage.id,
+        stageName: resolvedStageNames[stageUids.indexOf(sec.programStage.id)],
+      })),
+    } : {}),
   };
 
   // Record successful program create in the per-turn registry so a duplicate
@@ -11981,6 +12089,42 @@ async function addStageToProgram(args, defaultCatComboId) {
     sortOrder: j + 1,
   }));
 
+  // Build programStageSections if specified
+  const stageSections = stage.sections || [];
+  const addStageSections = [];
+  const stageSectionRefs = [];
+  if (stageSections.length > 0) {
+    const assignedDeNames = new Set();
+    for (let si = 0; si < stageSections.length; si++) {
+      const sec = stageSections[si];
+      const secUid = generateDhis2Uid();
+      const secDeIds = (sec.data_element_names || [])
+        .filter(n => deUidMap[n])
+        .map(n => { assignedDeNames.add(n); return { id: deUidMap[n] }; });
+      addStageSections.push({
+        id: secUid,
+        name: sec.name,
+        programStage: { id: stageUid },
+        dataElements: secDeIds,
+        sortOrder: si + 1,
+      });
+      stageSectionRefs.push({ id: secUid });
+    }
+    // Catch-all for ungrouped DEs
+    const ungrouped = (stage.data_elements || []).filter(de => !assignedDeNames.has(de.name));
+    if (ungrouped.length > 0) {
+      const catchUid = generateDhis2Uid();
+      addStageSections.push({
+        id: catchUid,
+        name: 'Other',
+        programStage: { id: stageUid },
+        dataElements: ungrouped.map(de => ({ id: deUidMap[de.name] })),
+        sortOrder: stageSections.length + 1,
+      });
+      stageSectionRefs.push({ id: catchUid });
+    }
+  }
+
   const stageObj = {
     id: stageUid,
     name: stage.name,
@@ -11989,12 +12133,17 @@ async function addStageToProgram(args, defaultCatComboId) {
     repeatable: stage.repeatable || false,
     programStageDataElements: psdes,
   };
+  if (stageSections.length > 0) {
+    stageObj.formType = 'SECTION';
+    stageObj.programStageSections = stageSectionRefs;
+  }
 
   const payload = {};
   if (allOptions.length) payload.options = allOptions;
   if (allOptionSets.length) payload.optionSets = allOptionSets;
   if (allDataElements.length) payload.dataElements = allDataElements;
   payload.programStages = [stageObj];
+  if (addStageSections.length) payload.programStageSections = addStageSections;
 
   const result = await postMetadataPayload(payload, args.dry_run_only);
 
@@ -12005,6 +12154,10 @@ async function addStageToProgram(args, defaultCatComboId) {
       program_id: args.program_id,
       dataElements: Object.entries(deUidMap).map(([name, id]) => ({ name, id })),
       optionSets: Object.entries(optionSetUidMap).map(([name, id]) => ({ name, id })),
+      // Include section IDs for subsequent HIDESECTION rule creation
+      ...(addStageSections.length ? {
+        sections: addStageSections.map(s => ({ id: s.id, name: s.name })),
+      } : {}),
     },
   };
 }
