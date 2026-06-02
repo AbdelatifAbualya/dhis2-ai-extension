@@ -4316,6 +4316,10 @@ Icon / display style update (any metadata object: programs, programStages, dataE
 1. manage_metadata(action=discover_icons, keywords=["lung","respir","tb","medical"])  ← discover real keys
 2. manage_metadata(action=update_style, object_type="programs", object_id=<id>, icon=<exact key from step 1>, color="#2196F3")
 update_style REFUSES any icon not verified through discover_icons this turn — DHIS2 has a fixed ~900-icon library and obvious names like "tuberculosis_positive" / "diabetes_positive" do not exist.
+Program stage sections (post-creation): use create_stage_section to add a named section to an EXISTING stage:
+- manage_metadata(action=create_stage_section, stage_id=<stageId>, section_name="Vital Signs", section_data_element_ids=[<de1>,<de2>])
+  Returns section_id — use in subsequent HIDESECTION rules via program_stage_section_id.
+  Preferred: pass sections in stages[] at create_program time (atomic, returns IDs in summary).
 Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = data (rw), positions 5-8 reserved.
   "rw------" = metadata read+write only (NO data access — won't appear in Capture/Data Entry)
   "rwrw----" = metadata + data read+write (full access)
@@ -4325,8 +4329,8 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
         properties: {
           action: {
             type: 'string',
-            enum: ['remove_from_stage', 'delete', 'check_references', 'update_program_org_units', 'update_sharing', 'add_program_attributes', 'update_style', 'convert_value_type', 'discover_icons'],
-            description: 'remove_from_stage = remove data element(s) from a program stage. delete = delete metadata with reference checking. check_references = list dependencies. update_program_org_units = set/add/remove the organisation units assigned to a program. update_sharing = update sharing/access settings via the DHIS2 sharing API. add_program_attributes = add tracked-entity attributes (by id or name, optionally creating new ones) to an existing program, with searchable / displayInList / mandatory flags. update_style = set the display icon and/or color on any metadata object. discover_icons = REQUIRED before update_style for any icon you have not already verified this turn. Pass keywords[] (broad short roots like ["lung","respir","tb","medical","clinic"] for a TB program) and the tool returns every matching real DHIS2 icon key + its keywords in one shot. update_style refuses fabricated keys; you MUST pick from a discover_icons response. convert_value_type = change valueType of a dataElement, trackedEntityAttribute, or optionSet (and cascade — e.g. converting an optionSet to MULTI_TEXT also flips every DE/TEA referencing it). Use this for "make this multi-select" / "switch to text with multiple values" requests; it patches both ends so the DE+optionSet pair stays consistent.'
+            enum: ['remove_from_stage', 'delete', 'check_references', 'update_program_org_units', 'update_sharing', 'add_program_attributes', 'update_style', 'convert_value_type', 'discover_icons', 'create_stage_section'],
+            description: 'remove_from_stage = remove data element(s) from a program stage. delete = delete metadata with reference checking. check_references = list dependencies. update_program_org_units = set/add/remove the organisation units assigned to a program. update_sharing = update sharing/access settings via the DHIS2 sharing API. add_program_attributes = add tracked-entity attributes (by id or name, optionally creating new ones) to an existing program, with searchable / displayInList / mandatory flags. update_style = set the display icon and/or color on any metadata object. discover_icons = REQUIRED before update_style for any icon you have not already verified this turn. Pass keywords[] (broad short roots like ["lung","respir","tb","medical","clinic"] for a TB program) and the tool returns every matching real DHIS2 icon key + its keywords in one shot. update_style refuses fabricated keys; you MUST pick from a discover_icons response. convert_value_type = change valueType of a dataElement, trackedEntityAttribute, or optionSet (and cascade — e.g. converting an optionSet to MULTI_TEXT also flips every DE/TEA referencing it). Use this for "make this multi-select" / "switch to text with multiple values" requests; it patches both ends so the DE+optionSet pair stays consistent. create_stage_section = add a named section (grouping DEs within a stage) to an EXISTING program stage. Requires stage_id, section_name, section_data_element_ids. Returns the new section UID for HIDESECTION rules. Preferred: pass sections inside stages[] at create_program time for atomic creation; use this only for post-creation additions.'
           },
           object_type: {
             type: 'string',
@@ -4432,6 +4436,15 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
           value_type: {
             type: 'string',
             description: 'For convert_value_type: the new valueType (e.g. MULTI_TEXT, TEXT, LONG_TEXT). MULTI_TEXT = multi-select; the tool auto-cascades the change so the DE/TEA and its optionSet end up with the same valueType, since DHIS2 New Tracker Capture only renders multi-select UI when both sides are MULTI_TEXT.'
+          },
+          section_name: {
+            type: 'string',
+            description: 'For create_stage_section: display name for the new program stage section.'
+          },
+          section_data_element_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'For create_stage_section: UIDs of data elements (already in the stage) to place in this section. Must be a subset of the stage\'s programStageDataElements.'
           },
           skip_backup: {
             type: 'boolean',
@@ -13133,7 +13146,99 @@ async function executeManageMetadata(args) {
     };
   }
 
-  return { _error: `Unknown action: ${action}. Use remove_from_stage, delete, check_references, update_program_org_units, update_sharing, add_program_attributes, update_style, convert_value_type, or discover_icons.` };
+  // ── create_stage_section: add a named section to an existing program stage ──
+  if (action === 'create_stage_section') {
+    const _gate = requireWriteAuth('manage_metadata', 'create_stage_section', { stage_id: args.stage_id });
+    if (_gate) return _gate;
+    if (!args.stage_id) return { _error: 'stage_id required for create_stage_section' };
+    if (!args.section_name) return { _error: 'section_name required for create_stage_section' };
+    const deIds = args.section_data_element_ids || args.data_element_ids || [];
+    if (!deIds.length) return { _error: 'section_data_element_ids (array of DE UIDs already in the stage) required for create_stage_section' };
+
+    // Load current stage — need PSDEs + existing sections for validation and atomic PUT
+    const stageResp = await safeDhis2Fetch(
+      `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,` +
+      `programStageDataElements[id,compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics,dataElement[id]],` +
+      `programStageSections[id,name,sortOrder,dataElements[id]]`
+    );
+    if (stageResp._error) return { _error: `Could not load stage ${args.stage_id}: ${stageResp._error}` };
+    if (!stageResp.name || !stageResp.program?.id) return { _error: `Stage ${args.stage_id} is missing required name/program fields` };
+
+    // Validate all requested DEs are in the stage
+    const stageDEIds = new Set(
+      (stageResp.programStageDataElements || []).map(p => p.dataElement?.id).filter(Boolean)
+    );
+    const notInStage = deIds.filter(id => !stageDEIds.has(id));
+    if (notInStage.length) {
+      return {
+        _error: `Data element(s) not found in stage "${stageResp.name}": ${notInStage.join(', ')}`,
+        _hint: 'section_data_element_ids must be UIDs of DEs already in the stage. Use get_program_info or search_metadata to list the stage\'s DEs.',
+        stage_data_element_ids: Array.from(stageDEIds),
+      };
+    }
+
+    const existingSections = stageResp.programStageSections || [];
+    const maxSortOrder = existingSections.reduce((m, s) => Math.max(m, s.sortOrder || 0), 0);
+    const newSortOrder = (typeof args.sort_order === 'number') ? args.sort_order : (maxSortOrder + 1);
+
+    const secUid = generateDhis2Uid();
+    const newSection = {
+      id: secUid,
+      name: args.section_name,
+      programStage: { id: args.stage_id },
+      sortOrder: newSortOrder,
+      renderType: { DESKTOP: { type: 'LISTING' }, MOBILE: { type: 'LISTING' } },
+      dataElements: deIds.map(id => ({ id })),
+    };
+
+    // Rebuild full stage object to ensure it references the new section and has formType=SECTION
+    const updatedStage = {
+      id: args.stage_id,
+      name: stageResp.name,
+      program: { id: stageResp.program.id },
+      sortOrder: stageResp.sortOrder,
+      repeatable: stageResp.repeatable || false,
+      formType: 'SECTION',
+      programStageDataElements: (stageResp.programStageDataElements || []).map(p => ({
+        id: p.id,
+        dataElement: { id: p.dataElement.id },
+        compulsory: p.compulsory || false,
+        allowProvidedElsewhere: p.allowProvidedElsewhere || false,
+        sortOrder: p.sortOrder,
+        displayInReports: p.displayInReports || false,
+        allowFutureDate: p.allowFutureDate || false,
+        renderOptionsAsRadio: p.renderOptionsAsRadio || false,
+        skipSynchronization: p.skipSynchronization || false,
+        skipAnalytics: p.skipAnalytics || false,
+      })),
+      programStageSections: [
+        ...existingSections.map(s => ({ id: s.id })),
+        { id: secUid },
+      ],
+    };
+
+    const payload = {
+      programStages: [updatedStage],
+      programStageSections: [newSection],
+    };
+
+    const result = await postMetadataPayload(payload, false);
+    if (!result.success) return result;
+
+    return {
+      success: true,
+      action: 'create_stage_section',
+      section_id: secUid,
+      section_name: args.section_name,
+      stage_id: args.stage_id,
+      stage_name: stageResp.name,
+      sort_order: newSortOrder,
+      data_element_count: deIds.length,
+      _note: `Section "${args.section_name}" (id: ${secUid}) added to stage "${stageResp.name}". Use section_id in HIDESECTION rule actions via program_stage_section_id: "${secUid}".`,
+    };
+  }
+
+  return { _error: `Unknown action: ${action}. Use remove_from_stage, delete, check_references, update_program_org_units, update_sharing, add_program_attributes, update_style, convert_value_type, discover_icons, or create_stage_section.` };
 }
 
 // Helper: check all references for a metadata object
