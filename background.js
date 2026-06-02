@@ -11861,18 +11861,43 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) referencedTEAs.add(act.tracked_entity_attribute_name);
       }
 
-      // Create DE-based PRVs
+      // Create DE-based PRVs.
+      // Smart sourceType: DATAELEMENT_CURRENT_EVENT for same-stage rules so
+      // HIDEFIELD/SHOWWARNING/SETMANDATORYFIELD evaluate in real-time as the
+      // user types. DATAELEMENT_NEWEST_EVENT_PROGRAM reads the most recently
+      // SAVED event — correct for cross-stage lookups but silently breaks
+      // real-time visibility rules (the form appears unchanged until save+reload).
+      // Note: _buildAndPostProgramRules already uses this same heuristic via
+      // pickSourceType(); this aligns the inline create_program builder.
+      const _inlineSameStageTypes = new Set([
+        'SHOWWARNING','SHOWERROR','WARNINGONCOMPLETE','ERRORONCOMPLETE',
+        'SHOWWARNINGINFORMATION','SETMANDATORYFIELD','DISPLAYTEXT',
+      ]);
       for (const deName of referencedDEs) {
         if (!prvCreated[deName]) {
           const prvUid = generateDhis2Uid();
           const deObj = allDataElements.find(d => d.name === deName);
           const hasOptionSet = !!(deObj?.optionSet);
+          let prvSourceType = 'DATAELEMENT_NEWEST_EVENT_PROGRAM';
+          for (let _si = 0; _si < stages.length; _si++) {
+            const _stgDEs = stages[_si].data_elements || [];
+            if (_stgDEs.some(d => d.name === deName)) {
+              const _stageDeNames = new Set(_stgDEs.map(d => d.name));
+              const hasSameStageAction = (rule.actions || []).some(act => {
+                if (_inlineSameStageTypes.has(act.type)) return true;
+                if (act.data_element_name && _stageDeNames.has(act.data_element_name)) return true;
+                return false;
+              });
+              if (hasSameStageAction) prvSourceType = 'DATAELEMENT_CURRENT_EVENT';
+              break;
+            }
+          }
           allProgramRuleVariables.push({
             id: prvUid,
             name: sanitizeVariableName(deName),
             program: { id: programUid },
             dataElement: { id: deUidMap[deName] },
-            programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+            programRuleVariableSourceType: prvSourceType,
             valueType: deObj?.valueType || 'TEXT',
             useCodeForOptionSet: hasOptionSet,
           });
