@@ -17226,7 +17226,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   let lastToolName = null;
   let emptyResponseCount = 0; // Guard against infinite think-only loops
 
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 30; i++) {
     // Contextual thinking label
     const thinkLabel = lastToolName
       ? thinkingAfterTool[lastToolName] || 'Processing results'
