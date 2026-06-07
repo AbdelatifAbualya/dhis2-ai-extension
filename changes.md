@@ -78,12 +78,22 @@ Add `redirect: 'manual'` to the `/api/system/info` probe so the login bounce is 
 instead of followed**:
 
 - With `redirect: 'manual'`, a 302-to-login surfaces as an **opaque redirect**
-  (`resp.type === 'opaqueredirect'` / `resp.status === 0`) and **no CORS error is logged**.
-- When that is detected, the probe now returns a clear, actionable message:
-  *"Not signed in to this DHIS2 instance. Log in to this server in the tab, then reopen the panel."*
-- This error string flows through the existing path with **no panel changes**: the `INITIALIZE`
-  handler returns it via `sendResponse` (`background.js:17737`) and the panel already displays
-  any returned `error` through `setStatus('disconnected', resp.error)` (`panel.js:203-204`).
+  (`resp.type === 'opaqueredirect'` / `resp.status === 0`), so the redirect is **no longer
+  followed into the login page and the CORS error is no longer produced**. The probe simply
+  treats the instance as not-connected and bails out cleanly.
+- The primary, verified outcome of this change is that **the CORS error is resolved**: switching
+  to another instance on the same host no longer floods the console with a misleading
+  `No 'Access-Control-Allow-Origin' header` error.
+
+**Note on the returned error string:** the probe returns
+`{ error: 'Not signed in to this DHIS2 instance…' }` for this case. That string is only surfaced
+in the panel's status bar when the **panel itself** initiates the connection (panel open / the
+"Allow access" flow) via `INITIALIZE → sendResponse → setStatus('disconnected', resp.error)`
+(`background.js:17737`, `panel.js:203-204`). When you switch instances while the panel is
+**already open**, reconnection is driven by the background auto-init listeners
+(`onActivated`/`syncFromTab`, `onUpdated`, `webNavigation`), which intentionally discard the
+returned value — so **no login message is shown on a live tab-switch**. This is acceptable: the
+goal of this change was to eliminate the confusing CORS error, which it does.
 
 **Before:**
 ```js
