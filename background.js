@@ -2695,10 +2695,22 @@ async function initializeFromUrl(url) {
   if (dhis2.baseUrl !== baseUrl || !dhis2.connected) {
     try {
       dhis2.baseUrl = baseUrl;
-      const info = await fetch(`${baseUrl}/api/system/info`, {
+      // `redirect: 'manual'` so a "not logged in" 302 to the login page surfaces as an
+      // opaque redirect instead of being followed into a noisy CORS error. Common on the
+      // DHIS2 playground: every instance shares one host (so the host permission, granted
+      // once, already covers them all) but each instance needs its own login.
+      const resp = await fetch(`${baseUrl}/api/system/info`, {
         credentials: 'include',
-        headers: { Accept: 'application/json' }
-      }).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+        headers: { Accept: 'application/json' },
+        redirect: 'manual',
+      });
+      if (resp.type === 'opaqueredirect' || resp.status === 0) {
+        dhis2.baseUrl = null;
+        dhis2.connected = false;
+        return { error: 'Not signed in to this DHIS2 instance. Log in to this server in the tab, then reopen the panel.' };
+      }
+      if (!resp.ok) throw new Error(resp.status);
+      const info = await resp.json();
       dhis2.apiVersion = info.version.split('.')[1];
       dhis2.systemInfo = info;
       dhis2.connected = true;
