@@ -64,13 +64,17 @@ scoped **per instance (path)**. On the DHIS2 playground every instance lives on 
    `fetch('…/api/system/info', { credentials: 'include' })` has no valid session for it, so
    DHIS2 responds with a **302 redirect to its login page**
    (`…/stable-2-42-4-1/dhis-web-login/`).
-3. `fetch` automatically **followed** that redirect. The login page carries no
-   `Access-Control-Allow-Origin` header, so the browser blocked the redirected response and
-   logged a **CORS error** — which looks like an extension bug, when the real cause is simply
-   "not signed in to this instance." The panel only showed a generic "Could not connect."
+3. `fetch` automatically **followed** that redirect, and the browser logged a **CORS error**
+   (`No 'Access-Control-Allow-Origin' header`) for the redirected login-page response — which
+   looks like an extension bug, when the real cause is simply "not signed in to this instance."
 
-This was not dangerous (it failed closed), but it surfaced a scary CORS error in the console
-and gave the user no actionable guidance — and the playground is exactly where a reviewer hits it.
+**Observed symptom:** the *only* visible sign of the problem was that CORS error in the
+**extension's background / service-worker console** (`chrome://extensions` → "service worker" /
+DevTools). The side panel itself did **not** show an error and did **not** say "Could not
+connect" — it kept displaying the previously-connected instance's state (the panel retains its
+in-memory state on a same-host tab-switch). So in practice the failure was silent in the panel UI
+and visible only in the logs. That stray CORS error is exactly what a reviewer testing on the
+playground would notice, which is why it was worth removing.
 
 ### The fix
 
