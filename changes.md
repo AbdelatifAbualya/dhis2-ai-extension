@@ -41,3 +41,84 @@ message at `background.js:17533` is unchanged and still triggers if the new, hig
 reached.
 
 **Verification:** `node --check background.js` passes (syntax valid).
+
+---
+
+## 2. Fix confusing CORS error when switching between DHIS2 instances on the same host
+
+**File:** `background.js`
+**Function:** `initializeFromUrl` (the connection probe), around line 2696
+**Type of change:** Modified (net +15 / −3 lines, one file; no panel/HTML/CSS changes)
+
+### The issue
+
+Chrome host permissions are granted **per host**, but a DHIS2 login session (cookie) is
+scoped **per instance (path)**. On the DHIS2 playground every instance lives on the same host
+(e.g. `https://play.im.dhis2.org/stable-2-41-…`, `…/stable-2-42-4-1/…`), so:
+
+1. After you click **Allow** on the first instance, the granted pattern is host-wide
+   (`https://play.im.dhis2.org/*`, built at `panel.js:184` and checked at `background.js:2671`).
+   Switching to a *second* instance on the same host therefore shows **no permission prompt** —
+   it is already covered.
+2. But you are **not logged in** to that second instance. The connection probe
+   `fetch('…/api/system/info', { credentials: 'include' })` has no valid session for it, so
+   DHIS2 responds with a **302 redirect to its login page**
+   (`…/stable-2-42-4-1/dhis-web-login/`).
+3. `fetch` automatically **followed** that redirect. The login page carries no
+   `Access-Control-Allow-Origin` header, so the browser blocked the redirected response and
+   logged a **CORS error** — which looks like an extension bug, when the real cause is simply
+   "not signed in to this instance." The panel only showed a generic "Could not connect."
+
+This was not dangerous (it failed closed), but it surfaced a scary CORS error in the console
+and gave the user no actionable guidance — and the playground is exactly where a reviewer hits it.
+
+### The fix
+
+Add `redirect: 'manual'` to the `/api/system/info` probe so the login bounce is **detected
+instead of followed**:
+
+- With `redirect: 'manual'`, a 302-to-login surfaces as an **opaque redirect**
+  (`resp.type === 'opaqueredirect'` / `resp.status === 0`) and **no CORS error is logged**.
+- When that is detected, the probe now returns a clear, actionable message:
+  *"Not signed in to this DHIS2 instance. Log in to this server in the tab, then reopen the panel."*
+- This error string flows through the existing path with **no panel changes**: the `INITIALIZE`
+  handler returns it via `sendResponse` (`background.js:17737`) and the panel already displays
+  any returned `error` through `setStatus('disconnected', resp.error)` (`panel.js:203-204`).
+
+**Before:**
+```js
+dhis2.baseUrl = baseUrl;
+const info = await fetch(`${baseUrl}/api/system/info`, {
+  credentials: 'include',
+  headers: { Accept: 'application/json' }
+}).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+dhis2.apiVersion = info.version.split('.')[1];
+```
+
+**After:**
+```js
+dhis2.baseUrl = baseUrl;
+// `redirect: 'manual'` so a "not logged in" 302 to the login page surfaces as an
+// opaque redirect instead of being followed into a noisy CORS error. Common on the
+// DHIS2 playground: every instance shares one host (so the host permission, granted
+// once, already covers them all) but each instance needs its own login.
+const resp = await fetch(`${baseUrl}/api/system/info`, {
+  credentials: 'include',
+  headers: { Accept: 'application/json' },
+  redirect: 'manual',
+});
+if (resp.type === 'opaqueredirect' || resp.status === 0) {
+  dhis2.baseUrl = null;
+  dhis2.connected = false;
+  return { error: 'Not signed in to this DHIS2 instance. Log in to this server in the tab, then reopen the panel.' };
+}
+if (!resp.ok) throw new Error(resp.status);
+const info = await resp.json();
+dhis2.apiVersion = info.version.split('.')[1];
+```
+
+**Scope of impact:** Only the connection probe in `initializeFromUrl` changes. The permission
+flow, tool logic, and all other fetches are untouched. The existing generic
+`catch → 'Could not connect to DHIS2'` fallback is preserved for genuine network failures.
+
+**Verification:** `node --check background.js` passes (syntax valid).
