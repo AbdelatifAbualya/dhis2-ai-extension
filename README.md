@@ -14,7 +14,7 @@
 
 - **Talks to DHIS2 in your active session.** No passwords stored — the extension proxies API calls through the tab you're already logged into. Sign out of DHIS2 and the assistant immediately loses access.
 - **Knows where you are.** Detects program / org unit / stage / TEI / dataset / visualization / map from the URL of your active DHIS2 tab. The system prompt narrows itself to the relevant tools and rules every turn.
-- **Runs as an agent.** The model picks tools, calls them, reads the JSON, and continues — up to 12 iterations per turn — without you driving the API.
+- **Runs as an agent.** The model picks tools, calls them, reads the JSON, and continues — up to 30 iterations per turn — without you driving the API.
 - **Authors metadata atomically.** Programs, stages, data elements, option sets, TEAs, program rules, program indicators, datasets, sections, **category combinations + disaggregation**, sharing, org-unit assignment, icons / colors, all in single bundled `/api/metadata` POSTs with auto-backup before every destructive write.
 - **Streams answers and downloads them.** Real-time chat with progress indicators per tool call; every response can be exported as HTML / Word / CSV / JSON.
 
@@ -89,7 +89,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 2. **System prompt assembly** — base rules + only the conditional blocks the request needs.
 3. **Reliability prefetch** — TEI details / visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
 4. **Tool selection** — `getContextualTools()` filters the 22 tools down to the 6–12 relevant for the request.
-5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 12 iterations per turn, 3 consecutive empty responses trigger bailout.
+5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 30 iterations per turn, 3 consecutive empty responses trigger bailout.
 6. **Persistence** — per-turn state (`knownIds`, `knownIcons`, `recentCreations`, `writeAuth`, …) survives service-worker restarts via stripped JSON snapshots.
 
 ### Write pipeline (the strict path destructive operations follow)
