@@ -136,3 +136,88 @@ flow, tool logic, and all other fetches are untouched. The existing generic
 `catch → 'Could not connect to DHIS2'` fallback is preserved for genuine network failures.
 
 **Verification:** `node --check background.js` passes (syntax valid).
+
+---
+
+## 3. Increase the agentic iteration limit from 30 to 50
+
+**File:** `background.js`
+**Function:** the main agentic loop (`for (let i = 0; i < N; i++)`)
+**Type of change:** Modified (1 line)
+
+**Before:**
+```js
+for (let i = 0; i < 30; i++) {
+```
+
+**After:**
+```js
+for (let i = 0; i < 50; i++) {
+```
+
+**What it does:**
+Raises the per-turn cap on agentic iterations from **30** to **50**. Each pass through this loop
+is one think→tool-call→read-result cycle. Multi-step authoring flows (e.g. "build a dataset,
+attach data elements, then design a custom form for it") can chain many tool calls in a single
+turn; 30 was occasionally hit before such a flow finished. No tool, prompt, or response-handling
+logic changed — only the upper bound. The "Reached maximum iterations" fallback still triggers if
+the new, higher limit is reached.
+
+Docs updated to match: `README.md` ("up to 50 iterations per turn", "Hard caps: 50 iterations per
+turn").
+
+**Verification:** `node --check background.js` passes (syntax valid).
+
+---
+
+## 4. New tool — `manage_custom_forms` (custom HTML data-entry forms for datasets AND tracker program stages)
+
+**Files:** `background.js` (tool definition, `TOOL_ROUTER`, `executeTool` dispatch, handler block,
+`getContextualTools`, `buildSystemPrompt` KB block), `sidepanel/panel.js` (icon, label, tool-card
+detail), `README.md` (tool table + quirks). This brings the tool count from **22 → 23**.
+
+**Type of change:** Added (new tool, ~430 new lines in `background.js`; small wiring edits elsewhere).
+
+### What it does
+Adds a dedicated tool to author **CUSTOM (HTML) data-entry forms** for two targets:
+
+- **dataSets** — the form renders in the new Aggregate Data Entry app.
+- **tracker/event program STAGES** — the form renders in the new Capture app.
+
+Actions: `get` (inspect current form), `preview_html` (auto-generate a clean table-based form
+skeleton from the target's data elements and return it **without saving**), `set_dataset_form`,
+`set_stage_form` (create/replace the form and flip `formType` to `CUSTOM`; pass your own
+`html_code` or let the tool auto-generate one), and `remove_form` (revert to DEFAULT/SECTION).
+The tool reuses the existing write-auth gate, `verifyTargetExists` 404 guard, and auto-backup
+(`ensureBackupOrBail`) before every write.
+
+### Why it was built this way — verified live on DHIS2 2.43 (play `stable-2-43-0-1`)
+The behaviour was confirmed end-to-end against a live 2.43 instance before writing the tool:
+created a custom dataset form, confirmed it renders in Aggregate Data Entry and that an entered
+value (42) persisted; created a custom program-stage form, confirmed it renders in Capture. The
+following DHIS2 quirks were discovered and are now encoded so the model never re-derives them:
+
+1. **A `dataEntryForm` cannot be created inline.** Embedding `{name, htmlCode}` in a
+   dataSet/programStage payload — via the `/api/metadata` importer **or** a direct object PUT —
+   fails with **E5002 "Invalid reference … (DataEntryForm)"**. The tool always `POST`s the form
+   standalone to `/api/dataEntryForms` first, then references it by id.
+2. **Input-id binding differs per target** (the apps bind native widgets to these ids and render
+   the rest of the HTML verbatim):
+   - dataset cell: `<input id="<dataElementUID>-<categoryOptionComboUID>-val" …>`
+   - stage cell:   `<input id="<programStageUID>-<dataElementUID>-val" …>`
+3. **Linking to a program stage drops the `program` reference** on a PATCH or naive PUT ("Program
+   stage must reference a program"), because `GET ?fields=:owner` omits `program`. The tool does a
+   full PUT that **re-attaches `program:{id}`** explicitly. (Datasets link cleanly via PATCH.)
+4. A dataset custom form only accepts data entry when sharing is `rwrw----` and an org unit is
+   assigned — the tool surfaces these as `_hints` (the fix stays with `manage_datasets`).
+
+### Wiring
+- `getContextualTools()` surfaces `manage_custom_forms` on dataset/tracker contexts and on custom-
+  form intent ("custom form", "design a data entry form", "html form", …); it is stripped in
+  read-only save-diagnosis mode and counted as write-capable (so `manage_backups` rides along).
+- `buildSystemPrompt()` adds a concise "Custom (HTML) Forms" KB block when relevant.
+- `panel.js` adds the 📝 icon, "Designing custom form" label, and a tool-card detail line.
+
+**Verification:** `node --check background.js`, `node --check sidepanel/panel.js` both pass.
+Underlying API sequence verified live on 2.43 (form renders + saves in both Aggregate Data Entry
+and Capture); test metadata cleaned up afterward.

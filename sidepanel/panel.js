@@ -1582,6 +1582,7 @@ ${turnXml}
       manage_metadata: { cls: 'tool-icon-create', icon: '\u{1F527}' },
       manage_program_notifications: { cls: 'tool-icon-notification', icon: '\u{1F4E8}' },
       manage_datasets: { cls: 'tool-icon-dataset', icon: '\u{1F4D1}' },
+      manage_custom_forms: { cls: 'tool-icon-create', icon: '\u{1F4DD}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1609,6 +1610,7 @@ ${turnXml}
       manage_metadata: 'Managing metadata',
       manage_program_notifications: 'Managing program notifications',
       manage_datasets: 'Managing datasets',
+      manage_custom_forms: 'Designing custom form',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1736,6 +1738,15 @@ ${turnXml}
       if (args.public_access) parts.push(`access: ${args.public_access}`);
       if (args.section_id) parts.push(`section: ${args.section_id.slice(0, 11)}`);
       if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_custom_forms') {
+      const parts = [args.action || 'unknown'];
+      if (args.dataset_id || args.object_id) parts.push(`dataset: ${String(args.dataset_id || args.object_id).slice(0, 11)}`);
+      if (args.program_stage_id || args.stage_id) parts.push(`stage: ${String(args.program_stage_id || args.stage_id).slice(0, 11)}`);
+      if (args.html_code) parts.push('custom html');
+      else if (args.action && args.action.startsWith('set')) parts.push('auto-generated');
+      if (args.style) parts.push(`style: ${args.style}`);
+      if (args.new_form_type) parts.push(`revert: ${args.new_form_type}`);
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {
       const parts = [args.action || 'list'];

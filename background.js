@@ -4667,6 +4667,57 @@ Returns: { success, dataset_id, dataset_name, ... summary }. On failure: { _erro
   {
     type: 'function',
     function: {
+      name: 'manage_custom_forms',
+      description: `Author CUSTOM (HTML) data-entry forms for BOTH dataSets (aggregate) AND tracker/event program stages. Use this whenever the user asks to "create a custom form", "design a data entry form", "build a custom layout", "make an HTML form", or wants full control over how fields are laid out (tables, headings, narrative text between fields) beyond DEFAULT/SECTION forms.
+
+Targets (pass exactly ONE):
+- dataset_id — a dataSet → the form renders in the Aggregate Data Entry app.
+- program_stage_id — a program stage (tracker OR event program) → the form renders in the Capture app.
+
+Actions:
+- get — inspect the current form: formType, linked dataEntryForm id/name/style, parsed input ids, html preview.
+- preview_html — auto-generate a clean table-based htmlCode skeleton from the target's data elements and RETURN it WITHOUT saving (so you can show/edit it first).
+- set_dataset_form — create/replace the custom form on a dataSet and flip formType to CUSTOM. Pass html_code, or omit it to auto-generate one input per data element × categoryOptionCombo.
+- set_stage_form — create/replace the custom form on a program stage and flip formType to CUSTOM. Pass html_code, or omit to auto-generate one input per stage data element.
+- remove_form — unlink the custom form and revert formType (new_form_type: DEFAULT | SECTION, default DEFAULT). Set delete_form_object:true to also delete the orphaned dataEntryForm.
+
+Input-id binding (CRITICAL — the apps bind native widgets to these ids and render the rest of the HTML verbatim):
+- dataset cell:      <input id="<dataElementUID>-<categoryOptionComboUID>-val" title="" value="">
+- program-stage cell: <input id="<programStageUID>-<dataElementUID>-val" title="" value="">
+
+DHIS2 quirks this tool encodes so you do NOT re-derive them (verified on 2.43):
+- A dataEntryForm CANNOT be embedded inline. The tool ALWAYS creates it standalone via POST /api/dataEntryForms first, then references it — embedding {name,htmlCode} in a dataSet/programStage payload fails with E5002 "Invalid reference (DataEntryForm)".
+- Linking to a program stage with PATCH or a naive PUT DROPS the program reference ("Program stage must reference a program"). The tool does a full PUT that re-attaches program:{id} (GET ?fields=:owner omits program).
+- A dataset custom form only accepts data entry when sharing is rwrw---- (data write) AND at least one org unit is assigned — the tool reports these as hints but you fix them with manage_datasets (update_sharing / assign_org_units).
+- Auto-backup runs before set_*/remove_form. style is one of NORMAL (default), COMFORTABLE, COMPACT, NONE.
+
+Returns: { success, target, form_id, input_count, form_type, backup, _hints }. On failure: { _error, _hint } so you can recover without re-prompting.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['get', 'preview_html', 'set_dataset_form', 'set_stage_form', 'remove_form'],
+            description: 'Which custom-form operation to perform.'
+          },
+          dataset_id: { type: 'string', description: 'DataSet UID. Use for dataset custom forms (get / preview_html / set_dataset_form / remove_form).' },
+          object_id: { type: 'string', description: 'Alias for dataset_id.' },
+          program_stage_id: { type: 'string', description: 'Program stage UID. Use for tracker/event program-stage custom forms (get / preview_html / set_stage_form / remove_form).' },
+          stage_id: { type: 'string', description: 'Alias for program_stage_id.' },
+          html_code: { type: 'string', description: 'For set_dataset_form / set_stage_form: the full custom-form HTML. Inputs MUST use the id binding format for the target (see description). If omitted, the tool auto-generates a clean table form from the target\'s data elements.' },
+          form_name: { type: 'string', description: 'Optional dataEntryForm display name (unique server-wide). Defaults to "<target name> custom form". When updating an existing form, the existing name is kept unless this is set.' },
+          style: { type: 'string', enum: ['NORMAL', 'COMFORTABLE', 'COMPACT', 'NONE'], description: 'Form rendering style. Default NORMAL.' },
+          new_form_type: { type: 'string', enum: ['DEFAULT', 'SECTION'], description: 'For remove_form: what to revert formType to. Default DEFAULT.' },
+          delete_form_object: { type: 'boolean', description: 'For remove_form: also DELETE the orphaned dataEntryForm object (default false — it is just unlinked).' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before set_*/remove_form. Only after the user is told the backup failed AND authorizes proceeding.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -4721,6 +4772,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_metadata: true,
   manage_program_notifications: true,
   manage_datasets: true,
+  manage_custom_forms: true,
   manage_backups: true,
 });
 
@@ -4787,6 +4839,13 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     || /\b(period\s*type|monthly\s*form|weekly\s*form|quarterly\s*form|yearly\s*form|monthly\s*report|weekly\s*report)\b/.test(combinedText)
     || /\b(category\s*combo|category\s*combination|disaggregation|cat\s*combo)\b/.test(combinedText)
     || /\b(data\s*set\s*sections?|dataset\s*sections?)\b/.test(combinedText);
+  // ── Custom-form intent ──
+  // "custom form", "custom data entry form", "design a form", "html form",
+  // "custom layout", "form designer" — for datasets OR program stages.
+  const wantsCustomFormIntent =
+    /\b(custom\s*forms?|custom\s*(data\s*)?entry\s*forms?|custom\s*layout|html\s*forms?|form\s*designer|dataentryform)\b/.test(combinedText)
+    || (/\b(design|build|create|make|lay\s*out|customi[sz]e)\b.{0,40}\b(form|layout)\b/.test(combinedText)
+        && /\b(custom|html|data\s*entry|tracker|stage|dataset|data\s*set|aggregate)\b/.test(combinedText));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -4915,10 +4974,20 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   if (inDatasetCtx || wantsDatasetIntent) {
     selected.add('manage_datasets');
     selected.add('manage_metadata');
+    selected.add('manage_custom_forms');
     selected.add('search_metadata');
     selected.add('get_program_info');
     // Resolve_option_codes is useful for cat-combo / option labels in saved values
     if (inDatasetCtx) selected.add('resolve_option_codes');
+  }
+
+  // ── Custom-form authoring — dataset OR program-stage HTML forms ──
+  // Surface manage_custom_forms whenever the user expresses form-design intent,
+  // or is in a tracker/dataset context where a custom form is plausible.
+  if (wantsCustomFormIntent || inTrackerCtx) {
+    selected.add('manage_custom_forms');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
   }
 
   // ── Intent-driven override: if the user explicitly asks to create or manage
@@ -4965,6 +5034,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const writeCapableNames = new Set([
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
+    'manage_custom_forms',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -4998,6 +5068,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_program_notifications');
     selected.delete('create_metadata');
     selected.delete('manage_datasets');
+    selected.delete('manage_custom_forms');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5064,6 +5135,10 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
     || /\b(period\s*type|monthly\s*form|weekly\s*form|quarterly\s*form|yearly\s*form)\b/i.test(text)
     || /\b(category\s*combo|category\s*combination|disaggregation|cat\s*combo)\b/i.test(text);
   const wantsTrackerWrite = inTrackerCtx && /\b(create|add|register|enroll|complete|close|update|change status|new enrollment|new profile|new event|mark.{0,20}complete|set.{0,20}complete)\b/i.test(text);
+  const wantsCustomFormPrompt =
+    /\b(custom\s*forms?|custom\s*(data\s*)?entry\s*forms?|custom\s*layout|html\s*forms?|form\s*designer|dataentryform)\b/i.test(text)
+    || (/\b(design|build|create|make|lay\s*out|customi[sz]e)\b.{0,40}\b(form|layout)\b/i.test(text)
+        && /\b(custom|html|data\s*entry|tracker|stage|dataset|data\s*set|aggregate)\b/i.test(text));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -5589,6 +5664,39 @@ A dataset only appears in a user's Data Entry app for the OUs assigned to it. Us
 - DataSet \`version\` auto-increments on save — never set it manually.
 - \`expiryDays = 0\` and \`openFuturePeriods = 0\` mean "never expires" and "no future periods open", NOT "expires immediately".
 - A dataset's "indicators" field is for DISPLAY indicators on the form (read-only sums). DON'T confuse with program indicators.
+`;
+  }
+
+  // ── Custom Forms KB — dataset & program-stage HTML data-entry forms ──
+  if (wantsCustomFormPrompt || inTrackerCtx || hasDatasetCtx || inAggDataEntryCtx) {
+    p += `
+## DHIS2 Custom (HTML) Forms — use the **manage_custom_forms** tool
+A CUSTOM form is hand-laid-out HTML for data entry. It works for BOTH dataSets (renders in the Aggregate Data Entry app) and tracker/event program STAGES (renders in the new Capture app). Use **manage_custom_forms** for ALL of this — never assemble raw POST/PUT bodies via dhis2_query.
+
+### When to use
+- "create/design/build a custom form", "custom data entry form", "html form", "custom layout/form designer" → manage_custom_forms.
+- For a dataset → pass \`dataset_id\`. For a tracker/event program stage → pass \`program_stage_id\` (NOT the program id — a custom form lives on the STAGE).
+
+### Actions
+- \`preview_html\` — auto-generate a clean table form skeleton from the target's data elements and SHOW it (nothing saved). Good first step so the user can review/tweak.
+- \`set_dataset_form\` / \`set_stage_form\` — create/replace the form and flip formType to CUSTOM. Omit \`html_code\` to auto-generate; or pass your own \`html_code\`.
+- \`get\` — inspect the existing form. \`remove_form\` — revert to DEFAULT/SECTION.
+
+### Input-id binding (the ONLY thing that makes a cell save) — the tool builds these for you, but if you hand-write html_code they MUST be exact:
+- dataset cell:       \`<input id="<dataElementUID>-<categoryOptionComboUID>-val" title="" value="">\`
+- program-stage cell: \`<input id="<programStageUID>-<dataElementUID>-val" title="" value="">\`
+Everything else in the HTML (tables, headings, narrative text) renders verbatim.
+
+### Hard-learned quirks the tool already handles — do NOT try to do these by hand:
+- The dataEntryForm is created STANDALONE first (POST /api/dataEntryForms); it can never be embedded inline in a dataSet/programStage (E5002).
+- Linking to a program stage re-attaches the program reference on a full PUT (a PATCH/naive PUT loses it → "must reference a program").
+- A dataset custom form needs sharing rwrw---- + an assigned org unit before users can actually enter data. If the tool's \`_hints\` flag these, fix them with **manage_datasets** (update_sharing / assign_org_units).
+
+### Recipes
+- "Make a custom form for this dataset": manage_custom_forms(action="set_dataset_form", dataset_id="<id>")  // auto-generates from its DEs
+- "Design a custom form for this tracker stage": manage_custom_forms(action="set_stage_form", program_stage_id="<stageId>")
+- "Show me what the form would look like first": manage_custom_forms(action="preview_html", dataset_id|program_stage_id)
+- "Use my own HTML": pass html_code="..." with the correct id bindings above.
 `;
   }
 
@@ -9606,6 +9714,11 @@ async function executeTool(name, args) {
     return await executeManageDatasets(args);
   }
 
+  // ── manage_custom_forms ──
+  if (name === 'manage_custom_forms') {
+    return await executeManageCustomForms(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -11098,6 +11211,470 @@ async function applySharingViaLegacyEndpoint(items, sharingInput) {
     }
   }
   return errors.length ? { ok: false, error: errors[0]?.error, errors, applied } : { ok: true, applied };
+}
+
+// ── manage_custom_forms: custom dataEntryForm authoring for datasets & program stages ──
+//
+// VERIFIED end-to-end on DHIS2 2.43 (play stable-2-43-0-1). These are the mechanics
+// the other tools never had to learn, codified here so the model never re-derives them:
+//
+//  1. A dataEntryForm CANNOT be created inline. Embedding `{name, htmlCode}` inside a
+//     dataSet / programStage payload — via the /metadata importer OR a direct object PUT —
+//     fails with E5002 "Invalid reference … (DataEntryForm)". The form MUST be created
+//     standalone via POST /api/dataEntryForms FIRST, then referenced by id.
+//  2. Input-id formats differ by target (the new Aggregate Data Entry app and the new
+//     Capture app both bind native widgets to these ids and render the surrounding HTML):
+//        dataset       → "<dataElementUID>-<categoryOptionComboUID>-val"
+//        program stage → "<programStageUID>-<dataElementUID>-val"
+//  3. Linking the form:
+//        dataset       → PATCH /api/dataSets/{id} (formType=CUSTOM + dataEntryForm) works.
+//        program stage → PATCH / naive PUT DROPS the `program` reference ("Program stage
+//                        must reference a program"), because GET ?fields=:owner OMITS
+//                        `program`. A full PUT must RE-ATTACH program:{id} explicitly.
+//  4. Data entry into a dataset custom form additionally needs sharing rwrw---- (data write)
+//     + at least one assigned org unit — that stays the job of manage_datasets.
+
+const DATA_ENTRY_FORM_STYLES = new Set(['NORMAL', 'COMFORTABLE', 'COMPACT', 'NONE']);
+const CUSTOM_FORM_REVERT_TYPES = new Set(['DEFAULT', 'SECTION', 'SECTION_MULTIORG']);
+
+function escapeCustomFormHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// A single data-entry cell DHIS2 binds to. The id is the only thing that matters for
+// binding; title/value mirror what the Maintenance custom-form designer emits.
+function customFormInputCell(inputId) {
+  return `<input id="${escapeCustomFormHtml(inputId)}" title="" value="">`;
+}
+
+// Build a clean, readable two-column custom-form htmlCode from grouped field rows.
+// groups: [{ heading?, rows: [{ inputId, label }] }]
+function buildCustomFormHtml(title, groups) {
+  const parts = [];
+  if (title) parts.push(`<h3>${escapeCustomFormHtml(title)}</h3>`);
+  for (const group of groups) {
+    if (group.heading) parts.push(`<h4>${escapeCustomFormHtml(group.heading)}</h4>`);
+    parts.push('<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">');
+    parts.push('<tr><th align="left">Field</th><th align="left">Value</th></tr>');
+    for (const row of group.rows) {
+      parts.push(`<tr><td>${escapeCustomFormHtml(row.label)}</td><td>${customFormInputCell(row.inputId)}</td></tr>`);
+    }
+    parts.push('</table>');
+  }
+  return parts.join('\n');
+}
+
+// Pull every `id="…-val"` data-entry marker out of an htmlCode blob.
+function extractCustomFormInputIds(htmlCode) {
+  if (typeof htmlCode !== 'string') return [];
+  const ids = [];
+  for (const m of htmlCode.matchAll(/<(?:input|select|textarea)[^>]*\bid="([^"]+)"/gi)) {
+    ids.push(m[1]);
+  }
+  return ids;
+}
+
+// Resolve which target the call addresses. Returns { kind, id } or { _error }.
+function resolveCustomFormTarget(args) {
+  const stageId = args.program_stage_id || args.stage_id;
+  const datasetId = args.dataset_id || args.object_id;
+  if (stageId && datasetId) {
+    return { _error: 'Pass only ONE of program_stage_id or dataset_id, not both.' };
+  }
+  if (stageId) return { kind: 'stage', id: stageId };
+  if (datasetId) return { kind: 'dataset', id: datasetId };
+  return {
+    _error: 'No target specified. Pass dataset_id (for a dataset custom form) OR program_stage_id (for a tracker/event program-stage custom form).',
+  };
+}
+
+// Build the auto-generated field rows for a dataset, one input per DE × categoryOptionCombo.
+async function buildDatasetFormGroups(datasetId) {
+  const ds = await safeDhis2Fetch(
+    `dataSets/${datasetId}?fields=id,displayName,dataSetElements[dataElement[id,displayName,valueType,categoryCombo[id,categoryOptionCombos[id,displayName]]],categoryCombo[id,categoryOptionCombos[id,displayName]]]`
+  );
+  if (ds?._error) return { _error: `Could not load dataset ${datasetId}: ${ds._error}` };
+  const dses = ds.dataSetElements || [];
+  if (!dses.length) {
+    return { _error: `Dataset "${ds.displayName || datasetId}" has no data elements to build a form from. Attach data elements first (manage_datasets action="add_data_elements").` };
+  }
+  const groups = [{ rows: [] }];
+  let totalInputs = 0;
+  for (const dse of dses) {
+    const de = dse.dataElement;
+    if (!de?.id) continue;
+    const combo = dse.categoryCombo || de.categoryCombo;
+    const cocs = combo?.categoryOptionCombos || [];
+    if (cocs.length <= 1) {
+      const coc = cocs[0];
+      if (!coc?.id) continue;
+      groups[0].rows.push({ inputId: `${de.id}-${coc.id}-val`, label: de.displayName });
+      totalInputs++;
+    } else {
+      for (const coc of cocs) {
+        if (!coc?.id) continue;
+        groups[0].rows.push({ inputId: `${de.id}-${coc.id}-val`, label: `${de.displayName} — ${coc.displayName}` });
+        totalInputs++;
+      }
+    }
+  }
+  if (!totalInputs) return { _error: `Dataset "${ds.displayName || datasetId}" has data elements but no category-option-combos resolved. Run /api/maintenance/categoryOptionComboUpdate or check the category combo.` };
+  return { groups, title: ds.displayName, totalInputs };
+}
+
+// Build the auto-generated field rows for a program stage, one input per DE.
+function buildStageFormGroups(stageId, stageName, programStageDataElements) {
+  const rows = [];
+  for (const psde of (programStageDataElements || [])) {
+    const de = psde.dataElement;
+    if (!de?.id) continue;
+    rows.push({ inputId: `${stageId}-${de.id}-val`, label: de.displayName });
+  }
+  if (!rows.length) return { _error: `Program stage "${stageName || stageId}" has no data elements to build a form from. Add data elements to the stage first.` };
+  return { groups: [{ rows }], title: stageName, totalInputs: rows.length };
+}
+
+// Create a new standalone dataEntryForm (POST) or update the existing one in place (PATCH).
+// Returns { formId } or { _error }.
+async function upsertDataEntryForm(existingFormId, name, style, htmlCode) {
+  const safeStyle = DATA_ENTRY_FORM_STYLES.has(style) ? style : 'NORMAL';
+  if (existingFormId) {
+    const patchBody = { style: safeStyle, htmlCode };
+    if (name) patchBody.name = name;
+    const resp = await safeDhis2Fetch(`dataEntryForms/${existingFormId}`, { method: 'PATCH', body: patchBody });
+    if (resp?._error) return { _error: `Could not update dataEntryForm ${existingFormId}: ${resp._error}` };
+    return { formId: existingFormId, reused: true };
+  }
+  const formId = generateDhis2Uid();
+  const resp = await safeDhis2Fetch('dataEntryForms', {
+    method: 'POST',
+    body: { id: formId, name, style: safeStyle, format: 2, htmlCode },
+  });
+  if (resp?._error) {
+    return {
+      _error: `Could not create dataEntryForm: ${resp._error}`,
+      _hint: 'dataEntryForm names are unique server-wide. Pass a distinct form_name if this collided.',
+    };
+  }
+  return { formId, reused: false };
+}
+
+async function getCustomForm(args) {
+  const target = resolveCustomFormTarget(args);
+  if (target._error) return target;
+  if (target.kind === 'dataset') {
+    const ds = await safeDhis2Fetch(
+      `dataSets/${target.id}?fields=id,displayName,formType,dataEntryForm[id,name,style,htmlCode],dataSetElements~size,organisationUnits~size,access`
+    );
+    if (ds?._error) return { _error: `Could not load dataset ${target.id}: ${ds._error}` };
+    const html = ds.dataEntryForm?.htmlCode || '';
+    return {
+      success: true,
+      target: 'dataset',
+      id: ds.id,
+      name: ds.displayName,
+      form_type: ds.formType || 'DEFAULT',
+      has_custom_form: !!ds.dataEntryForm,
+      form_id: ds.dataEntryForm?.id || null,
+      form_name: ds.dataEntryForm?.name || null,
+      style: ds.dataEntryForm?.style || null,
+      input_ids: extractCustomFormInputIds(html).slice(0, 200),
+      input_count: extractCustomFormInputIds(html).length,
+      html_length: html.length,
+      html_preview: html.slice(0, 4000),
+      data_elements: ds.dataSetElements ?? 0,
+      org_units: ds.organisationUnits ?? 0,
+      can_write_data: !!ds.access?.data?.write,
+    };
+  }
+  const ps = await safeDhis2Fetch(
+    `programStages/${target.id}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name,style,htmlCode],programStageDataElements~size`
+  );
+  if (ps?._error) return { _error: `Could not load program stage ${target.id}: ${ps._error}` };
+  const html = ps.dataEntryForm?.htmlCode || '';
+  return {
+    success: true,
+    target: 'stage',
+    id: ps.id,
+    name: ps.displayName,
+    program: ps.program ? { id: ps.program.id, name: ps.program.displayName, type: ps.program.programType } : null,
+    form_type: ps.formType || 'DEFAULT',
+    has_custom_form: !!ps.dataEntryForm,
+    form_id: ps.dataEntryForm?.id || null,
+    form_name: ps.dataEntryForm?.name || null,
+    style: ps.dataEntryForm?.style || null,
+    input_ids: extractCustomFormInputIds(html).slice(0, 200),
+    input_count: extractCustomFormInputIds(html).length,
+    html_length: html.length,
+    html_preview: html.slice(0, 4000),
+    data_elements: ps.programStageDataElements ?? 0,
+  };
+}
+
+async function previewCustomFormHtml(args) {
+  const target = resolveCustomFormTarget(args);
+  if (target._error) return target;
+  let built;
+  if (target.kind === 'dataset') {
+    built = await buildDatasetFormGroups(target.id);
+  } else {
+    const ps = await safeDhis2Fetch(
+      `programStages/${target.id}?fields=id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]`
+    );
+    if (ps?._error) return { _error: `Could not load program stage ${target.id}: ${ps._error}` };
+    built = buildStageFormGroups(ps.id, ps.displayName, ps.programStageDataElements);
+  }
+  if (built._error) return built;
+  const html = buildCustomFormHtml(built.title, built.groups);
+  return {
+    success: true,
+    target: target.kind,
+    id: target.id,
+    input_count: built.totalInputs,
+    html_length: html.length,
+    html_code: html,
+    _note: 'Preview only — nothing was saved. Call set_dataset_form / set_stage_form (optionally with this html_code) to apply it.',
+  };
+}
+
+async function setDatasetCustomForm(args) {
+  const datasetId = args.dataset_id || args.object_id;
+  if (!datasetId) return { _error: 'dataset_id required for set_dataset_form' };
+  const exists = await verifyTargetExists('dataSets', datasetId, 'manage_custom_forms', 'set_dataset_form', 'id,displayName');
+  if (!exists.exists) return exists.refusal;
+
+  const ds = await safeDhis2Fetch(
+    `dataSets/${datasetId}?fields=id,displayName,formType,dataEntryForm[id,name],dataSetElements[dataElement[id]],organisationUnits~size,access`
+  );
+  if (ds?._error) return { _error: `Could not load dataset ${datasetId}: ${ds._error}` };
+  const dsName = ds.displayName || datasetId;
+  const validDeIds = new Set((ds.dataSetElements || []).map(d => d.dataElement?.id).filter(Boolean));
+
+  // HTML: caller-supplied, or auto-built from the dataset's DE × COC grid.
+  let htmlCode = typeof args.html_code === 'string' && args.html_code.trim() ? args.html_code : null;
+  let autoInputs = null;
+  if (!htmlCode) {
+    const built = await buildDatasetFormGroups(datasetId);
+    if (built._error) return built;
+    htmlCode = buildCustomFormHtml(built.title, built.groups);
+    autoInputs = built.totalInputs;
+  }
+
+  // Lint: warn (don't block) when referenced DEs aren't attached to the dataset.
+  const inputIds = extractCustomFormInputIds(htmlCode);
+  const unknownDes = [];
+  for (const inputId of inputIds) {
+    const m = inputId.match(/^([A-Za-z][A-Za-z0-9]{10})-([A-Za-z][A-Za-z0-9]{10})-val$/);
+    if (!m) continue;
+    if (!validDeIds.has(m[1])) unknownDes.push(m[1]);
+  }
+  if (!inputIds.length) {
+    return { _error: 'The htmlCode contains no `id="<de>-<coc>-val"` data-entry inputs. A dataset custom form needs at least one bound cell.', _hint: 'Use action="preview_html" to auto-generate a valid form skeleton.' };
+  }
+
+  const backup = await ensureBackupOrBail(
+    { operation: 'set_custom_form', tool: 'manage_custom_forms', action: 'set_dataset_form', reason: `Set custom form on dataset ${dsName}` },
+    [{ object_type: 'dataSets', object_id: datasetId, role: 'primary' }],
+    args
+  );
+  if (!backup.ok) return backup.error;
+
+  const formName = args.form_name || `${dsName} custom form ${generateDhis2Uid().slice(-4)}`;
+  const upsert = await upsertDataEntryForm(ds.dataEntryForm?.id, formName, args.style, htmlCode);
+  if (upsert._error) return { ...upsert, backup: backup.block };
+
+  // Link the form + flip to CUSTOM. PATCH is safe for dataSets.
+  if (ds.formType !== 'CUSTOM' || ds.dataEntryForm?.id !== upsert.formId) {
+    const link = await safeDhis2Fetch(`dataSets/${datasetId}`, {
+      method: 'PATCH',
+      body: { formType: 'CUSTOM', dataEntryForm: { id: upsert.formId } },
+    });
+    if (link?._error) return { _error: `Form saved (${upsert.formId}) but linking it to the dataset failed: ${link._error}`, form_id: upsert.formId, backup: backup.block };
+  }
+
+  const hints = [];
+  if (!(ds.organisationUnits > 0)) hints.push('No org units are assigned — the dataset is invisible in Data Entry. Use manage_datasets(action="assign_org_units").');
+  if (!ds.access?.data?.write) hints.push('Public/your data-write access may be off — if Save no-ops, set sharing to rwrw---- via manage_datasets(action="update_sharing").');
+  if (unknownDes.length) hints.push(`htmlCode references ${unknownDes.length} data element(s) not attached to this dataset (${unknownDes.slice(0, 5).join(', ')}); those cells will not save until the DEs are added.`);
+
+  return {
+    success: true,
+    target: 'dataset',
+    dataset_id: datasetId,
+    dataset_name: dsName,
+    form_id: upsert.formId,
+    form_reused: upsert.reused,
+    form_type: 'CUSTOM',
+    input_count: inputIds.length,
+    auto_generated: autoInputs != null,
+    backup: backup.block,
+    _hints: hints.length ? hints : undefined,
+  };
+}
+
+async function setStageCustomForm(args) {
+  const stageId = args.program_stage_id || args.stage_id;
+  if (!stageId) return { _error: 'program_stage_id required for set_stage_form' };
+  const exists = await verifyTargetExists('programStages', stageId, 'manage_custom_forms', 'set_stage_form', 'id,displayName');
+  if (!exists.exists) return exists.refusal;
+
+  // Meta for html-building + the program reference we must re-attach on PUT.
+  const meta = await safeDhis2Fetch(
+    `programStages/${stageId}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name],programStageDataElements[dataElement[id,displayName,valueType]]`
+  );
+  if (meta?._error) return { _error: `Could not load program stage ${stageId}: ${meta._error}` };
+  if (!meta.program?.id) return { _error: `Program stage ${stageId} has no resolvable program — cannot safely PUT it.` };
+  const stageName = meta.displayName || stageId;
+  const validDeIds = new Set((meta.programStageDataElements || []).map(p => p.dataElement?.id).filter(Boolean));
+
+  let htmlCode = typeof args.html_code === 'string' && args.html_code.trim() ? args.html_code : null;
+  let autoInputs = null;
+  if (!htmlCode) {
+    const built = buildStageFormGroups(stageId, stageName, meta.programStageDataElements);
+    if (built._error) return built;
+    htmlCode = buildCustomFormHtml(built.title, built.groups);
+    autoInputs = built.totalInputs;
+  }
+
+  const inputIds = extractCustomFormInputIds(htmlCode);
+  if (!inputIds.length) {
+    return { _error: 'The htmlCode contains no `id="<stage>-<de>-val"` data-entry inputs. A program-stage custom form needs at least one bound cell.', _hint: 'Use action="preview_html" to auto-generate a valid form skeleton.' };
+  }
+  const unknownDes = [];
+  for (const inputId of inputIds) {
+    const m = inputId.match(/^([A-Za-z][A-Za-z0-9]{10})-([A-Za-z][A-Za-z0-9]{10})-val$/);
+    if (!m) continue;
+    if (m[1] !== stageId) { unknownDes.push(`${inputId} (stage prefix mismatch)`); continue; }
+    if (!validDeIds.has(m[2])) unknownDes.push(m[2]);
+  }
+
+  const backup = await ensureBackupOrBail(
+    { operation: 'set_custom_form', tool: 'manage_custom_forms', action: 'set_stage_form', reason: `Set custom form on program stage ${stageName}` },
+    [{ object_type: 'programStages', object_id: stageId, role: 'primary' }],
+    args
+  );
+  if (!backup.ok) return backup.error;
+
+  const formName = args.form_name || `${stageName} stage form ${generateDhis2Uid().slice(-4)}`;
+  const upsert = await upsertDataEntryForm(meta.dataEntryForm?.id, formName, args.style, htmlCode);
+  if (upsert._error) return { ...upsert, backup: backup.block };
+
+  // Full-object PUT — a programStage PATCH/naive-PUT loses `program` (E: "must
+  // reference a program"). :owner omits program, so we re-attach it explicitly.
+  const owner = await safeDhis2Fetch(`programStages/${stageId}?fields=:owner`);
+  if (owner?._error) return { _error: `Form saved (${upsert.formId}) but reloading the stage to link it failed: ${owner._error}`, form_id: upsert.formId, backup: backup.block };
+  owner.program = { id: meta.program.id };
+  owner.formType = 'CUSTOM';
+  owner.dataEntryForm = { id: upsert.formId };
+  const put = await safeDhis2Fetch(`programStages/${stageId}?mergeMode=REPLACE`, { method: 'PUT', body: owner });
+  if (put?._error) return { _error: `Form saved (${upsert.formId}) but linking it to the stage failed: ${put._error}`, form_id: upsert.formId, backup: backup.block };
+
+  const hints = [];
+  if (unknownDes.length) hints.push(`htmlCode references ${unknownDes.length} input(s) whose DE is not on this stage (${unknownDes.slice(0, 5).join(', ')}); those cells will not save.`);
+  hints.push('Custom program-stage forms render in the new Capture app; verify in Capture > new event/enrollment for this program.');
+
+  return {
+    success: true,
+    target: 'stage',
+    program_stage_id: stageId,
+    program_stage_name: stageName,
+    program: { id: meta.program.id, name: meta.program.displayName },
+    form_id: upsert.formId,
+    form_reused: upsert.reused,
+    form_type: 'CUSTOM',
+    input_count: inputIds.length,
+    auto_generated: autoInputs != null,
+    backup: backup.block,
+    _hints: hints,
+  };
+}
+
+async function removeCustomForm(args) {
+  const target = resolveCustomFormTarget(args);
+  if (target._error) return target;
+  const revertType = (args.new_form_type && CUSTOM_FORM_REVERT_TYPES.has(args.new_form_type)) ? args.new_form_type : 'DEFAULT';
+
+  if (target.kind === 'dataset') {
+    const exists = await verifyTargetExists('dataSets', target.id, 'manage_custom_forms', 'remove_form', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const owner = await safeDhis2Fetch(`dataSets/${target.id}?fields=:owner`);
+    if (owner?._error) return { _error: `Could not load dataset ${target.id}: ${owner._error}` };
+    const formId = owner.dataEntryForm?.id || null;
+    const backup = await ensureBackupOrBail(
+      { operation: 'remove_custom_form', tool: 'manage_custom_forms', action: 'remove_form', reason: `Remove custom form from dataset ${owner.name || target.id}` },
+      [{ object_type: 'dataSets', object_id: target.id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    delete owner.dataEntryForm;
+    owner.formType = revertType;
+    const put = await safeDhis2Fetch(`dataSets/${target.id}?mergeMode=REPLACE`, { method: 'PUT', body: owner });
+    if (put?._error) return { _error: `Failed to revert dataset form type: ${put._error}`, backup: backup.block };
+    let deletedForm = false;
+    if (formId && args.delete_form_object) {
+      const del = await safeDhis2Fetch(`dataEntryForms/${formId}`, { method: 'DELETE' });
+      deletedForm = !del?._error;
+    }
+    return { success: true, target: 'dataset', dataset_id: target.id, form_type: revertType, unlinked_form_id: formId, deleted_form_object: deletedForm, backup: backup.block };
+  }
+
+  const exists = await verifyTargetExists('programStages', target.id, 'manage_custom_forms', 'remove_form', 'id,displayName');
+  if (!exists.exists) return exists.refusal;
+  const meta = await safeDhis2Fetch(`programStages/${target.id}?fields=id,program[id],dataEntryForm[id]`);
+  if (meta?._error) return { _error: `Could not load program stage ${target.id}: ${meta._error}` };
+  if (!meta.program?.id) return { _error: `Program stage ${target.id} has no resolvable program — cannot safely PUT it.` };
+  const owner = await safeDhis2Fetch(`programStages/${target.id}?fields=:owner`);
+  if (owner?._error) return { _error: `Could not load program stage ${target.id}: ${owner._error}` };
+  const formId = meta.dataEntryForm?.id || null;
+  const backup = await ensureBackupOrBail(
+    { operation: 'remove_custom_form', tool: 'manage_custom_forms', action: 'remove_form', reason: `Remove custom form from program stage ${target.id}` },
+    [{ object_type: 'programStages', object_id: target.id, role: 'primary' }],
+    args
+  );
+  if (!backup.ok) return backup.error;
+  delete owner.dataEntryForm;
+  owner.program = { id: meta.program.id };
+  owner.formType = revertType === 'SECTION_MULTIORG' ? 'DEFAULT' : revertType;
+  const put = await safeDhis2Fetch(`programStages/${target.id}?mergeMode=REPLACE`, { method: 'PUT', body: owner });
+  if (put?._error) return { _error: `Failed to revert stage form type: ${put._error}`, backup: backup.block };
+  let deletedForm = false;
+  if (formId && args.delete_form_object) {
+    const del = await safeDhis2Fetch(`dataEntryForms/${formId}`, { method: 'DELETE' });
+    deletedForm = !del?._error;
+  }
+  return { success: true, target: 'stage', program_stage_id: target.id, form_type: owner.formType, unlinked_form_id: formId, deleted_form_object: deletedForm, backup: backup.block };
+}
+
+async function executeManageCustomForms(args) {
+  const action = args?.action;
+  if (!action) {
+    return {
+      _error: 'Missing required parameter: action',
+      _hint: 'One of: get, preview_html, set_dataset_form, set_stage_form, remove_form.',
+    };
+  }
+  if (action === 'get') return await getCustomForm(args);
+  if (action === 'preview_html') return await previewCustomFormHtml(args);
+  if (action === 'set_dataset_form') {
+    const gate = requireWriteAuth('manage_custom_forms', 'set_dataset_form', { dataset_id: args.dataset_id });
+    if (gate) return gate;
+    return await setDatasetCustomForm(args);
+  }
+  if (action === 'set_stage_form') {
+    const gate = requireWriteAuth('manage_custom_forms', 'set_stage_form', { program_stage_id: args.program_stage_id });
+    if (gate) return gate;
+    return await setStageCustomForm(args);
+  }
+  if (action === 'remove_form') {
+    const gate = requireWriteAuth('manage_custom_forms', 'remove_form', { dataset_id: args.dataset_id, program_stage_id: args.program_stage_id });
+    if (gate) return gate;
+    return await removeCustomForm(args);
+  }
+  return { _error: `Unknown manage_custom_forms action: ${action}`, _hint: 'One of: get, preview_html, set_dataset_form, set_stage_form, remove_form.' };
 }
 
 async function postMetadataPayload(payload, dryRunOnly) {
@@ -17238,7 +17815,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   let lastToolName = null;
   let emptyResponseCount = 0; // Guard against infinite think-only loops
 
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 50; i++) {
     // Contextual thinking label
     const thinkLabel = lastToolName
       ? thinkingAfterTool[lastToolName] || 'Processing results'
