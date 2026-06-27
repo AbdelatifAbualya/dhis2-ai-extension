@@ -14,13 +14,13 @@
 
 - **Talks to DHIS2 in your active session.** No passwords stored — the extension proxies API calls through the tab you're already logged into. Sign out of DHIS2 and the assistant immediately loses access.
 - **Knows where you are.** Detects program / org unit / stage / TEI / dataset / visualization / map from the URL of your active DHIS2 tab. The system prompt narrows itself to the relevant tools and rules every turn.
-- **Runs as an agent.** The model picks tools, calls them, reads the JSON, and continues — up to 30 iterations per turn — without you driving the API.
+- **Runs as an agent.** The model picks tools, calls them, reads the JSON, and continues — up to 50 iterations per turn — without you driving the API.
 - **Authors metadata atomically.** Programs, stages, data elements, option sets, TEAs, program rules, program indicators, datasets, sections, **category combinations + disaggregation**, sharing, org-unit assignment, icons / colors, all in single bundled `/api/metadata` POSTs with auto-backup before every destructive write.
 - **Streams answers and downloads them.** Real-time chat with progress indicators per tool call; every response can be exported as HTML / Word / CSV / JSON.
 
 ---
 
-## The 22 tools
+## The 23 tools
 
 Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → panel.js iconMap + toolLabels → CSS`. The model is given only the subset relevant to the current page and request — usually 6–12 of them.
 
@@ -48,6 +48,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 | 20 | `manage_program_notifications` | Program notification template CRUD + dedicated link/unlink endpoint + `create_and_link`. Encodes DHIS2 quirks: webhook URL goes in `messageTemplate` (no `url` field on schema), subject ≤ 100 / message ≤ 10000, recipient → channel auto-mapping. |
 | 21 | `manage_datasets` | Full DataSet CRUD (= "aggregate programs"): list / get / create / update / delete + `add_data_elements`, `remove_data_elements`, `assign_org_units`, `update_sharing`, plus full section CRUD (`create_section`, `update_section`, `delete_section`). Auto-resolves the system default categoryCombo, clamps shortName ≤ 50, defaults sharing to `rwrw----` so users can actually enter data, bundles sections atomically. |
 | 22 | `manage_backups` | List / get / restore / delete / purge_old metadata snapshots in the dataStore namespace `dhis2-ai-extension-backups`. Auto-created before every destructive metadata op; 30-day retention. |
+| 23 | `manage_custom_forms` | Author **CUSTOM (HTML) data-entry forms** for BOTH dataSets (render in Aggregate Data Entry) and tracker/event **program stages** (render in Capture). Actions: `get`, `preview_html` (auto-generate a table form skeleton from the target's DEs without saving), `set_dataset_form`, `set_stage_form`, `remove_form`. Encodes the verified-on-2.43 quirks: a `dataEntryForm` must be created standalone via `POST /api/dataEntryForms` first (it can never be embedded inline — E5002), the input-id binding differs per target (`<de>-<coc>-val` for datasets, `<stage>-<de>-val` for stages), and linking to a program stage re-attaches `program:{id}` on a full PUT (PATCH/naive PUT drops it). Auto-backup before every write. |
 
 ### Page-context auto-detection
 
@@ -74,7 +75,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 │ • URL change monitor  │   │ • DHIS2 detection & session │   │ • Chat interface      │
 │ • hashchange/popstate │   │ • Page-context extraction   │   │ • Streaming display   │
 │ • 2s polling fallback │   │ • Universal LLM streaming   │   │ • Tool progress UI    │
-│ • Sends ctx updates   │   │ • 22-tool agentic loop      │   │ • Chart rendering     │
+│ • Sends ctx updates   │   │ • 23-tool agentic loop      │   │ • Chart rendering     │
 │ • Self-heal on        │   │ • Tracker write pipeline    │   │ • Image attachments   │
 │   "context invalid"   │   │ • Atomic metadata bundles   │   │ • Settings modal      │
 │   after extension     │   │ • Auto-backup + restore     │   │ • Theme switching     │
@@ -88,8 +89,8 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 1. **Context extraction** — read URL of active DHIS2 tab → app type, program, stage, dataset, OU, TEI, viz, map.
 2. **System prompt assembly** — base rules + only the conditional blocks the request needs.
 3. **Reliability prefetch** — TEI details / visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
-4. **Tool selection** — `getContextualTools()` filters the 22 tools down to the 6–12 relevant for the request.
-5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 30 iterations per turn, 3 consecutive empty responses trigger bailout.
+4. **Tool selection** — `getContextualTools()` filters the 23 tools down to the 6–12 relevant for the request.
+5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 50 iterations per turn, 3 consecutive empty responses trigger bailout.
 6. **Persistence** — per-turn state (`knownIds`, `knownIcons`, `recentCreations`, `writeAuth`, …) survives service-worker restarts via stripped JSON snapshots.
 
 ### Write pipeline (the strict path destructive operations follow)
@@ -116,6 +117,7 @@ These are the silent-failure traps that this codebase has hit and codified, so y
 - **Program-rule conditions** can't trust `== false` on BOOLEAN / TRUE_ONLY in DHIS2 2.41. Canonical pattern: `!d2:hasValue(#{v}) || #{v} != true` (false-or-empty) or `#{v} == true` (true). `lintProgramRuleCondition` rejects the wrong shape before POST.
 - **Program rules with `#{var}` refs to data elements need matching program-rule variables** OR the rule loads but never fires. Auto-created by `_buildAndPostProgramRules` from the rule's data-element references.
 - **Icon search is prefix-on-keyword.** `pregnant` matches; `pregnancy` returns 0. Use SHORT roots (`preg`, `vacc`, `mater`). `discover_icons` is required before any `update_style` call so the model can't fabricate non-existent keys.
+- **Custom (HTML) data-entry forms can't be created inline.** A `dataEntryForm` embedded in a dataSet/programStage payload — via `/api/metadata` OR a direct object PUT — bounces with E5002 "Invalid reference (DataEntryForm)". It must be `POST`ed standalone to `/api/dataEntryForms` first, then referenced by id. Input ids bind by `<dataElementUID>-<categoryOptionComboUID>-val` (datasets) vs `<programStageUID>-<dataElementUID>-val` (stages). Linking to a program stage needs a full PUT that **re-attaches `program:{id}`** — a PATCH/naive PUT drops it ("Program stage must reference a program") because `?fields=:owner` omits `program`. All encoded in `manage_custom_forms`.
 - **HIDEFIELD on a compulsory program-stage data element** doesn't visually hide it in New Tracker Capture. The chatbot now auto-PUTs `compulsory:false` on affected PSDEs and pairs the rule with a `SETMANDATORYFIELD` rule keyed to the inverse condition, so compulsion is restored when the field shows again.
 
 ---
@@ -193,7 +195,7 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
 ```
 dhis2-AI/
-├── manifest.json              MV3 config (v2.1.7)
+├── manifest.json              MV3 config (v2.2.0)
 ├── background.js              Service worker — all AI + API logic (~18.2k LOC)
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
