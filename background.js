@@ -4764,6 +4764,50 @@ Returns: { success, namespace, app, locale, key, ... } on success; { _error, _hi
   {
     type: 'function',
     function: {
+      name: 'manage_growth_chart_plugin',
+      description: `Set up the WHO Capture Growth Chart plugin (App Hub app "Capture Growth Chart", key capture-growth-chart) end to end so it can render WHO growth charts on a tracker program's enrollment dashboard in the new Capture app. Use this whenever the user mentions the growth chart / growth monitoring plugin, WHO growth standards, anthropometry, weight-for-age / height-for-age / head-circumference charts, or asks to "set up / configure / install the growth chart plugin".
+
+What it does (verified on DHIS2 2.43):
+- status — report whether the plugin app is installed, the current captureGrowthChart/config, and which programs are configured/ready.
+- install — install the plugin from the DHIS2 App Hub (POST /api/appHub/{versionId}, latest version compatible with the server). Idempotent.
+- scaffold_program — create a ready-to-use tracker program for growth monitoring (Person TET, attributes First name/Last name/Gender[option set Male/Female]/Date of birth, and a repeatable stage with Weight/Height/Head circumference data elements), assigned to the given org unit. Use when the user has no suitable program.
+- configure — the core action. For a target program (+ optional stage) it resolves the required metadata and writes/merges the dataStore key captureGrowthChart/config. It auto-detects, or accepts explicit ids for: dateOfBirth + gender tracked-entity attributes (and the female/male option CODES), optional firstName/lastName, and the weight/height/headCircumference data elements on the stage. Merges so multiple programs can be configured side by side.
+- remove — remove one program from captureGrowthChart/config (program_id), or delete the whole config key (confirm_delete_all:true).
+
+The config schema this tool writes to dataStore namespace "captureGrowthChart", key "config":
+{ "metadata": { "attributes": { dateOfBirth, gender, firstName, lastName, femaleOptionCode, maleOptionCode }, "dataElements": { weight, height, headCircumference }, "programStageForGrowthChart": { "<programId>": "<programStageId>" } }, "settings": { usePercentiles, customReferences, weightInGrams, defaultIndicator } }
+
+Hard requirements the plugin enforces (the tool validates these and refuses with a clear list if unmet): the program MUST expose a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If ANY of the three data elements is missing the chart will not display. weightInGrams is auto-set true when the weight data element is recorded in grams.
+
+IMPORTANT — making the chart visible: this tool configures everything the plugin needs to FUNCTION, but the plugin widget must still be ADDED to the program's enrollment dashboard. That placement is owned by the Capture app / Tracker Plugin Configurator (an internal dataStore/capture layout this tool deliberately does NOT overwrite, to avoid corrupting the Capture cache). The tool returns the exact plugin source URL and the steps; relay them to the user. defaultIndicator is one of: wfa (weight-for-age), hcfa (head-circumference-for-age), lhfa (length/height-for-age), wflh (weight-for-length/height).
+
+Returns { success, ... , dashboard_attach } on success; { _error, _hint } on failure.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['status', 'install', 'scaffold_program', 'configure', 'remove'],
+            description: 'status=report install + config state; install=install the plugin from App Hub; scaffold_program=create a ready-to-use growth-monitoring program; configure=resolve metadata and write captureGrowthChart/config for a program; remove=remove a program from the config (or delete it all).'
+          },
+          program_id: { type: 'string', description: 'Target program UID for configure / remove. For configure this is the tracker program whose enrollment dashboard will show the chart.' },
+          program_stage_id: { type: 'string', description: 'For configure: the program stage UID that holds the weight/height/head-circumference data elements. If omitted, the tool picks the program stage that contains them.' },
+          attribute_ids: { type: 'object', description: 'For configure: explicit tracked-entity-attribute UIDs to override auto-detection. Keys: dateOfBirth, gender, firstName, lastName.', properties: { dateOfBirth: { type: 'string' }, gender: { type: 'string' }, firstName: { type: 'string' }, lastName: { type: 'string' } } },
+          data_element_ids: { type: 'object', description: 'For configure: explicit data-element UIDs to override auto-detection. Keys: weight, height, headCircumference.', properties: { weight: { type: 'string' }, height: { type: 'string' }, headCircumference: { type: 'string' } } },
+          female_option_code: { type: 'string', description: 'For configure: the gender option SET CODE that represents female (e.g. "Female"). Auto-detected from the gender attribute option set if omitted.' },
+          male_option_code: { type: 'string', description: 'For configure: the gender option SET CODE that represents male (e.g. "Male"). Auto-detected if omitted.' },
+          settings: { type: 'object', description: 'For configure: plugin settings to merge. Keys: usePercentiles (bool), customReferences (bool), weightInGrams (bool — auto-set from the weight DE name if omitted), defaultIndicator (one of wfa, hcfa, lhfa, wflh).', properties: { usePercentiles: { type: 'boolean' }, customReferences: { type: 'boolean' }, weightInGrams: { type: 'boolean' }, defaultIndicator: { type: 'string', enum: ['wfa', 'hcfa', 'lhfa', 'wflh'] } } },
+          org_unit_id: { type: 'string', description: 'For scaffold_program: the org unit UID to assign the new program to (required for scaffold).' },
+          program_name: { type: 'string', description: 'For scaffold_program: name of the new program. Default "Growth Monitoring".' },
+          confirm_delete_all: { type: 'boolean', description: 'For remove: when true (and no program_id), delete the entire captureGrowthChart/config key.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -4820,6 +4864,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_datasets: true,
   manage_custom_forms: true,
   manage_custom_translations: true,
+  manage_growth_chart_plugin: true,
   manage_backups: true,
 });
 
@@ -4899,6 +4944,12 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const wantsTranslationIntent =
     /\b(custom\s*translations?|translate|translations?|localis[ez]e|localiz[ae]tion)\b/.test(combinedText)
     || /\b(re-?label|re-?name|change|reword|customi[sz]e)\b.{0,40}\b(label|string|text|wording|caption|button|title|heading|menu\s*item)\b/.test(combinedText);
+  // ── Growth-chart plugin intent ──
+  // "growth chart/monitoring plugin", "WHO growth", anthropometry, weight/height-for-age,
+  // head circumference chart, child growth.
+  const wantsGrowthChartIntent =
+    /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/.test(combinedText)
+    || (/\bgrowth\b/.test(combinedText) && /\b(plugin|chart|standard|percentile|z-?score)\b/.test(combinedText));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5047,6 +5098,13 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   // App-agnostic: surface whenever the user expresses translation/relabel intent.
   if (wantsTranslationIntent) {
     selected.add('manage_custom_translations');
+  }
+
+  // ── Growth-chart plugin setup — install + datastore config for the WHO chart ──
+  if (wantsGrowthChartIntent) {
+    selected.add('manage_growth_chart_plugin');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
   }
 
   // ── Intent-driven override: if the user explicitly asks to create or manage
@@ -5201,6 +5259,9 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
   const wantsTranslationPrompt =
     /\b(custom\s*translations?|translate|translations?|localis[ez]e|localiz[ae]tion)\b/i.test(text)
     || /\b(re-?label|re-?name|change|reword|customi[sz]e)\b.{0,40}\b(label|string|text|wording|caption|button|title|heading|menu\s*item)\b/i.test(text);
+  const wantsGrowthChartPrompt =
+    /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/i.test(text)
+    || (/\bgrowth\b/i.test(text) && /\b(plugin|chart|standard|percentile|z-?score)\b/i.test(text));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -5793,6 +5854,31 @@ EXPERIMENTAL DHIS2 2.43+ feature. It translates or re-labels an app's UI strings
 - "Rename a button in English": manage_custom_translations(action="set", app="capture", locale="en", translations={"Report data":"Submit report"})
 - "What translations exist?": manage_custom_translations(action="list")
 - "Undo the Arabic translation": manage_custom_translations(action="remove", app="capture", locale="ar")
+`;
+  }
+
+  // ── Growth Chart plugin KB — WHO Capture Growth Chart setup ──
+  if (wantsGrowthChartPrompt) {
+    p += `
+## WHO Capture Growth Chart plugin — use the **manage_growth_chart_plugin** tool
+Sets up the "Capture Growth Chart" plugin (App Hub, key capture-growth-chart) so WHO growth charts render on a tracker program's enrollment dashboard in Capture. NEVER hand-assemble its dataStore via dhis2_query — use this tool.
+
+### Actions (typical order)
+- \`status\` — is the app installed? what is configured? Run this first.
+- \`install\` — install the plugin from the App Hub (idempotent).
+- \`scaffold_program\` — create a ready-to-use growth-monitoring tracker program (needs org_unit_id) when the user has no suitable program.
+- \`configure\` — the core step: pass program_id; the tool auto-detects the date-of-birth + gender attributes, the female/male option codes, and the weight/height/head-circumference data elements, then writes/merges dataStore captureGrowthChart/config. Pass attribute_ids / data_element_ids to override detection, settings to set usePercentiles/weightInGrams/defaultIndicator (wfa|hcfa|lhfa|wflh).
+- \`remove\` — drop a program from the config (program_id) or delete it all (confirm_delete_all:true).
+
+### Hard requirements (the tool validates and refuses with a list if unmet)
+The program MUST have a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If any of the three DEs is missing the chart will not display. If configure reports missing metadata, offer scaffold_program or ask the user for the exact attribute/DE ids.
+
+### Making it visible
+configure makes the plugin FUNCTION but does not place the widget. Relay the tool's \`dashboard_attach\` block: the plugin must be added to the enrollment dashboard via the Tracker Plugin Configurator app (or Capture's "Add plugin" with the returned plugin source URL). The tool deliberately does NOT write dataStore/capture (Capture-owned; risk of cache corruption).
+
+### Recipe
+- "Set up the growth chart plugin for <program>": status → install (if needed) → configure(program_id) → relay dashboard_attach steps.
+- "I have no program for it": scaffold_program(org_unit_id) → configure(created program) → install.
 `;
   }
 
@@ -9820,6 +9906,11 @@ async function executeTool(name, args) {
     return await executeManageCustomTranslations(args);
   }
 
+  // ── manage_growth_chart_plugin ──
+  if (name === 'manage_growth_chart_plugin') {
+    return await executeManageGrowthChartPlugin(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -12124,6 +12215,490 @@ async function executeManageCustomTranslations(args) {
     return await removeCustomTranslations(args);
   }
   return { _error: `Unknown manage_custom_translations action: ${action}`, _hint: 'One of: list, get, set, remove.' };
+}
+
+// ── manage_growth_chart_plugin: WHO Capture Growth Chart plugin setup ──
+//
+// VERIFIED on DHIS2 2.43 (play stable-2-43-0-1) against the dev-otta plugin
+// (https://github.com/dev-otta/dhis2-who-growth-chart). The plugin renders WHO growth
+// charts on a tracker enrollment dashboard in the new Capture app. It needs:
+//   1. The app installed (App Hub "Capture Growth Chart", key capture-growth-chart).
+//   2. A dataStore key — namespace "captureGrowthChart", key "config" — mapping the
+//      program's metadata to the plugin's expected roles:
+//        metadata.attributes:  dateOfBirth, gender, firstName, lastName, femaleOptionCode, maleOptionCode
+//        metadata.dataElements: weight, height, headCircumference
+//        metadata.programStageForGrowthChart: { "<programId>": "<programStageId>" }
+//        settings: usePercentiles, customReferences, weightInGrams, defaultIndicator (wfa|hcfa|lhfa|wflh)
+//   3. The plugin widget ADDED to the enrollment dashboard (owned by Capture / the Tracker
+//      Plugin Configurator — an internal dataStore/capture layout this tool does NOT touch).
+//
+// Install verified: POST /api/appHub/{versionId} → 201; afterwards /api/apps lists
+// capture-growth-chart with pluginLaunchUrl …/api/apps/capture-growth-chart/plugin.html.
+// Config write verified: POST dataStore/captureGrowthChart/config → 201. A full program +
+// stage + 3 measurement DEs + enrolled child with 3 measurements was created and accepted.
+
+const GROWTH_CHART_NS = 'captureGrowthChart';
+const GROWTH_CHART_KEY = 'config';
+const GROWTH_CHART_APP_KEY = 'capture-growth-chart';
+const GROWTH_CHART_APPHUB_NAME = 'Capture Growth Chart';
+const GROWTH_CHART_INDICATORS = new Set(['wfa', 'hcfa', 'lhfa', 'wflh']);
+
+function gcPath(key) {
+  return `dataStore/${encodeURIComponent(GROWTH_CHART_NS)}/${encodeURIComponent(key)}`;
+}
+
+// Read captureGrowthChart/config. Returns { exists, value } or { _error }.
+async function gcReadConfig() {
+  const resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY));
+  if (resp?._status === 404) return { exists: false, value: null };
+  if (resp?._error) return { _error: `Could not read ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}: ${resp._error}` };
+  return { exists: true, value: isPlainObject(resp) ? resp : null };
+}
+
+async function gcWriteConfig(value) {
+  let resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'POST', body: value });
+  if (resp?._status === 409) {
+    resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'PUT', body: value });
+  }
+  if (resp?._error) return { _error: `Could not write ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}: ${resp._error}` };
+  return { ok: true };
+}
+
+// Is the plugin app installed? Returns { installed, pluginLaunchUrl }.
+async function gcAppStatus() {
+  const apps = await safeDhis2Fetch('apps.json');
+  if (apps?._error || !Array.isArray(apps)) return { installed: null, _note: 'Could not read installed app list.' };
+  const app = apps.find(a => a.key === GROWTH_CHART_APP_KEY || /capture\s*growth\s*chart/i.test(a.name || ''));
+  if (!app) return { installed: false };
+  return {
+    installed: true,
+    app_key: app.key,
+    plugin_launch_url: app.pluginLaunchUrl || `${dhis2.baseUrl}/api/apps/${app.key}/plugin.html`,
+    version: app.version,
+  };
+}
+
+function gcServerMinorVersion() {
+  const n = Number(dhis2.apiVersion);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Install the plugin from the App Hub. Idempotent.
+async function gcInstall() {
+  const before = await gcAppStatus();
+  if (before.installed) {
+    return { success: true, already_installed: true, app_key: before.app_key, plugin_launch_url: before.plugin_launch_url, version: before.version };
+  }
+  const search = await safeDhis2Fetch(`appHub/v2/apps?query=${encodeURIComponent(GROWTH_CHART_APPHUB_NAME)}`);
+  if (search?._error) return { _error: `Could not query the App Hub: ${search._error}`, _hint: 'The server may have no App Hub access. Install the "Capture Growth Chart" app manually via App Management.' };
+  const results = search?.result || [];
+  const app = results.find(a => /capture\s*growth\s*chart/i.test(a.name || '')) || results[0];
+  if (!app) return { _error: 'Could not find "Capture Growth Chart" in the App Hub.', _hint: 'Install it manually via App Management, then re-run with action="configure".' };
+  const serverMinor = gcServerMinorVersion();
+  // versions are newest-first; pick the first compatible with this server.
+  const versions = Array.isArray(app.versions) ? app.versions : [];
+  const minorOf = (v) => { const m = String(v || '').match(/^\s*\d+\.(\d+)/); return m ? Number(m[1]) : null; };
+  const compatible = versions.find(v => {
+    if (serverMinor == null) return true;
+    const min = minorOf(v.minDhisVersion);
+    const max = minorOf(v.maxDhisVersion);
+    return (min == null || serverMinor >= min) && (max == null || serverMinor <= max);
+  }) || versions[0];
+  if (!compatible?.id) return { _error: 'The App Hub returned no installable version for Capture Growth Chart.' };
+  const install = await safeDhis2Fetch(`appHub/${encodeURIComponent(compatible.id)}`, { method: 'POST' });
+  if (install?._error) return { _error: `App Hub install failed: ${install._error}`, _hint: 'You may lack the authority to install apps. Install "Capture Growth Chart" via App Management instead.' };
+  const after = await gcAppStatus();
+  return {
+    success: true,
+    installed_version: compatible.version,
+    app_key: after.app_key || GROWTH_CHART_APP_KEY,
+    plugin_launch_url: after.plugin_launch_url || `${dhis2.baseUrl}/api/apps/${GROWTH_CHART_APP_KEY}/plugin.html`,
+    _note: after.installed ? 'Installed and confirmed in the app list.' : 'Install POST accepted; the app may take a moment to appear.',
+  };
+}
+
+// Build the dashboard-attach guidance block (the part this tool does NOT auto-write).
+function gcDashboardAttachBlock(pluginUrl, programId) {
+  return {
+    plugin_source_url: pluginUrl || `${dhis2.baseUrl}/api/apps/${GROWTH_CHART_APP_KEY}/plugin.html`,
+    note: 'The plugin is configured but must be ADDED to the enrollment dashboard to become visible. This tool does not modify the Capture dashboard layout (dataStore/capture) to avoid corrupting the Capture cache.',
+    steps: [
+      'Easiest: open the "Tracker Plugin Configurator" app, pick this program, and add the Capture Growth Chart plugin to the enrollment dashboard.',
+      `Or in Capture: open an enrollment for program ${programId || '<program>'}, use the enrollment dashboard "Edit"/"Add plugin" option, and paste the plugin source URL above.`,
+    ],
+  };
+}
+
+// Fetch a program with the attributes + stage data elements needed for detection.
+async function gcFetchProgram(programId) {
+  return await safeDhis2Fetch(
+    `programs/${programId}?fields=id,displayName,programType,` +
+    `programTrackedEntityAttributes[mandatory,trackedEntityAttribute[id,displayName,valueType,optionSet[id,options[code,displayName]]]],` +
+    `programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`
+  );
+}
+
+function gcMatch(list, getName, patterns, extra) {
+  for (const re of patterns) {
+    const m = list.find(item => re.test(getName(item)) && (!extra || extra(item)));
+    if (m) return m;
+  }
+  return null;
+}
+
+async function growthChartConfigure(args) {
+  const programId = args.program_id;
+  if (!programId) return { _error: 'program_id is required for configure.' };
+  const prog = await gcFetchProgram(programId);
+  if (prog?._error) return { _error: `Could not load program ${programId}: ${prog._error}`, _hint: 'Pass a valid tracker program UID.' };
+  if (prog.programType !== 'WITH_REGISTRATION') {
+    return { _error: `Program "${prog.displayName}" is not a tracker (WITH_REGISTRATION) program. The growth chart plugin only works on tracker programs.` };
+  }
+
+  const teas = (prog.programTrackedEntityAttributes || []).map(p => p.trackedEntityAttribute).filter(Boolean);
+  const teaName = t => t.displayName || '';
+  const ov = args.attribute_ids || {};
+  const byId = (id) => teas.find(t => t.id === id);
+
+  // ── Attribute detection (explicit override wins) ──
+  const dobTea = (ov.dateOfBirth && byId(ov.dateOfBirth))
+    || gcMatch(teas, teaName, [/date\s*of\s*birth/i, /\bdob\b/i, /\bbirth\s*date\b/i, /\bbirth\b/i], t => t.valueType === 'DATE');
+  const genderTea = (ov.gender && byId(ov.gender))
+    || gcMatch(teas, teaName, [/\bgender\b/i, /\bsex\b/i], t => !!t.optionSet);
+  const firstNameTea = (ov.firstName && byId(ov.firstName))
+    || gcMatch(teas, teaName, [/first\s*name/i, /given\s*name/i]);
+  const lastNameTea = (ov.lastName && byId(ov.lastName))
+    || gcMatch(teas, teaName, [/last\s*name/i, /surname/i, /family\s*name/i]);
+
+  // ── Stage + data-element detection ──
+  const stages = prog.programStages || [];
+  let stage = args.program_stage_id ? stages.find(s => s.id === args.program_stage_id) : null;
+  if (args.program_stage_id && !stage) {
+    return { _error: `Program stage ${args.program_stage_id} is not part of program ${programId}.` };
+  }
+  const deOv = args.data_element_ids || {};
+  const detectInStage = (s) => {
+    const des = (s.programStageDataElements || []).map(p => p.dataElement).filter(Boolean);
+    const dn = d => d.displayName || '';
+    const weight = (deOv.weight && des.find(d => d.id === deOv.weight)) || gcMatch(des, dn, [/\bweight\b/i, /\bwt\b/i]);
+    const height = (deOv.height && des.find(d => d.id === deOv.height)) || gcMatch(des, dn, [/\bheight\b/i, /\blength\b/i, /\bstature\b/i]);
+    const headCircumference = (deOv.headCircumference && des.find(d => d.id === deOv.headCircumference)) || gcMatch(des, dn, [/head\s*circ/i, /circumference/i, /\bhc\b/i]);
+    return { weight, height, headCircumference, count: [weight, height, headCircumference].filter(Boolean).length };
+  };
+  let de;
+  if (stage) {
+    de = detectInStage(stage);
+  } else {
+    // pick the stage that contains the most of the three measurements
+    let best = null;
+    for (const s of stages) {
+      const d = detectInStage(s);
+      if (!best || d.count > best.de.count) best = { stage: s, de: d };
+    }
+    if (best) { stage = best.stage; de = best.de; }
+  }
+  if (!stage) return { _error: `Program "${prog.displayName}" has no program stages.` };
+
+  // ── Gender option codes ──
+  const genderOptions = genderTea?.optionSet?.options || [];
+  let femaleCode = args.female_option_code
+    || (genderOptions.find(o => /female/i.test(o.code) || /female/i.test(o.displayName)) || {}).code;
+  let maleCode = args.male_option_code
+    || (genderOptions.find(o => (/male/i.test(o.code) || /male/i.test(o.displayName)) && !/female/i.test(o.code) && !/female/i.test(o.displayName)) || {}).code;
+
+  // ── Validate hard requirements ──
+  const missing = [];
+  if (!dobTea) missing.push('a Date-of-birth (DATE) tracked-entity attribute');
+  if (!genderTea) missing.push('a Gender/sex attribute with an option set');
+  if (genderTea && (!femaleCode || !maleCode)) missing.push('female/male option codes on the gender option set (pass female_option_code / male_option_code)');
+  if (!de || !de.weight) missing.push('a Weight data element on the stage');
+  if (!de || !de.height) missing.push('a Height/Length data element on the stage');
+  if (!de || !de.headCircumference) missing.push('a Head-circumference data element on the stage');
+  if (missing.length) {
+    return {
+      _error: `Program "${prog.displayName}" is missing required growth-chart metadata: ${missing.join('; ')}.`,
+      _hint: 'The plugin will not render unless all three data elements (weight, height, head circumference) and the date-of-birth + gender attributes exist. Pass explicit ids via attribute_ids / data_element_ids, or run action="scaffold_program" to create a ready-to-use program.',
+      detected: {
+        dateOfBirth: dobTea ? { id: dobTea.id, name: dobTea.displayName } : null,
+        gender: genderTea ? { id: genderTea.id, name: genderTea.displayName, femaleCode, maleCode } : null,
+        stage: stage ? { id: stage.id, name: stage.displayName } : null,
+        weight: de?.weight ? { id: de.weight.id, name: de.weight.displayName } : null,
+        height: de?.height ? { id: de.height.id, name: de.height.displayName } : null,
+        headCircumference: de?.headCircumference ? { id: de.headCircumference.id, name: de.headCircumference.displayName } : null,
+      },
+    };
+  }
+
+  // weightInGrams: explicit setting wins, else infer from the weight DE name.
+  const weightName = de.weight.displayName || '';
+  const inferGrams = /\(\s*g\s*\)|gram/i.test(weightName) && !/\(\s*kg\s*\)|kilogram/i.test(weightName);
+  const settingsIn = isPlainObject(args.settings) ? args.settings : {};
+  if (settingsIn.defaultIndicator && !GROWTH_CHART_INDICATORS.has(settingsIn.defaultIndicator)) {
+    return { _error: `Invalid defaultIndicator "${settingsIn.defaultIndicator}". One of: ${[...GROWTH_CHART_INDICATORS].join(', ')}.` };
+  }
+
+  // ── Merge into existing config (preserve other programs + settings) ──
+  const cfgRead = await gcReadConfig();
+  if (cfgRead._error) return cfgRead;
+  const existing = cfgRead.value || {};
+  const existingMeta = isPlainObject(existing.metadata) ? existing.metadata : {};
+  const existingStages = isPlainObject(existingMeta.programStageForGrowthChart) ? existingMeta.programStageForGrowthChart : {};
+  const existingSettings = isPlainObject(existing.settings) ? existing.settings : {};
+
+  const config = {
+    ...existing,
+    metadata: {
+      ...existingMeta,
+      attributes: {
+        dateOfBirth: dobTea.id,
+        gender: genderTea.id,
+        firstName: firstNameTea ? firstNameTea.id : (existingMeta.attributes?.firstName || ''),
+        lastName: lastNameTea ? lastNameTea.id : (existingMeta.attributes?.lastName || ''),
+        femaleOptionCode: femaleCode,
+        maleOptionCode: maleCode,
+      },
+      dataElements: {
+        weight: de.weight.id,
+        height: de.height.id,
+        headCircumference: de.headCircumference.id,
+      },
+      programStageForGrowthChart: { ...existingStages, [programId]: stage.id },
+    },
+    settings: {
+      usePercentiles: false,
+      customReferences: false,
+      weightInGrams: inferGrams,
+      defaultIndicator: 'wfa',
+      ...existingSettings,
+      ...settingsIn,
+    },
+  };
+  if (settingsIn.weightInGrams === undefined && existingSettings.weightInGrams === undefined) {
+    config.settings.weightInGrams = inferGrams;
+  }
+
+  const wrote = await gcWriteConfig(config);
+  if (wrote._error) return wrote;
+
+  const appStatus = await gcAppStatus();
+  const hints = [];
+  if (appStatus.installed === false) hints.push('The Capture Growth Chart app is NOT installed yet — run action="install" (or install it via App Management) or the dashboard widget cannot load.');
+  if (!firstNameTea || !lastNameTea) hints.push('First/last name attributes were not found; they are optional (used for printed charts) so configuration still proceeded.');
+
+  return {
+    success: true,
+    program: { id: prog.id, name: prog.displayName },
+    stage: { id: stage.id, name: stage.displayName },
+    resolved: {
+      attributes: config.metadata.attributes,
+      dataElements: config.metadata.dataElements,
+    },
+    settings: config.settings,
+    config_key: `${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}`,
+    plugin_installed: appStatus.installed,
+    dashboard_attach: gcDashboardAttachBlock(appStatus.plugin_launch_url, programId),
+    _hints: hints.length ? hints : undefined,
+  };
+}
+
+async function growthChartScaffoldProgram(args) {
+  const ouId = args.org_unit_id;
+  if (!ouId) return { _error: 'org_unit_id is required for scaffold_program (the org unit the new program is assigned to).' };
+  const ouCheck = await safeDhis2Fetch(`organisationUnits/${ouId}?fields=id,displayName`);
+  if (ouCheck?._error) return { _error: `Org unit ${ouId} not found: ${ouCheck._error}` };
+  const progName = (args.program_name && String(args.program_name).trim()) || 'Growth Monitoring';
+
+  // default categoryCombo
+  const ccResp = await safeDhis2Fetch('categoryCombos?fields=id&filter=isDefault:eq:true&paging=false');
+  const defaultCC = ccResp?.categoryCombos?.[0]?.id || 'bjDvmb4bfuf';
+
+  // Person TET — reuse if present, else create.
+  const tetResp = await safeDhis2Fetch('trackedEntityTypes?fields=id,displayName&paging=false');
+  let personTetId = (tetResp?.trackedEntityTypes || []).find(t => /person/i.test(t.displayName || ''))?.id;
+  const newObjs = { trackedEntityTypes: [], trackedEntityAttributes: [], optionSets: [], options: [], dataElements: [], programs: [], programStages: [] };
+  if (!personTetId) {
+    personTetId = generateDhis2Uid();
+    newObjs.trackedEntityTypes.push({ id: personTetId, name: `Person (${progName})`, sharing: { public: 'rwrw----' } });
+  }
+
+  // Reuse standard demo attributes by exact name when present, else create.
+  const wantTeas = [
+    { role: 'firstName', name: 'First name', valueType: 'TEXT' },
+    { role: 'lastName', name: 'Last name', valueType: 'TEXT' },
+    { role: 'gender', name: 'Gender', valueType: 'TEXT', withOptionSet: true },
+    { role: 'dateOfBirth', name: 'Date of birth', valueType: 'DATE' },
+  ];
+  const teaResp = await safeDhis2Fetch(
+    `trackedEntityAttributes?fields=id,displayName,valueType,optionSet[id,options[code,displayName]]&paging=false&filter=displayName:in:[${wantTeas.map(t => t.name).join(',')}]`
+  );
+  const foundTeas = teaResp?.trackedEntityAttributes || [];
+  const teaIds = {};
+  let optionSetId = null, femaleCode = 'Female', maleCode = 'Male';
+  for (const want of wantTeas) {
+    const hit = foundTeas.find(t => (t.displayName || '').toLowerCase() === want.name.toLowerCase() && t.valueType === want.valueType);
+    if (hit) {
+      teaIds[want.role] = hit.id;
+      if (want.role === 'gender' && hit.optionSet?.options?.length) {
+        femaleCode = (hit.optionSet.options.find(o => /female/i.test(o.code) || /female/i.test(o.displayName)) || {}).code || femaleCode;
+        maleCode = (hit.optionSet.options.find(o => (/male/i.test(o.code) || /male/i.test(o.displayName)) && !/female/i.test(o.code) && !/female/i.test(o.displayName)) || {}).code || maleCode;
+      }
+      continue;
+    }
+    const id = generateDhis2Uid();
+    teaIds[want.role] = id;
+    const tea = { id, name: `${progName}: ${want.name}`, shortName: `${want.name}`.slice(0, 50), valueType: want.valueType, aggregationType: 'NONE', sharing: { public: 'rwrw----' } };
+    if (want.withOptionSet) {
+      optionSetId = generateDhis2Uid();
+      const femaleId = generateDhis2Uid(), maleId = generateDhis2Uid();
+      newObjs.optionSets.push({ id: optionSetId, name: `${progName}: Sex`, valueType: 'TEXT', options: [{ id: maleId }, { id: femaleId }] });
+      newObjs.options.push({ id: maleId, name: 'Male', code: 'Male', optionSet: { id: optionSetId }, sortOrder: 1 });
+      newObjs.options.push({ id: femaleId, name: 'Female', code: 'Female', optionSet: { id: optionSetId }, sortOrder: 2 });
+      tea.optionSet = { id: optionSetId };
+      femaleCode = 'Female'; maleCode = 'Male';
+    }
+    newObjs.trackedEntityAttributes.push(tea);
+  }
+
+  // Three fresh measurement data elements (names prefixed to avoid collisions).
+  const deDefs = [
+    { role: 'weight', label: 'Weight (kg)' },
+    { role: 'height', label: 'Height (cm)' },
+    { role: 'headCircumference', label: 'Head circumference (cm)' },
+  ];
+  const deIds = {};
+  for (const d of deDefs) {
+    const id = generateDhis2Uid();
+    deIds[d.role] = id;
+    newObjs.dataElements.push({ id, name: `${progName}: ${d.label}`, shortName: `${d.label}`.slice(0, 50), valueType: 'NUMBER', domainType: 'TRACKER', aggregationType: 'AVERAGE', categoryCombo: { id: defaultCC }, sharing: { public: 'rw------' } });
+  }
+
+  const programId = generateDhis2Uid();
+  const stageId = generateDhis2Uid();
+  newObjs.programs.push({
+    id: programId, name: progName, shortName: progName.slice(0, 50), programType: 'WITH_REGISTRATION',
+    trackedEntityType: { id: personTetId }, categoryCombo: { id: defaultCC }, sharing: { public: 'rwrw----' },
+    organisationUnits: [{ id: ouId }],
+    programTrackedEntityAttributes: [
+      { trackedEntityAttribute: { id: teaIds.firstName }, displayInList: true, searchable: true },
+      { trackedEntityAttribute: { id: teaIds.lastName }, displayInList: true, searchable: true },
+      { trackedEntityAttribute: { id: teaIds.gender }, mandatory: true },
+      { trackedEntityAttribute: { id: teaIds.dateOfBirth }, mandatory: true },
+    ],
+    programStages: [{ id: stageId }],
+  });
+  newObjs.programStages.push({
+    id: stageId, name: 'Growth measurements', program: { id: programId }, repeatable: true, sharing: { public: 'rwrw----' },
+    programStageDataElements: [
+      { dataElement: { id: deIds.weight } },
+      { dataElement: { id: deIds.height } },
+      { dataElement: { id: deIds.headCircumference } },
+    ],
+  });
+
+  // Strip empty buckets so the importer doesn't choke.
+  const payload = {};
+  for (const [k, v] of Object.entries(newObjs)) if (v.length) payload[k] = v;
+
+  const imp = await safeDhis2Fetch('metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL', { method: 'POST', body: payload });
+  const resp = imp?.response || imp;
+  if (resp?.status === 'ERROR' || imp?._error) {
+    const errs = (resp?.typeReports || []).flatMap(t => (t.objectReports || []).flatMap(o => (o.errorReports || []).map(e => `${(t.klass || '').split('.').pop()}: ${e.message}`)));
+    return { _error: `Could not create the growth-monitoring program: ${imp?._error || 'import failed'}`, import_errors: errs.slice(0, 8) };
+  }
+
+  return {
+    success: true,
+    created_program: { id: programId, name: progName, stage_id: stageId },
+    org_unit: { id: ouId, name: ouCheck.displayName },
+    attributes: teaIds,
+    data_elements: deIds,
+    gender_codes: { femaleCode, maleCode },
+    import_stats: resp?.stats,
+    _next: `Now run action="configure" with program_id="${programId}" to write captureGrowthChart/config. Then run action="install" if the plugin app isn't installed.`,
+  };
+}
+
+async function growthChartRemove(args) {
+  const programId = args.program_id;
+  const cfgRead = await gcReadConfig();
+  if (cfgRead._error) return cfgRead;
+  if (!cfgRead.exists) return { success: true, removed: false, _note: 'No captureGrowthChart/config key exists.' };
+
+  if (!programId) {
+    if (args.confirm_delete_all !== true) {
+      return { _error: 'remove without program_id deletes the ENTIRE captureGrowthChart/config. Re-run with confirm_delete_all:true to proceed, or pass program_id to remove just one program.' };
+    }
+    const del = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'DELETE' });
+    if (del?._error && del?._status !== 404) return { _error: `Could not delete config: ${del._error}` };
+    return { success: true, removed_all: true, previous_value: cfgRead.value };
+  }
+
+  const cfg = cfgRead.value || {};
+  const map = cfg.metadata?.programStageForGrowthChart || {};
+  if (!(programId in map)) {
+    return { success: true, removed: false, _note: `Program ${programId} is not in the growth-chart config.`, configured_programs: Object.keys(map) };
+  }
+  const previous = JSON.parse(JSON.stringify(cfg));
+  delete map[programId];
+  cfg.metadata.programStageForGrowthChart = map;
+  const wrote = await gcWriteConfig(cfg);
+  if (wrote._error) return wrote;
+  return { success: true, removed_program: programId, remaining_programs: Object.keys(map), previous_value: previous };
+}
+
+async function growthChartStatus() {
+  const app = await gcAppStatus();
+  const cfgRead = await gcReadConfig();
+  if (cfgRead._error) return cfgRead;
+  const cfg = cfgRead.value;
+  const programMap = cfg?.metadata?.programStageForGrowthChart || {};
+  const programIds = Object.keys(programMap);
+  let programs = [];
+  if (programIds.length) {
+    const resp = await safeDhis2Fetch(`programs?fields=id,displayName&filter=id:in:[${programIds.join(',')}]&paging=false`);
+    const names = Object.fromEntries((resp?.programs || []).map(p => [p.id, p.displayName]));
+    programs = programIds.map(id => ({ id, name: names[id] || '(unknown)', stage_id: programMap[id] }));
+  }
+  return {
+    success: true,
+    plugin_installed: app.installed,
+    plugin_launch_url: app.plugin_launch_url || null,
+    config_exists: cfgRead.exists,
+    configured_programs: programs,
+    settings: cfg?.settings || null,
+    attributes: cfg?.metadata?.attributes || null,
+    data_elements: cfg?.metadata?.dataElements || null,
+    _hint: app.installed === false
+      ? 'Plugin app not installed — run action="install".'
+      : (!cfgRead.exists ? 'No config yet — run action="configure" with a program_id (or scaffold_program first).' : undefined),
+  };
+}
+
+async function executeManageGrowthChartPlugin(args) {
+  const action = args?.action;
+  if (!action) return { _error: 'Missing required parameter: action', _hint: 'One of: status, install, scaffold_program, configure, remove.' };
+  if (action === 'status') return await growthChartStatus();
+  if (action === 'install') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'install', {});
+    if (gate) return gate;
+    return await gcInstall();
+  }
+  if (action === 'scaffold_program') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'scaffold_program', { org_unit_id: args.org_unit_id });
+    if (gate) return gate;
+    return await growthChartScaffoldProgram(args);
+  }
+  if (action === 'configure') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'configure', { program_id: args.program_id });
+    if (gate) return gate;
+    return await growthChartConfigure(args);
+  }
+  if (action === 'remove') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'remove', { program_id: args.program_id });
+    if (gate) return gate;
+    return await growthChartRemove(args);
+  }
+  return { _error: `Unknown manage_growth_chart_plugin action: ${action}`, _hint: 'One of: status, install, scaffold_program, configure, remove.' };
 }
 
 async function postMetadataPayload(payload, dryRunOnly) {
