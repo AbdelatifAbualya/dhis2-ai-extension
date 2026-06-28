@@ -286,3 +286,19 @@ Blood Group codes → A_POS, A_NEG, B_POS, B_NEG, AB_POS, AB_NEG, O_POS, O_NEG  
 Previously this same operation 409'd on the duplicate `A_` code. Unit-checked `deriveOptionCode`
 against all the prompt's option sets (+ a deliberate all-collide set) — every code unique. Test
 metadata deleted afterward. `node --check background.js` passes.
+
+---
+
+## 6. Dev process — add the "DHIS2 chatbot performance enhancement" skill
+
+**File:** `.claude/skills/dhis2-chatbot-performance-enhancement/SKILL.md` (developer tooling;
+NOT part of the shipped extension — the publish workflow excludes `.claude/`).
+**Type of change:** Added.
+
+A project skill that encodes the rules for working on this extension so they apply every time:
+the chatbot must work perfectly after every change (zero-error API calls); a new tool/ability
+must never regress another tool — cross-tool interactions may only make the other tools better;
+and every change must be tested against the DHIS2 playground first so the tool logic mirrors a
+sequence proven to succeed. Also captures the playground testing protocol (instances, VALIDATE
+vs DB constraints, pre-generating UIDs for cross-referencing bundles, cleanup), the tool-wiring
+map, and a definition-of-done checklist. Pairs with the `document-extension-changes` memory.
