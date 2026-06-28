@@ -10855,17 +10855,62 @@ async function disambiguateShortNamesAgainstServer(objects, dhis2Resource, class
   }
 }
 
+// Generate a DHIS2-valid, UNIQUE option code from an option name.
+//
+// DHIS2 enforces a per-option-set unique code (DB constraint
+// `optionvalue_unique_optionsetid_and_code`). The naive `toUpperCase().replace(/[^A-Z0-9]/g,'_')`
+// collapses any two names that differ only by a symbol — "A+" and "A-" both become "A_",
+// "1+"/"1-" both become "1_" — so two options in one set get the SAME code and the COMMIT
+// fails with a 409. The metadata VALIDATE pass can NOT catch this: it's a database unique
+// constraint, not a metadata-import rule, so it only surfaces at COMMIT (INSERT) time.
+//
+// Fix: (1) map a trailing +/- sign to a readable _POS/_NEG token so the common
+// blood-group / lab-result / urine-protein cases stay meaningful AND distinct, (2) sanitize
+// the rest, then (3) guarantee uniqueness against codes already used in the same scope by
+// appending _2, _3, … This makes the generated codes collision-free by construction, so the
+// tool never emits a request that 409s on the duplicate-code constraint.
+function deriveOptionCode(rawName, usedCodes, explicitCode) {
+  const used = usedCodes instanceof Set ? usedCodes : new Set();
+  const sanitize = (s) => String(s == null ? '' : s)
+    .toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
+  let base;
+  if (explicitCode && String(explicitCode).trim()) {
+    base = sanitize(explicitCode) || 'OPT';
+  } else {
+    let s = String(rawName == null ? '' : rawName).trim();
+    let sign = '';
+    const m = s.match(/([+\-])\s*$/); // trailing sign: A+, A-, 1+, 3-, O+ …
+    if (m) { sign = m[1] === '+' ? '_POS' : '_NEG'; s = s.slice(0, m.index); }
+    base = (sanitize(s) + sign).replace(/^_+/, '').slice(0, 50) || 'OPT';
+  }
+  let code = base;
+  let n = 2;
+  while (used.has(code)) {
+    const suffix = `_${n}`;
+    code = `${base.slice(0, 50 - suffix.length)}${suffix}`;
+    n++;
+  }
+  used.add(code);
+  return code;
+}
+
 function buildOptionSetAndOptions(osDef, parentValueType) {
   const osUid = generateDhis2Uid();
   const options = [];
   const optionUids = [];
+  // Codes must be unique WITHIN this option set — track what we have minted so
+  // "A+"/"A-" (and any other symbol-only-difference names) never collide.
+  const usedCodes = new Set();
   for (let i = 0; i < osDef.options.length; i++) {
+    const raw = osDef.options[i];
+    const optName = (typeof raw === 'string') ? raw : (raw?.name ?? raw?.displayName ?? String(raw));
+    const explicitCode = (raw && typeof raw === 'object') ? (raw.code ?? raw.optionCode) : undefined;
     const optUid = generateDhis2Uid();
     optionUids.push(optUid);
     options.push({
       id: optUid,
-      name: osDef.options[i],
-      code: osDef.options[i].toUpperCase().replace(/[^A-Z0-9]/g, '_').substring(0, 50),
+      name: optName,
+      code: deriveOptionCode(optName, usedCodes, explicitCode),
       sortOrder: i + 1,
     });
   }
@@ -11030,6 +11075,9 @@ async function buildCategoryComboBundle(combo) {
   // 3. Walk the requested list and decide reuse vs. create for each.
   const newOptions = [];
   const newOptionUidsByLower = new Map();
+  // Category-option codes collide on the same "A+"/"A-" → "A_" problem; keep them
+  // unique across everything we mint in this bundle.
+  const usedOptionCodes = new Set();
   const newCategories = [];
   const resolvedCategoryIds = [];
   const summary = {
@@ -11110,7 +11158,7 @@ async function buildCategoryComboBundle(combo) {
         name: optName,
         shortName: clampShortName(optName, optName, null, 'Option'),
       };
-      const codeVal = (optCode && String(optCode).trim()) || optName.toUpperCase().replace(/[^A-Z0-9]/g, '_').slice(0, 50);
+      const codeVal = deriveOptionCode(optName, usedOptionCodes, optCode);
       if (codeVal) newOpt.code = codeVal;
       newOptions.push(newOpt);
       catOptionRefs.push({ id: optUid });
