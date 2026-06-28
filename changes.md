@@ -221,3 +221,68 @@ following DHIS2 quirks were discovered and are now encoded so the model never re
 **Verification:** `node --check background.js`, `node --check sidepanel/panel.js` both pass.
 Underlying API sequence verified live on 2.43 (form renders + saves in both Aggregate Data Entry
 and Capture); test metadata cleaned up afterward.
+
+---
+
+## 5. Fix — option-set creation 409 on duplicate auto-generated codes ("A+"/"A-" → "A_")
+
+**File:** `background.js`
+**Functions:** new `deriveOptionCode()` helper; `buildOptionSetAndOptions()`; the category-option
+builder inside the category-combo flow.
+**Type of change:** Bug fix (root cause of a 409 loop), net +~45 lines.
+
+### Reported symptom
+Creating a tracker program ("ANC Clinical & Lab Registry") with a Blood Group option set
+(`A+, A-, B+, B-, AB+, AB-, O+, O-`) failed and the chatbot then looped through several more
+failing calls:
+
+```
+create_program → 409 duplicate key … "optionvalue_unique_optionsetid_and_code" (optionsetid, code)=(…, A_)
+create_option_set → same 409 on a NEW optionsetid
+POST optionSets (raw) → 409
+options?filter=… → STOP: 3 HTTP 4xx errors, tool calls blocked
+```
+
+### Root cause
+Option codes were auto-generated with
+`name.toUpperCase().replace(/[^A-Z0-9]/g,'_')` and **no uniqueness guarantee**. Any two option
+names that differ only by a non-alphanumeric symbol collapse to the **same code**: `A+` and `A-`
+both become `A_` (likewise `1+`/`1-`, `B+`/`B-`, …). DHIS2 enforces a per-option-set unique code
+via the Postgres constraint `optionvalue_unique_optionsetid_and_code`, so the two same-coded
+options collide and the import **fails with a 409 at COMMIT**.
+
+Two compounding factors explained the loop:
+- The `/api/metadata?importMode=VALIDATE` pass **cannot** catch this — it is a database unique
+  constraint, not a metadata-import rule, so it only surfaces at COMMIT (INSERT) time.
+- After the 409 the model **misdiagnosed** the cause ("orphaned objects may remain" — there were
+  none; `atomicMode=ALL` had rolled the import back cleanly) and retried with the **same** buggy
+  code generation, producing `A_` twice again, until the existing 3-error circuit-breaker stopped it.
+
+### Fix
+New `deriveOptionCode(rawName, usedCodes, explicitCode)` generates collision-free codes **by
+construction**:
+1. Maps a trailing `+`/`-` sign to a readable `_POS`/`_NEG` token, so the common blood-group /
+   lab-result / urine-protein cases stay meaningful **and** distinct (`A+`→`A_POS`, `A-`→`A_NEG`,
+   `1+`→`1_POS`).
+2. Sanitizes the rest to `[A-Z0-9_]`.
+3. Guarantees uniqueness against codes already minted in the same scope by appending `_2`, `_3`, …
+   (so even pathological sets like `N/A, N.A., N-A, N+A` → `N_A, N_A_2, N_A_3, N_A_4`).
+
+Applied at both option-creation chokepoints: `buildOptionSetAndOptions()` (per option set) and the
+category-option builder in the category-combo flow (per bundle). `buildOptionSetAndOptions` also
+now tolerates `{name, code}` option entries, not just strings.
+
+### Verification (live, DHIS2 2.43 `stable-2-43-0-1`)
+Reproduced the exact failing program as one atomic `/api/metadata` POST (5 option sets incl. Blood
+Group, 24 options, 4 TEAs, 11 data elements, 2 stages, 1 program assigned to all 1332 org units
+with production sharing):
+
+```
+VALIDATE → status OK, 47 created, 0 errors
+COMMIT   → status OK, 47 created, 0 errors
+Blood Group codes → A_POS, A_NEG, B_POS, B_NEG, AB_POS, AB_NEG, O_POS, O_NEG  (all unique)
+```
+
+Previously this same operation 409'd on the duplicate `A_` code. Unit-checked `deriveOptionCode`
+against all the prompt's option sets (+ a deliberate all-collide set) — every code unique. Test
+metadata deleted afterward. `node --check background.js` passes.
