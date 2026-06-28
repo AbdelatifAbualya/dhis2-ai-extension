@@ -393,3 +393,110 @@ the exact plugin source URL and the steps to add the widget via the Tracker Plug
   was unavailable in the automated session. The functional contract is verified end to end.
 
 `node --check background.js` and `node --check sidepanel/panel.js` both pass.
+
+---
+
+## 9. Fix three issues from the "Child and Adolescent Growth" program report (memory loss, value-type default, program-rule misdiagnosis)
+
+A user created a tracker program ("Child and Adolescent Growth", program `eyloSZ4Gkef` on
+`play.im.dhis2.org/stable-2-42-5-1`) and reported three problems: (1) numeric data elements were
+allegedly created as TEXT, (2) the auto-age program rule "failed" and the assistant could not fix
+it, and (3) the assistant has no memory of what it *did* (API calls, created IDs) across turns of
+the same thread — only of the user's prompts.
+
+### Ground-truth investigation (live, against the user's actual instance `stable-2-42-5-1`)
+
+I queried the actual created metadata via the API (admin/district):
+- **Data element value types were already correct:** Head circumference `NUMBER`, Height in cm
+  `NUMBER`, Weight in kg `INTEGER_POSITIVE`, Age in months `INTEGER`; DOB attribute `DATE`. So #1
+  did **not** manifest in this run — but the builder's silent `|| 'TEXT'` fallback is a real latent
+  trap whenever the model omits `value_type`, so it is worth hardening.
+- **The program rule was syntactically correct:** condition `d2:hasValue(A{dob})`, action
+  `ASSIGN d2:monthsBetween(A{dob}, V{current_date}) → "Age in months"`, with a `dob` PRV of
+  sourceType `TEI_ATTRIBUTE` mapped to the DOB attribute and an `age_in_months` DE PRV. The
+  assistant's proposed "fix" (rewrite `A{dob}` → `#{dob}`) was a **misdiagnosis** — `A{tea}` is the
+  canonical reference for an attribute-sourced rule variable. Confirmed by the demo DB's own working
+  rules: WHO RMNCH uses `d2:yearsBetween(A{born}, V{current_date})` and Malaria uses
+  `A{Sex} == 'MALE'` / `d2:yearsBetween(A{dateofbirth}, V{current_date})`. Importing a test TEI
+  with a DOB through `/api/tracker` succeeded with 0 errors (then deleted); server-side import does
+  not apply ASSIGN side-effects (that is a Capture/runtime behaviour), so emptiness there is not
+  evidence the rule is broken.
+- **The memory loss (#3) is a real code bug** (see fix below).
+
+### Fix 3 (primary) — persist the full action trail across turns
+
+**File:** `background.js`
+**Functions/areas:** new helpers `truncateToolContentForHistory`, `trimConversationHistory`,
+`buildTurnHistory` (near `saveState`); the agentic loop's turn-finalization blocks; `saveState`.
+
+**Before:** after the agentic loop finished a turn, only two messages were appended to
+`conversationHistory`: `{role:'user', content: historyText}` and `{role:'assistant', content:
+finalText}`. Every assistant `tool_calls` message and every `role:'tool'` result produced during
+the loop was discarded. On the next turn the model saw only the user's prompts and its own prose
+summaries — it had amnesia about the API calls it made and the IDs it created. Trimming was a blunt
+`slice(-16)`.
+
+**After:** at turn end we persist the *whole structured turn* via `buildTurnHistory(messages,
+turnStartIdx, historyText)` — the user message plus every assistant `tool_calls` message and every
+`tool` result the loop produced (the final assistant text is already in `messages`). `turnStartIdx
+= 1 + conversationHistory.length` marks where this turn's messages begin. Transient mid-loop
+`system` nudges/reminders are dropped; empty assistant turns are skipped; oversized tool results are
+clipped to 1800 chars (`truncateToolContentForHistory`) so history stays bounded. Trimming is now
+`trimConversationHistory` which only ever cuts on a `user` turn boundary, so an
+assistant-`tool_calls` message is never separated from its `tool` results (which every provider
+rejects). `HISTORY_MAX_MESSAGES = 60`. `saveState` persists the trimmed history (was `slice(-20)`,
+which could orphan a tool message on reload).
+
+**Why this is safe for all providers:** the `messages` array is already provider-valid on every
+loop iteration; we persist a subset of it (only dropping standalone `system` messages) and only cut
+on user boundaries, so tool-call/result pairing is preserved by construction. Verified with a
+simulation: persisted turns keep `user → assistant[tool_calls] → tool → assistant`, system messages
+are dropped, the compact user text is stored (not the full inspect-log-laden content), trimming
+keeps a user boundary, and every `tool` message stays paired with its assistant.
+
+**Memory clears correctly on a new thread:** `CLEAR_HISTORY` still resets `conversationHistory = []`
+(triggered by panel.js line 281), so within-thread memory now persists and a new thread starts clean
+— exactly the requested behaviour.
+
+### Fix 1 — value-type inference safety net (no more silent TEXT for numeric fields)
+
+**File:** `background.js`
+**Functions:** new `inferValueType(name, fallback)`; `buildDataElement` (DE valueType line);
+the inline TEA builder in `createFullProgram`.
+
+**Before:** `valueType: de.value_type || 'TEXT'` and `valueType: attr.value_type || 'TEXT'` — an
+omitted `value_type` silently became TEXT.
+
+**After:** `value_type: de.value_type || (de.option_set ? 'TEXT' : inferValueType(de.name, 'TEXT'))`
+(same for TEAs). An explicit `value_type` always wins; option-set fields stay TEXT; otherwise the
+name is inspected with conservative, high-confidence cues: DOB/"date" → `DATE`; "age"/"number of"/
+counts/doses → `INTEGER`; height/weight/circumference/temperature/BMI/vitals and unit suffixes like
+`(cm)`/`(kg)`/`(mm)`/`(g)`/`in cm`/`in kg` → `NUMBER`; "percent"/`(%)` → `PERCENTAGE`; else the
+fallback. Unit-tested against 16 names (incl. all four from this program) — 16/16 correct, no false
+positives on Name/Sex/Comments/Diagnosis. VALIDATE-imported NUMBER/INTEGER/PERCENTAGE DEs on 2.43
+(`importMode=VALIDATE`, status OK, 0 errors).
+
+### Fix 2 — program-rule guidance (stop the A{}→#{} misdiagnosis; diagnose from real metadata)
+
+**File:** `background.js` — `buildSystemPrompt()` "Program Rule syntax" block.
+
+Added two guidance bullets: (a) `A{attr_name}` IS the correct, canonical way to reference a
+TEA-sourced program rule variable in conditions and ASSIGN/expression `data`, matching DHIS2's own
+demo rules; never "fix" a working `A{tea}` into `#{tea}` (that is a regression and is never the
+cause of a rule not firing). (b) When a user says an auto-assign/calc rule "isn't working", diagnose
+from the real metadata (`manage_program_rules action=get` + `list_variables`) before claiming a
+cause; if the expression matches a known-good pattern, say it is correct; the real reasons an ASSIGN
+value looks missing are runtime/UX (value appears on opening the stage event once the source has a
+value; field is read-only by design; target DE valueType can't hold the result) — do not invent
+"the reference doesn't resolve at runtime" without evidence. Fix 3 reinforces this: the model will
+now actually remember the rule + PRV mapping it built earlier in the thread.
+
+**Scope of impact:** Fix 3 changes only how a completed turn is persisted/trimmed (no change to
+tool execution or to what the model receives mid-turn). Fix 1 only changes the *default* valueType
+when `value_type` is omitted and no option set is attached — explicit types and option-set fields
+are untouched. Fix 2 is prompt-only. No existing tool is regressed.
+
+**Verification:** `node --check background.js` and `node --check sidepanel/panel.js` pass;
+`inferValueType` unit test 16/16; memory persistence/trim simulation confirms provider-valid
+pairing; value types VALIDATE-import cleanly on 2.43; live diagnosis run against the user's
+`stable-2-42-5-1` instance (test TEI created and deleted, no residue left behind).

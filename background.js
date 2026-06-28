@@ -931,12 +931,89 @@ function snapshotDhis2ForPersistence() {
   return out;
 }
 
+// ── Conversation-memory helpers ─────────────────────────────────────────────
+// The agentic loop accumulates a full structured turn in its local `messages`
+// array: the user message, every assistant message that issued tool_calls, and
+// every `tool` result message. Historically only the user text + final
+// assistant prose were persisted into `conversationHistory`, so on the NEXT
+// turn the model had amnesia about what it actually DID (API calls, created
+// IDs, the metadata it built) — it could only re-read its own summary prose.
+// These helpers let us persist the real action trail while keeping the history
+// bounded and structurally valid for every provider.
+
+// Cap on how much of a single tool result we keep in long-term history. Full
+// results (OU dumps, whole-metadata exports) can be tens of KB; the model only
+// needs the IDs / status / shape to stay oriented on later turns.
+const HISTORY_TOOL_RESULT_CAP = 1800;
+// Max messages retained across turns. Tool turns inflate the count (1 user + N
+// assistant/tool messages), so this is larger than the old 20-message cap.
+const HISTORY_MAX_MESSAGES = 60;
+
+// Shrink a persisted `tool` message's content so history stays small. Tries to
+// keep the head of the JSON (where ids/status/_error live) plus a truncation
+// marker so the model knows the payload was clipped, not empty.
+function truncateToolContentForHistory(content) {
+  if (typeof content !== 'string' || content.length <= HISTORY_TOOL_RESULT_CAP) return content;
+  return content.slice(0, HISTORY_TOOL_RESULT_CAP) +
+    `…[truncated ${content.length - HISTORY_TOOL_RESULT_CAP} chars — full result was returned to the model on the turn it ran]`;
+}
+
+// Trim history WITHOUT orphaning a `tool` message from the assistant tool_calls
+// it answers (which makes OpenAI/Anthropic/Google reject the request). We only
+// ever cut on a `user` boundary, so every assistant→tool group stays intact.
+function trimConversationHistory(history, maxMessages = HISTORY_MAX_MESSAGES) {
+  if (!Array.isArray(history) || history.length <= maxMessages) return history;
+  let start = history.length - maxMessages;
+  // Advance to the next turn boundary (a 'user' message) so the slice never
+  // begins in the middle of a tool_call/tool_result group.
+  while (start < history.length && history[start].role !== 'user') start++;
+  if (start >= history.length) {
+    // Fallback: keep from the last user message onward.
+    start = history.length - 1;
+    while (start > 0 && history[start].role !== 'user') start--;
+  }
+  return history.slice(start);
+}
+
+// Build the persistable record of one turn from the live `messages` array.
+// `persistFromIdx` points at the first message that belongs to THIS turn
+// (right after system + prior history). Drops transient `system` nudges/
+// reminders injected mid-loop, clones objects so the live array is untouched,
+// and clips oversized tool results.
+function buildTurnHistory(messages, persistFromIdx, userContentOverride) {
+  const out = [];
+  for (let k = persistFromIdx; k < messages.length; k++) {
+    const m = messages[k];
+    if (!m || m.role === 'system') continue; // transient nudges/reminders
+    if (m.role === 'tool') {
+      out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: truncateToolContentForHistory(m.content) });
+    } else if (m.role === 'assistant') {
+      const hasCalls = m.tool_calls && m.tool_calls.length;
+      const hasText = m.content && String(m.content).trim();
+      // Skip empty assistant turns (no text, no tool_calls) — they carry no
+      // memory and some providers reject null-content assistant messages.
+      if (!hasCalls && !hasText) continue;
+      const a = { role: 'assistant', content: m.content ?? null };
+      if (hasCalls) a.tool_calls = m.tool_calls;
+      out.push(a);
+    } else if (m.role === 'user') {
+      // Persist the compact user text (override) for the turn's own user
+      // message — the live array may carry large inspect-log/web blocks we do
+      // not want to retain across turns.
+      const useOverride = k === persistFromIdx && typeof userContentOverride !== 'undefined';
+      out.push({ role: 'user', content: useOverride ? userContentOverride : m.content });
+    }
+  }
+  return out;
+}
+
 async function saveState() {
   try {
     await chrome.storage.session.set({
       dhis2State: getSerializableState(),
       dhis2Full: JSON.parse(JSON.stringify(snapshotDhis2ForPersistence())),
-      chatHistory: conversationHistory.slice(-20),
+      // Trim on a user boundary so a reload never restores an orphaned tool msg.
+      chatHistory: trimConversationHistory(conversationHistory),
     });
   } catch {}
 }
@@ -5928,6 +6005,8 @@ Never retry by looping through children one-at-a-time when the single atomic ret
 
 **Program Rule syntax:**
 - Condition: \`#{variable_name}\` for DEs (lowercase, underscores), \`A{attr_name}\` for TEAs, \`V{current_date}\` for system vars
+- ⚠ **\`A{attr_name}\` IS the correct, canonical way to reference a tracked-entity-attribute program rule variable** in BOTH conditions and ASSIGN/expression \`data\` — this matches DHIS2's own demo rules, e.g. \`d2:yearsBetween(A{born}, V{current_date})\` and \`A{Sex} == 'MALE'\`. \`#{...}\` is for DATA-ELEMENT-sourced variables only. **Do NOT "fix" a working \`A{tea}\` reference into \`#{tea}\`** — for a TEA variable that is a regression, not a fix, and it is NEVER the cause of a rule "not firing". Auto-calc-from-attribute patterns like \`ASSIGN d2:monthsBetween(A{dob}, V{current_date}) → "Age in months"\` are correct as written.
+- 🔎 **When a user says an auto-assign / calculation rule "isn't working", DIAGNOSE from real metadata — never guess a syntax cause.** First \`manage_program_rules(action=get)\` + \`action=list_variables\` and read the ACTUAL condition, the PRV source types, and the target DE's valueType. If the expression already matches a known-good pattern (A{tea} for attributes, V{current_date}, a valid d2: function, ASSIGN target DE that can hold the result), the rule is correct — say so. The real reasons an ASSIGN value looks "missing" are runtime/UX, not syntax: (a) the assigned value only appears once you open the stage event that contains the target DE and the source attribute already has a value; (b) the target field is read-only/auto-filled by design; (c) the target DE valueType cannot hold the computed value (e.g. a number assigned to a TEXT field). Explain the real cause and verify; do NOT invent "the reference doesn't resolve at runtime" without evidence.
 - HIDEFIELD on TEA: use \`tracked_entity_attribute_name\`; on DE: use \`data_element_name\`
 - Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, WARNINGONCOMPLETE, ERRORONCOMPLETE, SHOWWARNINGINFORMATION
 - Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
@@ -11123,6 +11202,27 @@ function buildOptionSetAndOptions(osDef, parentValueType) {
   return { optionSet, options, osUid };
 }
 
+// Safety net for when the model omits value_type on a data element / attribute.
+// Historically the builder silently defaulted to TEXT, so an obviously numeric
+// field ("Height in cm", "Weight in kg", "Head circumference", "Age in months")
+// could be created as TEXT — blocking numeric validation, indicators and charts.
+// This only fires when value_type is ABSENT; an explicit value_type always wins.
+// Kept deliberately conservative: only high-confidence cues flip the default.
+function inferValueType(rawName, fallback = 'TEXT') {
+  const name = String(rawName || '').toLowerCase().trim();
+  if (!name) return fallback;
+  // Date-ish
+  if (/\b(dob|date of birth|birth\s?date|date)\b/.test(name)) return 'DATE';
+  // Count / age / "number of …" → whole numbers
+  if (/\bage\b|\bage in (months|years|days|weeks)\b/.test(name)) return 'INTEGER';
+  if (/\b(number of|no\.? of|count of|count|# of|quantity|qty|doses?|visits?|episodes?)\b/.test(name)) return 'INTEGER';
+  // Measurements / vitals / generic numerics, incl. unit suffixes like (cm)/(kg)/(mm)/(g)
+  if (/\b(height|weight|circumference|temperature|temp|bmi|length|width|diameter|pressure|pulse|heart rate|respiratory rate|spo2|saturation|glucose|haemoglobin|hemoglobin|dosage|dose|score|level|amount|volume|distance|measurement|reading)\b/.test(name)) return 'NUMBER';
+  if (/\bpercent(age)?\b|\(\s*%\s*\)|\s%$/.test(name)) return 'PERCENTAGE';
+  if (/\(\s*(cm|kg|mm|g|ml|mg|cm3|m|kg\/m2|mmhg|bpm|°c|c)\s*\)|\b(in|in cm|in kg|in mm|in g|in ml)\b/.test(name)) return 'NUMBER';
+  return fallback;
+}
+
 function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames = null, opts = {}) {
   const uid = generateDhis2Uid();
   // Aggregate DEs (used by dataSets) need domainType:AGGREGATE + a real
@@ -11153,7 +11253,10 @@ function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames
     name: de.name,
     shortName: clampShortName(de.short_name, de.name, seenShortNames, 'Data Element'),
     domainType,
-    valueType: de.value_type || 'TEXT',
+    // Explicit value_type always wins. When absent, infer from the name so
+    // numeric fields are not silently created as TEXT — but never infer when an
+    // option set is attached (those are code-valued, keep TEXT default).
+    valueType: de.value_type || (de.option_set ? 'TEXT' : inferValueType(de.name, 'TEXT')),
     aggregationType,
     categoryCombo: { id: ccId },
   };
@@ -13062,7 +13165,10 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           id: teaUid,
           name: attr.name,
           shortName: clampShortName(attr.short_name, attr.name, seenTEAShortNames, 'Attribute'),
-          valueType: attr.value_type || 'TEXT',
+          // Explicit value_type wins; otherwise infer from the name (e.g. DOB →
+          // DATE, "Age" → INTEGER) instead of silently defaulting numerics/dates
+          // to TEXT. Option-set attributes stay TEXT.
+          valueType: attr.value_type || (attr.option_set ? 'TEXT' : inferValueType(attr.name, 'TEXT')),
           aggregationType: 'NONE',
         };
         if (attr.option_set && optionSetUidMap[attr.option_set.name]) {
@@ -18839,6 +18945,15 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   let lastToolName = null;
   let emptyResponseCount = 0; // Guard against infinite think-only loops
 
+  // Marker: everything in `messages` from this index on is THIS turn (the user
+  // message + any prefetch + every assistant/tool message the loop adds). The
+  // array was built as [system, ...conversationHistory, userMsg], and
+  // conversationHistory is not mutated until turn end, so the user message sits
+  // at exactly 1 + conversationHistory.length. At turn end we persist
+  // messages.slice(turnStartIdx) so the next turn remembers the actual tool
+  // calls + results, not just the final prose.
+  const turnStartIdx = 1 + conversationHistory.length;
+
   for (let i = 0; i < 50; i++) {
     // Contextual thinking label
     const thinkLabel = lastToolName
@@ -19114,9 +19229,14 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           const fallback = 'I was unable to produce a response. Please try rephrasing your question.';
           broadcast({ type: 'AI_STREAM_START' });
           broadcast({ type: 'AI_STREAM_END', text: fallback });
-          conversationHistory.push({ role: 'user', content: historyText });
-          conversationHistory.push({ role: 'assistant', content: fallback });
-          if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-16);
+          // Persist the full action trail for this turn (tool calls + results),
+          // then the fallback as the assistant's closing message, so the next
+          // turn still remembers what was done before the empty-response bail.
+          const turnHist = buildTurnHistory(messages, turnStartIdx, historyText)
+            .filter(m => !(m.role === 'assistant' && !m.tool_calls && !(m.content && String(m.content).trim())));
+          turnHist.push({ role: 'assistant', content: fallback });
+          conversationHistory.push(...turnHist);
+          conversationHistory = trimConversationHistory(conversationHistory);
           saveState();
           return { text: fallback, charts, streamed: true };
         }
@@ -19133,9 +19253,15 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       if (streamStartBroadcast) {
         broadcast({ type: 'AI_STREAM_END', text });
       }
-      conversationHistory.push({ role: 'user', content: historyText });
-      conversationHistory.push({ role: 'assistant', content: text });
-      if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-16);
+      // Persist the WHOLE structured turn — the user message plus every
+      // assistant tool_call and tool result the loop produced (the final
+      // assistant text message was already pushed onto `messages` at the top of
+      // this iteration, so it is included). This is what gives the model real
+      // memory of the API calls it made and the IDs it created on later turns,
+      // instead of forcing it to re-read its own summary prose.
+      const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
+      conversationHistory.push(...turnHist);
+      conversationHistory = trimConversationHistory(conversationHistory);
 
       lastInteraction = { question: userText, apiCalls: apiCallsLog, answer: text };
       saveState();
@@ -19143,6 +19269,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     }
   }
 
+  // Even when the loop exhausts its iteration budget, persist the action trail
+  // so the next turn still remembers the tool calls/IDs from this turn.
+  try {
+    const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
+    if (turnHist.length) {
+      conversationHistory.push(...turnHist);
+      conversationHistory = trimConversationHistory(conversationHistory);
+      saveState();
+    }
+  } catch {}
   return { text: 'Reached maximum iterations. Try a more specific question.', charts };
 }
 
