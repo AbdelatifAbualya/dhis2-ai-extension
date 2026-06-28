@@ -4718,6 +4718,52 @@ Returns: { success, target, form_id, input_count, form_type, backup, _hints }. O
   {
     type: 'function',
     function: {
+      name: 'manage_custom_translations',
+      description: `Translate or re-label the UI strings of ANY DHIS2 app using the experimental DHIS2 2.43 "custom-translations" datastore feature. Use this whenever the user asks to "translate the Capture app", "translate this app to Arabic/French/...", "change/relabel a UI string", "rename a button/label", or "customise the wording" of an app — WITHOUT touching the app's source code.
+
+REQUIRES DHIS2 2.43+ (the apps only read this datastore namespace on 2.43 and later). On older servers the write is harmless but has no effect; the tool refuses with a clear message.
+
+How it works (verified on 2.43 — the Capture app fetches BOTH keys at startup):
+- A single registry key "controller" in dataStore namespace "custom-translations" maps each app slug to the locales it has custom translations for, e.g. { "capture": ["ar"] }. If an app/locale pair is NOT in the controller, the app NEVER loads its translations — this tool keeps the controller in sync automatically.
+- One key per app+locale named "<slug>__<locale>" (double underscore), e.g. "capture__ar". Its value is a JSON object mapping each EXACT original English source string to its replacement string.
+- At render time the app swaps each matching source string for its replacement.
+
+Two modes (the feature treats both identically — it is a literal source→target string map):
+- TRANSLATION: locale is a different language (e.g. "ar", "fr") → English source renders as the translated value.
+- SAME-LANGUAGE REWRITE: locale is the language already in use (e.g. "en") → relabel/reword strings in place (e.g. "Report data" → "Submit report").
+
+Actions:
+- list — list the custom-translations namespace: the controller registry (which apps/locales are registered) and all translation keys.
+- get — read one translation map. Pass app + locale; omit them to return just the controller registry. Warns if an app/locale is registered but its key is missing, or vice-versa.
+- set — create/update translations for app + locale. Writes the "<slug>__<locale>" key AND registers the pair in the controller in one step. Merges into any existing map by default; pass replace:true to overwrite the whole map.
+- remove — delete translations for app + locale (key + controller de-registration), or pass keys:[...] to drop only specific source strings.
+
+CRITICAL string matching: each property name in translations must match the app's source string EXACTLY — same capitalisation, punctuation and whitespace — or that string will not be swapped. Read the exact on-screen English first.
+
+Datastore keys are NOT covered by manage_backups (that tool only restores metadata objects), so set/remove return the pre-write state inline as previous_value / previous_controller for manual rollback.
+
+Returns: { success, namespace, app, locale, key, ... } on success; { _error, _hint } on failure.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'set', 'remove'],
+            description: 'list=show the namespace (controller registry + keys); get=read one translation map (or the controller if app/locale omitted); set=create/update translations for an app+locale; remove=delete an app+locale map or specific strings.'
+          },
+          app: { type: 'string', description: 'The app slug, e.g. "capture", "dashboard", "data-visualizer", "maps". Lowercased automatically. Required for set/remove; optional for get.' },
+          locale: { type: 'string', description: 'Locale code. Use a different language to TRANSLATE (e.g. "ar", "fr", "pt_BR") or the current language to REWRITE strings in place (e.g. "en"). Required for set/remove; optional for get.' },
+          translations: { type: 'object', description: 'For set: JSON object mapping each EXACT source string to its replacement string, e.g. {"Report data":"الإبلاغ عن البيانات","Get started with Capture app":"ابدأ مع برنامج الالتقاط"}. All values must be strings.', additionalProperties: { type: 'string' } },
+          replace: { type: 'boolean', description: 'For set: when true, REPLACE the entire translation map for this app+locale. Default false = merge the provided pairs into the existing map.' },
+          keys: { type: 'array', items: { type: 'string' }, description: 'For remove: drop only these specific source strings from the map (keeps the rest and the registration). Omit to remove the whole app+locale map and de-register it from the controller.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -4773,6 +4819,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_program_notifications: true,
   manage_datasets: true,
   manage_custom_forms: true,
+  manage_custom_translations: true,
   manage_backups: true,
 });
 
@@ -4846,6 +4893,12 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     /\b(custom\s*forms?|custom\s*(data\s*)?entry\s*forms?|custom\s*layout|html\s*forms?|form\s*designer|dataentryform)\b/.test(combinedText)
     || (/\b(design|build|create|make|lay\s*out|customi[sz]e)\b.{0,40}\b(form|layout)\b/.test(combinedText)
         && /\b(custom|html|data\s*entry|tracker|stage|dataset|data\s*set|aggregate)\b/.test(combinedText));
+  // ── Custom-translation intent ──
+  // "translate this app", "custom translation(s)", "translate Capture to Arabic",
+  // "relabel/rename/change a UI string/label/wording", "localise the app".
+  const wantsTranslationIntent =
+    /\b(custom\s*translations?|translate|translations?|localis[ez]e|localiz[ae]tion)\b/.test(combinedText)
+    || /\b(re-?label|re-?name|change|reword|customi[sz]e)\b.{0,40}\b(label|string|text|wording|caption|button|title|heading|menu\s*item)\b/.test(combinedText);
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -4988,6 +5041,12 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('manage_custom_forms');
     selected.add('get_program_info');
     selected.add('search_metadata');
+  }
+
+  // ── Custom-translation authoring — app UI string translation / re-labelling ──
+  // App-agnostic: surface whenever the user expresses translation/relabel intent.
+  if (wantsTranslationIntent) {
+    selected.add('manage_custom_translations');
   }
 
   // ── Intent-driven override: if the user explicitly asks to create or manage
@@ -5139,6 +5198,9 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
     /\b(custom\s*forms?|custom\s*(data\s*)?entry\s*forms?|custom\s*layout|html\s*forms?|form\s*designer|dataentryform)\b/i.test(text)
     || (/\b(design|build|create|make|lay\s*out|customi[sz]e)\b.{0,40}\b(form|layout)\b/i.test(text)
         && /\b(custom|html|data\s*entry|tracker|stage|dataset|data\s*set|aggregate)\b/i.test(text));
+  const wantsTranslationPrompt =
+    /\b(custom\s*translations?|translate|translations?|localis[ez]e|localiz[ae]tion)\b/i.test(text)
+    || /\b(re-?label|re-?name|change|reword|customi[sz]e)\b.{0,40}\b(label|string|text|wording|caption|button|title|heading|menu\s*item)\b/i.test(text);
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -5697,6 +5759,40 @@ Everything else in the HTML (tables, headings, narrative text) renders verbatim.
 - "Design a custom form for this tracker stage": manage_custom_forms(action="set_stage_form", program_stage_id="<stageId>")
 - "Show me what the form would look like first": manage_custom_forms(action="preview_html", dataset_id|program_stage_id)
 - "Use my own HTML": pass html_code="..." with the correct id bindings above.
+`;
+  }
+
+  // ── Custom Translations KB — translate / re-label app UI strings (DHIS2 2.43+) ──
+  if (wantsTranslationPrompt) {
+    p += `
+## DHIS2 Custom Translations — use the **manage_custom_translations** tool
+EXPERIMENTAL DHIS2 2.43+ feature. It translates or re-labels an app's UI strings via the "custom-translations" dataStore namespace — NO source-code changes. Use it whenever the user wants to translate an app (e.g. Capture → Arabic), or simply change/relabel a UI string. NEVER hand-write these dataStore keys via dhis2_query — use this tool so the controller registry stays in sync.
+
+### How the feature works (verified on 2.43 — the app fetches both keys at startup)
+- Registry key "controller": { "<appSlug>": ["<locale>", ...] }. If an app/locale is NOT registered here, the app never loads its translations.
+- Per app+locale key "<slug>__<locale>" (double underscore, e.g. capture__ar): { "<exact source string>": "<replacement>", ... }. The app swaps each matching source string at render time.
+
+### Two uses (identical mechanics — it's a literal source→target string map)
+- TRANSLATE: locale is another language (e.g. "ar","fr") → English source renders as the translation.
+- REWRITE same language: locale is the language already shown (e.g. "en") → relabel/reword in place, e.g. "Report data" → "Submit report".
+
+### Actions
+- \`get\` — read the controller registry (omit app/locale) or one translation map (pass app+locale). Use this FIRST to see what exists.
+- \`set\` — create/update translations for app+locale; it writes the key AND registers the pair in the controller in one call. Merges by default; pass replace:true to overwrite the whole map.
+- \`remove\` — delete an app+locale map (or pass keys:[...] to drop specific source strings).
+- \`list\` — show the whole namespace.
+
+### Critical
+- Match each source string EXACTLY as shown on screen (capitalisation, punctuation, whitespace) — read the real UI text first; an inexact key is silently ignored.
+- The app slug is lowercase (capture, dashboard, data-visualizer, maps). The user must reload the app with that locale active to see changes.
+- Requires DHIS2 2.43+; the tool refuses on older servers (the apps don't read the namespace there).
+- DataStore keys are NOT covered by manage_backups. set/remove return previous_value / previous_controller for manual rollback — surface the key name to the user.
+
+### Recipes
+- "Translate Capture to Arabic": manage_custom_translations(action="set", app="capture", locale="ar", translations={"Get started with Capture app":"...","Report data":"..."})
+- "Rename a button in English": manage_custom_translations(action="set", app="capture", locale="en", translations={"Report data":"Submit report"})
+- "What translations exist?": manage_custom_translations(action="list")
+- "Undo the Arabic translation": manage_custom_translations(action="remove", app="capture", locale="ar")
 `;
   }
 
@@ -9719,6 +9815,11 @@ async function executeTool(name, args) {
     return await executeManageCustomForms(args);
   }
 
+  // ── manage_custom_translations ──
+  if (name === 'manage_custom_translations') {
+    return await executeManageCustomTranslations(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -11723,6 +11824,306 @@ async function executeManageCustomForms(args) {
     return await removeCustomForm(args);
   }
   return { _error: `Unknown manage_custom_forms action: ${action}`, _hint: 'One of: get, preview_html, set_dataset_form, set_stage_form, remove_form.' };
+}
+
+// ── manage_custom_translations: experimental DHIS2 2.43 "custom-translations" datastore feature ──
+//
+// VERIFIED on DHIS2 2.43 (play stable-2-43-0-1): the new Capture app fetches, at startup:
+//   1. GET /api/dataStore/custom-translations/controller   → { "<appSlug>": ["<locale>", ...] }
+//   2. GET /api/dataStore/custom-translations/<slug>__<locale>  (when the active UI locale is
+//      registered for that app) → { "<source string>": "<replacement>", ... }
+// Both requests were observed returning 200 from the Capture app, and the key template
+// `${slug}__${locale}` (slug lowercased) was confirmed in the app bundle. At render time the
+// app swaps each matching source string for its replacement.
+//
+// The replacement can be a DIFFERENT language (true translation) or the SAME language (a plain
+// string rewrite, e.g. "Report data" → "Submit report" under locale "en"). The feature treats
+// it as a literal source→target map; this tool supports both uses identically.
+//
+// IMPORTANT: an app/locale pair that is NOT listed in the `controller` key is never loaded by
+// the app, so set/remove always keep the controller registry and the per-locale key in sync.
+//
+// DataStore keys are not metadata objects, so the standard ensureBackupOrBail/manage_backups
+// machinery (which restores via /api/metadata) cannot roll them back. Instead set/remove return
+// the pre-write state inline (previous_value / previous_controller) for manual recovery.
+
+const CUSTOM_TRANSLATIONS_NS = 'custom-translations';
+const CUSTOM_TRANSLATIONS_CONTROLLER_KEY = 'controller';
+const CUSTOM_TRANSLATIONS_MIN_API = 43;
+
+// Refuse on servers older than 2.43 — the apps simply don't read this namespace there.
+function customTranslationsVersionGate() {
+  const v = Number(dhis2.apiVersion);
+  if (Number.isFinite(v) && v >= CUSTOM_TRANSLATIONS_MIN_API) return null;
+  return {
+    _error: `Refused: custom translations require DHIS2 2.${CUSTOM_TRANSLATIONS_MIN_API}+. This instance reports API version "${dhis2.apiVersion || '?'}" (${dhis2.systemInfo?.version || 'unknown'}).`,
+    _hint: 'The custom-translations datastore feature is only read by DHIS2 apps on 2.43 and later. On older servers, writing these keys has no visible effect — do not attempt it.',
+  };
+}
+
+function normalizeAppSlug(app) {
+  return String(app == null ? '' : app).trim().toLowerCase();
+}
+// Locale casing is significant (e.g. pt_BR, uz_UZ_Cyrl) — only trim, never lowercase.
+function normalizeLocale(locale) {
+  return String(locale == null ? '' : locale).trim();
+}
+function customTranslationKey(slug, locale) {
+  return `${slug}__${locale}`;
+}
+function ctPath(key) {
+  return `dataStore/${encodeURIComponent(CUSTOM_TRANSLATIONS_NS)}/${encodeURIComponent(key)}`;
+}
+function isPlainObject(v) {
+  return v && typeof v === 'object' && !Array.isArray(v);
+}
+
+// Read the controller registry. Returns { exists, value } (value is {} when missing) or { _error }.
+async function ctFetchController() {
+  const resp = await safeDhis2Fetch(ctPath(CUSTOM_TRANSLATIONS_CONTROLLER_KEY));
+  if (resp?._status === 404) return { exists: false, value: {} };
+  if (resp?._error) return { _error: `Could not read the controller registry: ${resp._error}` };
+  return { exists: true, value: isPlainObject(resp) ? resp : {} };
+}
+
+// Upsert any custom-translations key: POST to create, fall back to PUT on 409 (already exists).
+async function ctUpsertKey(key, value) {
+  let resp = await safeDhis2Fetch(ctPath(key), { method: 'POST', body: value });
+  if (resp?._status === 409) {
+    resp = await safeDhis2Fetch(ctPath(key), { method: 'PUT', body: value });
+  }
+  if (resp?._error) return { _error: `Could not write key "${key}": ${resp._error}` };
+  return { ok: true };
+}
+
+async function ctWriteController(value) {
+  return await ctUpsertKey(CUSTOM_TRANSLATIONS_CONTROLLER_KEY, value);
+}
+
+async function listCustomTranslations() {
+  const keysResp = await safeDhis2Fetch(`dataStore/${encodeURIComponent(CUSTOM_TRANSLATIONS_NS)}`);
+  if (keysResp?._status === 404) {
+    return {
+      success: true, namespace: CUSTOM_TRANSLATIONS_NS, exists: false,
+      registered: {}, translation_keys: [],
+      _note: 'The custom-translations namespace does not exist yet. Use action="set" to create the first translation (it also creates the controller registry).',
+    };
+  }
+  if (keysResp?._error) return { _error: `Could not list custom-translations keys: ${keysResp._error}` };
+  const keys = Array.isArray(keysResp) ? keysResp : [];
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  const translationKeys = keys
+    .filter(k => k !== CUSTOM_TRANSLATIONS_CONTROLLER_KEY)
+    .map(k => {
+      const idx = k.indexOf('__');
+      return idx > 0
+        ? { key: k, app: k.slice(0, idx), locale: k.slice(idx + 2) }
+        : { key: k, app: null, locale: null, _note: 'Key does not follow the <slug>__<locale> format.' };
+    });
+  return {
+    success: true,
+    namespace: CUSTOM_TRANSLATIONS_NS,
+    exists: true,
+    registered: controller.value,
+    translation_keys: translationKeys,
+    key_count: keys.length,
+  };
+}
+
+async function getCustomTranslations(args) {
+  const slug = normalizeAppSlug(args.app);
+  const locale = normalizeLocale(args.locale);
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  if (!slug || !locale) {
+    return {
+      success: true, namespace: CUSTOM_TRANSLATIONS_NS,
+      registered: controller.value,
+      _note: 'Pass both app and locale to read a specific translation map.',
+    };
+  }
+  const key = customTranslationKey(slug, locale);
+  const registeredLocales = Array.isArray(controller.value[slug]) ? controller.value[slug] : [];
+  const isRegistered = registeredLocales.includes(locale);
+  const resp = await safeDhis2Fetch(ctPath(key));
+  if (resp?._status === 404) {
+    return {
+      success: true, app: slug, locale, key, exists: false, registered: isRegistered, translations: {},
+      _hint: isRegistered
+        ? 'The controller lists this app/locale but the translation key is missing — the app has nothing to load. Use action="set" to add strings.'
+        : 'No translations stored for this app/locale yet.',
+    };
+  }
+  if (resp?._error) return { _error: `Could not read ${key}: ${resp._error}` };
+  const translations = isPlainObject(resp) ? resp : {};
+  return {
+    success: true, app: slug, locale, key, exists: true,
+    registered: isRegistered,
+    entry_count: Object.keys(translations).length,
+    translations,
+    _hint: isRegistered
+      ? undefined
+      : `WARNING: "${slug}" + "${locale}" is NOT in the controller registry, so the app will NOT load these translations. Run action="set" (which registers automatically) to fix it.`,
+  };
+}
+
+async function setCustomTranslations(args) {
+  const slug = normalizeAppSlug(args.app);
+  const locale = normalizeLocale(args.locale);
+  if (!slug) return { _error: 'app is required for set (the app slug, e.g. "capture").' };
+  if (!locale) return { _error: 'locale is required for set (e.g. "ar" to translate, or "en" to rewrite English strings in place).' };
+  const translations = args.translations;
+  if (!isPlainObject(translations)) {
+    return { _error: 'translations must be a JSON object mapping each exact source string to its replacement, e.g. {"Report data":"الإبلاغ عن البيانات"}.' };
+  }
+  const entries = Object.entries(translations);
+  if (!entries.length) return { _error: 'translations is empty — provide at least one source→replacement pair.' };
+  const badValues = entries.filter(([, v]) => typeof v !== 'string');
+  if (badValues.length) {
+    return { _error: `All translation values must be strings. Offending source string(s): ${badValues.slice(0, 5).map(e => JSON.stringify(e[0])).join(', ')}.` };
+  }
+
+  const key = customTranslationKey(slug, locale);
+
+  // Read existing map (for merge + restore snapshot).
+  const existingResp = await safeDhis2Fetch(ctPath(key));
+  const keyExisted = existingResp?._status !== 404;
+  if (existingResp?._error && existingResp?._status !== 404) {
+    return { _error: `Could not read the existing ${key}: ${existingResp._error}` };
+  }
+  const existing = (keyExisted && isPlainObject(existingResp)) ? existingResp : {};
+  const replace = args.replace === true;
+  const finalMap = replace ? { ...translations } : { ...existing, ...translations };
+
+  // Controller registry: ensure slug + locale are registered.
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  const previousController = JSON.parse(JSON.stringify(controller.value || {}));
+  const reg = controller.value || {};
+  const locales = Array.isArray(reg[slug]) ? reg[slug].slice() : [];
+  const controllerNeedsUpdate = !Array.isArray(reg[slug]) || !locales.includes(locale);
+  if (!locales.includes(locale)) locales.push(locale);
+  reg[slug] = locales;
+
+  // Write the translation key first, then the controller (so a registered pair always has a key).
+  const w1 = await ctUpsertKey(key, finalMap);
+  if (w1._error) return w1;
+  if (controllerNeedsUpdate) {
+    const w2 = await ctWriteController(reg);
+    if (w2._error) {
+      return {
+        _error: `Translations saved to ${key}, but updating the controller registry failed: ${w2._error}`,
+        _hint: 'Without the controller entry the app will NOT load these translations. Retry action="set", or set the controller key manually.',
+        previous_value: keyExisted ? existing : null,
+      };
+    }
+  }
+
+  const isRewrite = /^en\b/i.test(locale) || locale.toLowerCase() === 'en';
+  return {
+    success: true,
+    namespace: CUSTOM_TRANSLATIONS_NS,
+    app: slug,
+    locale,
+    key,
+    mode: replace ? 'replace' : 'merge',
+    entries_written: entries.length,
+    total_entries: Object.keys(finalMap).length,
+    key_existed: keyExisted,
+    controller_updated: controllerNeedsUpdate,
+    registered_locales: locales,
+    previous_value: keyExisted ? existing : null,
+    previous_controller: previousController,
+    _hints: [
+      `Reload the "${slug}" app with the UI locale set to "${locale}" to see the strings change.`,
+      isRewrite
+        ? 'Same-language rewrite: each value replaces its English source string verbatim.'
+        : 'Translation: each English source string renders as its translated value.',
+      'Each source string must match the on-screen text EXACTLY (capitalisation, punctuation, whitespace) or it will not be swapped.',
+    ],
+  };
+}
+
+async function removeCustomTranslations(args) {
+  const slug = normalizeAppSlug(args.app);
+  const locale = normalizeLocale(args.locale);
+  if (!slug || !locale) return { _error: 'app and locale are required for remove.' };
+  const key = customTranslationKey(slug, locale);
+  const keysToRemove = Array.isArray(args.keys) ? args.keys.filter(k => typeof k === 'string') : null;
+
+  const existingResp = await safeDhis2Fetch(ctPath(key));
+  if (existingResp?._status === 404) {
+    return { success: true, app: slug, locale, key, removed: false, _note: 'Nothing to remove — that translation key does not exist.' };
+  }
+  if (existingResp?._error) return { _error: `Could not read ${key}: ${existingResp._error}` };
+  const existing = isPlainObject(existingResp) ? existingResp : {};
+
+  // Partial removal: drop only the named source strings, keeping the key + registration —
+  // unless that would empty the map, in which case fall through to a full delete.
+  if (keysToRemove && keysToRemove.length) {
+    const remaining = { ...existing };
+    let removedCount = 0;
+    for (const k of keysToRemove) { if (k in remaining) { delete remaining[k]; removedCount++; } }
+    if (Object.keys(remaining).length > 0) {
+      const w = await ctUpsertKey(key, remaining);
+      if (w._error) return w;
+      return {
+        success: true, app: slug, locale, key,
+        removed_entries: removedCount,
+        remaining_entries: Object.keys(remaining).length,
+        previous_value: existing,
+      };
+    }
+  }
+
+  // Full removal: delete the key and de-register the locale from the controller.
+  const del = await safeDhis2Fetch(ctPath(key), { method: 'DELETE' });
+  if (del?._error && del?._status !== 404) return { _error: `Could not delete ${key}: ${del._error}` };
+
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  const previousController = JSON.parse(JSON.stringify(controller.value || {}));
+  const reg = controller.value || {};
+  let controllerUpdated = false;
+  if (Array.isArray(reg[slug]) && reg[slug].includes(locale)) {
+    reg[slug] = reg[slug].filter(l => l !== locale);
+    if (reg[slug].length === 0) delete reg[slug];
+    controllerUpdated = true;
+    const w = await ctWriteController(reg);
+    if (w._error) return { _error: `Key deleted but de-registering it from the controller failed: ${w._error}`, previous_value: existing };
+  }
+
+  return {
+    success: true, app: slug, locale, key, removed: true,
+    controller_updated: controllerUpdated,
+    previous_value: existing,
+    previous_controller: previousController,
+    _hint: 'Reload the app to confirm the strings reverted to their defaults.',
+  };
+}
+
+async function executeManageCustomTranslations(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, set, remove.' };
+  }
+  const gate = customTranslationsVersionGate();
+  if (gate) return gate;
+
+  if (action === 'list') return await listCustomTranslations();
+  if (action === 'get') return await getCustomTranslations(args);
+  if (action === 'set') {
+    const wa = requireWriteAuth('manage_custom_translations', 'set', { app: args.app, locale: args.locale });
+    if (wa) return wa;
+    return await setCustomTranslations(args);
+  }
+  if (action === 'remove') {
+    const wa = requireWriteAuth('manage_custom_translations', 'remove', { app: args.app, locale: args.locale });
+    if (wa) return wa;
+    return await removeCustomTranslations(args);
+  }
+  return { _error: `Unknown manage_custom_translations action: ${action}`, _hint: 'One of: list, get, set, remove.' };
 }
 
 async function postMetadataPayload(payload, dryRunOnly) {

@@ -302,3 +302,40 @@ and every change must be tested against the DHIS2 playground first so the tool l
 sequence proven to succeed. Also captures the playground testing protocol (instances, VALIDATE
 vs DB constraints, pre-generating UIDs for cross-referencing bundles, cleanup), the tool-wiring
 map, and a definition-of-done checklist. Pairs with the `document-extension-changes` memory.
+
+---
+
+## 7. New tool — `manage_custom_translations` (DHIS2 2.43 custom-translations feature)
+
+**Files:** `background.js` (tool definition, `TOOL_ROUTER`, `getContextualTools`, dispatch in
+`callTool`, implementation `executeManageCustomTranslations` + helpers, system-prompt KB),
+`sidepanel/panel.js` (icon, status label, args-detail renderer), `README.md`.
+**Type of change:** Added.
+**Tool count:** 23 → **24**.
+
+Adds a tool that translates or re-labels any DHIS2 app's UI strings using the experimental
+**DHIS2 2.43+** `custom-translations` dataStore namespace — no app source changes. Actions:
+`list`, `get`, `set`, `remove`. `set`/`remove` keep the `controller` registry
+(`{ "<slug>": ["<locale>"] }`) and the per-app key (`<slug>__<locale>` → a
+`{ "<source string>": "<replacement>" }` map) in sync in one call. Supports both true
+translation (different locale) and same-language re-labelling (locale `en`). Version-gated to
+2.43+ (`customTranslationsVersionGate`); `requireWriteAuth` gates `set`/`remove`; merges by
+default with `replace:true` to overwrite. DataStore keys aren't covered by `manage_backups`
+(metadata-only restore), so `set`/`remove` return `previous_value` / `previous_controller`
+inline for manual rollback.
+
+**Playground verification (play `stable-2-43-0-1`, version 2.43.0.1):**
+- Created `custom-translations/controller = { "capture": ["ar"] }` and `capture__ar` via the
+  dataStore API → both `201 Created`.
+- Set the user UI locale to `ar` and loaded the Capture app. Network capture showed the app
+  itself fetching **`GET /api/dataStore/custom-translations/controller`** and
+  **`GET /api/dataStore/custom-translations/capture__ar`** — both `200`. This confirms the
+  namespace, the `controller` registry, and the `<slug>__<locale>` (double-underscore, lowercased
+  slug) key format that the tool writes. The key template `${slug}__${locale}` was also confirmed
+  in the Capture bundle (`main-CiArLA10.js`).
+- The Capture app renders the translated strings in the live app (confirmed by the user in the
+  open tab). Automated screenshots earlier missed the swap because they were taken against a
+  PWA-cached / mid-reload state; clearing the service-worker cache mid-test also briefly broke the
+  instance's `/apps/*` routing (self-heals on instance reset). Neither affected the tool.
+
+`node --check background.js` and `node --check sidepanel/panel.js` both pass.

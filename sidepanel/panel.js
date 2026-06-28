@@ -1583,6 +1583,7 @@ ${turnXml}
       manage_program_notifications: { cls: 'tool-icon-notification', icon: '\u{1F4E8}' },
       manage_datasets: { cls: 'tool-icon-dataset', icon: '\u{1F4D1}' },
       manage_custom_forms: { cls: 'tool-icon-create', icon: '\u{1F4DD}' },
+      manage_custom_translations: { cls: 'tool-icon-create', icon: '\u{1F310}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1611,6 +1612,7 @@ ${turnXml}
       manage_program_notifications: 'Managing program notifications',
       manage_datasets: 'Managing datasets',
       manage_custom_forms: 'Designing custom form',
+      manage_custom_translations: 'Managing custom translations',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1747,6 +1749,14 @@ ${turnXml}
       else if (args.action && args.action.startsWith('set')) parts.push('auto-generated');
       if (args.style) parts.push(`style: ${args.style}`);
       if (args.new_form_type) parts.push(`revert: ${args.new_form_type}`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_custom_translations') {
+      const parts = [args.action || 'unknown'];
+      if (args.app) parts.push(`app: ${args.app}`);
+      if (args.locale) parts.push(`locale: ${args.locale}`);
+      if (args.translations && typeof args.translations === 'object') parts.push(`${Object.keys(args.translations).length} string(s)`);
+      if (args.replace) parts.push('replace');
+      if (Array.isArray(args.keys)) parts.push(`${args.keys.length} key(s)`);
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {
       const parts = [args.action || 'list'];
