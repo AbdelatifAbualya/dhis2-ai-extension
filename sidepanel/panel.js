@@ -1584,6 +1584,7 @@ ${turnXml}
       manage_datasets: { cls: 'tool-icon-dataset', icon: '\u{1F4D1}' },
       manage_custom_forms: { cls: 'tool-icon-create', icon: '\u{1F4DD}' },
       manage_custom_translations: { cls: 'tool-icon-create', icon: '\u{1F310}' },
+      manage_growth_chart_plugin: { cls: 'tool-icon-create', icon: '\u{1F4C8}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1613,6 +1614,7 @@ ${turnXml}
       manage_datasets: 'Managing datasets',
       manage_custom_forms: 'Designing custom form',
       manage_custom_translations: 'Managing custom translations',
+      manage_growth_chart_plugin: 'Setting up growth chart plugin',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1757,6 +1759,12 @@ ${turnXml}
       if (args.translations && typeof args.translations === 'object') parts.push(`${Object.keys(args.translations).length} string(s)`);
       if (args.replace) parts.push('replace');
       if (Array.isArray(args.keys)) parts.push(`${args.keys.length} key(s)`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_growth_chart_plugin') {
+      const parts = [args.action || 'status'];
+      if (args.program_id) parts.push(`program: ${String(args.program_id).slice(0, 11)}`);
+      if (args.program_stage_id) parts.push(`stage: ${String(args.program_stage_id).slice(0, 11)}`);
+      if (args.org_unit_id) parts.push(`ou: ${String(args.org_unit_id).slice(0, 11)}`);
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {
       const parts = [args.action || 'list'];

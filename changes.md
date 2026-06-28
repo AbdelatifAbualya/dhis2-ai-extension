@@ -339,3 +339,57 @@ inline for manual rollback.
   instance's `/apps/*` routing (self-heals on instance reset). Neither affected the tool.
 
 `node --check background.js` and `node --check sidepanel/panel.js` both pass.
+
+---
+
+## 8. New tool — `manage_growth_chart_plugin` (WHO Capture Growth Chart setup)
+
+**Files:** `background.js` (tool definition, `TOOL_ROUTER`, `getContextualTools` intent +
+selection, dispatch in `callTool`, implementation `executeManageGrowthChartPlugin` + helpers,
+system-prompt KB), `sidepanel/panel.js` (icon 📈, status label, args-detail renderer),
+`README.md`, `manifest.json` (2.3.0 → **2.4.0**).
+**Type of change:** Added.
+**Tool count:** 24 → **25**.
+
+Adds a tool that sets up the WHO Capture Growth Chart plugin
+([dev-otta/dhis2-who-growth-chart](https://github.com/dev-otta/dhis2-who-growth-chart),
+App Hub key `capture-growth-chart`) end to end. Actions:
+- `status` — installed? config present? which programs configured.
+- `install` — install from the App Hub (`POST /api/appHub/{versionId}`, latest server-compatible
+  version), idempotent.
+- `scaffold_program` — create a ready-to-use growth-monitoring tracker program (Person TET,
+  First/Last name + Gender[Male/Female option set] + Date of birth attributes, repeatable stage
+  with Weight/Height/Head-circumference DEs) assigned to a given org unit.
+- `configure` — resolve the program's metadata (auto-detect DOB + gender attributes, female/male
+  option codes, weight/height/head-circumference DEs; explicit overrides supported) and write/merge
+  `dataStore/captureGrowthChart/config`. Validates the plugin's hard requirements and refuses with a
+  precise missing-items list. Infers `weightInGrams` from the weight DE name. Merges so multiple
+  programs coexist.
+- `remove` — drop a program from the config, or delete the whole key (`confirm_delete_all:true`).
+
+`install`/`scaffold_program`/`configure`/`remove` are gated by `requireWriteAuth`. The tool does
+**not** write the Capture-owned `dataStore/capture` enrollment-dashboard layout (cache-corruption
+risk + internal/undocumented schema); instead `configure` returns a `dashboard_attach` block with
+the exact plugin source URL and the steps to add the widget via the Tracker Plugin Configurator.
+
+**Playground verification (play `stable-2-43-0-1`, DHIS2 2.43.0.1):**
+- Read the plugin docs (dev-otta `docs/using-capture-growth-charts.md`) for the namespace/key/schema.
+- Plugin was **not** installed → installed it from the App Hub
+  (`POST /api/appHub/742e72b1-…` v1.2.0) → `201`; `/api/apps` then lists `capture-growth-chart`
+  with `pluginLaunchUrl …/api/apps/capture-growth-chart/plugin.html`.
+- No clean target program existed (Child Programme lacks a DOB attribute + height/head-circ DEs), so
+  created a dedicated tracker program **Growth Monitoring (Plugin Test)** (`bCdtzjLanGm`) with stage
+  `yb00SY11bGc` and 3 NUMBER DEs, reusing the demo First/Last/Gender/Date-of-birth attributes
+  (one `/api/metadata` import; fixed the data-sharing-on-DataElement E-string by using `rw------`
+  for DEs and `rwrw----` for program/stage).
+- Wrote `dataStore/captureGrowthChart/config` (`201`) and read it back intact.
+- Enrolled a test child (`n8CBRSd3GyP`) with 3 growth measurements (`/api/tracker`, 5 objects, 0 errors).
+- Validated the tool's **exact** call paths under the versioned `/api/43/` prefix that
+  `safeDhis2Fetch` builds (`apps.json`, `appHub/v2/apps`, `categoryCombos?filter=isDefault`,
+  `programs/{id}`) and confirmed the auto-detection heuristics resolve the right IDs on the test
+  program (dob=`iESIqZ0R0R0`, gender=`cejWyOfXge6` + Female/Male codes, weight/height/head DEs).
+- Not visually confirmed: the chart pixels on the enrollment dashboard, because that needs the
+  widget placed on the dashboard (the manual/configurator step the tool guides) and the Capture UI
+  was unavailable in the automated session. The functional contract is verified end to end.
+
+`node --check background.js` and `node --check sidepanel/panel.js` both pass.
