@@ -931,12 +931,89 @@ function snapshotDhis2ForPersistence() {
   return out;
 }
 
+// ── Conversation-memory helpers ─────────────────────────────────────────────
+// The agentic loop accumulates a full structured turn in its local `messages`
+// array: the user message, every assistant message that issued tool_calls, and
+// every `tool` result message. Historically only the user text + final
+// assistant prose were persisted into `conversationHistory`, so on the NEXT
+// turn the model had amnesia about what it actually DID (API calls, created
+// IDs, the metadata it built) — it could only re-read its own summary prose.
+// These helpers let us persist the real action trail while keeping the history
+// bounded and structurally valid for every provider.
+
+// Cap on how much of a single tool result we keep in long-term history. Full
+// results (OU dumps, whole-metadata exports) can be tens of KB; the model only
+// needs the IDs / status / shape to stay oriented on later turns.
+const HISTORY_TOOL_RESULT_CAP = 1800;
+// Max messages retained across turns. Tool turns inflate the count (1 user + N
+// assistant/tool messages), so this is larger than the old 20-message cap.
+const HISTORY_MAX_MESSAGES = 60;
+
+// Shrink a persisted `tool` message's content so history stays small. Tries to
+// keep the head of the JSON (where ids/status/_error live) plus a truncation
+// marker so the model knows the payload was clipped, not empty.
+function truncateToolContentForHistory(content) {
+  if (typeof content !== 'string' || content.length <= HISTORY_TOOL_RESULT_CAP) return content;
+  return content.slice(0, HISTORY_TOOL_RESULT_CAP) +
+    `…[truncated ${content.length - HISTORY_TOOL_RESULT_CAP} chars — full result was returned to the model on the turn it ran]`;
+}
+
+// Trim history WITHOUT orphaning a `tool` message from the assistant tool_calls
+// it answers (which makes OpenAI/Anthropic/Google reject the request). We only
+// ever cut on a `user` boundary, so every assistant→tool group stays intact.
+function trimConversationHistory(history, maxMessages = HISTORY_MAX_MESSAGES) {
+  if (!Array.isArray(history) || history.length <= maxMessages) return history;
+  let start = history.length - maxMessages;
+  // Advance to the next turn boundary (a 'user' message) so the slice never
+  // begins in the middle of a tool_call/tool_result group.
+  while (start < history.length && history[start].role !== 'user') start++;
+  if (start >= history.length) {
+    // Fallback: keep from the last user message onward.
+    start = history.length - 1;
+    while (start > 0 && history[start].role !== 'user') start--;
+  }
+  return history.slice(start);
+}
+
+// Build the persistable record of one turn from the live `messages` array.
+// `persistFromIdx` points at the first message that belongs to THIS turn
+// (right after system + prior history). Drops transient `system` nudges/
+// reminders injected mid-loop, clones objects so the live array is untouched,
+// and clips oversized tool results.
+function buildTurnHistory(messages, persistFromIdx, userContentOverride) {
+  const out = [];
+  for (let k = persistFromIdx; k < messages.length; k++) {
+    const m = messages[k];
+    if (!m || m.role === 'system') continue; // transient nudges/reminders
+    if (m.role === 'tool') {
+      out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: truncateToolContentForHistory(m.content) });
+    } else if (m.role === 'assistant') {
+      const hasCalls = m.tool_calls && m.tool_calls.length;
+      const hasText = m.content && String(m.content).trim();
+      // Skip empty assistant turns (no text, no tool_calls) — they carry no
+      // memory and some providers reject null-content assistant messages.
+      if (!hasCalls && !hasText) continue;
+      const a = { role: 'assistant', content: m.content ?? null };
+      if (hasCalls) a.tool_calls = m.tool_calls;
+      out.push(a);
+    } else if (m.role === 'user') {
+      // Persist the compact user text (override) for the turn's own user
+      // message — the live array may carry large inspect-log/web blocks we do
+      // not want to retain across turns.
+      const useOverride = k === persistFromIdx && typeof userContentOverride !== 'undefined';
+      out.push({ role: 'user', content: useOverride ? userContentOverride : m.content });
+    }
+  }
+  return out;
+}
+
 async function saveState() {
   try {
     await chrome.storage.session.set({
       dhis2State: getSerializableState(),
       dhis2Full: JSON.parse(JSON.stringify(snapshotDhis2ForPersistence())),
-      chatHistory: conversationHistory.slice(-20),
+      // Trim on a user boundary so a reload never restores an orphaned tool msg.
+      chatHistory: trimConversationHistory(conversationHistory),
     });
   } catch {}
 }
@@ -4667,6 +4744,147 @@ Returns: { success, dataset_id, dataset_name, ... summary }. On failure: { _erro
   {
     type: 'function',
     function: {
+      name: 'manage_custom_forms',
+      description: `Author CUSTOM (HTML) data-entry forms for BOTH dataSets (aggregate) AND tracker/event program stages. Use this whenever the user asks to "create a custom form", "design a data entry form", "build a custom layout", "make an HTML form", or wants full control over how fields are laid out (tables, headings, narrative text between fields) beyond DEFAULT/SECTION forms.
+
+Targets (pass exactly ONE):
+- dataset_id — a dataSet → the form renders in the Aggregate Data Entry app.
+- program_stage_id — a program stage (tracker OR event program) → the form renders in the Capture app.
+
+Actions:
+- get — inspect the current form: formType, linked dataEntryForm id/name/style, parsed input ids, html preview.
+- preview_html — auto-generate a clean table-based htmlCode skeleton from the target's data elements and RETURN it WITHOUT saving (so you can show/edit it first).
+- set_dataset_form — create/replace the custom form on a dataSet and flip formType to CUSTOM. Pass html_code, or omit it to auto-generate one input per data element × categoryOptionCombo.
+- set_stage_form — create/replace the custom form on a program stage and flip formType to CUSTOM. Pass html_code, or omit to auto-generate one input per stage data element.
+- remove_form — unlink the custom form and revert formType (new_form_type: DEFAULT | SECTION, default DEFAULT). Set delete_form_object:true to also delete the orphaned dataEntryForm.
+
+Input-id binding (CRITICAL — the apps bind native widgets to these ids and render the rest of the HTML verbatim):
+- dataset cell:      <input id="<dataElementUID>-<categoryOptionComboUID>-val" title="" value="">
+- program-stage cell: <input id="<programStageUID>-<dataElementUID>-val" title="" value="">
+
+DHIS2 quirks this tool encodes so you do NOT re-derive them (verified on 2.43):
+- A dataEntryForm CANNOT be embedded inline. The tool ALWAYS creates it standalone via POST /api/dataEntryForms first, then references it — embedding {name,htmlCode} in a dataSet/programStage payload fails with E5002 "Invalid reference (DataEntryForm)".
+- Linking to a program stage with PATCH or a naive PUT DROPS the program reference ("Program stage must reference a program"). The tool does a full PUT that re-attaches program:{id} (GET ?fields=:owner omits program).
+- A dataset custom form only accepts data entry when sharing is rwrw---- (data write) AND at least one org unit is assigned — the tool reports these as hints but you fix them with manage_datasets (update_sharing / assign_org_units).
+- Auto-backup runs before set_*/remove_form. style is one of NORMAL (default), COMFORTABLE, COMPACT, NONE.
+
+Returns: { success, target, form_id, input_count, form_type, backup, _hints }. On failure: { _error, _hint } so you can recover without re-prompting.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['get', 'preview_html', 'set_dataset_form', 'set_stage_form', 'remove_form'],
+            description: 'Which custom-form operation to perform.'
+          },
+          dataset_id: { type: 'string', description: 'DataSet UID. Use for dataset custom forms (get / preview_html / set_dataset_form / remove_form).' },
+          object_id: { type: 'string', description: 'Alias for dataset_id.' },
+          program_stage_id: { type: 'string', description: 'Program stage UID. Use for tracker/event program-stage custom forms (get / preview_html / set_stage_form / remove_form).' },
+          stage_id: { type: 'string', description: 'Alias for program_stage_id.' },
+          html_code: { type: 'string', description: 'For set_dataset_form / set_stage_form: the full custom-form HTML. Inputs MUST use the id binding format for the target (see description). If omitted, the tool auto-generates a clean table form from the target\'s data elements.' },
+          form_name: { type: 'string', description: 'Optional dataEntryForm display name (unique server-wide). Defaults to "<target name> custom form". When updating an existing form, the existing name is kept unless this is set.' },
+          style: { type: 'string', enum: ['NORMAL', 'COMFORTABLE', 'COMPACT', 'NONE'], description: 'Form rendering style. Default NORMAL.' },
+          new_form_type: { type: 'string', enum: ['DEFAULT', 'SECTION'], description: 'For remove_form: what to revert formType to. Default DEFAULT.' },
+          delete_form_object: { type: 'boolean', description: 'For remove_form: also DELETE the orphaned dataEntryForm object (default false — it is just unlinked).' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before set_*/remove_form. Only after the user is told the backup failed AND authorizes proceeding.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_custom_translations',
+      description: `Translate or re-label the UI strings of ANY DHIS2 app using the experimental DHIS2 2.43 "custom-translations" datastore feature. Use this whenever the user asks to "translate the Capture app", "translate this app to Arabic/French/...", "change/relabel a UI string", "rename a button/label", or "customise the wording" of an app — WITHOUT touching the app's source code.
+
+REQUIRES DHIS2 2.43+ (the apps only read this datastore namespace on 2.43 and later). On older servers the write is harmless but has no effect; the tool refuses with a clear message.
+
+How it works (verified on 2.43 — the Capture app fetches BOTH keys at startup):
+- A single registry key "controller" in dataStore namespace "custom-translations" maps each app slug to the locales it has custom translations for, e.g. { "capture": ["ar"] }. If an app/locale pair is NOT in the controller, the app NEVER loads its translations — this tool keeps the controller in sync automatically.
+- One key per app+locale named "<slug>__<locale>" (double underscore), e.g. "capture__ar". Its value is a JSON object mapping each EXACT original English source string to its replacement string.
+- At render time the app swaps each matching source string for its replacement.
+
+Two modes (the feature treats both identically — it is a literal source→target string map):
+- TRANSLATION: locale is a different language (e.g. "ar", "fr") → English source renders as the translated value.
+- SAME-LANGUAGE REWRITE: locale is the language already in use (e.g. "en") → relabel/reword strings in place (e.g. "Report data" → "Submit report").
+
+Actions:
+- list — list the custom-translations namespace: the controller registry (which apps/locales are registered) and all translation keys.
+- get — read one translation map. Pass app + locale; omit them to return just the controller registry. Warns if an app/locale is registered but its key is missing, or vice-versa.
+- set — create/update translations for app + locale. Writes the "<slug>__<locale>" key AND registers the pair in the controller in one step. Merges into any existing map by default; pass replace:true to overwrite the whole map.
+- remove — delete translations for app + locale (key + controller de-registration), or pass keys:[...] to drop only specific source strings.
+
+CRITICAL string matching: each property name in translations must match the app's source string EXACTLY — same capitalisation, punctuation and whitespace — or that string will not be swapped. Read the exact on-screen English first.
+
+Datastore keys are NOT covered by manage_backups (that tool only restores metadata objects), so set/remove return the pre-write state inline as previous_value / previous_controller for manual rollback.
+
+Returns: { success, namespace, app, locale, key, ... } on success; { _error, _hint } on failure.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'set', 'remove'],
+            description: 'list=show the namespace (controller registry + keys); get=read one translation map (or the controller if app/locale omitted); set=create/update translations for an app+locale; remove=delete an app+locale map or specific strings.'
+          },
+          app: { type: 'string', description: 'The app slug, e.g. "capture", "dashboard", "data-visualizer", "maps". Lowercased automatically. Required for set/remove; optional for get.' },
+          locale: { type: 'string', description: 'Locale code. Use a different language to TRANSLATE (e.g. "ar", "fr", "pt_BR") or the current language to REWRITE strings in place (e.g. "en"). Required for set/remove; optional for get.' },
+          translations: { type: 'object', description: 'For set: JSON object mapping each EXACT source string to its replacement string, e.g. {"Report data":"الإبلاغ عن البيانات","Get started with Capture app":"ابدأ مع برنامج الالتقاط"}. All values must be strings.', additionalProperties: { type: 'string' } },
+          replace: { type: 'boolean', description: 'For set: when true, REPLACE the entire translation map for this app+locale. Default false = merge the provided pairs into the existing map.' },
+          keys: { type: 'array', items: { type: 'string' }, description: 'For remove: drop only these specific source strings from the map (keeps the rest and the registration). Omit to remove the whole app+locale map and de-register it from the controller.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_growth_chart_plugin',
+      description: `Set up the WHO Capture Growth Chart plugin (App Hub app "Capture Growth Chart", key capture-growth-chart) end to end so it can render WHO growth charts on a tracker program's enrollment dashboard in the new Capture app. Use this whenever the user mentions the growth chart / growth monitoring plugin, WHO growth standards, anthropometry, weight-for-age / height-for-age / head-circumference charts, or asks to "set up / configure / install the growth chart plugin".
+
+What it does (verified on DHIS2 2.43):
+- status — report whether the plugin app is installed, the current captureGrowthChart/config, and which programs are configured/ready.
+- install — install the plugin from the DHIS2 App Hub (POST /api/appHub/{versionId}, latest version compatible with the server). Idempotent.
+- scaffold_program — create a ready-to-use tracker program for growth monitoring (Person TET, attributes First name/Last name/Gender[option set Male/Female]/Date of birth, and a repeatable stage with Weight/Height/Head circumference data elements), assigned to the given org unit. Use when the user has no suitable program.
+- configure — the core action. For a target program (+ optional stage) it resolves the required metadata and writes/merges the dataStore key captureGrowthChart/config. It auto-detects, or accepts explicit ids for: dateOfBirth + gender tracked-entity attributes (and the female/male option CODES), optional firstName/lastName, and the weight/height/headCircumference data elements on the stage. Merges so multiple programs can be configured side by side.
+- remove — remove one program from captureGrowthChart/config (program_id), or delete the whole config key (confirm_delete_all:true).
+
+The config schema this tool writes to dataStore namespace "captureGrowthChart", key "config":
+{ "metadata": { "attributes": { dateOfBirth, gender, firstName, lastName, femaleOptionCode, maleOptionCode }, "dataElements": { weight, height, headCircumference }, "programStageForGrowthChart": { "<programId>": "<programStageId>" } }, "settings": { usePercentiles, customReferences, weightInGrams, defaultIndicator } }
+
+Hard requirements the plugin enforces (the tool validates these and refuses with a clear list if unmet): the program MUST expose a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If ANY of the three data elements is missing the chart will not display. weightInGrams is auto-set true when the weight data element is recorded in grams.
+
+IMPORTANT — making the chart visible: this tool configures everything the plugin needs to FUNCTION, but the plugin widget must still be ADDED to the program's enrollment dashboard. That placement is owned by the Capture app / Tracker Plugin Configurator (an internal dataStore/capture layout this tool deliberately does NOT overwrite, to avoid corrupting the Capture cache). The tool returns the exact plugin source URL and the steps; relay them to the user. defaultIndicator is one of: wfa (weight-for-age), hcfa (head-circumference-for-age), lhfa (length/height-for-age), wflh (weight-for-length/height).
+
+Returns { success, ... , dashboard_attach } on success; { _error, _hint } on failure.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['status', 'install', 'scaffold_program', 'configure', 'remove'],
+            description: 'status=report install + config state; install=install the plugin from App Hub; scaffold_program=create a ready-to-use growth-monitoring program; configure=resolve metadata and write captureGrowthChart/config for a program; remove=remove a program from the config (or delete it all).'
+          },
+          program_id: { type: 'string', description: 'Target program UID for configure / remove. For configure this is the tracker program whose enrollment dashboard will show the chart.' },
+          program_stage_id: { type: 'string', description: 'For configure: the program stage UID that holds the weight/height/head-circumference data elements. If omitted, the tool picks the program stage that contains them.' },
+          attribute_ids: { type: 'object', description: 'For configure: explicit tracked-entity-attribute UIDs to override auto-detection. Keys: dateOfBirth, gender, firstName, lastName.', properties: { dateOfBirth: { type: 'string' }, gender: { type: 'string' }, firstName: { type: 'string' }, lastName: { type: 'string' } } },
+          data_element_ids: { type: 'object', description: 'For configure: explicit data-element UIDs to override auto-detection. Keys: weight, height, headCircumference.', properties: { weight: { type: 'string' }, height: { type: 'string' }, headCircumference: { type: 'string' } } },
+          female_option_code: { type: 'string', description: 'For configure: the gender option SET CODE that represents female (e.g. "Female"). Auto-detected from the gender attribute option set if omitted.' },
+          male_option_code: { type: 'string', description: 'For configure: the gender option SET CODE that represents male (e.g. "Male"). Auto-detected if omitted.' },
+          settings: { type: 'object', description: 'For configure: plugin settings to merge. Keys: usePercentiles (bool), customReferences (bool), weightInGrams (bool — auto-set from the weight DE name if omitted), defaultIndicator (one of wfa, hcfa, lhfa, wflh).', properties: { usePercentiles: { type: 'boolean' }, customReferences: { type: 'boolean' }, weightInGrams: { type: 'boolean' }, defaultIndicator: { type: 'string', enum: ['wfa', 'hcfa', 'lhfa', 'wflh'] } } },
+          org_unit_id: { type: 'string', description: 'For scaffold_program: the org unit UID to assign the new program to (required for scaffold).' },
+          program_name: { type: 'string', description: 'For scaffold_program: name of the new program. Default "Growth Monitoring".' },
+          confirm_delete_all: { type: 'boolean', description: 'For remove: when true (and no program_id), delete the entire captureGrowthChart/config key.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -4721,6 +4939,9 @@ const TOOL_ROUTER = Object.freeze({
   manage_metadata: true,
   manage_program_notifications: true,
   manage_datasets: true,
+  manage_custom_forms: true,
+  manage_custom_translations: true,
+  manage_growth_chart_plugin: true,
   manage_backups: true,
 });
 
@@ -4787,6 +5008,25 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     || /\b(period\s*type|monthly\s*form|weekly\s*form|quarterly\s*form|yearly\s*form|monthly\s*report|weekly\s*report)\b/.test(combinedText)
     || /\b(category\s*combo|category\s*combination|disaggregation|cat\s*combo)\b/.test(combinedText)
     || /\b(data\s*set\s*sections?|dataset\s*sections?)\b/.test(combinedText);
+  // ── Custom-form intent ──
+  // "custom form", "custom data entry form", "design a form", "html form",
+  // "custom layout", "form designer" — for datasets OR program stages.
+  const wantsCustomFormIntent =
+    /\b(custom\s*forms?|custom\s*(data\s*)?entry\s*forms?|custom\s*layout|html\s*forms?|form\s*designer|dataentryform)\b/.test(combinedText)
+    || (/\b(design|build|create|make|lay\s*out|customi[sz]e)\b.{0,40}\b(form|layout)\b/.test(combinedText)
+        && /\b(custom|html|data\s*entry|tracker|stage|dataset|data\s*set|aggregate)\b/.test(combinedText));
+  // ── Custom-translation intent ──
+  // "translate this app", "custom translation(s)", "translate Capture to Arabic",
+  // "relabel/rename/change a UI string/label/wording", "localise the app".
+  const wantsTranslationIntent =
+    /\b(custom\s*translations?|translate|translations?|localis[ez]e|localiz[ae]tion)\b/.test(combinedText)
+    || /\b(re-?label|re-?name|change|reword|customi[sz]e)\b.{0,40}\b(label|string|text|wording|caption|button|title|heading|menu\s*item)\b/.test(combinedText);
+  // ── Growth-chart plugin intent ──
+  // "growth chart/monitoring plugin", "WHO growth", anthropometry, weight/height-for-age,
+  // head circumference chart, child growth.
+  const wantsGrowthChartIntent =
+    /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/.test(combinedText)
+    || (/\bgrowth\b/.test(combinedText) && /\b(plugin|chart|standard|percentile|z-?score)\b/.test(combinedText));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -4915,10 +5155,33 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   if (inDatasetCtx || wantsDatasetIntent) {
     selected.add('manage_datasets');
     selected.add('manage_metadata');
+    selected.add('manage_custom_forms');
     selected.add('search_metadata');
     selected.add('get_program_info');
     // Resolve_option_codes is useful for cat-combo / option labels in saved values
     if (inDatasetCtx) selected.add('resolve_option_codes');
+  }
+
+  // ── Custom-form authoring — dataset OR program-stage HTML forms ──
+  // Surface manage_custom_forms whenever the user expresses form-design intent,
+  // or is in a tracker/dataset context where a custom form is plausible.
+  if (wantsCustomFormIntent || inTrackerCtx) {
+    selected.add('manage_custom_forms');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
+  }
+
+  // ── Custom-translation authoring — app UI string translation / re-labelling ──
+  // App-agnostic: surface whenever the user expresses translation/relabel intent.
+  if (wantsTranslationIntent) {
+    selected.add('manage_custom_translations');
+  }
+
+  // ── Growth-chart plugin setup — install + datastore config for the WHO chart ──
+  if (wantsGrowthChartIntent) {
+    selected.add('manage_growth_chart_plugin');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
   }
 
   // ── Intent-driven override: if the user explicitly asks to create or manage
@@ -4965,6 +5228,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const writeCapableNames = new Set([
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
+    'manage_custom_forms',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -4998,6 +5262,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_program_notifications');
     selected.delete('create_metadata');
     selected.delete('manage_datasets');
+    selected.delete('manage_custom_forms');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5064,6 +5329,16 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
     || /\b(period\s*type|monthly\s*form|weekly\s*form|quarterly\s*form|yearly\s*form)\b/i.test(text)
     || /\b(category\s*combo|category\s*combination|disaggregation|cat\s*combo)\b/i.test(text);
   const wantsTrackerWrite = inTrackerCtx && /\b(create|add|register|enroll|complete|close|update|change status|new enrollment|new profile|new event|mark.{0,20}complete|set.{0,20}complete)\b/i.test(text);
+  const wantsCustomFormPrompt =
+    /\b(custom\s*forms?|custom\s*(data\s*)?entry\s*forms?|custom\s*layout|html\s*forms?|form\s*designer|dataentryform)\b/i.test(text)
+    || (/\b(design|build|create|make|lay\s*out|customi[sz]e)\b.{0,40}\b(form|layout)\b/i.test(text)
+        && /\b(custom|html|data\s*entry|tracker|stage|dataset|data\s*set|aggregate)\b/i.test(text));
+  const wantsTranslationPrompt =
+    /\b(custom\s*translations?|translate|translations?|localis[ez]e|localiz[ae]tion)\b/i.test(text)
+    || /\b(re-?label|re-?name|change|reword|customi[sz]e)\b.{0,40}\b(label|string|text|wording|caption|button|title|heading|menu\s*item)\b/i.test(text);
+  const wantsGrowthChartPrompt =
+    /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/i.test(text)
+    || (/\bgrowth\b/i.test(text) && /\b(plugin|chart|standard|percentile|z-?score)\b/i.test(text));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -5592,6 +5867,98 @@ A dataset only appears in a user's Data Entry app for the OUs assigned to it. Us
 `;
   }
 
+  // ── Custom Forms KB — dataset & program-stage HTML data-entry forms ──
+  if (wantsCustomFormPrompt || inTrackerCtx || hasDatasetCtx || inAggDataEntryCtx) {
+    p += `
+## DHIS2 Custom (HTML) Forms — use the **manage_custom_forms** tool
+A CUSTOM form is hand-laid-out HTML for data entry. It works for BOTH dataSets (renders in the Aggregate Data Entry app) and tracker/event program STAGES (renders in the new Capture app). Use **manage_custom_forms** for ALL of this — never assemble raw POST/PUT bodies via dhis2_query.
+
+### When to use
+- "create/design/build a custom form", "custom data entry form", "html form", "custom layout/form designer" → manage_custom_forms.
+- For a dataset → pass \`dataset_id\`. For a tracker/event program stage → pass \`program_stage_id\` (NOT the program id — a custom form lives on the STAGE).
+
+### Actions
+- \`preview_html\` — auto-generate a clean table form skeleton from the target's data elements and SHOW it (nothing saved). Good first step so the user can review/tweak.
+- \`set_dataset_form\` / \`set_stage_form\` — create/replace the form and flip formType to CUSTOM. Omit \`html_code\` to auto-generate; or pass your own \`html_code\`.
+- \`get\` — inspect the existing form. \`remove_form\` — revert to DEFAULT/SECTION.
+
+### Input-id binding (the ONLY thing that makes a cell save) — the tool builds these for you, but if you hand-write html_code they MUST be exact:
+- dataset cell:       \`<input id="<dataElementUID>-<categoryOptionComboUID>-val" title="" value="">\`
+- program-stage cell: \`<input id="<programStageUID>-<dataElementUID>-val" title="" value="">\`
+Everything else in the HTML (tables, headings, narrative text) renders verbatim.
+
+### Hard-learned quirks the tool already handles — do NOT try to do these by hand:
+- The dataEntryForm is created STANDALONE first (POST /api/dataEntryForms); it can never be embedded inline in a dataSet/programStage (E5002).
+- Linking to a program stage re-attaches the program reference on a full PUT (a PATCH/naive PUT loses it → "must reference a program").
+- A dataset custom form needs sharing rwrw---- + an assigned org unit before users can actually enter data. If the tool's \`_hints\` flag these, fix them with **manage_datasets** (update_sharing / assign_org_units).
+
+### Recipes
+- "Make a custom form for this dataset": manage_custom_forms(action="set_dataset_form", dataset_id="<id>")  // auto-generates from its DEs
+- "Design a custom form for this tracker stage": manage_custom_forms(action="set_stage_form", program_stage_id="<stageId>")
+- "Show me what the form would look like first": manage_custom_forms(action="preview_html", dataset_id|program_stage_id)
+- "Use my own HTML": pass html_code="..." with the correct id bindings above.
+`;
+  }
+
+  // ── Custom Translations KB — translate / re-label app UI strings (DHIS2 2.43+) ──
+  if (wantsTranslationPrompt) {
+    p += `
+## DHIS2 Custom Translations — use the **manage_custom_translations** tool
+EXPERIMENTAL DHIS2 2.43+ feature. It translates or re-labels an app's UI strings via the "custom-translations" dataStore namespace — NO source-code changes. Use it whenever the user wants to translate an app (e.g. Capture → Arabic), or simply change/relabel a UI string. NEVER hand-write these dataStore keys via dhis2_query — use this tool so the controller registry stays in sync.
+
+### How the feature works (verified on 2.43 — the app fetches both keys at startup)
+- Registry key "controller": { "<appSlug>": ["<locale>", ...] }. If an app/locale is NOT registered here, the app never loads its translations.
+- Per app+locale key "<slug>__<locale>" (double underscore, e.g. capture__ar): { "<exact source string>": "<replacement>", ... }. The app swaps each matching source string at render time.
+
+### Two uses (identical mechanics — it's a literal source→target string map)
+- TRANSLATE: locale is another language (e.g. "ar","fr") → English source renders as the translation.
+- REWRITE same language: locale is the language already shown (e.g. "en") → relabel/reword in place, e.g. "Report data" → "Submit report".
+
+### Actions
+- \`get\` — read the controller registry (omit app/locale) or one translation map (pass app+locale). Use this FIRST to see what exists.
+- \`set\` — create/update translations for app+locale; it writes the key AND registers the pair in the controller in one call. Merges by default; pass replace:true to overwrite the whole map.
+- \`remove\` — delete an app+locale map (or pass keys:[...] to drop specific source strings).
+- \`list\` — show the whole namespace.
+
+### Critical
+- Match each source string EXACTLY as shown on screen (capitalisation, punctuation, whitespace) — read the real UI text first; an inexact key is silently ignored.
+- The app slug is lowercase (capture, dashboard, data-visualizer, maps). The user must reload the app with that locale active to see changes.
+- Requires DHIS2 2.43+; the tool refuses on older servers (the apps don't read the namespace there).
+- DataStore keys are NOT covered by manage_backups. set/remove return previous_value / previous_controller for manual rollback — surface the key name to the user.
+
+### Recipes
+- "Translate Capture to Arabic": manage_custom_translations(action="set", app="capture", locale="ar", translations={"Get started with Capture app":"...","Report data":"..."})
+- "Rename a button in English": manage_custom_translations(action="set", app="capture", locale="en", translations={"Report data":"Submit report"})
+- "What translations exist?": manage_custom_translations(action="list")
+- "Undo the Arabic translation": manage_custom_translations(action="remove", app="capture", locale="ar")
+`;
+  }
+
+  // ── Growth Chart plugin KB — WHO Capture Growth Chart setup ──
+  if (wantsGrowthChartPrompt) {
+    p += `
+## WHO Capture Growth Chart plugin — use the **manage_growth_chart_plugin** tool
+Sets up the "Capture Growth Chart" plugin (App Hub, key capture-growth-chart) so WHO growth charts render on a tracker program's enrollment dashboard in Capture. NEVER hand-assemble its dataStore via dhis2_query — use this tool.
+
+### Actions (typical order)
+- \`status\` — is the app installed? what is configured? Run this first.
+- \`install\` — install the plugin from the App Hub (idempotent).
+- \`scaffold_program\` — create a ready-to-use growth-monitoring tracker program (needs org_unit_id) when the user has no suitable program.
+- \`configure\` — the core step: pass program_id; the tool auto-detects the date-of-birth + gender attributes, the female/male option codes, and the weight/height/head-circumference data elements, then writes/merges dataStore captureGrowthChart/config. Pass attribute_ids / data_element_ids to override detection, settings to set usePercentiles/weightInGrams/defaultIndicator (wfa|hcfa|lhfa|wflh).
+- \`remove\` — drop a program from the config (program_id) or delete it all (confirm_delete_all:true).
+
+### Hard requirements (the tool validates and refuses with a list if unmet)
+The program MUST have a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If any of the three DEs is missing the chart will not display. If configure reports missing metadata, offer scaffold_program or ask the user for the exact attribute/DE ids.
+
+### Making it visible
+configure makes the plugin FUNCTION but does not place the widget. Relay the tool's \`dashboard_attach\` block: the plugin must be added to the enrollment dashboard via the Tracker Plugin Configurator app (or Capture's "Add plugin" with the returned plugin source URL). The tool deliberately does NOT write dataStore/capture (Capture-owned; risk of cache corruption).
+
+### Recipe
+- "Set up the growth chart plugin for <program>": status → install (if needed) → configure(program_id) → relay dashboard_attach steps.
+- "I have no program for it": scaffold_program(org_unit_id) → configure(created program) → install.
+`;
+  }
+
   // ── Meta-Architect Protocol — only included when user is creating/modifying metadata ──
   if (isCreating || wantsProgramRulesPrompt || wantsProgramIndicatorsPrompt) {
     p += `
@@ -5638,6 +6005,8 @@ Never retry by looping through children one-at-a-time when the single atomic ret
 
 **Program Rule syntax:**
 - Condition: \`#{variable_name}\` for DEs (lowercase, underscores), \`A{attr_name}\` for TEAs, \`V{current_date}\` for system vars
+- ⚠ **\`A{attr_name}\` IS the correct, canonical way to reference a tracked-entity-attribute program rule variable** in BOTH conditions and ASSIGN/expression \`data\` — this matches DHIS2's own demo rules, e.g. \`d2:yearsBetween(A{born}, V{current_date})\` and \`A{Sex} == 'MALE'\`. \`#{...}\` is for DATA-ELEMENT-sourced variables only. **Do NOT "fix" a working \`A{tea}\` reference into \`#{tea}\`** — for a TEA variable that is a regression, not a fix, and it is NEVER the cause of a rule "not firing". Auto-calc-from-attribute patterns like \`ASSIGN d2:monthsBetween(A{dob}, V{current_date}) → "Age in months"\` are correct as written.
+- 🔎 **When a user says an auto-assign / calculation rule "isn't working", DIAGNOSE from real metadata — never guess a syntax cause.** First \`manage_program_rules(action=get)\` + \`action=list_variables\` and read the ACTUAL condition, the PRV source types, and the target DE's valueType. If the expression already matches a known-good pattern (A{tea} for attributes, V{current_date}, a valid d2: function, ASSIGN target DE that can hold the result), the rule is correct — say so. The real reasons an ASSIGN value looks "missing" are runtime/UX, not syntax: (a) the assigned value only appears once you open the stage event that contains the target DE and the source attribute already has a value; (b) the target field is read-only/auto-filled by design; (c) the target DE valueType cannot hold the computed value (e.g. a number assigned to a TEXT field). Explain the real cause and verify; do NOT invent "the reference doesn't resolve at runtime" without evidence.
 - HIDEFIELD on TEA: use \`tracked_entity_attribute_name\`; on DE: use \`data_element_name\`
 - Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, WARNINGONCOMPLETE, ERRORONCOMPLETE, SHOWWARNINGINFORMATION
 - Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
@@ -9606,6 +9975,21 @@ async function executeTool(name, args) {
     return await executeManageDatasets(args);
   }
 
+  // ── manage_custom_forms ──
+  if (name === 'manage_custom_forms') {
+    return await executeManageCustomForms(args);
+  }
+
+  // ── manage_custom_translations ──
+  if (name === 'manage_custom_translations') {
+    return await executeManageCustomTranslations(args);
+  }
+
+  // ── manage_growth_chart_plugin ──
+  if (name === 'manage_growth_chart_plugin') {
+    return await executeManageGrowthChartPlugin(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -10742,17 +11126,62 @@ async function disambiguateShortNamesAgainstServer(objects, dhis2Resource, class
   }
 }
 
+// Generate a DHIS2-valid, UNIQUE option code from an option name.
+//
+// DHIS2 enforces a per-option-set unique code (DB constraint
+// `optionvalue_unique_optionsetid_and_code`). The naive `toUpperCase().replace(/[^A-Z0-9]/g,'_')`
+// collapses any two names that differ only by a symbol — "A+" and "A-" both become "A_",
+// "1+"/"1-" both become "1_" — so two options in one set get the SAME code and the COMMIT
+// fails with a 409. The metadata VALIDATE pass can NOT catch this: it's a database unique
+// constraint, not a metadata-import rule, so it only surfaces at COMMIT (INSERT) time.
+//
+// Fix: (1) map a trailing +/- sign to a readable _POS/_NEG token so the common
+// blood-group / lab-result / urine-protein cases stay meaningful AND distinct, (2) sanitize
+// the rest, then (3) guarantee uniqueness against codes already used in the same scope by
+// appending _2, _3, … This makes the generated codes collision-free by construction, so the
+// tool never emits a request that 409s on the duplicate-code constraint.
+function deriveOptionCode(rawName, usedCodes, explicitCode) {
+  const used = usedCodes instanceof Set ? usedCodes : new Set();
+  const sanitize = (s) => String(s == null ? '' : s)
+    .toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
+  let base;
+  if (explicitCode && String(explicitCode).trim()) {
+    base = sanitize(explicitCode) || 'OPT';
+  } else {
+    let s = String(rawName == null ? '' : rawName).trim();
+    let sign = '';
+    const m = s.match(/([+\-])\s*$/); // trailing sign: A+, A-, 1+, 3-, O+ …
+    if (m) { sign = m[1] === '+' ? '_POS' : '_NEG'; s = s.slice(0, m.index); }
+    base = (sanitize(s) + sign).replace(/^_+/, '').slice(0, 50) || 'OPT';
+  }
+  let code = base;
+  let n = 2;
+  while (used.has(code)) {
+    const suffix = `_${n}`;
+    code = `${base.slice(0, 50 - suffix.length)}${suffix}`;
+    n++;
+  }
+  used.add(code);
+  return code;
+}
+
 function buildOptionSetAndOptions(osDef, parentValueType) {
   const osUid = generateDhis2Uid();
   const options = [];
   const optionUids = [];
+  // Codes must be unique WITHIN this option set — track what we have minted so
+  // "A+"/"A-" (and any other symbol-only-difference names) never collide.
+  const usedCodes = new Set();
   for (let i = 0; i < osDef.options.length; i++) {
+    const raw = osDef.options[i];
+    const optName = (typeof raw === 'string') ? raw : (raw?.name ?? raw?.displayName ?? String(raw));
+    const explicitCode = (raw && typeof raw === 'object') ? (raw.code ?? raw.optionCode) : undefined;
     const optUid = generateDhis2Uid();
     optionUids.push(optUid);
     options.push({
       id: optUid,
-      name: osDef.options[i],
-      code: osDef.options[i].toUpperCase().replace(/[^A-Z0-9]/g, '_').substring(0, 50),
+      name: optName,
+      code: deriveOptionCode(optName, usedCodes, explicitCode),
       sortOrder: i + 1,
     });
   }
@@ -10771,6 +11200,27 @@ function buildOptionSetAndOptions(osDef, parentValueType) {
     options: optionUids.map(id => ({ id })),
   };
   return { optionSet, options, osUid };
+}
+
+// Safety net for when the model omits value_type on a data element / attribute.
+// Historically the builder silently defaulted to TEXT, so an obviously numeric
+// field ("Height in cm", "Weight in kg", "Head circumference", "Age in months")
+// could be created as TEXT — blocking numeric validation, indicators and charts.
+// This only fires when value_type is ABSENT; an explicit value_type always wins.
+// Kept deliberately conservative: only high-confidence cues flip the default.
+function inferValueType(rawName, fallback = 'TEXT') {
+  const name = String(rawName || '').toLowerCase().trim();
+  if (!name) return fallback;
+  // Date-ish
+  if (/\b(dob|date of birth|birth\s?date|date)\b/.test(name)) return 'DATE';
+  // Count / age / "number of …" → whole numbers
+  if (/\bage\b|\bage in (months|years|days|weeks)\b/.test(name)) return 'INTEGER';
+  if (/\b(number of|no\.? of|count of|count|# of|quantity|qty|doses?|visits?|episodes?)\b/.test(name)) return 'INTEGER';
+  // Measurements / vitals / generic numerics, incl. unit suffixes like (cm)/(kg)/(mm)/(g)
+  if (/\b(height|weight|circumference|temperature|temp|bmi|length|width|diameter|pressure|pulse|heart rate|respiratory rate|spo2|saturation|glucose|haemoglobin|hemoglobin|dosage|dose|score|level|amount|volume|distance|measurement|reading)\b/.test(name)) return 'NUMBER';
+  if (/\bpercent(age)?\b|\(\s*%\s*\)|\s%$/.test(name)) return 'PERCENTAGE';
+  if (/\(\s*(cm|kg|mm|g|ml|mg|cm3|m|kg\/m2|mmhg|bpm|°c|c)\s*\)|\b(in|in cm|in kg|in mm|in g|in ml)\b/.test(name)) return 'NUMBER';
+  return fallback;
 }
 
 function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames = null, opts = {}) {
@@ -10803,7 +11253,10 @@ function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames
     name: de.name,
     shortName: clampShortName(de.short_name, de.name, seenShortNames, 'Data Element'),
     domainType,
-    valueType: de.value_type || 'TEXT',
+    // Explicit value_type always wins. When absent, infer from the name so
+    // numeric fields are not silently created as TEXT — but never infer when an
+    // option set is attached (those are code-valued, keep TEXT default).
+    valueType: de.value_type || (de.option_set ? 'TEXT' : inferValueType(de.name, 'TEXT')),
     aggregationType,
     categoryCombo: { id: ccId },
   };
@@ -10917,6 +11370,9 @@ async function buildCategoryComboBundle(combo) {
   // 3. Walk the requested list and decide reuse vs. create for each.
   const newOptions = [];
   const newOptionUidsByLower = new Map();
+  // Category-option codes collide on the same "A+"/"A-" → "A_" problem; keep them
+  // unique across everything we mint in this bundle.
+  const usedOptionCodes = new Set();
   const newCategories = [];
   const resolvedCategoryIds = [];
   const summary = {
@@ -10997,7 +11453,7 @@ async function buildCategoryComboBundle(combo) {
         name: optName,
         shortName: clampShortName(optName, optName, null, 'Option'),
       };
-      const codeVal = (optCode && String(optCode).trim()) || optName.toUpperCase().replace(/[^A-Z0-9]/g, '_').slice(0, 50);
+      const codeVal = deriveOptionCode(optName, usedOptionCodes, optCode);
       if (codeVal) newOpt.code = codeVal;
       newOptions.push(newOpt);
       catOptionRefs.push({ id: optUid });
@@ -11098,6 +11554,1254 @@ async function applySharingViaLegacyEndpoint(items, sharingInput) {
     }
   }
   return errors.length ? { ok: false, error: errors[0]?.error, errors, applied } : { ok: true, applied };
+}
+
+// ── manage_custom_forms: custom dataEntryForm authoring for datasets & program stages ──
+//
+// VERIFIED end-to-end on DHIS2 2.43 (play stable-2-43-0-1). These are the mechanics
+// the other tools never had to learn, codified here so the model never re-derives them:
+//
+//  1. A dataEntryForm CANNOT be created inline. Embedding `{name, htmlCode}` inside a
+//     dataSet / programStage payload — via the /metadata importer OR a direct object PUT —
+//     fails with E5002 "Invalid reference … (DataEntryForm)". The form MUST be created
+//     standalone via POST /api/dataEntryForms FIRST, then referenced by id.
+//  2. Input-id formats differ by target (the new Aggregate Data Entry app and the new
+//     Capture app both bind native widgets to these ids and render the surrounding HTML):
+//        dataset       → "<dataElementUID>-<categoryOptionComboUID>-val"
+//        program stage → "<programStageUID>-<dataElementUID>-val"
+//  3. Linking the form:
+//        dataset       → PATCH /api/dataSets/{id} (formType=CUSTOM + dataEntryForm) works.
+//        program stage → PATCH / naive PUT DROPS the `program` reference ("Program stage
+//                        must reference a program"), because GET ?fields=:owner OMITS
+//                        `program`. A full PUT must RE-ATTACH program:{id} explicitly.
+//  4. Data entry into a dataset custom form additionally needs sharing rwrw---- (data write)
+//     + at least one assigned org unit — that stays the job of manage_datasets.
+
+const DATA_ENTRY_FORM_STYLES = new Set(['NORMAL', 'COMFORTABLE', 'COMPACT', 'NONE']);
+const CUSTOM_FORM_REVERT_TYPES = new Set(['DEFAULT', 'SECTION', 'SECTION_MULTIORG']);
+
+function escapeCustomFormHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// A single data-entry cell DHIS2 binds to. The id is the only thing that matters for
+// binding; title/value mirror what the Maintenance custom-form designer emits.
+function customFormInputCell(inputId) {
+  return `<input id="${escapeCustomFormHtml(inputId)}" title="" value="">`;
+}
+
+// Build a clean, readable two-column custom-form htmlCode from grouped field rows.
+// groups: [{ heading?, rows: [{ inputId, label }] }]
+function buildCustomFormHtml(title, groups) {
+  const parts = [];
+  if (title) parts.push(`<h3>${escapeCustomFormHtml(title)}</h3>`);
+  for (const group of groups) {
+    if (group.heading) parts.push(`<h4>${escapeCustomFormHtml(group.heading)}</h4>`);
+    parts.push('<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">');
+    parts.push('<tr><th align="left">Field</th><th align="left">Value</th></tr>');
+    for (const row of group.rows) {
+      parts.push(`<tr><td>${escapeCustomFormHtml(row.label)}</td><td>${customFormInputCell(row.inputId)}</td></tr>`);
+    }
+    parts.push('</table>');
+  }
+  return parts.join('\n');
+}
+
+// Pull every `id="…-val"` data-entry marker out of an htmlCode blob.
+function extractCustomFormInputIds(htmlCode) {
+  if (typeof htmlCode !== 'string') return [];
+  const ids = [];
+  for (const m of htmlCode.matchAll(/<(?:input|select|textarea)[^>]*\bid="([^"]+)"/gi)) {
+    ids.push(m[1]);
+  }
+  return ids;
+}
+
+// Resolve which target the call addresses. Returns { kind, id } or { _error }.
+function resolveCustomFormTarget(args) {
+  const stageId = args.program_stage_id || args.stage_id;
+  const datasetId = args.dataset_id || args.object_id;
+  if (stageId && datasetId) {
+    return { _error: 'Pass only ONE of program_stage_id or dataset_id, not both.' };
+  }
+  if (stageId) return { kind: 'stage', id: stageId };
+  if (datasetId) return { kind: 'dataset', id: datasetId };
+  return {
+    _error: 'No target specified. Pass dataset_id (for a dataset custom form) OR program_stage_id (for a tracker/event program-stage custom form).',
+  };
+}
+
+// Build the auto-generated field rows for a dataset, one input per DE × categoryOptionCombo.
+async function buildDatasetFormGroups(datasetId) {
+  const ds = await safeDhis2Fetch(
+    `dataSets/${datasetId}?fields=id,displayName,dataSetElements[dataElement[id,displayName,valueType,categoryCombo[id,categoryOptionCombos[id,displayName]]],categoryCombo[id,categoryOptionCombos[id,displayName]]]`
+  );
+  if (ds?._error) return { _error: `Could not load dataset ${datasetId}: ${ds._error}` };
+  const dses = ds.dataSetElements || [];
+  if (!dses.length) {
+    return { _error: `Dataset "${ds.displayName || datasetId}" has no data elements to build a form from. Attach data elements first (manage_datasets action="add_data_elements").` };
+  }
+  const groups = [{ rows: [] }];
+  let totalInputs = 0;
+  for (const dse of dses) {
+    const de = dse.dataElement;
+    if (!de?.id) continue;
+    const combo = dse.categoryCombo || de.categoryCombo;
+    const cocs = combo?.categoryOptionCombos || [];
+    if (cocs.length <= 1) {
+      const coc = cocs[0];
+      if (!coc?.id) continue;
+      groups[0].rows.push({ inputId: `${de.id}-${coc.id}-val`, label: de.displayName });
+      totalInputs++;
+    } else {
+      for (const coc of cocs) {
+        if (!coc?.id) continue;
+        groups[0].rows.push({ inputId: `${de.id}-${coc.id}-val`, label: `${de.displayName} — ${coc.displayName}` });
+        totalInputs++;
+      }
+    }
+  }
+  if (!totalInputs) return { _error: `Dataset "${ds.displayName || datasetId}" has data elements but no category-option-combos resolved. Run /api/maintenance/categoryOptionComboUpdate or check the category combo.` };
+  return { groups, title: ds.displayName, totalInputs };
+}
+
+// Build the auto-generated field rows for a program stage, one input per DE.
+function buildStageFormGroups(stageId, stageName, programStageDataElements) {
+  const rows = [];
+  for (const psde of (programStageDataElements || [])) {
+    const de = psde.dataElement;
+    if (!de?.id) continue;
+    rows.push({ inputId: `${stageId}-${de.id}-val`, label: de.displayName });
+  }
+  if (!rows.length) return { _error: `Program stage "${stageName || stageId}" has no data elements to build a form from. Add data elements to the stage first.` };
+  return { groups: [{ rows }], title: stageName, totalInputs: rows.length };
+}
+
+// Create a new standalone dataEntryForm (POST) or update the existing one in place (PATCH).
+// Returns { formId } or { _error }.
+async function upsertDataEntryForm(existingFormId, name, style, htmlCode) {
+  const safeStyle = DATA_ENTRY_FORM_STYLES.has(style) ? style : 'NORMAL';
+  if (existingFormId) {
+    const patchBody = { style: safeStyle, htmlCode };
+    if (name) patchBody.name = name;
+    const resp = await safeDhis2Fetch(`dataEntryForms/${existingFormId}`, { method: 'PATCH', body: patchBody });
+    if (resp?._error) return { _error: `Could not update dataEntryForm ${existingFormId}: ${resp._error}` };
+    return { formId: existingFormId, reused: true };
+  }
+  const formId = generateDhis2Uid();
+  const resp = await safeDhis2Fetch('dataEntryForms', {
+    method: 'POST',
+    body: { id: formId, name, style: safeStyle, format: 2, htmlCode },
+  });
+  if (resp?._error) {
+    return {
+      _error: `Could not create dataEntryForm: ${resp._error}`,
+      _hint: 'dataEntryForm names are unique server-wide. Pass a distinct form_name if this collided.',
+    };
+  }
+  return { formId, reused: false };
+}
+
+async function getCustomForm(args) {
+  const target = resolveCustomFormTarget(args);
+  if (target._error) return target;
+  if (target.kind === 'dataset') {
+    const ds = await safeDhis2Fetch(
+      `dataSets/${target.id}?fields=id,displayName,formType,dataEntryForm[id,name,style,htmlCode],dataSetElements~size,organisationUnits~size,access`
+    );
+    if (ds?._error) return { _error: `Could not load dataset ${target.id}: ${ds._error}` };
+    const html = ds.dataEntryForm?.htmlCode || '';
+    return {
+      success: true,
+      target: 'dataset',
+      id: ds.id,
+      name: ds.displayName,
+      form_type: ds.formType || 'DEFAULT',
+      has_custom_form: !!ds.dataEntryForm,
+      form_id: ds.dataEntryForm?.id || null,
+      form_name: ds.dataEntryForm?.name || null,
+      style: ds.dataEntryForm?.style || null,
+      input_ids: extractCustomFormInputIds(html).slice(0, 200),
+      input_count: extractCustomFormInputIds(html).length,
+      html_length: html.length,
+      html_preview: html.slice(0, 4000),
+      data_elements: ds.dataSetElements ?? 0,
+      org_units: ds.organisationUnits ?? 0,
+      can_write_data: !!ds.access?.data?.write,
+    };
+  }
+  const ps = await safeDhis2Fetch(
+    `programStages/${target.id}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name,style,htmlCode],programStageDataElements~size`
+  );
+  if (ps?._error) return { _error: `Could not load program stage ${target.id}: ${ps._error}` };
+  const html = ps.dataEntryForm?.htmlCode || '';
+  return {
+    success: true,
+    target: 'stage',
+    id: ps.id,
+    name: ps.displayName,
+    program: ps.program ? { id: ps.program.id, name: ps.program.displayName, type: ps.program.programType } : null,
+    form_type: ps.formType || 'DEFAULT',
+    has_custom_form: !!ps.dataEntryForm,
+    form_id: ps.dataEntryForm?.id || null,
+    form_name: ps.dataEntryForm?.name || null,
+    style: ps.dataEntryForm?.style || null,
+    input_ids: extractCustomFormInputIds(html).slice(0, 200),
+    input_count: extractCustomFormInputIds(html).length,
+    html_length: html.length,
+    html_preview: html.slice(0, 4000),
+    data_elements: ps.programStageDataElements ?? 0,
+  };
+}
+
+async function previewCustomFormHtml(args) {
+  const target = resolveCustomFormTarget(args);
+  if (target._error) return target;
+  let built;
+  if (target.kind === 'dataset') {
+    built = await buildDatasetFormGroups(target.id);
+  } else {
+    const ps = await safeDhis2Fetch(
+      `programStages/${target.id}?fields=id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]`
+    );
+    if (ps?._error) return { _error: `Could not load program stage ${target.id}: ${ps._error}` };
+    built = buildStageFormGroups(ps.id, ps.displayName, ps.programStageDataElements);
+  }
+  if (built._error) return built;
+  const html = buildCustomFormHtml(built.title, built.groups);
+  return {
+    success: true,
+    target: target.kind,
+    id: target.id,
+    input_count: built.totalInputs,
+    html_length: html.length,
+    html_code: html,
+    _note: 'Preview only — nothing was saved. Call set_dataset_form / set_stage_form (optionally with this html_code) to apply it.',
+  };
+}
+
+async function setDatasetCustomForm(args) {
+  const datasetId = args.dataset_id || args.object_id;
+  if (!datasetId) return { _error: 'dataset_id required for set_dataset_form' };
+  const exists = await verifyTargetExists('dataSets', datasetId, 'manage_custom_forms', 'set_dataset_form', 'id,displayName');
+  if (!exists.exists) return exists.refusal;
+
+  const ds = await safeDhis2Fetch(
+    `dataSets/${datasetId}?fields=id,displayName,formType,dataEntryForm[id,name],dataSetElements[dataElement[id]],organisationUnits~size,access`
+  );
+  if (ds?._error) return { _error: `Could not load dataset ${datasetId}: ${ds._error}` };
+  const dsName = ds.displayName || datasetId;
+  const validDeIds = new Set((ds.dataSetElements || []).map(d => d.dataElement?.id).filter(Boolean));
+
+  // HTML: caller-supplied, or auto-built from the dataset's DE × COC grid.
+  let htmlCode = typeof args.html_code === 'string' && args.html_code.trim() ? args.html_code : null;
+  let autoInputs = null;
+  if (!htmlCode) {
+    const built = await buildDatasetFormGroups(datasetId);
+    if (built._error) return built;
+    htmlCode = buildCustomFormHtml(built.title, built.groups);
+    autoInputs = built.totalInputs;
+  }
+
+  // Lint: warn (don't block) when referenced DEs aren't attached to the dataset.
+  const inputIds = extractCustomFormInputIds(htmlCode);
+  const unknownDes = [];
+  for (const inputId of inputIds) {
+    const m = inputId.match(/^([A-Za-z][A-Za-z0-9]{10})-([A-Za-z][A-Za-z0-9]{10})-val$/);
+    if (!m) continue;
+    if (!validDeIds.has(m[1])) unknownDes.push(m[1]);
+  }
+  if (!inputIds.length) {
+    return { _error: 'The htmlCode contains no `id="<de>-<coc>-val"` data-entry inputs. A dataset custom form needs at least one bound cell.', _hint: 'Use action="preview_html" to auto-generate a valid form skeleton.' };
+  }
+
+  const backup = await ensureBackupOrBail(
+    { operation: 'set_custom_form', tool: 'manage_custom_forms', action: 'set_dataset_form', reason: `Set custom form on dataset ${dsName}` },
+    [{ object_type: 'dataSets', object_id: datasetId, role: 'primary' }],
+    args
+  );
+  if (!backup.ok) return backup.error;
+
+  const formName = args.form_name || `${dsName} custom form ${generateDhis2Uid().slice(-4)}`;
+  const upsert = await upsertDataEntryForm(ds.dataEntryForm?.id, formName, args.style, htmlCode);
+  if (upsert._error) return { ...upsert, backup: backup.block };
+
+  // Link the form + flip to CUSTOM. PATCH is safe for dataSets.
+  if (ds.formType !== 'CUSTOM' || ds.dataEntryForm?.id !== upsert.formId) {
+    const link = await safeDhis2Fetch(`dataSets/${datasetId}`, {
+      method: 'PATCH',
+      body: { formType: 'CUSTOM', dataEntryForm: { id: upsert.formId } },
+    });
+    if (link?._error) return { _error: `Form saved (${upsert.formId}) but linking it to the dataset failed: ${link._error}`, form_id: upsert.formId, backup: backup.block };
+  }
+
+  const hints = [];
+  if (!(ds.organisationUnits > 0)) hints.push('No org units are assigned — the dataset is invisible in Data Entry. Use manage_datasets(action="assign_org_units").');
+  if (!ds.access?.data?.write) hints.push('Public/your data-write access may be off — if Save no-ops, set sharing to rwrw---- via manage_datasets(action="update_sharing").');
+  if (unknownDes.length) hints.push(`htmlCode references ${unknownDes.length} data element(s) not attached to this dataset (${unknownDes.slice(0, 5).join(', ')}); those cells will not save until the DEs are added.`);
+
+  return {
+    success: true,
+    target: 'dataset',
+    dataset_id: datasetId,
+    dataset_name: dsName,
+    form_id: upsert.formId,
+    form_reused: upsert.reused,
+    form_type: 'CUSTOM',
+    input_count: inputIds.length,
+    auto_generated: autoInputs != null,
+    backup: backup.block,
+    _hints: hints.length ? hints : undefined,
+  };
+}
+
+async function setStageCustomForm(args) {
+  const stageId = args.program_stage_id || args.stage_id;
+  if (!stageId) return { _error: 'program_stage_id required for set_stage_form' };
+  const exists = await verifyTargetExists('programStages', stageId, 'manage_custom_forms', 'set_stage_form', 'id,displayName');
+  if (!exists.exists) return exists.refusal;
+
+  // Meta for html-building + the program reference we must re-attach on PUT.
+  const meta = await safeDhis2Fetch(
+    `programStages/${stageId}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name],programStageDataElements[dataElement[id,displayName,valueType]]`
+  );
+  if (meta?._error) return { _error: `Could not load program stage ${stageId}: ${meta._error}` };
+  if (!meta.program?.id) return { _error: `Program stage ${stageId} has no resolvable program — cannot safely PUT it.` };
+  const stageName = meta.displayName || stageId;
+  const validDeIds = new Set((meta.programStageDataElements || []).map(p => p.dataElement?.id).filter(Boolean));
+
+  let htmlCode = typeof args.html_code === 'string' && args.html_code.trim() ? args.html_code : null;
+  let autoInputs = null;
+  if (!htmlCode) {
+    const built = buildStageFormGroups(stageId, stageName, meta.programStageDataElements);
+    if (built._error) return built;
+    htmlCode = buildCustomFormHtml(built.title, built.groups);
+    autoInputs = built.totalInputs;
+  }
+
+  const inputIds = extractCustomFormInputIds(htmlCode);
+  if (!inputIds.length) {
+    return { _error: 'The htmlCode contains no `id="<stage>-<de>-val"` data-entry inputs. A program-stage custom form needs at least one bound cell.', _hint: 'Use action="preview_html" to auto-generate a valid form skeleton.' };
+  }
+  const unknownDes = [];
+  for (const inputId of inputIds) {
+    const m = inputId.match(/^([A-Za-z][A-Za-z0-9]{10})-([A-Za-z][A-Za-z0-9]{10})-val$/);
+    if (!m) continue;
+    if (m[1] !== stageId) { unknownDes.push(`${inputId} (stage prefix mismatch)`); continue; }
+    if (!validDeIds.has(m[2])) unknownDes.push(m[2]);
+  }
+
+  const backup = await ensureBackupOrBail(
+    { operation: 'set_custom_form', tool: 'manage_custom_forms', action: 'set_stage_form', reason: `Set custom form on program stage ${stageName}` },
+    [{ object_type: 'programStages', object_id: stageId, role: 'primary' }],
+    args
+  );
+  if (!backup.ok) return backup.error;
+
+  const formName = args.form_name || `${stageName} stage form ${generateDhis2Uid().slice(-4)}`;
+  const upsert = await upsertDataEntryForm(meta.dataEntryForm?.id, formName, args.style, htmlCode);
+  if (upsert._error) return { ...upsert, backup: backup.block };
+
+  // Full-object PUT — a programStage PATCH/naive-PUT loses `program` (E: "must
+  // reference a program"). :owner omits program, so we re-attach it explicitly.
+  const owner = await safeDhis2Fetch(`programStages/${stageId}?fields=:owner`);
+  if (owner?._error) return { _error: `Form saved (${upsert.formId}) but reloading the stage to link it failed: ${owner._error}`, form_id: upsert.formId, backup: backup.block };
+  owner.program = { id: meta.program.id };
+  owner.formType = 'CUSTOM';
+  owner.dataEntryForm = { id: upsert.formId };
+  const put = await safeDhis2Fetch(`programStages/${stageId}?mergeMode=REPLACE`, { method: 'PUT', body: owner });
+  if (put?._error) return { _error: `Form saved (${upsert.formId}) but linking it to the stage failed: ${put._error}`, form_id: upsert.formId, backup: backup.block };
+
+  const hints = [];
+  if (unknownDes.length) hints.push(`htmlCode references ${unknownDes.length} input(s) whose DE is not on this stage (${unknownDes.slice(0, 5).join(', ')}); those cells will not save.`);
+  hints.push('Custom program-stage forms render in the new Capture app; verify in Capture > new event/enrollment for this program.');
+
+  return {
+    success: true,
+    target: 'stage',
+    program_stage_id: stageId,
+    program_stage_name: stageName,
+    program: { id: meta.program.id, name: meta.program.displayName },
+    form_id: upsert.formId,
+    form_reused: upsert.reused,
+    form_type: 'CUSTOM',
+    input_count: inputIds.length,
+    auto_generated: autoInputs != null,
+    backup: backup.block,
+    _hints: hints,
+  };
+}
+
+async function removeCustomForm(args) {
+  const target = resolveCustomFormTarget(args);
+  if (target._error) return target;
+  const revertType = (args.new_form_type && CUSTOM_FORM_REVERT_TYPES.has(args.new_form_type)) ? args.new_form_type : 'DEFAULT';
+
+  if (target.kind === 'dataset') {
+    const exists = await verifyTargetExists('dataSets', target.id, 'manage_custom_forms', 'remove_form', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const owner = await safeDhis2Fetch(`dataSets/${target.id}?fields=:owner`);
+    if (owner?._error) return { _error: `Could not load dataset ${target.id}: ${owner._error}` };
+    const formId = owner.dataEntryForm?.id || null;
+    const backup = await ensureBackupOrBail(
+      { operation: 'remove_custom_form', tool: 'manage_custom_forms', action: 'remove_form', reason: `Remove custom form from dataset ${owner.name || target.id}` },
+      [{ object_type: 'dataSets', object_id: target.id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    delete owner.dataEntryForm;
+    owner.formType = revertType;
+    const put = await safeDhis2Fetch(`dataSets/${target.id}?mergeMode=REPLACE`, { method: 'PUT', body: owner });
+    if (put?._error) return { _error: `Failed to revert dataset form type: ${put._error}`, backup: backup.block };
+    let deletedForm = false;
+    if (formId && args.delete_form_object) {
+      const del = await safeDhis2Fetch(`dataEntryForms/${formId}`, { method: 'DELETE' });
+      deletedForm = !del?._error;
+    }
+    return { success: true, target: 'dataset', dataset_id: target.id, form_type: revertType, unlinked_form_id: formId, deleted_form_object: deletedForm, backup: backup.block };
+  }
+
+  const exists = await verifyTargetExists('programStages', target.id, 'manage_custom_forms', 'remove_form', 'id,displayName');
+  if (!exists.exists) return exists.refusal;
+  const meta = await safeDhis2Fetch(`programStages/${target.id}?fields=id,program[id],dataEntryForm[id]`);
+  if (meta?._error) return { _error: `Could not load program stage ${target.id}: ${meta._error}` };
+  if (!meta.program?.id) return { _error: `Program stage ${target.id} has no resolvable program — cannot safely PUT it.` };
+  const owner = await safeDhis2Fetch(`programStages/${target.id}?fields=:owner`);
+  if (owner?._error) return { _error: `Could not load program stage ${target.id}: ${owner._error}` };
+  const formId = meta.dataEntryForm?.id || null;
+  const backup = await ensureBackupOrBail(
+    { operation: 'remove_custom_form', tool: 'manage_custom_forms', action: 'remove_form', reason: `Remove custom form from program stage ${target.id}` },
+    [{ object_type: 'programStages', object_id: target.id, role: 'primary' }],
+    args
+  );
+  if (!backup.ok) return backup.error;
+  delete owner.dataEntryForm;
+  owner.program = { id: meta.program.id };
+  owner.formType = revertType === 'SECTION_MULTIORG' ? 'DEFAULT' : revertType;
+  const put = await safeDhis2Fetch(`programStages/${target.id}?mergeMode=REPLACE`, { method: 'PUT', body: owner });
+  if (put?._error) return { _error: `Failed to revert stage form type: ${put._error}`, backup: backup.block };
+  let deletedForm = false;
+  if (formId && args.delete_form_object) {
+    const del = await safeDhis2Fetch(`dataEntryForms/${formId}`, { method: 'DELETE' });
+    deletedForm = !del?._error;
+  }
+  return { success: true, target: 'stage', program_stage_id: target.id, form_type: owner.formType, unlinked_form_id: formId, deleted_form_object: deletedForm, backup: backup.block };
+}
+
+async function executeManageCustomForms(args) {
+  const action = args?.action;
+  if (!action) {
+    return {
+      _error: 'Missing required parameter: action',
+      _hint: 'One of: get, preview_html, set_dataset_form, set_stage_form, remove_form.',
+    };
+  }
+  if (action === 'get') return await getCustomForm(args);
+  if (action === 'preview_html') return await previewCustomFormHtml(args);
+  if (action === 'set_dataset_form') {
+    const gate = requireWriteAuth('manage_custom_forms', 'set_dataset_form', { dataset_id: args.dataset_id });
+    if (gate) return gate;
+    return await setDatasetCustomForm(args);
+  }
+  if (action === 'set_stage_form') {
+    const gate = requireWriteAuth('manage_custom_forms', 'set_stage_form', { program_stage_id: args.program_stage_id });
+    if (gate) return gate;
+    return await setStageCustomForm(args);
+  }
+  if (action === 'remove_form') {
+    const gate = requireWriteAuth('manage_custom_forms', 'remove_form', { dataset_id: args.dataset_id, program_stage_id: args.program_stage_id });
+    if (gate) return gate;
+    return await removeCustomForm(args);
+  }
+  return { _error: `Unknown manage_custom_forms action: ${action}`, _hint: 'One of: get, preview_html, set_dataset_form, set_stage_form, remove_form.' };
+}
+
+// ── manage_custom_translations: experimental DHIS2 2.43 "custom-translations" datastore feature ──
+//
+// VERIFIED on DHIS2 2.43 (play stable-2-43-0-1): the new Capture app fetches, at startup:
+//   1. GET /api/dataStore/custom-translations/controller   → { "<appSlug>": ["<locale>", ...] }
+//   2. GET /api/dataStore/custom-translations/<slug>__<locale>  (when the active UI locale is
+//      registered for that app) → { "<source string>": "<replacement>", ... }
+// Both requests were observed returning 200 from the Capture app, and the key template
+// `${slug}__${locale}` (slug lowercased) was confirmed in the app bundle. At render time the
+// app swaps each matching source string for its replacement.
+//
+// The replacement can be a DIFFERENT language (true translation) or the SAME language (a plain
+// string rewrite, e.g. "Report data" → "Submit report" under locale "en"). The feature treats
+// it as a literal source→target map; this tool supports both uses identically.
+//
+// IMPORTANT: an app/locale pair that is NOT listed in the `controller` key is never loaded by
+// the app, so set/remove always keep the controller registry and the per-locale key in sync.
+//
+// DataStore keys are not metadata objects, so the standard ensureBackupOrBail/manage_backups
+// machinery (which restores via /api/metadata) cannot roll them back. Instead set/remove return
+// the pre-write state inline (previous_value / previous_controller) for manual recovery.
+
+const CUSTOM_TRANSLATIONS_NS = 'custom-translations';
+const CUSTOM_TRANSLATIONS_CONTROLLER_KEY = 'controller';
+const CUSTOM_TRANSLATIONS_MIN_API = 43;
+
+// Refuse on servers older than 2.43 — the apps simply don't read this namespace there.
+function customTranslationsVersionGate() {
+  const v = Number(dhis2.apiVersion);
+  if (Number.isFinite(v) && v >= CUSTOM_TRANSLATIONS_MIN_API) return null;
+  return {
+    _error: `Refused: custom translations require DHIS2 2.${CUSTOM_TRANSLATIONS_MIN_API}+. This instance reports API version "${dhis2.apiVersion || '?'}" (${dhis2.systemInfo?.version || 'unknown'}).`,
+    _hint: 'The custom-translations datastore feature is only read by DHIS2 apps on 2.43 and later. On older servers, writing these keys has no visible effect — do not attempt it.',
+  };
+}
+
+function normalizeAppSlug(app) {
+  return String(app == null ? '' : app).trim().toLowerCase();
+}
+// Locale casing is significant (e.g. pt_BR, uz_UZ_Cyrl) — only trim, never lowercase.
+function normalizeLocale(locale) {
+  return String(locale == null ? '' : locale).trim();
+}
+function customTranslationKey(slug, locale) {
+  return `${slug}__${locale}`;
+}
+function ctPath(key) {
+  return `dataStore/${encodeURIComponent(CUSTOM_TRANSLATIONS_NS)}/${encodeURIComponent(key)}`;
+}
+function isPlainObject(v) {
+  return v && typeof v === 'object' && !Array.isArray(v);
+}
+
+// Read the controller registry. Returns { exists, value } (value is {} when missing) or { _error }.
+async function ctFetchController() {
+  const resp = await safeDhis2Fetch(ctPath(CUSTOM_TRANSLATIONS_CONTROLLER_KEY));
+  if (resp?._status === 404) return { exists: false, value: {} };
+  if (resp?._error) return { _error: `Could not read the controller registry: ${resp._error}` };
+  return { exists: true, value: isPlainObject(resp) ? resp : {} };
+}
+
+// Upsert any custom-translations key: POST to create, fall back to PUT on 409 (already exists).
+async function ctUpsertKey(key, value) {
+  let resp = await safeDhis2Fetch(ctPath(key), { method: 'POST', body: value });
+  if (resp?._status === 409) {
+    resp = await safeDhis2Fetch(ctPath(key), { method: 'PUT', body: value });
+  }
+  if (resp?._error) return { _error: `Could not write key "${key}": ${resp._error}` };
+  return { ok: true };
+}
+
+async function ctWriteController(value) {
+  return await ctUpsertKey(CUSTOM_TRANSLATIONS_CONTROLLER_KEY, value);
+}
+
+async function listCustomTranslations() {
+  const keysResp = await safeDhis2Fetch(`dataStore/${encodeURIComponent(CUSTOM_TRANSLATIONS_NS)}`);
+  if (keysResp?._status === 404) {
+    return {
+      success: true, namespace: CUSTOM_TRANSLATIONS_NS, exists: false,
+      registered: {}, translation_keys: [],
+      _note: 'The custom-translations namespace does not exist yet. Use action="set" to create the first translation (it also creates the controller registry).',
+    };
+  }
+  if (keysResp?._error) return { _error: `Could not list custom-translations keys: ${keysResp._error}` };
+  const keys = Array.isArray(keysResp) ? keysResp : [];
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  const translationKeys = keys
+    .filter(k => k !== CUSTOM_TRANSLATIONS_CONTROLLER_KEY)
+    .map(k => {
+      const idx = k.indexOf('__');
+      return idx > 0
+        ? { key: k, app: k.slice(0, idx), locale: k.slice(idx + 2) }
+        : { key: k, app: null, locale: null, _note: 'Key does not follow the <slug>__<locale> format.' };
+    });
+  return {
+    success: true,
+    namespace: CUSTOM_TRANSLATIONS_NS,
+    exists: true,
+    registered: controller.value,
+    translation_keys: translationKeys,
+    key_count: keys.length,
+  };
+}
+
+async function getCustomTranslations(args) {
+  const slug = normalizeAppSlug(args.app);
+  const locale = normalizeLocale(args.locale);
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  if (!slug || !locale) {
+    return {
+      success: true, namespace: CUSTOM_TRANSLATIONS_NS,
+      registered: controller.value,
+      _note: 'Pass both app and locale to read a specific translation map.',
+    };
+  }
+  const key = customTranslationKey(slug, locale);
+  const registeredLocales = Array.isArray(controller.value[slug]) ? controller.value[slug] : [];
+  const isRegistered = registeredLocales.includes(locale);
+  const resp = await safeDhis2Fetch(ctPath(key));
+  if (resp?._status === 404) {
+    return {
+      success: true, app: slug, locale, key, exists: false, registered: isRegistered, translations: {},
+      _hint: isRegistered
+        ? 'The controller lists this app/locale but the translation key is missing — the app has nothing to load. Use action="set" to add strings.'
+        : 'No translations stored for this app/locale yet.',
+    };
+  }
+  if (resp?._error) return { _error: `Could not read ${key}: ${resp._error}` };
+  const translations = isPlainObject(resp) ? resp : {};
+  return {
+    success: true, app: slug, locale, key, exists: true,
+    registered: isRegistered,
+    entry_count: Object.keys(translations).length,
+    translations,
+    _hint: isRegistered
+      ? undefined
+      : `WARNING: "${slug}" + "${locale}" is NOT in the controller registry, so the app will NOT load these translations. Run action="set" (which registers automatically) to fix it.`,
+  };
+}
+
+async function setCustomTranslations(args) {
+  const slug = normalizeAppSlug(args.app);
+  const locale = normalizeLocale(args.locale);
+  if (!slug) return { _error: 'app is required for set (the app slug, e.g. "capture").' };
+  if (!locale) return { _error: 'locale is required for set (e.g. "ar" to translate, or "en" to rewrite English strings in place).' };
+  const translations = args.translations;
+  if (!isPlainObject(translations)) {
+    return { _error: 'translations must be a JSON object mapping each exact source string to its replacement, e.g. {"Report data":"الإبلاغ عن البيانات"}.' };
+  }
+  const entries = Object.entries(translations);
+  if (!entries.length) return { _error: 'translations is empty — provide at least one source→replacement pair.' };
+  const badValues = entries.filter(([, v]) => typeof v !== 'string');
+  if (badValues.length) {
+    return { _error: `All translation values must be strings. Offending source string(s): ${badValues.slice(0, 5).map(e => JSON.stringify(e[0])).join(', ')}.` };
+  }
+
+  const key = customTranslationKey(slug, locale);
+
+  // Read existing map (for merge + restore snapshot).
+  const existingResp = await safeDhis2Fetch(ctPath(key));
+  const keyExisted = existingResp?._status !== 404;
+  if (existingResp?._error && existingResp?._status !== 404) {
+    return { _error: `Could not read the existing ${key}: ${existingResp._error}` };
+  }
+  const existing = (keyExisted && isPlainObject(existingResp)) ? existingResp : {};
+  const replace = args.replace === true;
+  const finalMap = replace ? { ...translations } : { ...existing, ...translations };
+
+  // Controller registry: ensure slug + locale are registered.
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  const previousController = JSON.parse(JSON.stringify(controller.value || {}));
+  const reg = controller.value || {};
+  const locales = Array.isArray(reg[slug]) ? reg[slug].slice() : [];
+  const controllerNeedsUpdate = !Array.isArray(reg[slug]) || !locales.includes(locale);
+  if (!locales.includes(locale)) locales.push(locale);
+  reg[slug] = locales;
+
+  // Write the translation key first, then the controller (so a registered pair always has a key).
+  const w1 = await ctUpsertKey(key, finalMap);
+  if (w1._error) return w1;
+  if (controllerNeedsUpdate) {
+    const w2 = await ctWriteController(reg);
+    if (w2._error) {
+      return {
+        _error: `Translations saved to ${key}, but updating the controller registry failed: ${w2._error}`,
+        _hint: 'Without the controller entry the app will NOT load these translations. Retry action="set", or set the controller key manually.',
+        previous_value: keyExisted ? existing : null,
+      };
+    }
+  }
+
+  const isRewrite = /^en\b/i.test(locale) || locale.toLowerCase() === 'en';
+  return {
+    success: true,
+    namespace: CUSTOM_TRANSLATIONS_NS,
+    app: slug,
+    locale,
+    key,
+    mode: replace ? 'replace' : 'merge',
+    entries_written: entries.length,
+    total_entries: Object.keys(finalMap).length,
+    key_existed: keyExisted,
+    controller_updated: controllerNeedsUpdate,
+    registered_locales: locales,
+    previous_value: keyExisted ? existing : null,
+    previous_controller: previousController,
+    _hints: [
+      `Reload the "${slug}" app with the UI locale set to "${locale}" to see the strings change.`,
+      isRewrite
+        ? 'Same-language rewrite: each value replaces its English source string verbatim.'
+        : 'Translation: each English source string renders as its translated value.',
+      'Each source string must match the on-screen text EXACTLY (capitalisation, punctuation, whitespace) or it will not be swapped.',
+    ],
+  };
+}
+
+async function removeCustomTranslations(args) {
+  const slug = normalizeAppSlug(args.app);
+  const locale = normalizeLocale(args.locale);
+  if (!slug || !locale) return { _error: 'app and locale are required for remove.' };
+  const key = customTranslationKey(slug, locale);
+  const keysToRemove = Array.isArray(args.keys) ? args.keys.filter(k => typeof k === 'string') : null;
+
+  const existingResp = await safeDhis2Fetch(ctPath(key));
+  if (existingResp?._status === 404) {
+    return { success: true, app: slug, locale, key, removed: false, _note: 'Nothing to remove — that translation key does not exist.' };
+  }
+  if (existingResp?._error) return { _error: `Could not read ${key}: ${existingResp._error}` };
+  const existing = isPlainObject(existingResp) ? existingResp : {};
+
+  // Partial removal: drop only the named source strings, keeping the key + registration —
+  // unless that would empty the map, in which case fall through to a full delete.
+  if (keysToRemove && keysToRemove.length) {
+    const remaining = { ...existing };
+    let removedCount = 0;
+    for (const k of keysToRemove) { if (k in remaining) { delete remaining[k]; removedCount++; } }
+    if (Object.keys(remaining).length > 0) {
+      const w = await ctUpsertKey(key, remaining);
+      if (w._error) return w;
+      return {
+        success: true, app: slug, locale, key,
+        removed_entries: removedCount,
+        remaining_entries: Object.keys(remaining).length,
+        previous_value: existing,
+      };
+    }
+  }
+
+  // Full removal: delete the key and de-register the locale from the controller.
+  const del = await safeDhis2Fetch(ctPath(key), { method: 'DELETE' });
+  if (del?._error && del?._status !== 404) return { _error: `Could not delete ${key}: ${del._error}` };
+
+  const controller = await ctFetchController();
+  if (controller._error) return controller;
+  const previousController = JSON.parse(JSON.stringify(controller.value || {}));
+  const reg = controller.value || {};
+  let controllerUpdated = false;
+  if (Array.isArray(reg[slug]) && reg[slug].includes(locale)) {
+    reg[slug] = reg[slug].filter(l => l !== locale);
+    if (reg[slug].length === 0) delete reg[slug];
+    controllerUpdated = true;
+    const w = await ctWriteController(reg);
+    if (w._error) return { _error: `Key deleted but de-registering it from the controller failed: ${w._error}`, previous_value: existing };
+  }
+
+  return {
+    success: true, app: slug, locale, key, removed: true,
+    controller_updated: controllerUpdated,
+    previous_value: existing,
+    previous_controller: previousController,
+    _hint: 'Reload the app to confirm the strings reverted to their defaults.',
+  };
+}
+
+async function executeManageCustomTranslations(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, set, remove.' };
+  }
+  const gate = customTranslationsVersionGate();
+  if (gate) return gate;
+
+  if (action === 'list') return await listCustomTranslations();
+  if (action === 'get') return await getCustomTranslations(args);
+  if (action === 'set') {
+    const wa = requireWriteAuth('manage_custom_translations', 'set', { app: args.app, locale: args.locale });
+    if (wa) return wa;
+    return await setCustomTranslations(args);
+  }
+  if (action === 'remove') {
+    const wa = requireWriteAuth('manage_custom_translations', 'remove', { app: args.app, locale: args.locale });
+    if (wa) return wa;
+    return await removeCustomTranslations(args);
+  }
+  return { _error: `Unknown manage_custom_translations action: ${action}`, _hint: 'One of: list, get, set, remove.' };
+}
+
+// ── manage_growth_chart_plugin: WHO Capture Growth Chart plugin setup ──
+//
+// VERIFIED on DHIS2 2.43 (play stable-2-43-0-1) against the dev-otta plugin
+// (https://github.com/dev-otta/dhis2-who-growth-chart). The plugin renders WHO growth
+// charts on a tracker enrollment dashboard in the new Capture app. It needs:
+//   1. The app installed (App Hub "Capture Growth Chart", key capture-growth-chart).
+//   2. A dataStore key — namespace "captureGrowthChart", key "config" — mapping the
+//      program's metadata to the plugin's expected roles:
+//        metadata.attributes:  dateOfBirth, gender, firstName, lastName, femaleOptionCode, maleOptionCode
+//        metadata.dataElements: weight, height, headCircumference
+//        metadata.programStageForGrowthChart: { "<programId>": "<programStageId>" }
+//        settings: usePercentiles, customReferences, weightInGrams, defaultIndicator (wfa|hcfa|lhfa|wflh)
+//   3. The plugin widget ADDED to the enrollment dashboard (owned by Capture / the Tracker
+//      Plugin Configurator — an internal dataStore/capture layout this tool does NOT touch).
+//
+// Install verified: POST /api/appHub/{versionId} → 201; afterwards /api/apps lists
+// capture-growth-chart with pluginLaunchUrl …/api/apps/capture-growth-chart/plugin.html.
+// Config write verified: POST dataStore/captureGrowthChart/config → 201. A full program +
+// stage + 3 measurement DEs + enrolled child with 3 measurements was created and accepted.
+
+const GROWTH_CHART_NS = 'captureGrowthChart';
+const GROWTH_CHART_KEY = 'config';
+const GROWTH_CHART_APP_KEY = 'capture-growth-chart';
+const GROWTH_CHART_APPHUB_NAME = 'Capture Growth Chart';
+const GROWTH_CHART_INDICATORS = new Set(['wfa', 'hcfa', 'lhfa', 'wflh']);
+
+function gcPath(key) {
+  return `dataStore/${encodeURIComponent(GROWTH_CHART_NS)}/${encodeURIComponent(key)}`;
+}
+
+// Read captureGrowthChart/config. Returns { exists, value } or { _error }.
+async function gcReadConfig() {
+  const resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY));
+  if (resp?._status === 404) return { exists: false, value: null };
+  if (resp?._error) return { _error: `Could not read ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}: ${resp._error}` };
+  return { exists: true, value: isPlainObject(resp) ? resp : null };
+}
+
+async function gcWriteConfig(value) {
+  let resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'POST', body: value });
+  if (resp?._status === 409) {
+    resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'PUT', body: value });
+  }
+  if (resp?._error) return { _error: `Could not write ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}: ${resp._error}` };
+  return { ok: true };
+}
+
+// Is the plugin app installed? Returns { installed, pluginLaunchUrl }.
+async function gcAppStatus() {
+  const apps = await safeDhis2Fetch('apps.json');
+  if (apps?._error || !Array.isArray(apps)) return { installed: null, _note: 'Could not read installed app list.' };
+  const app = apps.find(a => a.key === GROWTH_CHART_APP_KEY || /capture\s*growth\s*chart/i.test(a.name || ''));
+  if (!app) return { installed: false };
+  return {
+    installed: true,
+    app_key: app.key,
+    plugin_launch_url: app.pluginLaunchUrl || `${dhis2.baseUrl}/api/apps/${app.key}/plugin.html`,
+    version: app.version,
+  };
+}
+
+function gcServerMinorVersion() {
+  const n = Number(dhis2.apiVersion);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Install the plugin from the App Hub. Idempotent.
+async function gcInstall() {
+  const before = await gcAppStatus();
+  if (before.installed) {
+    return { success: true, already_installed: true, app_key: before.app_key, plugin_launch_url: before.plugin_launch_url, version: before.version };
+  }
+  const search = await safeDhis2Fetch(`appHub/v2/apps?query=${encodeURIComponent(GROWTH_CHART_APPHUB_NAME)}`);
+  if (search?._error) return { _error: `Could not query the App Hub: ${search._error}`, _hint: 'The server may have no App Hub access. Install the "Capture Growth Chart" app manually via App Management.' };
+  const results = search?.result || [];
+  const app = results.find(a => /capture\s*growth\s*chart/i.test(a.name || '')) || results[0];
+  if (!app) return { _error: 'Could not find "Capture Growth Chart" in the App Hub.', _hint: 'Install it manually via App Management, then re-run with action="configure".' };
+  const serverMinor = gcServerMinorVersion();
+  // versions are newest-first; pick the first compatible with this server.
+  const versions = Array.isArray(app.versions) ? app.versions : [];
+  const minorOf = (v) => { const m = String(v || '').match(/^\s*\d+\.(\d+)/); return m ? Number(m[1]) : null; };
+  const compatible = versions.find(v => {
+    if (serverMinor == null) return true;
+    const min = minorOf(v.minDhisVersion);
+    const max = minorOf(v.maxDhisVersion);
+    return (min == null || serverMinor >= min) && (max == null || serverMinor <= max);
+  }) || versions[0];
+  if (!compatible?.id) return { _error: 'The App Hub returned no installable version for Capture Growth Chart.' };
+  const install = await safeDhis2Fetch(`appHub/${encodeURIComponent(compatible.id)}`, { method: 'POST' });
+  if (install?._error) return { _error: `App Hub install failed: ${install._error}`, _hint: 'You may lack the authority to install apps. Install "Capture Growth Chart" via App Management instead.' };
+  const after = await gcAppStatus();
+  return {
+    success: true,
+    installed_version: compatible.version,
+    app_key: after.app_key || GROWTH_CHART_APP_KEY,
+    plugin_launch_url: after.plugin_launch_url || `${dhis2.baseUrl}/api/apps/${GROWTH_CHART_APP_KEY}/plugin.html`,
+    _note: after.installed ? 'Installed and confirmed in the app list.' : 'Install POST accepted; the app may take a moment to appear.',
+  };
+}
+
+// Build the dashboard-attach guidance block (the part this tool does NOT auto-write).
+function gcDashboardAttachBlock(pluginUrl, programId) {
+  return {
+    plugin_source_url: pluginUrl || `${dhis2.baseUrl}/api/apps/${GROWTH_CHART_APP_KEY}/plugin.html`,
+    note: 'The plugin is configured but must be ADDED to the enrollment dashboard to become visible. This tool does not modify the Capture dashboard layout (dataStore/capture) to avoid corrupting the Capture cache.',
+    steps: [
+      'Easiest: open the "Tracker Plugin Configurator" app, pick this program, and add the Capture Growth Chart plugin to the enrollment dashboard.',
+      `Or in Capture: open an enrollment for program ${programId || '<program>'}, use the enrollment dashboard "Edit"/"Add plugin" option, and paste the plugin source URL above.`,
+    ],
+  };
+}
+
+// Fetch a program with the attributes + stage data elements needed for detection.
+async function gcFetchProgram(programId) {
+  return await safeDhis2Fetch(
+    `programs/${programId}?fields=id,displayName,programType,` +
+    `programTrackedEntityAttributes[mandatory,trackedEntityAttribute[id,displayName,valueType,optionSet[id,options[code,displayName]]]],` +
+    `programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`
+  );
+}
+
+function gcMatch(list, getName, patterns, extra) {
+  for (const re of patterns) {
+    const m = list.find(item => re.test(getName(item)) && (!extra || extra(item)));
+    if (m) return m;
+  }
+  return null;
+}
+
+async function growthChartConfigure(args) {
+  const programId = args.program_id;
+  if (!programId) return { _error: 'program_id is required for configure.' };
+  const prog = await gcFetchProgram(programId);
+  if (prog?._error) return { _error: `Could not load program ${programId}: ${prog._error}`, _hint: 'Pass a valid tracker program UID.' };
+  if (prog.programType !== 'WITH_REGISTRATION') {
+    return { _error: `Program "${prog.displayName}" is not a tracker (WITH_REGISTRATION) program. The growth chart plugin only works on tracker programs.` };
+  }
+
+  const teas = (prog.programTrackedEntityAttributes || []).map(p => p.trackedEntityAttribute).filter(Boolean);
+  const teaName = t => t.displayName || '';
+  const ov = args.attribute_ids || {};
+  const byId = (id) => teas.find(t => t.id === id);
+
+  // ── Attribute detection (explicit override wins) ──
+  const dobTea = (ov.dateOfBirth && byId(ov.dateOfBirth))
+    || gcMatch(teas, teaName, [/date\s*of\s*birth/i, /\bdob\b/i, /\bbirth\s*date\b/i, /\bbirth\b/i], t => t.valueType === 'DATE');
+  const genderTea = (ov.gender && byId(ov.gender))
+    || gcMatch(teas, teaName, [/\bgender\b/i, /\bsex\b/i], t => !!t.optionSet);
+  const firstNameTea = (ov.firstName && byId(ov.firstName))
+    || gcMatch(teas, teaName, [/first\s*name/i, /given\s*name/i]);
+  const lastNameTea = (ov.lastName && byId(ov.lastName))
+    || gcMatch(teas, teaName, [/last\s*name/i, /surname/i, /family\s*name/i]);
+
+  // ── Stage + data-element detection ──
+  const stages = prog.programStages || [];
+  let stage = args.program_stage_id ? stages.find(s => s.id === args.program_stage_id) : null;
+  if (args.program_stage_id && !stage) {
+    return { _error: `Program stage ${args.program_stage_id} is not part of program ${programId}.` };
+  }
+  const deOv = args.data_element_ids || {};
+  const detectInStage = (s) => {
+    const des = (s.programStageDataElements || []).map(p => p.dataElement).filter(Boolean);
+    const dn = d => d.displayName || '';
+    const weight = (deOv.weight && des.find(d => d.id === deOv.weight)) || gcMatch(des, dn, [/\bweight\b/i, /\bwt\b/i]);
+    const height = (deOv.height && des.find(d => d.id === deOv.height)) || gcMatch(des, dn, [/\bheight\b/i, /\blength\b/i, /\bstature\b/i]);
+    const headCircumference = (deOv.headCircumference && des.find(d => d.id === deOv.headCircumference)) || gcMatch(des, dn, [/head\s*circ/i, /circumference/i, /\bhc\b/i]);
+    return { weight, height, headCircumference, count: [weight, height, headCircumference].filter(Boolean).length };
+  };
+  let de;
+  if (stage) {
+    de = detectInStage(stage);
+  } else {
+    // pick the stage that contains the most of the three measurements
+    let best = null;
+    for (const s of stages) {
+      const d = detectInStage(s);
+      if (!best || d.count > best.de.count) best = { stage: s, de: d };
+    }
+    if (best) { stage = best.stage; de = best.de; }
+  }
+  if (!stage) return { _error: `Program "${prog.displayName}" has no program stages.` };
+
+  // ── Gender option codes ──
+  const genderOptions = genderTea?.optionSet?.options || [];
+  let femaleCode = args.female_option_code
+    || (genderOptions.find(o => /female/i.test(o.code) || /female/i.test(o.displayName)) || {}).code;
+  let maleCode = args.male_option_code
+    || (genderOptions.find(o => (/male/i.test(o.code) || /male/i.test(o.displayName)) && !/female/i.test(o.code) && !/female/i.test(o.displayName)) || {}).code;
+
+  // ── Validate hard requirements ──
+  const missing = [];
+  if (!dobTea) missing.push('a Date-of-birth (DATE) tracked-entity attribute');
+  if (!genderTea) missing.push('a Gender/sex attribute with an option set');
+  if (genderTea && (!femaleCode || !maleCode)) missing.push('female/male option codes on the gender option set (pass female_option_code / male_option_code)');
+  if (!de || !de.weight) missing.push('a Weight data element on the stage');
+  if (!de || !de.height) missing.push('a Height/Length data element on the stage');
+  if (!de || !de.headCircumference) missing.push('a Head-circumference data element on the stage');
+  if (missing.length) {
+    return {
+      _error: `Program "${prog.displayName}" is missing required growth-chart metadata: ${missing.join('; ')}.`,
+      _hint: 'The plugin will not render unless all three data elements (weight, height, head circumference) and the date-of-birth + gender attributes exist. Pass explicit ids via attribute_ids / data_element_ids, or run action="scaffold_program" to create a ready-to-use program.',
+      detected: {
+        dateOfBirth: dobTea ? { id: dobTea.id, name: dobTea.displayName } : null,
+        gender: genderTea ? { id: genderTea.id, name: genderTea.displayName, femaleCode, maleCode } : null,
+        stage: stage ? { id: stage.id, name: stage.displayName } : null,
+        weight: de?.weight ? { id: de.weight.id, name: de.weight.displayName } : null,
+        height: de?.height ? { id: de.height.id, name: de.height.displayName } : null,
+        headCircumference: de?.headCircumference ? { id: de.headCircumference.id, name: de.headCircumference.displayName } : null,
+      },
+    };
+  }
+
+  // weightInGrams: explicit setting wins, else infer from the weight DE name.
+  const weightName = de.weight.displayName || '';
+  const inferGrams = /\(\s*g\s*\)|gram/i.test(weightName) && !/\(\s*kg\s*\)|kilogram/i.test(weightName);
+  const settingsIn = isPlainObject(args.settings) ? args.settings : {};
+  if (settingsIn.defaultIndicator && !GROWTH_CHART_INDICATORS.has(settingsIn.defaultIndicator)) {
+    return { _error: `Invalid defaultIndicator "${settingsIn.defaultIndicator}". One of: ${[...GROWTH_CHART_INDICATORS].join(', ')}.` };
+  }
+
+  // ── Merge into existing config (preserve other programs + settings) ──
+  const cfgRead = await gcReadConfig();
+  if (cfgRead._error) return cfgRead;
+  const existing = cfgRead.value || {};
+  const existingMeta = isPlainObject(existing.metadata) ? existing.metadata : {};
+  const existingStages = isPlainObject(existingMeta.programStageForGrowthChart) ? existingMeta.programStageForGrowthChart : {};
+  const existingSettings = isPlainObject(existing.settings) ? existing.settings : {};
+
+  const config = {
+    ...existing,
+    metadata: {
+      ...existingMeta,
+      attributes: {
+        dateOfBirth: dobTea.id,
+        gender: genderTea.id,
+        firstName: firstNameTea ? firstNameTea.id : (existingMeta.attributes?.firstName || ''),
+        lastName: lastNameTea ? lastNameTea.id : (existingMeta.attributes?.lastName || ''),
+        femaleOptionCode: femaleCode,
+        maleOptionCode: maleCode,
+      },
+      dataElements: {
+        weight: de.weight.id,
+        height: de.height.id,
+        headCircumference: de.headCircumference.id,
+      },
+      programStageForGrowthChart: { ...existingStages, [programId]: stage.id },
+    },
+    settings: {
+      usePercentiles: false,
+      customReferences: false,
+      weightInGrams: inferGrams,
+      defaultIndicator: 'wfa',
+      ...existingSettings,
+      ...settingsIn,
+    },
+  };
+  if (settingsIn.weightInGrams === undefined && existingSettings.weightInGrams === undefined) {
+    config.settings.weightInGrams = inferGrams;
+  }
+
+  const wrote = await gcWriteConfig(config);
+  if (wrote._error) return wrote;
+
+  const appStatus = await gcAppStatus();
+  const hints = [];
+  if (appStatus.installed === false) hints.push('The Capture Growth Chart app is NOT installed yet — run action="install" (or install it via App Management) or the dashboard widget cannot load.');
+  if (!firstNameTea || !lastNameTea) hints.push('First/last name attributes were not found; they are optional (used for printed charts) so configuration still proceeded.');
+
+  return {
+    success: true,
+    program: { id: prog.id, name: prog.displayName },
+    stage: { id: stage.id, name: stage.displayName },
+    resolved: {
+      attributes: config.metadata.attributes,
+      dataElements: config.metadata.dataElements,
+    },
+    settings: config.settings,
+    config_key: `${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}`,
+    plugin_installed: appStatus.installed,
+    dashboard_attach: gcDashboardAttachBlock(appStatus.plugin_launch_url, programId),
+    _hints: hints.length ? hints : undefined,
+  };
+}
+
+async function growthChartScaffoldProgram(args) {
+  const ouId = args.org_unit_id;
+  if (!ouId) return { _error: 'org_unit_id is required for scaffold_program (the org unit the new program is assigned to).' };
+  const ouCheck = await safeDhis2Fetch(`organisationUnits/${ouId}?fields=id,displayName`);
+  if (ouCheck?._error) return { _error: `Org unit ${ouId} not found: ${ouCheck._error}` };
+  const progName = (args.program_name && String(args.program_name).trim()) || 'Growth Monitoring';
+
+  // default categoryCombo
+  const ccResp = await safeDhis2Fetch('categoryCombos?fields=id&filter=isDefault:eq:true&paging=false');
+  const defaultCC = ccResp?.categoryCombos?.[0]?.id || 'bjDvmb4bfuf';
+
+  // Person TET — reuse if present, else create.
+  const tetResp = await safeDhis2Fetch('trackedEntityTypes?fields=id,displayName&paging=false');
+  let personTetId = (tetResp?.trackedEntityTypes || []).find(t => /person/i.test(t.displayName || ''))?.id;
+  const newObjs = { trackedEntityTypes: [], trackedEntityAttributes: [], optionSets: [], options: [], dataElements: [], programs: [], programStages: [] };
+  if (!personTetId) {
+    personTetId = generateDhis2Uid();
+    newObjs.trackedEntityTypes.push({ id: personTetId, name: `Person (${progName})`, sharing: { public: 'rwrw----' } });
+  }
+
+  // Reuse standard demo attributes by exact name when present, else create.
+  const wantTeas = [
+    { role: 'firstName', name: 'First name', valueType: 'TEXT' },
+    { role: 'lastName', name: 'Last name', valueType: 'TEXT' },
+    { role: 'gender', name: 'Gender', valueType: 'TEXT', withOptionSet: true },
+    { role: 'dateOfBirth', name: 'Date of birth', valueType: 'DATE' },
+  ];
+  const teaResp = await safeDhis2Fetch(
+    `trackedEntityAttributes?fields=id,displayName,valueType,optionSet[id,options[code,displayName]]&paging=false&filter=displayName:in:[${wantTeas.map(t => t.name).join(',')}]`
+  );
+  const foundTeas = teaResp?.trackedEntityAttributes || [];
+  const teaIds = {};
+  let optionSetId = null, femaleCode = 'Female', maleCode = 'Male';
+  for (const want of wantTeas) {
+    const hit = foundTeas.find(t => (t.displayName || '').toLowerCase() === want.name.toLowerCase() && t.valueType === want.valueType);
+    if (hit) {
+      teaIds[want.role] = hit.id;
+      if (want.role === 'gender' && hit.optionSet?.options?.length) {
+        femaleCode = (hit.optionSet.options.find(o => /female/i.test(o.code) || /female/i.test(o.displayName)) || {}).code || femaleCode;
+        maleCode = (hit.optionSet.options.find(o => (/male/i.test(o.code) || /male/i.test(o.displayName)) && !/female/i.test(o.code) && !/female/i.test(o.displayName)) || {}).code || maleCode;
+      }
+      continue;
+    }
+    const id = generateDhis2Uid();
+    teaIds[want.role] = id;
+    const tea = { id, name: `${progName}: ${want.name}`, shortName: `${want.name}`.slice(0, 50), valueType: want.valueType, aggregationType: 'NONE', sharing: { public: 'rwrw----' } };
+    if (want.withOptionSet) {
+      optionSetId = generateDhis2Uid();
+      const femaleId = generateDhis2Uid(), maleId = generateDhis2Uid();
+      newObjs.optionSets.push({ id: optionSetId, name: `${progName}: Sex`, valueType: 'TEXT', options: [{ id: maleId }, { id: femaleId }] });
+      newObjs.options.push({ id: maleId, name: 'Male', code: 'Male', optionSet: { id: optionSetId }, sortOrder: 1 });
+      newObjs.options.push({ id: femaleId, name: 'Female', code: 'Female', optionSet: { id: optionSetId }, sortOrder: 2 });
+      tea.optionSet = { id: optionSetId };
+      femaleCode = 'Female'; maleCode = 'Male';
+    }
+    newObjs.trackedEntityAttributes.push(tea);
+  }
+
+  // Three fresh measurement data elements (names prefixed to avoid collisions).
+  const deDefs = [
+    { role: 'weight', label: 'Weight (kg)' },
+    { role: 'height', label: 'Height (cm)' },
+    { role: 'headCircumference', label: 'Head circumference (cm)' },
+  ];
+  const deIds = {};
+  for (const d of deDefs) {
+    const id = generateDhis2Uid();
+    deIds[d.role] = id;
+    newObjs.dataElements.push({ id, name: `${progName}: ${d.label}`, shortName: `${d.label}`.slice(0, 50), valueType: 'NUMBER', domainType: 'TRACKER', aggregationType: 'AVERAGE', categoryCombo: { id: defaultCC }, sharing: { public: 'rw------' } });
+  }
+
+  const programId = generateDhis2Uid();
+  const stageId = generateDhis2Uid();
+  newObjs.programs.push({
+    id: programId, name: progName, shortName: progName.slice(0, 50), programType: 'WITH_REGISTRATION',
+    trackedEntityType: { id: personTetId }, categoryCombo: { id: defaultCC }, sharing: { public: 'rwrw----' },
+    organisationUnits: [{ id: ouId }],
+    programTrackedEntityAttributes: [
+      { trackedEntityAttribute: { id: teaIds.firstName }, displayInList: true, searchable: true },
+      { trackedEntityAttribute: { id: teaIds.lastName }, displayInList: true, searchable: true },
+      { trackedEntityAttribute: { id: teaIds.gender }, mandatory: true },
+      { trackedEntityAttribute: { id: teaIds.dateOfBirth }, mandatory: true },
+    ],
+    programStages: [{ id: stageId }],
+  });
+  newObjs.programStages.push({
+    id: stageId, name: 'Growth measurements', program: { id: programId }, repeatable: true, sharing: { public: 'rwrw----' },
+    programStageDataElements: [
+      { dataElement: { id: deIds.weight } },
+      { dataElement: { id: deIds.height } },
+      { dataElement: { id: deIds.headCircumference } },
+    ],
+  });
+
+  // Strip empty buckets so the importer doesn't choke.
+  const payload = {};
+  for (const [k, v] of Object.entries(newObjs)) if (v.length) payload[k] = v;
+
+  const imp = await safeDhis2Fetch('metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL', { method: 'POST', body: payload });
+  const resp = imp?.response || imp;
+  if (resp?.status === 'ERROR' || imp?._error) {
+    const errs = (resp?.typeReports || []).flatMap(t => (t.objectReports || []).flatMap(o => (o.errorReports || []).map(e => `${(t.klass || '').split('.').pop()}: ${e.message}`)));
+    return { _error: `Could not create the growth-monitoring program: ${imp?._error || 'import failed'}`, import_errors: errs.slice(0, 8) };
+  }
+
+  return {
+    success: true,
+    created_program: { id: programId, name: progName, stage_id: stageId },
+    org_unit: { id: ouId, name: ouCheck.displayName },
+    attributes: teaIds,
+    data_elements: deIds,
+    gender_codes: { femaleCode, maleCode },
+    import_stats: resp?.stats,
+    _next: `Now run action="configure" with program_id="${programId}" to write captureGrowthChart/config. Then run action="install" if the plugin app isn't installed.`,
+  };
+}
+
+async function growthChartRemove(args) {
+  const programId = args.program_id;
+  const cfgRead = await gcReadConfig();
+  if (cfgRead._error) return cfgRead;
+  if (!cfgRead.exists) return { success: true, removed: false, _note: 'No captureGrowthChart/config key exists.' };
+
+  if (!programId) {
+    if (args.confirm_delete_all !== true) {
+      return { _error: 'remove without program_id deletes the ENTIRE captureGrowthChart/config. Re-run with confirm_delete_all:true to proceed, or pass program_id to remove just one program.' };
+    }
+    const del = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'DELETE' });
+    if (del?._error && del?._status !== 404) return { _error: `Could not delete config: ${del._error}` };
+    return { success: true, removed_all: true, previous_value: cfgRead.value };
+  }
+
+  const cfg = cfgRead.value || {};
+  const map = cfg.metadata?.programStageForGrowthChart || {};
+  if (!(programId in map)) {
+    return { success: true, removed: false, _note: `Program ${programId} is not in the growth-chart config.`, configured_programs: Object.keys(map) };
+  }
+  const previous = JSON.parse(JSON.stringify(cfg));
+  delete map[programId];
+  cfg.metadata.programStageForGrowthChart = map;
+  const wrote = await gcWriteConfig(cfg);
+  if (wrote._error) return wrote;
+  return { success: true, removed_program: programId, remaining_programs: Object.keys(map), previous_value: previous };
+}
+
+async function growthChartStatus() {
+  const app = await gcAppStatus();
+  const cfgRead = await gcReadConfig();
+  if (cfgRead._error) return cfgRead;
+  const cfg = cfgRead.value;
+  const programMap = cfg?.metadata?.programStageForGrowthChart || {};
+  const programIds = Object.keys(programMap);
+  let programs = [];
+  if (programIds.length) {
+    const resp = await safeDhis2Fetch(`programs?fields=id,displayName&filter=id:in:[${programIds.join(',')}]&paging=false`);
+    const names = Object.fromEntries((resp?.programs || []).map(p => [p.id, p.displayName]));
+    programs = programIds.map(id => ({ id, name: names[id] || '(unknown)', stage_id: programMap[id] }));
+  }
+  return {
+    success: true,
+    plugin_installed: app.installed,
+    plugin_launch_url: app.plugin_launch_url || null,
+    config_exists: cfgRead.exists,
+    configured_programs: programs,
+    settings: cfg?.settings || null,
+    attributes: cfg?.metadata?.attributes || null,
+    data_elements: cfg?.metadata?.dataElements || null,
+    _hint: app.installed === false
+      ? 'Plugin app not installed — run action="install".'
+      : (!cfgRead.exists ? 'No config yet — run action="configure" with a program_id (or scaffold_program first).' : undefined),
+  };
+}
+
+async function executeManageGrowthChartPlugin(args) {
+  const action = args?.action;
+  if (!action) return { _error: 'Missing required parameter: action', _hint: 'One of: status, install, scaffold_program, configure, remove.' };
+  if (action === 'status') return await growthChartStatus();
+  if (action === 'install') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'install', {});
+    if (gate) return gate;
+    return await gcInstall();
+  }
+  if (action === 'scaffold_program') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'scaffold_program', { org_unit_id: args.org_unit_id });
+    if (gate) return gate;
+    return await growthChartScaffoldProgram(args);
+  }
+  if (action === 'configure') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'configure', { program_id: args.program_id });
+    if (gate) return gate;
+    return await growthChartConfigure(args);
+  }
+  if (action === 'remove') {
+    const gate = requireWriteAuth('manage_growth_chart_plugin', 'remove', { program_id: args.program_id });
+    if (gate) return gate;
+    return await growthChartRemove(args);
+  }
+  return { _error: `Unknown manage_growth_chart_plugin action: ${action}`, _hint: 'One of: status, install, scaffold_program, configure, remove.' };
 }
 
 async function postMetadataPayload(payload, dryRunOnly) {
@@ -11461,7 +13165,10 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           id: teaUid,
           name: attr.name,
           shortName: clampShortName(attr.short_name, attr.name, seenTEAShortNames, 'Attribute'),
-          valueType: attr.value_type || 'TEXT',
+          // Explicit value_type wins; otherwise infer from the name (e.g. DOB →
+          // DATE, "Age" → INTEGER) instead of silently defaulting numerics/dates
+          // to TEXT. Option-set attributes stay TEXT.
+          valueType: attr.value_type || (attr.option_set ? 'TEXT' : inferValueType(attr.name, 'TEXT')),
           aggregationType: 'NONE',
         };
         if (attr.option_set && optionSetUidMap[attr.option_set.name]) {
@@ -17238,7 +18945,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   let lastToolName = null;
   let emptyResponseCount = 0; // Guard against infinite think-only loops
 
-  for (let i = 0; i < 30; i++) {
+  // Marker: everything in `messages` from this index on is THIS turn (the user
+  // message + any prefetch + every assistant/tool message the loop adds). The
+  // array was built as [system, ...conversationHistory, userMsg], and
+  // conversationHistory is not mutated until turn end, so the user message sits
+  // at exactly 1 + conversationHistory.length. At turn end we persist
+  // messages.slice(turnStartIdx) so the next turn remembers the actual tool
+  // calls + results, not just the final prose.
+  const turnStartIdx = 1 + conversationHistory.length;
+
+  for (let i = 0; i < 50; i++) {
     // Contextual thinking label
     const thinkLabel = lastToolName
       ? thinkingAfterTool[lastToolName] || 'Processing results'
@@ -17513,9 +19229,14 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           const fallback = 'I was unable to produce a response. Please try rephrasing your question.';
           broadcast({ type: 'AI_STREAM_START' });
           broadcast({ type: 'AI_STREAM_END', text: fallback });
-          conversationHistory.push({ role: 'user', content: historyText });
-          conversationHistory.push({ role: 'assistant', content: fallback });
-          if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-16);
+          // Persist the full action trail for this turn (tool calls + results),
+          // then the fallback as the assistant's closing message, so the next
+          // turn still remembers what was done before the empty-response bail.
+          const turnHist = buildTurnHistory(messages, turnStartIdx, historyText)
+            .filter(m => !(m.role === 'assistant' && !m.tool_calls && !(m.content && String(m.content).trim())));
+          turnHist.push({ role: 'assistant', content: fallback });
+          conversationHistory.push(...turnHist);
+          conversationHistory = trimConversationHistory(conversationHistory);
           saveState();
           return { text: fallback, charts, streamed: true };
         }
@@ -17532,9 +19253,15 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       if (streamStartBroadcast) {
         broadcast({ type: 'AI_STREAM_END', text });
       }
-      conversationHistory.push({ role: 'user', content: historyText });
-      conversationHistory.push({ role: 'assistant', content: text });
-      if (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-16);
+      // Persist the WHOLE structured turn — the user message plus every
+      // assistant tool_call and tool result the loop produced (the final
+      // assistant text message was already pushed onto `messages` at the top of
+      // this iteration, so it is included). This is what gives the model real
+      // memory of the API calls it made and the IDs it created on later turns,
+      // instead of forcing it to re-read its own summary prose.
+      const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
+      conversationHistory.push(...turnHist);
+      conversationHistory = trimConversationHistory(conversationHistory);
 
       lastInteraction = { question: userText, apiCalls: apiCallsLog, answer: text };
       saveState();
@@ -17542,6 +19269,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     }
   }
 
+  // Even when the loop exhausts its iteration budget, persist the action trail
+  // so the next turn still remembers the tool calls/IDs from this turn.
+  try {
+    const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
+    if (turnHist.length) {
+      conversationHistory.push(...turnHist);
+      conversationHistory = trimConversationHistory(conversationHistory);
+      saveState();
+    }
+  } catch {}
   return { text: 'Reached maximum iterations. Try a more specific question.', charts };
 }
 
