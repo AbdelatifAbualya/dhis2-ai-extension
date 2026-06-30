@@ -1588,6 +1588,7 @@ ${turnXml}
       manage_validation_rules: { cls: 'tool-icon-info', icon: '\u{2705}' },
       manage_org_units: { cls: 'tool-icon-create', icon: '\u{1F3E2}' },
       manage_indicators: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
+      manage_option_sets: { cls: 'tool-icon-create', icon: '\u{1F5C2}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1621,6 +1622,7 @@ ${turnXml}
       manage_validation_rules: 'Managing validation rules',
       manage_org_units: 'Managing org units',
       manage_indicators: 'Managing indicators',
+      manage_option_sets: 'Managing option sets',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1806,6 +1808,21 @@ ${turnXml}
       }
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.indicator_type && !(args.indicator && args.indicator.indicator_type)) parts.push(`type: ${String(args.indicator_type).slice(0, 20)}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_option_sets') {
+      const parts = [args.action || 'unknown'];
+      if (args.option_set_id) parts.push(`id: ${String(args.option_set_id).slice(0, 11)}`);
+      if (args.option_set && typeof args.option_set === 'object') {
+        if (args.option_set.name) parts.push(`"${String(args.option_set.name).slice(0, 30)}"`);
+        if (Array.isArray(args.option_set.options)) parts.push(`${args.option_set.options.length} option(s)`);
+        if (args.option_set.value_type) parts.push(`type: ${String(args.option_set.value_type).slice(0, 16)}`);
+      }
+      if (Array.isArray(args.options)) parts.push(`+${args.options.length} option(s)`);
+      if (Array.isArray(args.option_codes)) parts.push(`-${args.option_codes.length} code(s)`);
+      if (Array.isArray(args.order)) parts.push(`reorder ${args.order.length}`);
+      else if (Array.isArray(args.option_ids)) parts.push(`${args.option_ids.length} id(s)`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.dry_run_only) parts.push('DRY RUN');
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {

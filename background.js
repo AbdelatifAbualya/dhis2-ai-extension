@@ -5024,6 +5024,55 @@ NEVER invent dataElement / dataSet / programIndicator / constant UIDs — reuse 
   {
     type: 'function',
     function: {
+      name: 'manage_option_sets',
+      description: `Full lifecycle CRUD for DHIS2 **option sets** — the reusable code/label pick-lists (drop-downs) that data elements and tracked-entity attributes use to constrain input to a fixed set of choices (e.g. "HIV Result: Positive/Negative/Inconclusive", "Sex: Male/Female"). Use this tool for ALL standalone option-set work — NEVER hand-assemble /metadata option bodies via dhis2_query.
+Actions: list / get / create / update / add_options / remove_options / reorder_options / delete.
+An option set has a valueType (the data type of its codes) and an ORDERED list of options; each option is a { code, name } pair — code is the value stored in data, name is the label shown to the user. Codes must be UNIQUE within a set.
+- create: a brand-new standalone option set plus its options, imported atomically (VALIDATE then COMMIT).
+- add_options / remove_options: append new options to, or delete options from, an EXISTING set (remove deletes the option objects, which auto-detaches them; it refuses to remove the last remaining option).
+- reorder_options: set the display order of an existing set's options by listing their codes (or UIDs) in the desired order.
+- update: patch the set's OWN fields (name / code / description / value_type) — does NOT change membership.
+- delete: remove the whole set (and its options); refuses, with the exact blockers, if any data element or tracked-entity attribute still uses it.
+Each update/add/remove/reorder/delete auto-snapshots a backup first (restore via manage_backups).
+(To create an option set INLINE as part of a NEW data element in one shot, use create_metadata's option_set field instead. To CONVERT an existing set to MULTI_TEXT/etc. and cascade the change, use manage_metadata(action=convert_value_type). This tool owns the standalone option-set lifecycle.)
+NEVER invent option-set or option UIDs — reuse UIDs from search_metadata / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'add_options', 'remove_options', 'reorder_options', 'delete'],
+            description: 'list=paginated option-set list (optional name / value_type filters); get=one set with its options in display order; create=new standalone set + options; update=patch the set\'s own fields; add_options=append options; remove_options=delete options; reorder_options=set option display order; delete=remove the whole set + its options.'
+          },
+          option_set_id: { type: 'string', description: 'Existing option set UID (required for get, update, add_options, remove_options, reorder_options, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on option-set name.' },
+          value_type: { type: 'string', description: 'For list: filter by valueType (e.g. TEXT). (For create/update set it inside the option_set object.)' },
+          limit: { type: 'integer', description: 'For list: max option sets to return (1–200, default 50).' },
+          option_set: {
+            type: 'object',
+            description: 'Option-set definition (required for create; for update pass only the changed OWN fields).',
+            properties: {
+              name: { type: 'string', description: 'Unique option-set name.' },
+              code: { type: 'string', description: 'Optional unique option-set code.' },
+              description: { type: 'string' },
+              value_type: { type: 'string', description: 'Data type of the option codes (TEXT, NUMBER, INTEGER, LETTER, BOOLEAN, MULTI_TEXT, …). Defaults to TEXT if omitted on create.' },
+              options: { type: 'array', description: 'For create: the ordered options. Each { code, name }. Codes must be unique within the set.', items: { type: 'object', properties: { code: { type: 'string' }, name: { type: 'string' } } } }
+            }
+          },
+          options: { type: 'array', description: 'For add_options: the new options to append, each { code, name }. New codes must not collide with the set\'s existing codes.', items: { type: 'object', properties: { code: { type: 'string' }, name: { type: 'string' } } } },
+          option_codes: { type: 'array', description: 'For remove_options: the codes of the options to delete from the set. (Use option_ids to target by UID instead.)', items: { type: 'string' } },
+          option_ids: { type: 'array', description: 'For remove_options: option UIDs to delete (alternative to option_codes). For reorder_options: may be used as the ordered list of option UIDs if order is omitted.', items: { type: 'string' } },
+          order: { type: 'array', description: 'For reorder_options: the option codes (or UIDs) in the desired display order. Must cover every option currently in the set, each exactly once.', items: { type: 'string' } },
+          dry_run_only: { type: 'boolean', description: 'For create: validate the metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/add_options/remove_options/reorder_options/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -5084,6 +5133,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_validation_rules: true,
   manage_org_units: true,
   manage_indicators: true,
+  manage_option_sets: true,
   manage_backups: true,
 });
 
@@ -5207,6 +5257,18 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
       || /\b(numerator|denominator)\b/.test(combinedText)
       || (/\bindicators?\b/.test(combinedText)
           && /\b(create|add|build|make|define|set\s*up|edit|update|modify|rename|delete|remove|coverage|per\s*cent|percentage|reporting\s*rate|rate|ratio|formula|factor)\b/.test(combinedText)));
+  // ── Option-set intent ──
+  // Reusable code/label pick-lists. Conservative: fires on an explicit
+  // "option set(s)" / "optionset(s)" mention, OR a membership-mutation verb on
+  // "option(s)" coupled with a drop-down / code-list / "to the set" container
+  // term — so a bare "what options do I have" never surfaces the tool.
+  const wantsOptionSetIntent =
+    /\boption\s*sets?\b/.test(combinedText)
+    || /\boptionsets?\b/.test(combinedText)
+    || (/\b(add|append|remove|delete|drop|reorder|re-?order)\b/.test(combinedText)
+        && /\boptions?\b/.test(combinedText)
+        && (/\b(drop[\s-]?down|pick[\s-]?list|picklist|code\s*list|choices?\s+list)\b/.test(combinedText)
+            || /\b(?:the|this|that)\s+(?:[\w-]+\s+){0,2}set\b/.test(combinedText)));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5390,6 +5452,15 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Option-set authoring — surfaced only on explicit option-set intent so it
+  //    never crowds unrelated flows. search_metadata is the companion for
+  //    resolving the set / option UIDs the membership ops need. Purely additive:
+  //    create_metadata's inline option_set path is unaffected. ──
+  if (wantsOptionSetIntent) {
+    selected.add('manage_option_sets');
+    selected.add('search_metadata');
+  }
+
   // ── Intent-driven override: if the user explicitly asks to create or manage
   //    metadata, the full authoring kit must be available regardless of page.
   //    This fixes the failure mode where a user on Data Visualizer / Maps / a
@@ -5435,7 +5506,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
     'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
-    'manage_indicators',
+    'manage_indicators', 'manage_option_sets',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5473,6 +5544,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_validation_rules');
     selected.delete('manage_org_units');
     selected.delete('manage_indicators');
+    selected.delete('manage_option_sets');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5567,6 +5639,13 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
       || /\b(numerator|denominator)\b/i.test(text)
       || (/\bindicators?\b/i.test(text)
           && /\b(create|add|build|make|define|set\s*up|edit|update|modify|rename|delete|remove|coverage|per\s*cent|percentage|reporting\s*rate|rate|ratio|formula|factor)\b/i.test(text)));
+  const wantsOptionSetPrompt =
+    /\boption\s*sets?\b/i.test(text)
+    || /\boptionsets?\b/i.test(text)
+    || (/\b(add|append|remove|delete|drop|reorder|re-?order)\b/i.test(text)
+        && /\boptions?\b/i.test(text)
+        && (/\b(drop[\s-]?down|pick[\s-]?list|picklist|code\s*list|choices?\s+list)\b/i.test(text)
+            || /\b(?:the|this|that)\s+(?:[\w-]+\s+){0,2}set\b/i.test(text)));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -6187,6 +6266,33 @@ Pass a UID or the exact name. Common types: **"Number (Factor 1)"** (×1 — raw
 - "ANC 1 coverage as a percentage of expected pregnancies": create indicator:{ name:"ANC 1 Coverage", indicator_type:"Per cent", numerator:"#{anc1Uid}", denominator:"#{expectedPregnanciesUid}" }.
 - "Maternal deaths per 100,000 live births": indicator_type:"Per hundred thousand", numerator:"#{maternalDeaths}", denominator:"#{liveBirths}".
 - "Total malaria cases (a plain sum)": indicator_type:"Number (Factor 1)", numerator:"#{malariaConfirmed} + #{malariaClinical}", denominator:"1".
+`;
+  }
+
+  // ── Option Sets KB — reusable code/label pick-lists (manage_option_sets) ──
+  if (wantsOptionSetPrompt) {
+    p += `
+## DHIS2 Option Sets (manage_option_sets)
+An **option set** is a reusable, ordered pick-list (drop-down) of \`{ code, name }\` pairs that constrains a data element or tracked-entity attribute to a fixed set of choices (e.g. HIV Result = Positive/Negative/Inconclusive). \`code\` is the value stored in data; \`name\` is the label shown to users. **Codes must be unique within a set.** Use **manage_option_sets** for ALL standalone option-set work — never hand-write /metadata option bodies via dhis2_query.
+
+### Actions
+- **list** (name / value_type filters) and **get** (returns options in display order) are read-only.
+- **create** — a new standalone set + its options, imported atomically (VALIDATE then COMMIT). Pass \`option_set:{ name, value_type, options:[{code,name},…] }\`. value_type defaults to TEXT if omitted.
+- **add_options** — append new options to an existing set: \`option_set_id\` + \`options:[{code,name},…]\`. New codes must not collide with existing ones.
+- **remove_options** — delete options from a set by \`option_codes:[…]\` or \`option_ids:[…]\`. Deletes the option objects (which auto-detaches them); refuses to remove the last remaining option.
+- **reorder_options** — set display order via \`order:[…]\` listing every current option's code (or UID) in the desired sequence.
+- **update** — patch the set's OWN fields (name / code / description / value_type) only — never membership.
+- **delete** — remove the whole set (and its options); refuses with the exact blockers if any data element or tracked-entity attribute still uses it.
+
+### Rules
+- update / add_options / remove_options / reorder_options / delete each auto-snapshot a backup first (restore via manage_backups).
+- NEVER invent option-set or option UIDs — get them from search_metadata / action=get.
+- To create an option set as part of a NEW data element in one shot, use create_metadata's inline \`option_set\` instead. To CONVERT a set to MULTI_TEXT (multi-select) and cascade the change to every DE/TEA using it, use manage_metadata(action=convert_value_type). This tool owns standalone option-set CRUD.
+
+### Examples
+- "Create an HIV Result option set with Positive/Negative/Inconclusive": create option_set:{ name:"HIV Result", value_type:"TEXT", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INC",name:"Inconclusive"}] }.
+- "Add a 'Refused' choice to that set": add_options option_set_id:"<id>", options:[{code:"REF",name:"Refused"}].
+- "Put Negative before Positive": reorder_options option_set_id:"<id>", order:["NEG","POS","INC"].
 `;
   }
 
@@ -10328,6 +10434,11 @@ async function executeTool(name, args) {
     return await executeManageIndicators(args);
   }
 
+  // ── manage_option_sets ──
+  if (name === 'manage_option_sets') {
+    return await executeManageOptionSets(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -11300,6 +11411,378 @@ async function createIndicator(args) {
     numerator_meaning: numChk.description,
     denominator_meaning: denChk.description,
     message: `Created indicator "${name}" (${id}) of type "${itype.name}" (factor ${itype.factor}).`,
+  };
+}
+
+// ── manage_option_sets: full lifecycle CRUD for DHIS2 option sets ──
+//
+// An option set is a reusable, ordered pick-list of { code, name } options that
+// data elements / tracked-entity attributes reference to constrain input.
+// Proven on the 2.43 playground BEFORE writing: the optionSet (owning side via
+// its options[] list) and the standalone Option objects are imported together
+// in one atomic /metadata payload; an option is removed by deleting the Option
+// object (which auto-detaches it from the set); ordering is driven by each
+// option's sortOrder. All shared helpers are reused with their existing
+// signatures — no shared code is modified.
+
+const OPTION_SET_VALUE_TYPES = new Set([
+  'TEXT', 'LONG_TEXT', 'MULTI_TEXT', 'LETTER', 'PHONE_NUMBER', 'EMAIL', 'BOOLEAN',
+  'TRUE_ONLY', 'DATE', 'DATETIME', 'TIME', 'NUMBER', 'UNIT_INTERVAL', 'PERCENTAGE',
+  'INTEGER', 'INTEGER_POSITIVE', 'INTEGER_NEGATIVE', 'INTEGER_ZERO_OR_POSITIVE',
+  'USERNAME', 'COORDINATE', 'ORGANISATION_UNIT', 'REFERENCE', 'AGE', 'URL',
+  'FILE_RESOURCE', 'IMAGE', 'GEOJSON',
+]);
+
+// Validate + normalize an array of { code, name } option inputs.
+// Returns { ok:true, options:[{code,name}] } or { _error }.
+function normalizeOptionInputs(rawList, label = 'options') {
+  if (!Array.isArray(rawList) || rawList.length === 0) {
+    return { _error: `${label} must be a non-empty array of { code, name } objects.` };
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length; i++) {
+    const o = rawList[i] || {};
+    const code = String(o.code ?? '').trim();
+    const name = String(o.name ?? '').trim();
+    if (!code) return { _error: `${label}[${i}] is missing a code.` };
+    if (!name) return { _error: `${label}[${i}] (code "${code}") is missing a name.` };
+    if (seen.has(code)) return { _error: `${label} contains duplicate code "${code}". Codes must be unique within an option set.` };
+    seen.add(code);
+    out.push({ code, name });
+  }
+  return { ok: true, options: out };
+}
+
+async function executeManageOptionSets(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create, update, add_options, remove_options, reorder_options, delete.' };
+  }
+  const osId = args.option_set_id || args.object_id;
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.value_type) filters.push(`valueType:eq:${encodeURIComponent(String(args.value_type).toUpperCase())}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `optionSets?fields=id,displayName,code,valueType,options~size&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `optionSets list failed: ${resp._error}` };
+    const optionSets = (resp.optionSets || []).map(o => ({
+      id: o.id,
+      name: o.displayName,
+      code: o.code || null,
+      valueType: o.valueType,
+      options: o.options ?? 0,
+    }));
+    return { success: true, total: optionSets.length, pager_total: resp.pager?.total ?? null, optionSets };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    if (!osId) return { _error: 'option_set_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `optionSets/${osId}?fields=id,displayName,code,description,valueType,options[id,displayName,code,sortOrder]`
+    );
+    if (resp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load option set ${osId}: ${resp._error}` };
+    const options = (resp.options || [])
+      .slice()
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
+      .map(o => ({ id: o.id, name: o.displayName, code: o.code, sortOrder: o.sortOrder }));
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      code: resp.code,
+      description: resp.description,
+      valueType: resp.valueType,
+      option_count: options.length,
+      options,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_option_sets', 'create');
+    if (_gate) return _gate;
+    return await createOptionSet(args);
+  }
+
+  // ── update (own fields only) ────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_option_sets', 'update', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for update' };
+    const os = args.option_set;
+    if (!os || typeof os !== 'object') {
+      return { _error: 'option_set object required for update', _hint: 'Pass option_set:{ name?, code?, description?, value_type? }. To change membership use add_options / remove_options / reorder_options.' };
+    }
+    if (os.value_type !== undefined && os.value_type !== null) {
+      const vt = String(os.value_type).toUpperCase();
+      if (!OPTION_SET_VALUE_TYPES.has(vt)) return { _error: `Invalid value_type "${os.value_type}".`, _hint: `One of: ${[...OPTION_SET_VALUE_TYPES].join(', ')}.` };
+    }
+    const exists = await verifyTargetExists('optionSets', osId, 'manage_option_sets', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=:owner`);
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || osId;
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_option_set', tool: 'manage_option_sets', action: 'update', reason: `Update option set ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (os.name !== undefined) { ownerResp.name = os.name; applied.name = os.name; }
+    if (os.code !== undefined) { ownerResp.code = os.code; applied.code = os.code; }
+    if (os.description !== undefined) { ownerResp.description = os.description; applied.description = os.description; }
+    if (os.value_type !== undefined && os.value_type !== null) { ownerResp.valueType = String(os.value_type).toUpperCase(); applied.valueType = ownerResp.valueType; }
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'option_set supplied no recognized own-fields to update.', _hint: 'Recognized: name, code, description, value_type. For options use add_options / remove_options / reorder_options.', backup: backup.block };
+    }
+    const putResp = await safeDhis2Fetch(`optionSets/${osId}`, { method: 'PUT', body: ownerResp });
+    if (putResp?._error) return { _error: `Failed to update option set: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', option_set_id: osId, option_set_name: objName, applied, backup: backup.block };
+  }
+
+  // ── add_options ─────────────────────────────────────────────────────────
+  if (action === 'add_options') {
+    const _gate = requireWriteAuth('manage_option_sets', 'add_options', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for add_options' };
+    const norm = normalizeOptionInputs(args.options, 'options');
+    if (norm._error) return norm;
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || osId;
+
+    // Reject codes that already exist in the set — option codes must be unique.
+    const existing = await safeDhis2Fetch(`options?filter=optionSet.id:eq:${osId}&fields=code&paging=false`);
+    if (existing?._error) return { _error: `Could not read existing options of ${osId}: ${existing._error}` };
+    const existingCodes = new Set((existing.options || []).map(o => o.code));
+    const collide = norm.options.filter(o => existingCodes.has(o.code)).map(o => o.code);
+    if (collide.length) return { _error: `These codes already exist in "${objName}": ${collide.join(', ')}.`, _hint: 'Option codes must be unique within a set. Choose different codes, or remove the existing options first.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'add_options', tool: 'manage_option_sets', action: 'add_options', reason: `Add ${norm.options.length} option(s) to ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const baseOrder = Array.isArray(ownerResp.options) ? ownerResp.options.length : 0;
+    const newOptionObjs = norm.options.map((o, i) => ({ id: generateDhis2Uid(), name: o.name, code: o.code, sortOrder: baseOrder + i, optionSet: { id: osId } }));
+    ownerResp.options = [...(ownerResp.options || []), ...newOptionObjs.map(o => ({ id: o.id }))];
+
+    const result = await postMetadataPayload({ optionSets: [ownerResp], options: newOptionObjs }, false);
+    if (!result.success) return { _error: result._error || 'add_options failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return {
+      success: true,
+      action: 'add_options',
+      option_set_id: osId,
+      option_set_name: objName,
+      added: newOptionObjs.map(o => ({ id: o.id, code: o.code, name: o.name })),
+      backup: backup.block,
+    };
+  }
+
+  // ── remove_options ───────────────────────────────────────────────────────
+  if (action === 'remove_options') {
+    const _gate = requireWriteAuth('manage_option_sets', 'remove_options', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for remove_options' };
+    const byId = Array.isArray(args.option_ids) && args.option_ids.length > 0;
+    const byCode = Array.isArray(args.option_codes) && args.option_codes.length > 0;
+    if (!byId && !byCode) return { _error: 'Provide option_codes[] or option_ids[] for remove_options.' };
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=id,displayName,options[id,code]`);
+    if (ownerResp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.displayName || osId;
+    const setOptions = ownerResp.options || [];
+    const targetIds = [];
+    const notFound = [];
+    if (byId) {
+      for (const id of args.option_ids) { (setOptions.some(o => o.id === id) ? targetIds : notFound).push(id); }
+    } else {
+      const codeToId = new Map(setOptions.map(o => [o.code, o.id]));
+      for (const c of args.option_codes) { const id = codeToId.get(c); if (id) targetIds.push(id); else notFound.push(c); }
+    }
+    if (notFound.length) return { _error: `These ${byId ? 'option ids' : 'codes'} are not in "${objName}": ${notFound.join(', ')}.`, _hint: 'Use action=get to list the set\'s current options.' };
+    if (targetIds.length >= setOptions.length) return { _error: `Refusing to remove ALL ${setOptions.length} option(s) from "${objName}" — that would leave an empty option set.`, _hint: 'Keep at least one option, or delete the whole set with action=delete.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'remove_options', tool: 'manage_option_sets', action: 'remove_options', reason: `Remove ${targetIds.length} option(s) from ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }, ...targetIds.map(id => ({ object_type: 'options', object_id: id, role: 'cascade' }))],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const removed = [];
+    const failed = [];
+    for (const id of targetIds) {
+      const del = await safeDhis2Fetch(`options/${id}`, { method: 'DELETE' });
+      if (del?._error) failed.push({ id, error: del._error }); else removed.push(id);
+    }
+    if (failed.length) return { _error: `Removed ${removed.length}/${targetIds.length}; ${failed.length} failed.`, removed, failed, backup: backup.block, _hint: 'An option may be referenced by saved data values; DHIS2 blocks those deletions.' };
+    return { success: true, action: 'remove_options', option_set_id: osId, option_set_name: objName, removed_count: removed.length, removed_ids: removed, backup: backup.block };
+  }
+
+  // ── reorder_options ───────────────────────────────────────────────────────
+  if (action === 'reorder_options') {
+    const _gate = requireWriteAuth('manage_option_sets', 'reorder_options', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for reorder_options' };
+    const order = (Array.isArray(args.order) && args.order.length) ? args.order
+      : (Array.isArray(args.option_ids) && args.option_ids.length ? args.option_ids : null);
+    if (!order) return { _error: 'Provide order[] (option codes or UIDs in the desired display order) for reorder_options.' };
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || osId;
+    const optsResp = await safeDhis2Fetch(`options?filter=optionSet.id:eq:${osId}&fields=:owner&paging=false`);
+    if (optsResp?._error) return { _error: `Could not load options of ${osId}: ${optsResp._error}` };
+    const opts = optsResp.options || [];
+    if (opts.length === 0) return { _error: `Option set "${objName}" has no options to reorder.` };
+    const byOptId = new Map(opts.map(o => [o.id, o]));
+    const byOptCode = new Map(opts.map(o => [o.code, o]));
+    const resolved = [];
+    const unknown = [];
+    const seen = new Set();
+    for (const tok of order) {
+      const o = byOptId.get(tok) || byOptCode.get(tok);
+      if (!o) { unknown.push(tok); continue; }
+      if (seen.has(o.id)) continue;
+      seen.add(o.id);
+      resolved.push(o);
+    }
+    if (unknown.length) return { _error: `These tokens don't match any option in "${objName}": ${unknown.join(', ')}.`, _hint: 'order[] must use this set\'s option codes or UIDs (action=get lists them).' };
+    if (resolved.length !== opts.length) {
+      const missing = opts.filter(o => !seen.has(o.id)).map(o => o.code);
+      return { _error: `order[] must cover every option exactly once. Missing: ${missing.join(', ')}.`, _hint: 'Include all current option codes/UIDs.' };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'reorder_options', tool: 'manage_option_sets', action: 'reorder_options', reason: `Reorder options of ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    resolved.forEach((o, i) => { o.sortOrder = i; });
+    ownerResp.options = resolved.map(o => ({ id: o.id }));
+    const result = await postMetadataPayload({ optionSets: [ownerResp], options: resolved }, false);
+    if (!result.success) return { _error: result._error || 'reorder_options failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'reorder_options', option_set_id: osId, option_set_name: objName, order: resolved.map(o => o.code), backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_option_sets', 'delete', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for delete' };
+    const exists = await verifyTargetExists('optionSets', osId, 'manage_option_sets', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || osId;
+
+    // optionSets IS mapped in checkMetadataReferences (data elements + TEAs that
+    // use it). If anything references it, refuse with the exact blockers — the
+    // option set must be detached before it can be deleted.
+    const refsResult = await checkMetadataReferences('optionSets', osId);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete option set "${objName}" — it is still in use.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('optionSets', osId, refsResult.references),
+      };
+    }
+
+    // Child options must be deleted first; deleting the set alone can leave
+    // orphaned Option objects. Snapshot the set AND its options for restore.
+    const optsResp = await safeDhis2Fetch(`options?filter=optionSet.id:eq:${osId}&fields=id&paging=false`);
+    const childIds = (optsResp?.options || []).map(o => o.id);
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_option_set', tool: 'manage_option_sets', action: 'delete', reason: `Deleting option set ${objName} (${osId})` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }, ...childIds.map(id => ({ object_type: 'options', object_id: id, role: 'cascade' }))],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    for (const id of childIds) { await safeDhis2Fetch(`options/${id}`, { method: 'DELETE' }); }
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { optionSets: [{ id: osId }] },
+    });
+    if (delResp?._error) return { _error: `Option set deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'optionSets', id: osId, name: objName, options_deleted: childIds.length },
+        message: `Successfully deleted option set "${objName}" and its ${childIds.length} option(s).`,
+        backup: backup.block,
+      };
+    }
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Option set "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'It may still be referenced by a data element or tracked-entity attribute. Detach those first, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_option_sets.`,
+    _hint: 'One of: list, get, create, update, add_options, remove_options, reorder_options, delete.',
+  };
+}
+
+async function createOptionSet(args) {
+  const os = args.option_set;
+  if (!os || typeof os !== 'object') {
+    return { _error: 'option_set object required for create', _hint: 'Pass option_set:{ name, value_type, options:[{code,name},…] }.' };
+  }
+  if (!os.name || !String(os.name).trim()) return { _error: 'option_set.name is required.' };
+  const vt = (os.value_type === undefined || os.value_type === null || !String(os.value_type).trim())
+    ? 'TEXT'
+    : String(os.value_type).toUpperCase();
+  if (!OPTION_SET_VALUE_TYPES.has(vt)) return { _error: `Invalid value_type "${os.value_type}".`, _hint: `One of: ${[...OPTION_SET_VALUE_TYPES].join(', ')}.` };
+  const norm = normalizeOptionInputs(os.options, 'option_set.options');
+  if (norm._error) return norm;
+
+  const setId = generateDhis2Uid();
+  const name = String(os.name).trim();
+  const optionObjs = norm.options.map((o, i) => ({ id: generateDhis2Uid(), name: o.name, code: o.code, sortOrder: i, optionSet: { id: setId } }));
+  const setObj = { id: setId, name, valueType: vt, options: optionObjs.map(o => ({ id: o.id })) };
+  if (os.code) setObj.code = String(os.code).trim();
+  if (os.description) setObj.description = os.description;
+
+  const result = await postMetadataPayload({ optionSets: [setObj], options: optionObjs }, !!args.dry_run_only);
+  if (!result.success) {
+    return { _error: result._error || 'Option set create failed.', phase: result.phase, errors: result.errors };
+  }
+  if (args.dry_run_only) {
+    return { success: true, dry_run: true, message: `Validation passed for "${name}". No option set created (dry_run_only=true).`, would_create: { id: setId, name, valueType: vt, option_count: optionObjs.length } };
+  }
+  return {
+    success: true,
+    action: 'create',
+    option_set_id: setId,
+    option_set: { id: setId, name, valueType: vt, code: setObj.code, options: optionObjs.map(o => ({ id: o.id, code: o.code, name: o.name, sortOrder: o.sortOrder })) },
+    message: `Created option set "${name}" (${setId}, ${vt}) with ${optionObjs.length} option(s).`,
   };
 }
 

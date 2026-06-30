@@ -708,3 +708,85 @@ read-back 404. A bad indicatorType was rejected ("Invalid reference … (Indicat
 numeric expressions (valid → status OK + description; bad UID / malformed → status ERROR). Every test object was
 deleted and a `name:like:ZZ` sweep confirmed **zero residue**. `node --check background.js` and
 `node --check sidepanel/panel.js` both pass; the intent battery passes with zero false positives.
+
+---
+
+## 13. New tool — `manage_option_sets` (DHIS2 option sets — reusable code/label pick-lists)
+
+**File:** `background.js` (new `executeManageOptionSets` + `createOptionSet` + `normalizeOptionInputs`
++ `OPTION_SET_VALUE_TYPES`, TOOLS entry, TOOL_ROUTER, dispatch, `getContextualTools`,
+`buildSystemPrompt`), `sidepanel/panel.js` (iconMap / toolLabels / detail renderer),
+`manifest.json` (version 2.4.3 → 2.4.4).
+
+**Type of change:** Added (new tool, purely additive).
+
+**What it does:**
+Adds full **standalone option-set lifecycle management**. An option set is the reusable, ordered
+pick-list (drop-down) of `{ code, name }` options that data elements and tracked-entity attributes
+reference to constrain input (e.g. "HIV Result: Positive/Negative/Inconclusive"). Before this run the
+chatbot could only create an option set **inline** inside a new data element (`create_metadata`) or
+**convert/delete** one through `manage_metadata` — there was **no way** to create a standalone set,
+add/remove/reorder its options, or rename/retype it. `manage_option_sets` closes that gap with eight
+actions:
+
+- **list / get** — read-only (get returns options in display order).
+- **create** — a new standalone optionSet + its Option objects, imported atomically through the shared
+  `postMetadataPayload` VALIDATE-then-COMMIT path. `value_type` is validated against the canonical DHIS2
+  valueType enum (defaults to TEXT); option codes are required, non-empty and de-duplicated up front.
+  Supports `dry_run_only`.
+- **add_options** — appends new options to an existing set. Re-fetches the set's `:owner`, rejects codes
+  that collide with existing ones, generates UIDs, extends `options[]` and imports the new Option objects
+  + updated set in one atomic payload.
+- **remove_options** — deletes options by `option_codes[]` or `option_ids[]`. Deletes the Option objects
+  directly (DHIS2 auto-detaches them from the set), and **refuses to remove the last remaining option**.
+- **reorder_options** — sets display order from `order[]` (codes or UIDs). Fetches every option's `:owner`,
+  validates the list covers each option exactly once, reassigns `sortOrder` 0-based and re-imports.
+- **update** — patches only the set's OWN fields (name / code / description / value_type), never membership;
+  auto-snapshots a backup then PUTs the merged `:owner`.
+- **delete** — runs `checkMetadataReferences('optionSets', …)` (data elements + TEAs using the set) and
+  refuses with the exact blockers if in use; otherwise deletes the child options first (so none are
+  orphaned), then the set via atomic DELETE, surfacing DHIS2's exact reason on a `deleted:0`.
+
+All destructive actions auto-snapshot a backup first (`ensureBackupOrBail`, restorable via
+`manage_backups`).
+
+**Wiring (every layer):** `TOOLS` array → `TOOL_ROUTER` → `executeTool` dispatch → handler →
+`getContextualTools` (surfaced **only** on an explicit `wantsOptionSetIntent`, plus `search_metadata` for
+resolving set/option UIDs; added to `writeCapableNames` so `manage_backups` is offered after a write; added
+to the save-error-diagnosis read-only strip list) → `buildSystemPrompt` (an Option Sets KB block gated on
+`wantsOptionSetPrompt`) → `panel.js` iconMap (`🗂️`), toolLabels and a `detail` renderer.
+
+**No-regression analysis:**
+- **Purely additive.** The only `git diff` "deletion" is a one-line reflow that keeps `manage_indicators`
+  in `writeCapableNames` while appending `manage_option_sets` to the same line — no behavior removed. No
+  existing function, prompt block, router branch or contextual-selection rule was modified. The new
+  contextual intent only *adds* `manage_option_sets` (+`search_metadata`) to the selected Set; it can never
+  remove or crowd out an existing tool.
+- **Conservative, collision-free intent.** `wantsOptionSetIntent` / `wantsOptionSetPrompt` fire on an
+  explicit "option set(s)" / "optionset(s)" mention, or a membership-mutation verb on "option(s)" coupled
+  with a drop-down / code-list / "the … set" container term. A 24-phrase battery passes with **zero false
+  positives** across 14 negatives (including adversarial "set the options for the analysis", "remove me from
+  the data set query", "give me options to improve performance", "show me the dropdown menu settings") and
+  9/10 realistic positives. The KB block and tool description explicitly defer inline option-set creation to
+  `create_metadata` and MULTI_TEXT conversion to `manage_metadata(action=convert_value_type)`, so the
+  system-prompt addition **reinforces** rather than contradicts existing guidance.
+- **Touches no shared code's behavior.** It only *calls* `safeDhis2Fetch`, `requireWriteAuth`,
+  `verifyTargetExists`, `ensureBackupOrBail`, `checkMetadataReferences`, `buildDeletionHint`,
+  `postMetadataPayload` and `generateDhis2Uid` with their existing signatures — no edits to any of them.
+  `checkMetadataReferences` already maps `optionSets` (DE + TEA usage); `postMetadataPayload` already lists
+  `optionSets`/`options` in its shortName-autofix array; `getSnapshotFields` falls back to `:owner` for
+  `optionSets`, so the auto-backup/restore machinery supports the tool out of the box. New module-level
+  identifiers (`OPTION_SET_VALUE_TYPES`, `normalizeOptionInputs`, `executeManageOptionSets`,
+  `createOptionSet`) were confirmed collision-free.
+- `panel.js` changes are additive (iconMap/toolLabels lookups fall back by default; the new `else if` branch
+  precedes `manage_backups`), so every existing tool still renders.
+
+**Verification (DHIS2 2.43 playground, `stable-2-43-0-1`):** The full lifecycle was proven via curl with the
+tool's exact paths/payloads BEFORE writing the code — pre-generated UIDs; atomic create
+(`optionSets` + `options`) via `importMode=VALIDATE` (created:4, 0 errors) then COMMIT; read-back matched
+(3 options, sortOrder normalized 0-based); `add_options` (full set `:owner` + new Option → created:1
+updated:1); `reorder_options` (fetch options `:owner`, reassign sortOrder, re-import → updated:4, order
+reversed exactly); `remove_options` (direct `DELETE /options/{id}` auto-detached from the set);
+`update` (PUT `:owner` rename) returned OK; `delete` (child options then set) returned 200 each. A
+`name:like:ZZAITEST` sweep confirmed **zero residue** (0 optionSets, 0 options). `node --check background.js`
+and `node --check sidepanel/panel.js` both pass; the intent battery passes with zero false positives.
