@@ -5306,7 +5306,12 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     || /\bnew (tracker|program|stage|data element|option set|indicator|rule|category|category combo|category combination|disaggregation|dataset|data set)\b/.test(combinedText);
   const wantsManageIntent =
     /\b(delete|remove|drop|detach|unassign|clean up|update|modify|change|fix|grant|give|enable|set|share|assign)\b.{0,120}\b(program|stage|data ?element|option set|attribute|metadata|sharing|access|permission|org unit|organisation unit|ou|category|category combo|category combination|disaggregation|dataset|data set)\b/.test(combinedText);
-  const wantsSharingIntent = /\b(sharing|access|permission|publicaccess|public access|user group access|share with|include me|include my user)\b/.test(combinedText);
+  const wantsSharingIntent =
+    /\b(sharing|shared|access|permission|publicaccess|public access|user group access|share with|include me|include my user)\b/.test(combinedText)
+    || /\b(make|set|mark|publish|share)\b.{0,30}\bpublic(ly)?\b/.test(combinedText)
+    || /\bpublic(ly)?\b.{0,25}\b(access|sharing|visible|to\s+everyone|to\s+all)\b/.test(combinedText)
+    || /\bshare[ds]?\b.{0,40}\bwith\b.{0,40}\b(everyone|all\s+users|the\s+public|public|user\s*group|colleagues?|team)\b/.test(combinedText)
+    || /\b(give|grant)\b.{0,30}\b(everyone|all\s+users)\b.{0,20}\baccess\b/.test(combinedText);
   const wantsIconStyleIntent = /\b(icon|color|colour|style)\b/.test(combinedText)
     && /\b(program|stage|data ?element|option set|attribute|tea|indicator|option)\b/.test(combinedText);
   const wantsNotificationsIntent =
@@ -5641,6 +5646,16 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   if (wantsDashboardIntent || isDashboard || isDataViz) {
     selected.add('manage_dashboards');
     selected.add('search_metadata');
+    // Dashboard/visualization SHARING and DELETION live in manage_metadata
+    // (manage_dashboards only CREATES and READS). The canonical multi-step
+    // dashboard goal ends in a "share it" / "make it public" step, so the
+    // sharing tool must travel with explicit dashboard/visualization authoring
+    // intent — otherwise that final step has no tool and the model falls back
+    // to a raw dhis2_query PUT that DHIS2 rejects. Gated on the explicit text
+    // intent (NOT bare isDataViz/isDashboard) so pure analytics turns add no
+    // destructive tool; on the Dashboard app manage_metadata is already
+    // surfaced by the non-tracker authoring block above.
+    if (wantsDashboardIntent) selected.add('manage_metadata');
   }
 
   // ── Intent-driven override: if the user explicitly asks to create or manage
@@ -5774,7 +5789,9 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
   const wantsSharingAccess = /\b(sharing|access|permission|can'?t see|not visible|not showing|doesn'?t appear|doesn'?t show|don'?t see|missing from|hidden|no access|data access|publicAccess|public access|user group access)\b/i.test(text)
     || /\b(capture|data entry|tracker).{0,60}\b(not|doesn'?t|can'?t|missing|hidden|don'?t)\b/i.test(text)
     || /\b(not|doesn'?t|can'?t|missing|hidden|don'?t).{0,60}\b(capture|data entry|tracker|drop.?down|dropdown|list)\b/i.test(text)
-    || /\b(fix|update|change|set|grant|give|enable)\b.{0,40}\b(sharing|access|permission|visibility)\b/i.test(text);
+    || /\b(fix|update|change|set|grant|give|enable)\b.{0,40}\b(sharing|access|permission|visibility)\b/i.test(text)
+    || /\b(make|set|mark|publish|share)\b.{0,30}\bpublic(ly)?\b/i.test(text)
+    || /\bshare[ds]?\b.{0,40}\bwith\b.{0,40}\b(everyone|all\s+users|the\s+public|user\s*group|team|colleagues?)\b/i.test(text);
   const wantsIconStyle = /\b(icon|style)\b/i.test(text) && /\b(program|stage|data ?element|option set|attribute|tea|indicator)\b/i.test(text)
     || /\b(give|set|assign|change|update|pick|choose|add)\b.{0,25}\b(icon|style|color|colour)\b/i.test(text)
     || /\b(icon|style|color|colour)\b.{0,40}\b(for|to|on)\b.{0,40}\b(program|stage|data ?element|option set|attribute|indicator)\b/i.test(text);
@@ -5849,6 +5866,28 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
     || (/\b(create|build|make|save|design|set\s*up|assemble)\b/i.test(text)
         && (/\bvisuali[sz]ations?\b/i.test(text) || /\bpivot\s*tables?\b/i.test(text)
             || /\bsingle[-\s]?value\b/i.test(text) || /\b(saved|reusable|favou?rite)\s+(chart|graph|visuali[sz]ation|pivot)\b/i.test(text)));
+
+  // Compound / multi-step authoring goal — the request needs several DEPENDENT
+  // steps to finish (e.g. a dashboard whose indicators/visualizations do not
+  // exist yet, or "set up a program AND its indicators AND a dashboard AND
+  // sharing"). Detected when dashboard authoring co-occurs with create /
+  // indicator / visualization intent, OR when an assembling verb co-occurs with
+  // a chaining word and two-or-more distinct buildable nouns. Used only to add
+  // the orchestration playbook below — never to remove or gate any tool.
+  const _buildNouns = (text.match(/\b(programmes?|programs?|datasets?|data\s*sets?|data\s*elements?|program\s*indicators?|indicators?|visuali[sz]ations?|charts?|pivots?|dashboards?|option\s*sets?|legend\s*sets?|validation\s*rules?|org(?:anisation)?\s*units?|sharing)\b/gi) || []);
+  const _distinctBuildNouns = new Set(_buildNouns.map(s => s.toLowerCase().replace(/\s+/g, ' ').replace(/s$/, '')));
+  const wantsMultiStepGoal =
+    // Dashboard CREATION (isCreating) that ALSO names a second buildable piece —
+    // an indicator/visualization/data-element, or explicit "don't have it yet"
+    // language. Both guards are required: bare "build a dashboard of X" (one
+    // step, no second piece) and bare "make this visualization public" (a pure
+    // sharing step, no creation) must each stay false.
+    (wantsDashboardPrompt && isCreating && (wantsIndicatorPrompt
+        || /\b(indicators?|visuali[sz]ations?|program\s*indicators?|data\s*elements?)\b/i.test(text)
+        || /\b(don'?t|do\s*not|doesn'?t|does\s*not|not\s*yet|missing|need(s)?\s+(new|to\s+create)|that\s+don'?t\s+exist)\b/i.test(text)))
+    || (/\b(build|create|make|set\s*up|setup|assemble|design)\b/i.test(text)
+        && /\b(and|then|plus|including|along\s+with|as\s+well\s+as|so\s+that)\b/i.test(text)
+        && _distinctBuildNouns.size >= 2);
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -6108,6 +6147,37 @@ When a call returns 404 or 409:
 - **404**: the path / UID / resource does not exist. STOP. Do not retry the same path. Do not try a similar verb. Do not invent "stale cache" explanations. Either ask the user, or call a discovery endpoint.
 - **409**: the request body or constraints are wrong. Read the error code (E1xxx for tracker, importSummary for metadata). STOP. Do not retry without first correcting the request based on the error.
 `;
+
+  // ── Multi-step orchestration playbook — only for compound goals ──
+  // Teaches decomposition, dependency ordering, and ID-chaining across tools so
+  // the model finishes a goal whose pieces don't exist yet (the canonical
+  // "build a dashboard that needs new indicators, then share it" chain) entirely
+  // on its own. Gated on wantsMultiStepGoal so it never bloats single-step turns.
+  if (wantsMultiStepGoal) {
+    p += `
+## Multi-step goals — decompose, order by dependency, chain IDs
+This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose indicators/visualizations don't exist yet, or "set up a program AND its indicators AND a dashboard AND sharing"). Do NOT stop after the first tool and do NOT hand the remaining steps back to the user. Plan the WHOLE chain, then execute every step yourself, in dependency order, feeding each tool's returned UID into the next tool's inputs.
+
+### Procedure
+1. UNDERSTAND the end state: list every object that must EXIST when you are done.
+2. Walk the dependencies BACKWARDS: a dashboard needs visualizations; a visualization needs data items (indicators / data elements / program indicators); an aggregate indicator needs the data elements in its numerator/denominator. For each piece, check whether it already exists (search_metadata or a list action) or must be CREATED first.
+3. ORDER the steps so every input exists before it is referenced — create the missing LEAF metadata FIRST, then the objects that reference it, and do SHARING/access LAST.
+4. EXECUTE each step and READ ITS RESULT. Capture the new UID the tool returns:
+   - manage_indicators(action="create") → \`indicator_id\`
+   - manage_dashboards(action="create_visualization") → \`visualization_id\`
+   - manage_dashboards(action="create_dashboard") → \`dashboard_id\` (+ \`new_visualizations[]\`)
+   - create_metadata / manage_datasets / manage_org_units / manage_option_sets / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
+5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` goes into the dashboard's \`new_visualization.data_items\`; a saved visualization's id goes into a dashboard item's \`visualization_id\`. (This is exactly the verified provenance the Verify-before-call rule demands.)
+6. SHARE last: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). NEVER set sharing with a raw dhis2_query PUT — it fails.
+
+### Worked chain — "build a malaria dashboard that needs new indicators, then make it public"
+1. search_metadata(object_type="dataElements", query=…) → the data-element UIDs the indicator formulas need (e.g. malaria deaths, malaria cases).
+2. manage_indicators(action="create", indicator:{ name, numerator:"#{deathsUID}", denominator:"#{casesUID}", indicator_type:"Per cent" }) for EACH missing indicator → keep each returned \`indicator_id\`.
+3. manage_dashboards(action="create_dashboard", dashboard:{ name:"Malaria Surveillance" }, items:[ { new_visualization:{ name:"CFR by month", vis_type:"COLUMN", data_items:[<indicator_id #1>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } }, { new_visualization:{ name:"ACT coverage", vis_type:"SINGLE_VALUE", data_items:[<indicator_id #2>], periods:["THIS_YEAR"], org_units:["<ou>"] } } ]) — the inline visualizations and the dashboard import atomically; keep the returned \`dashboard_id\`.
+4. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------") so everyone can view it.
+Run all steps without pausing. Only ask the user when a step is genuinely ambiguous (e.g. which data element represents "malaria cases").
+`;
+  }
 
   if (hasMapCtx) {
     p += `
@@ -12784,6 +12854,10 @@ async function executeManageDashboards(args) {
     return {
       success: true,
       action: 'create_visualization',
+      // Top-level *_id mirrors manage_indicators' `indicator_id` convention so a
+      // multi-step caller can chain this UID into the next tool without digging
+      // into the nested object. The nested `visualization` object is preserved.
+      visualization_id: built.id,
       visualization: { id: built.id, name: built.viz.name, type: built.viz.type, data_items: built.viz.dataDimensionItems.length },
       message: `Created ${built.viz.type} visualization "${built.viz.name}" (${built.id}).`,
     };
@@ -12905,6 +12979,10 @@ async function executeManageDashboards(args) {
     return {
       success: true,
       action: 'create_dashboard',
+      // Top-level dashboard_id mirrors the *_id convention so the final sharing
+      // step (manage_metadata update_sharing) can chain it directly. The nested
+      // `dashboard` object is preserved for any existing reader.
+      dashboard_id: dashId,
       dashboard: { id: dashId, name: dashObj.name },
       items: dashboardItems.length,
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),

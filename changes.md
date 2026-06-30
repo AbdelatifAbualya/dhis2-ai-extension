@@ -1037,3 +1037,75 @@ metadata endpoints) → 36/36. The full gate chain (`pathReadsPatientData` → `
 blocks `tracker/events.csv` and `tracker/trackedEntities.json` while still allowing
 `analytics/events/aggregate.json`; under a LOCAL (Ollama) provider it correctly allows the patient
 read. No playground objects were created (read-only GET probes), so there is nothing to clean up.
+
+## 18. Router + orchestration — flawless multi-step dashboard goals (no new tools)
+
+**Files:** `background.js` (getContextualTools router; buildSystemPrompt; executeManageDashboards), `manifest.json` (2.6.1 → 2.6.2).
+
+**Goal of this phase:** make the ROUTER perfect and the EXISTING tools deeply orchestrated for
+MULTI-STEP goals where reaching the user's request needs several dependent steps in the right order —
+the canonical case being "build a dashboard that needs indicators/visualizations that don't exist
+yet". No new user-facing tool was added; only routing, orchestration guidance, and integration
+robustness were strengthened.
+
+**What was reproduced first (the chatbot's own tools, traced end-to-end):** for the request *"Build a
+malaria surveillance dashboard for case fatality rate and ACT coverage — we don't have those
+indicators yet, create them and the dashboard, and share it with everyone"*, the existing
+`getContextualTools` + `buildSystemPrompt` were traced. Three concrete defects surfaced:
+1. **Routing miss (sharing tool absent):** `manage_metadata` is the ONLY tool that can set a
+   dashboard's sharing or delete it (`manage_dashboards` only creates/reads). It was NOT co-surfaced
+   with `manage_dashboards`, so on Data Visualizer / Maps the chain's final "share it" step had no tool
+   and would fall back to a raw `dhis2_query` PUT that DHIS2 rejects (405/500).
+2. **Routing miss (sharing intent too narrow):** `wantsSharingIntent` matched only
+   "sharing/access/permission/share with…"; natural phrasings "share the dashboard with everyone",
+   "make it public", "publicly" did NOT fire it, so a sharing follow-up off the Dashboard app surfaced
+   no sharing tool.
+3. **Orchestration gap:** no cross-tool playbook told the model to decompose a compound goal, create
+   leaf metadata first, chain each tool's RETURNED UID into the next tool's inputs, and share last.
+   Plus an integration wrinkle: `manage_indicators` returns top-level `indicator_id` but
+   `manage_dashboards` returned only nested `visualization.id` / `dashboard.id`, making ID-chaining
+   inconsistent.
+
+**Gold-standard sequence proven on the live 2.43 playground (before editing):** real malaria data
+elements → 2 aggregate indicators (atomic VALIDATE→COMMIT) → 2 visualizations + 1 dashboard referencing
+those indicator UIDs (atomic VALIDATE→COMMIT) → dashboard public sharing (`publicAccess r-------`).
+Every stage returned 0 errors; the dashboard read back with both visualizations chained to the new
+indicators and `publicAccess=r-------`. All 5 objects deleted and a `name:like:ZZAITEST` sweep across
+indicators + visualizations + dashboards confirmed ZERO residue.
+
+**Changes made (all additive / strengthening — no safeguard touched):**
+- **Routing — `getContextualTools`:** (a) `wantsSharingIntent` broadened to recognise "make/set/
+  mark/publish/share … public(ly)", "public(ly) … access/sharing/visible/to everyone/to all",
+  "share … with everyone/all users/the public/user group/team/colleagues", and "give/grant everyone
+  access" — tightened so "create a public health **program**" does NOT misfire. (b) When explicit
+  dashboard/visualization authoring intent fires (`wantsDashboardIntent`), `manage_metadata` is now
+  co-surfaced alongside `manage_dashboards` so the sharing/delete step of the dashboard chain is always
+  reachable in the same turn. Gated on explicit text intent (NOT bare `isDataViz`/`isDashboard`), so
+  pure analytics turns add no destructive tool.
+- **Orchestration — `buildSystemPrompt`:** new gated **"Multi-step goals — decompose, order by
+  dependency, chain IDs"** section. It teaches: understand the end state → walk dependencies backwards
+  → create leaf metadata first → read each result and capture the returned UID
+  (`indicator_id` / `visualization_id` / `dashboard_id`) → chain it into the next tool's inputs →
+  share LAST via `manage_metadata(update_sharing)`. Includes the exact 4-step malaria worked chain that
+  was proven on the playground. Gated on a new `wantsMultiStepGoal` flag (dashboard CREATION + a second
+  buildable piece, OR an assembling verb + chaining word + ≥2 distinct buildable nouns) so it never
+  bloats single-step turns. `wantsSharingAccess` got the same "make public / share with everyone"
+  alternatives so the Sharing KB loads on those phrasings.
+- **Integration — `executeManageDashboards`:** `create_visualization` now returns top-level
+  `visualization_id` and `create_dashboard` returns top-level `dashboard_id` (alongside the existing
+  nested objects, which are preserved), mirroring `manage_indicators`' `indicator_id` convention so
+  cross-tool ID-chaining is consistent and reliable.
+
+**No-regression gate:** every `getContextualTools` change is purely additive (`selected.add` only — no
+tool removed, no branch altered); the save-failure read-only strip block still runs AFTER the new
+`manage_metadata` add, so destructive tools are still hidden in diagnostic mode (safeguard intact). The
+new prompt flag only GATES the new section; no other KB section changed. The return-field additions are
+new keys only — no code consumes these results (they go to the LLM); `args.visualization_id` /
+`args.dashboard_id` readers operate on tool INPUTS, not outputs. `enforcePatientDataPrivacyGate`,
+`PATIENT_DATA_TOOL_NAMES`, `requireWriteAuth`, `verifyTargetExists`, `ensureBackupOrBail`, and the
+UID-verification gates are untouched. A node re-trace of the canonical request plus 5 regression
+controls (explain-chart on Data Visualizer, "create a public health program", simple single-step
+dashboard, share-follow-up, count question) passed every assertion: the canonical request now surfaces
+`manage_metadata` and shows the orchestration playbook, while every control is unchanged. Both gold
+payloads re-VALIDATE on the live playground with 0 errors. `node --check` passes on `background.js` and
+`sidepanel/panel.js`.
