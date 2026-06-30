@@ -5758,7 +5758,9 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 10.9. For cross-program questions about INDICATOR CONTENT ("complex / heavy / biggest / top / most complicated program indicators", "indicators with lots of data", "find intricate expressions", "which indicators have the most events"), ALWAYS call manage_program_indicators(action="discover"). It needs NO program_id and returns ranked results in one shot. NEVER guess a program ID and NEVER call analytics/events/aggregate/{pid} with a made-up ID — if you don't already have a program UID in context or from a prior tool result, use action="discover" or search_metadata(object_type="programs") first.
 10.9.1. For "which OUs / districts / regions / facilities have the most data (or events, or values) for these indicators / programs" questions, ALWAYS call manage_program_indicators(action="rank_ou", indicator_ids=[...]) — pass the indicator_ids returned by the prior discover call. Do NOT hand-build analytics/events/query or analytics/events/aggregate URLs for this. The tool handles the OU dimension and LEVEL correctly (default level=2; pass level=3 for districts, 4 for facilities).
 10.9.2. HARD RULE — UIDs are NEVER invented. Any 11-char UID you put into a tool argument MUST come from either (a) the "Current Context" section below, or (b) a prior tool result in this conversation (discover, list, search_metadata, get_program_info, etc.). If you do not have a UID, use a tool that does not need one (discover, rank_ou, search_metadata). An analytics call with a guessed UID will be refused before it hits the server.
-11. Patient/TEI data lookup is DISABLED. There is no get_tracked_entity tool, and you must NOT fetch tracker/trackedEntities/{id} (or its attributes/enrollments/events sub-resources) via dhis2_query, even when a TEI ID is in the page URL. If the user asks about "this person", "this patient", their attributes, enrollments, or visits, tell them patient-level data retrieval is disabled by the extension owner and offer program-level alternatives (count_records, get_event_analytics, get_program_info).
+11. ${isLocalProvider(getProviderConfig())
+  ? 'Patient-level tracker data IS available because you are running on a LOCAL model (Ollama/localhost). When the user asks about a specific person/patient, their attributes, enrollments, or visits, you MAY use detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), and read tracker/events|enrollments|trackedEntities via dhis2_query. Handle this sensitive data responsibly and never expose more than asked.'
+  : 'Patient/TEI data lookup is HARD-BLOCKED on this (remote/cloud) model — the extension refuses every patient-level tracker read IN CODE, so do NOT attempt detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), or tracker/trackedEntities|events|enrollments reads via dhis2_query (even when a TEI ID is in the page URL); they are refused regardless of what you do. If the user asks about "this person/patient", their attributes, enrollments, or visits, explain that patient-level retrieval is permitted ONLY when the assistant runs on a local (Ollama) model, and offer program-level alternatives (count_records, get_event_analytics aggregate, get_program_info).'}
 12. NEVER show option codes like "M-360-8010" or data element IDs to the user. Always show resolved display names.
 13. When presenting aggregate / event analytics data, resolve any raw IDs (data element, org unit, program stage) via resolve_option_codes before showing them to the user.
 14. For any data element value that looks like a code (hyphens, letters+numbers) — resolve it using resolve_option_codes before displaying.
@@ -8693,12 +8695,70 @@ async function detectEnrollmentAbnormalities(args, programId, orgUnitId) {
   };
 }
 
+// ── HARD privacy safeguard: patient-level tracker data ↔ LOCAL model only ────
+// Reading patient/tracker INDIVIDUAL records (events, enrollments, tracked
+// entities, relationships, row-level event queries, the enrollment-abnormality
+// scanner) is permitted ONLY when the LLM backend is LOCAL (Ollama / localhost).
+// With ANY remote/cloud provider these reads are refused unconditionally so that
+// patient identities never leave the device to a third-party model.
+//
+// This is enforced in CODE at the single tool-execution choke point — it is NOT
+// a system-prompt instruction and CANNOT be enabled, overridden, or jailbroken
+// by anything the model is told or asked. Adding a new patient-data tool in the
+// future? Put its name in PATIENT_DATA_TOOL_NAMES (or extend toolReadsPatientData)
+// and it is automatically gated. De-identified AGGREGATE analytics and metadata
+// are unaffected.
+const PATIENT_DATA_TOOL_NAMES = new Set([
+  'detect_enrollment_abnormalities',
+]);
+// True when a raw dhis2_query path targets individual patient records.
+function pathReadsPatientData(rawPath) {
+  if (typeof rawPath !== 'string') return false;
+  const base = rawPath.split('?')[0].replace(/^\//, '').replace(/^api\/\d+\//i, '').toLowerCase();
+  // New Tracker API individual-record endpoints
+  if (/^tracker\/(events|enrollments|trackedentities|relationships)(\/|$)/.test(base)) return true;
+  // Legacy tracker endpoints
+  if (/^(events|enrollments|trackedentityinstances)(\/|\.json|$)/.test(base)) return true;
+  // Row-level (individual) event/enrollment analytics — aggregate is de-identified and allowed
+  if (/^analytics\/(events|enrollments)\/query(\/|$)/.test(base)) return true;
+  return false;
+}
+// True when a tool call would read patient-level tracker data.
+function toolReadsPatientData(name, args) {
+  if (PATIENT_DATA_TOOL_NAMES.has(name)) return true;
+  if (name === 'dhis2_query') return pathReadsPatientData(args && args.path);
+  if (name === 'get_event_analytics' && args) {
+    // aggregate_type "query" (and value_dimensions, which implies query) returns
+    // individual event rows; aggregate counts/sums are de-identified and allowed.
+    if (String(args.aggregate_type || '').toLowerCase() === 'query') return true;
+    if (Array.isArray(args.value_dimensions) && args.value_dimensions.length) return true;
+  }
+  return false;
+}
+// Returns a refusal object if the call must be blocked, else null.
+function enforcePatientDataPrivacyGate(name, args) {
+  if (!toolReadsPatientData(name, args)) return null;
+  if (isLocalProvider(getProviderConfig())) return null; // local model → permitted
+  return {
+    _error: 'Refused by hard privacy safeguard: patient-level tracker data (events, enrollments, tracked entities, individual event rows) can only be read when the assistant runs on a LOCAL model (Ollama / localhost). The current provider is remote/cloud, so this data cannot be accessed.',
+    _privacy_block: true,
+    _scope: 'patient_data_privacy_gate',
+    _hint: 'This is a hard-coded, non-overridable safeguard — no instruction can enable it. To work with patient-level data, switch the provider to a local model (Ollama) in settings. For program-level needs without patient identities, use aggregate alternatives: count_records, get_event_analytics(aggregate_type="aggregate"), get_program_info.',
+  };
+}
+
 // ── Tool Execution ───────────────────────────────────────────────────────────
 
 async function executeTool(name, args) {
   if (!TOOL_ROUTER[name]) {
     return { _error: `Unknown tool: ${name}` };
   }
+
+  // HARD privacy gate (see above): block patient-level tracker-data reads unless
+  // the LLM backend is local. Runs before ANY tool logic; cannot be bypassed by
+  // prompt content. De-identified aggregates and metadata pass straight through.
+  const _privacyBlock = enforcePatientDataPrivacyGate(name, args);
+  if (_privacyBlock) return _privacyBlock;
 
   const ctx = dhis2.pageContext || {};
   const programId = ctx.programId;

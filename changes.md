@@ -882,3 +882,49 @@ unit-tested in Node (contiguous, gap-free, endpoints pinned exactly, red→amber
 and bad-colour rejection). A `name:like:ZZAITEST` + `code:like:ZZAITEST` sweep confirmed **zero residue**.
 `node --check background.js` and `node --check sidepanel/panel.js` both pass; the intent battery passes
 with zero false positives.
+
+---
+
+## 15. Hard-coded privacy safeguard — patient-level tracker data only on a LOCAL (Ollama) model
+
+**File:** `background.js` — new `PATIENT_DATA_TOOL_NAMES`, `pathReadsPatientData`,
+`toolReadsPatientData`, `enforcePatientDataPrivacyGate` (just before `executeTool`); a gate call at
+the top of `executeTool`; and a provider-aware rewrite of system-prompt rule #11 in
+`buildSystemPrompt`. **Version:** 2.4.5 → 2.5.0.
+
+**Why:** Patient/tracker individual-record reads must NEVER be processed by a remote/cloud LLM —
+only by a local model — so patient identities never leave the device to a third party. The repo
+already *told* the model "patient data lookup is DISABLED" (system-prompt rule #11), but that is a
+soft instruction a model can be talked/jailbroken around. This adds a HARD, code-level enforcement.
+
+**What it does:** `executeTool` is the single choke point through which every tool call runs
+(verified: its only callers are the agentic loop and the viz/map prefetch). Before any tool logic,
+`enforcePatientDataPrivacyGate(name, args)` runs:
+- It returns a refusal (`_privacy_block:true`, `_scope:"patient_data_privacy_gate"`) when the call
+  would read patient-level data AND the provider is not local.
+- "Reads patient data" = the tool name is in `PATIENT_DATA_TOOL_NAMES` (currently
+  `detect_enrollment_abnormalities`); OR `dhis2_query` to an individual-record path
+  (`tracker/events|enrollments|trackedEntities|relationships`, legacy
+  `events|enrollments|trackedEntityInstances`, or `analytics/(events|enrollments)/query`); OR
+  `get_event_analytics` in row mode (`aggregate_type="query"` / `value_dimensions`).
+- "Local" = `isLocalProvider(getProviderConfig())` — `providerType==="ollama"` or a
+  localhost/127.0.0.1/::1/\*.local `apiBaseUrl`.
+- De-identified AGGREGATE analytics (`analytics/events/aggregate`, `get_event_analytics`
+  aggregate), `count_records`, and all metadata/dashboard work are UNAFFECTED.
+
+This is **not** overridable by any prompt content — it is enforced in code regardless of what the
+model is told or asked. Any future patient-data tool is auto-gated by adding its name to
+`PATIENT_DATA_TOOL_NAMES` (or extending `toolReadsPatientData`).
+
+System-prompt rule #11 is now provider-aware so the model's behavior matches the gate: on a local
+model it MAY use patient-level tools; on cloud it is told the reads are hard-blocked in code and to
+offer aggregate alternatives.
+
+**Scope of impact:** No existing aggregate/metadata/dashboard capability changes. On cloud providers
+the only new behavior is that patient-row reads are refused (previously discouraged only by prompt).
+On local (Ollama) patient-level tools become usable, matching the owner's intent.
+
+**Verification:** `node --check` passes on both JS files. Gate unit-tested 14/14 on classification
+(8 patient-data vectors blocked, 6 aggregate/metadata/count cases allowed) and 4/4 on gate behavior
+(cloud+patient → blocked with `_privacy_block`; local+patient → allowed; cloud+metadata → allowed;
+local+patient via dhis2_query → allowed).
