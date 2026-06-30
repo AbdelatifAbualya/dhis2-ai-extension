@@ -1587,6 +1587,7 @@ ${turnXml}
       manage_growth_chart_plugin: { cls: 'tool-icon-create', icon: '\u{1F4C8}' },
       manage_validation_rules: { cls: 'tool-icon-info', icon: '\u{2705}' },
       manage_org_units: { cls: 'tool-icon-create', icon: '\u{1F3E2}' },
+      manage_indicators: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1619,6 +1620,7 @@ ${turnXml}
       manage_growth_chart_plugin: 'Setting up growth chart plugin',
       manage_validation_rules: 'Managing validation rules',
       manage_org_units: 'Managing org units',
+      manage_indicators: 'Managing indicators',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1793,6 +1795,17 @@ ${turnXml}
       if (args.parent_id && !(args.org_unit && args.org_unit.parent_id)) parts.push(`parent: ${String(args.parent_id).slice(0, 11)}`);
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.level != null) parts.push(`level: ${args.level}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_indicators') {
+      const parts = [args.action || 'unknown'];
+      if (args.indicator_id) parts.push(`id: ${String(args.indicator_id).slice(0, 11)}`);
+      if (args.indicator && typeof args.indicator === 'object') {
+        if (args.indicator.name) parts.push(`"${String(args.indicator.name).slice(0, 30)}"`);
+        if (args.indicator.indicator_type) parts.push(`type: ${String(args.indicator.indicator_type).slice(0, 20)}`);
+      }
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.indicator_type && !(args.indicator && args.indicator.indicator_type)) parts.push(`type: ${String(args.indicator_type).slice(0, 20)}`);
       if (args.dry_run_only) parts.push('DRY RUN');
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {

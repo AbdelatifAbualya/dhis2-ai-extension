@@ -631,3 +631,80 @@ moved node)**, a parent-with-children delete correctly blocked (E4030), and a cl
 → read-back 404. Every test object was deleted and a name sweep confirmed **zero residue**. `node --check
 background.js` and `node --check sidepanel/panel.js` both pass; the 25-case intent-routing test passes with
 zero false positives.
+
+---
+
+## 12. New tool — `manage_indicators` (DHIS2 aggregate indicators — numerator/denominator formulas)
+
+**File:** `background.js` (tool def, `TOOL_ROUTER`, `executeTool` dispatch, `executeManageIndicators` +
+`createIndicator` handlers, `resolveIndicatorType` helper, `getContextualTools`, `buildSystemPrompt` KB);
+`sidepanel/panel.js` (iconMap / toolLabels / detail).
+
+**What was missing:** The chatbot could author tracker/event **program** indicators (`manage_program_indicators`),
+datasets, validation rules and org units — but had **no** first-class way to author **aggregate indicators**,
+the `(numerator / denominator) × factor` calculated values that dashboards, pivot tables and maps actually
+display (ANC coverage, case-fatality rate, reporting rate, …). The only path was hand-assembling `/api/metadata`
+bodies via `dhis2_query`, with no expression validation, no indicatorType resolution, no auto-backup and no
+reference-aware delete.
+
+**New capability — `manage_indicators`** with actions `list / get / create / update / delete`:
+- **create** requires `name`, `numerator`, `denominator`, `indicator_type`. It **resolves + verifies the
+  indicatorType** first (by UID or exact name — "Number (Factor 1)", "Per cent", "Per thousand", …), then
+  **server-validates BOTH expressions** via DHIS2's `/expressions/description` endpoint (the playground
+  confirmed it accepts the full aggregate-indicator grammar: `#{de}` / `#{de.coc}`, `R{ds.REPORTING_RATE}`,
+  `I{programIndicator}`, `C{const}`, numeric literals and `+ - * /`). A bad UID or malformed syntax is rejected
+  at create time with the parser's exact error — never silently saved. It generates the UID and imports through
+  the shared `postMetadataPayload` VALIDATE-then-COMMIT path. Descriptions auto-derive from the validator if
+  omitted; `short_name` defaults to `name` (≤50); `decimals` is range-checked 0–5; `denominator:"1"` gives a
+  plain count/sum. Supports `dry_run_only`.
+- **update** patches any field (incl. re-resolving a new `indicator_type` and re-validating any new
+  numerator/denominator) **before** auto-snapshotting a backup (`ensureBackupOrBail`, restorable via
+  `manage_backups`) and PUTting the `:owner` object.
+- **delete** runs the reference check + auto-backup, deletes via `metadata?importStrategy=DELETE&atomicMode=ALL`,
+  and on a `deleted:0` result **surfaces DHIS2's exact blocking reason** (referenced by a dataSet /
+  visualization / indicatorGroup / predictor) instead of a generic message.
+- **list/get** are read-only summaries (type, factor, annualized, both expressions).
+
+**Wiring (every layer):** `TOOLS` array → `TOOL_ROUTER` → `executeTool` dispatch → handler →
+`getContextualTools` (surfaced **only** on an explicit, program-indicator-disjoint `wantsIndicatorIntent`, plus
+`search_metadata` for resolving expression UIDs; added to `writeCapableNames` so `manage_backups` is offered
+after a write; added to the save-error-diagnosis read-only strip list) → `buildSystemPrompt` (an Aggregate
+Indicators KB block gated on the matching `wantsIndicatorPrompt`) → `panel.js` iconMap (`📊`), toolLabels and a
+`detail` renderer.
+
+**No-regression analysis:**
+- **Purely additive.** The `background.js` and `panel.js` diffs contain **zero deleted lines** — no existing
+  function, prompt block, router branch or contextual-selection rule was modified. The new contextual intent
+  only *adds* `manage_indicators` (+`search_metadata`) to the selected Set; it can never remove or crowd out an
+  existing tool.
+- **Disjoint from program indicators.** `wantsIndicatorIntent` / `wantsIndicatorPrompt` bail out the instant a
+  turn mentions "program indicator(s)", so a `manage_program_indicators` (tracker) turn is **never** stolen. A
+  25-phrase intent battery passes with **zero false positives** — all 11 unrelated/program-indicator phrasings
+  ("create a program indicator…", "fix the broken program indicators", "audit indicators with complex
+  expressions", "render a map of facilities", "what is the ANC coverage in 2023", …) correctly do NOT fire; all
+  10 aggregate-indicator phrasings do. The tool description and the KB block each explicitly point program/event
+  indicator work back to `manage_program_indicators`, so the system-prompt addition reinforces rather than
+  contradicts existing guidance.
+- **Touches no shared code's behavior.** It only *calls* `safeDhis2Fetch`, `requireWriteAuth`,
+  `verifyTargetExists`, `ensureBackupOrBail`, `checkMetadataReferences`, `buildDeletionHint`,
+  `postMetadataPayload`, `generateDhis2Uid` and `describeValidationExpression` with their existing signatures —
+  no edits to any of them. `describeValidationExpression` is reused as the generic `/expressions/description`
+  validator (its only prior caller, `executeManageValidationRules`, is unaffected). New module-level identifiers
+  (`resolveIndicatorType`, `executeManageIndicators`, `createIndicator`) were confirmed collision-free.
+  `indicators` is already a recognized backup type and is in `postMetadataPayload`'s shortName-autofix list, so
+  the auto-backup/restore + conflict-autofix machinery supports the tool out of the box.
+  `checkMetadataReferences('indicators', …)` is an unmapped type → returns `has_references:false`, after which
+  DHIS2's atomic DELETE reports any genuine blocking reference (identical to `manage_validation_rules` /
+  `manage_org_units`).
+- `panel.js` changes are additive (iconMap/toolLabels lookups fall back by default; the new `else if` branch
+  precedes `manage_backups`), so every existing tool still renders.
+
+**Verification (DHIS2 2.43 playground, `stable-2-43-0-1`):** The full lifecycle was proven via curl with the
+tool's exact paths/payloads BEFORE writing the code — pre-generated UID; `/api/metadata?importMode=VALIDATE`
+(created:1, 0 errors) then COMMIT (created:1); read-back matched the payload exactly (indicatorType "Number
+(Factor 1)", factor 1); `:owner` PUT update (rename + annualized→true) returned OK; `DELETE` returned deleted:1;
+read-back 404. A bad indicatorType was rejected ("Invalid reference … (IndicatorType)") and the generic
+`/expressions/description` endpoint was confirmed to validate `#{de}`, `R{ds.REPORTING_RATE}`, `I{pi}` and
+numeric expressions (valid → status OK + description; bad UID / malformed → status ERROR). Every test object was
+deleted and a `name:like:ZZ` sweep confirmed **zero residue**. `node --check background.js` and
+`node --check sidepanel/panel.js` both pass; the intent battery passes with zero false positives.

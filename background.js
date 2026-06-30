@@ -4980,6 +4980,50 @@ Dates: openingDate is required on create; openingDate/closedDate accept YYYY-MM-
   {
     type: 'function',
     function: {
+      name: 'manage_indicators',
+      description: `CRUD for DHIS2 aggregate Indicators — the calculated values shown in dashboards, pivot tables and maps, computed as (numerator / denominator) × the indicatorType factor (1, 100, 1000, …). Examples: "ANC coverage = ANC 1st visits ÷ expected pregnancies × 100", "case fatality rate", "facilities reporting rate". Use this tool for ALL aggregate-indicator work — NEVER assemble raw /metadata POST/PUT bodies via dhis2_query. (This is for AGGREGATE indicators; tracker/event program indicators are handled by manage_program_indicators.)
+Actions: list / get / create / update / delete.
+numerator and denominator are DHIS2 aggregate expressions: #{dataElementUid} (summed across all category-option-combos) or #{dataElementUid.cocUid} (one disaggregation); R{dataSetUid.REPORTING_RATE} for reporting rates; I{programIndicatorUid} to reuse a program indicator; C{constantUid} for constants; numeric literals and + - * / are allowed. For a plain count/sum use denominator "1". The chatbot server-validates BOTH expressions via DHIS2's /expressions/description endpoint BEFORE saving — a malformed or unresolved expression is rejected at create/update time, never silently saved.
+indicator_type selects the scaling factor: "Number (Factor 1)" for a raw ratio/count, "Per cent" (×100) for a percentage, "Per thousand"/"Per ten thousand"/"Per hundred thousand" for rates. Pass its UID or exact name — the tool resolves and verifies it before writing.
+NEVER invent dataElement / dataSet / programIndicator / constant UIDs — reuse UIDs from search_metadata / manage_datasets / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete'],
+            description: 'list=paginated indicator list (optional name / indicator_type filters); get=one indicator with both expressions; create=new indicator; update=patch an existing indicator; delete=remove an indicator.'
+          },
+          indicator_id: { type: 'string', description: 'Existing indicator UID (required for get, update, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on indicator name.' },
+          indicator_type: { type: 'string', description: 'For list: filter by indicatorType (UID or exact name). (For create/update set it inside the indicator object.)' },
+          limit: { type: 'integer', description: 'For list: max indicators to return (1–200, default 50).' },
+          indicator: {
+            type: 'object',
+            description: 'Indicator definition (required for create; pass only the changed fields for update).',
+            properties: {
+              name: { type: 'string', description: 'Unique indicator name.' },
+              short_name: { type: 'string', description: 'Short name (≤50 chars). Defaults to name on create if omitted.' },
+              description: { type: 'string' },
+              indicator_type: { type: 'string', description: 'indicatorType UID or exact name ("Number (Factor 1)", "Per cent", "Per thousand", …). REQUIRED on create.' },
+              numerator: { type: 'string', description: 'Numerator expression, e.g. "#{anc1Uid}" or "#{deA} + #{deB}". REQUIRED on create.' },
+              numerator_description: { type: 'string', description: 'Human label for the numerator (auto-derived from DHIS2 if omitted).' },
+              denominator: { type: 'string', description: 'Denominator expression. Use "1" for a plain count/sum. REQUIRED on create.' },
+              denominator_description: { type: 'string', description: 'Human label for the denominator (auto-derived from DHIS2 if omitted).' },
+              annualized: { type: 'boolean', description: 'Annualize the value (scale to a full year based on the selected period). Default false.' },
+              decimals: { type: 'integer', description: 'Fixed number of output decimals (0–5). Omit/null to inherit the system default.' }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create: validate expressions + indicatorType + metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -5039,6 +5083,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_growth_chart_plugin: true,
   manage_validation_rules: true,
   manage_org_units: true,
+  manage_indicators: true,
   manage_backups: true,
 });
 
@@ -5146,6 +5191,22 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/.test(combinedText)
     || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinic|hospital|chiefdom|catchment\s*area|sub[-\s]?district)\b/.test(combinedText)
     || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/.test(combinedText);
+  // ── Aggregate-indicator intent ──
+  // Aggregate indicators = (numerator / denominator) × factor, surfaced in
+  // dashboards/pivots/maps. Conservative AND disjoint from program (tracker)
+  // indicators: a turn that mentions "program indicator(s)" never matches here,
+  // so manage_indicators can never steal a manage_program_indicators turn.
+  // Fires on an explicit aggregate signal (aggregate indicator / indicator
+  // type / numerator / denominator) OR "indicator" coupled with an authoring /
+  // aggregate-analytics term.
+  const mentionsProgramIndicator = /\bprogram\s+indicators?\b/.test(combinedText);
+  const wantsIndicatorIntent =
+    !mentionsProgramIndicator && (
+      /\baggregate\s+indicators?\b/.test(combinedText)
+      || /\bindicator\s*types?\b/.test(combinedText)
+      || /\b(numerator|denominator)\b/.test(combinedText)
+      || (/\bindicators?\b/.test(combinedText)
+          && /\b(create|add|build|make|define|set\s*up|edit|update|modify|rename|delete|remove|coverage|per\s*cent|percentage|reporting\s*rate|rate|ratio|formula|factor)\b/.test(combinedText)));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5319,6 +5380,16 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Aggregate-indicator authoring — surfaced only on explicit, program-
+  //    indicator-disjoint aggregate-indicator intent so it never crowds
+  //    unrelated analytics/tracker flows. search_metadata is the companion for
+  //    resolving the dataElement / dataSet / programIndicator UIDs the
+  //    numerator/denominator expressions need. ──
+  if (wantsIndicatorIntent) {
+    selected.add('manage_indicators');
+    selected.add('search_metadata');
+  }
+
   // ── Intent-driven override: if the user explicitly asks to create or manage
   //    metadata, the full authoring kit must be available regardless of page.
   //    This fixes the failure mode where a user on Data Visualizer / Maps / a
@@ -5364,6 +5435,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
     'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
+    'manage_indicators',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5400,6 +5472,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_custom_forms');
     selected.delete('manage_validation_rules');
     selected.delete('manage_org_units');
+    selected.delete('manage_indicators');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5487,6 +5560,13 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
     || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/i.test(text)
     || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinic|hospital|chiefdom|catchment\s*area|sub[-\s]?district)\b/i.test(text)
     || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/i.test(text);
+  const wantsIndicatorPrompt =
+    !/\bprogram\s+indicators?\b/i.test(text) && (
+      /\baggregate\s+indicators?\b/i.test(text)
+      || /\bindicator\s*types?\b/i.test(text)
+      || /\b(numerator|denominator)\b/i.test(text)
+      || (/\bindicators?\b/i.test(text)
+          && /\b(create|add|build|make|define|set\s*up|edit|update|modify|rename|delete|remove|coverage|per\s*cent|percentage|reporting\s*rate|rate|ratio|formula|factor)\b/i.test(text)));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -6077,6 +6157,36 @@ list (filter by name/level/parent_id), get, create, update, delete.
 - "Add a new facility 'Bo CHC' under Badjia chiefdom (opened 2015-01-01)": create with org_unit:{ name:"Bo CHC", parent_id:"<BadjiaUID>", opening_date:"2015-01-01" }.
 - "Move the Ngelehun clinic under Kakua chiefdom instead": update org_unit_id=<clinic> org_unit:{ parent_id:"<KakuaUID>" }.
 - "Close facility X as of 2024-12-31": update org_unit:{ closed_date:"2024-12-31" }.
+`;
+  }
+
+  // ── Aggregate Indicators KB — numerator/denominator formulas (manage_indicators) ──
+  if (wantsIndicatorPrompt) {
+    p += `
+## DHIS2 Aggregate Indicators (manage_indicators)
+An aggregate **indicator** is a calculated value: **(numerator / denominator) × the indicatorType factor**. It is what dashboards, pivot tables and maps usually display (e.g. ANC coverage, case fatality rate, reporting rate). Use **manage_indicators** for ALL aggregate-indicator work — never hand-write /metadata bodies via dhis2_query.
+IMPORTANT: this tool is for **aggregate** indicators only. **Tracker / event program indicators** are a DIFFERENT object — use **manage_program_indicators** for those.
+
+### Actions
+list (filter by name / indicator_type), get, create, update, delete. Update auto-snapshots a backup first (restore via manage_backups); delete checks references then surfaces DHIS2's exact blocker (dataSet / visualization / indicatorGroup / predictor) if the indicator is still in use.
+
+### Expressions (numerator & denominator)
+- \`#{dataElementUid}\` = data element summed across all its category-option-combos; \`#{dataElementUid.cocUid}\` = one disaggregation cell.
+- \`R{dataSetUid.REPORTING_RATE}\` (also ACTUAL_REPORTS, EXPECTED_REPORTS, …) for reporting rates; \`I{programIndicatorUid}\` to reuse a program indicator; \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed.
+- For a plain count/sum, set denominator to \`"1"\`.
+- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving — a bad UID or malformed syntax is rejected at create/update time with the parser's exact error. Fix the expression and retry, don't loop.
+- Look up UIDs with search_metadata / manage_datasets(action=get) — NEVER invent them.
+
+### indicator_type (the scaling factor)
+Pass a UID or the exact name. Common types: **"Number (Factor 1)"** (×1 — raw ratio/count), **"Per cent"** (×100 — a percentage), **"Per thousand"**, **"Per ten thousand"**, **"Per hundred thousand"**. The tool resolves and verifies the type before writing.
+
+### Other fields
+- short_name: ≤50 chars (defaults to name). annualized: scale to a full year for the chosen period (default false). decimals: 0–5 fixed output decimals (omit to inherit the default). numerator_description / denominator_description: auto-derived from DHIS2 if omitted.
+
+### Examples
+- "ANC 1 coverage as a percentage of expected pregnancies": create indicator:{ name:"ANC 1 Coverage", indicator_type:"Per cent", numerator:"#{anc1Uid}", denominator:"#{expectedPregnanciesUid}" }.
+- "Maternal deaths per 100,000 live births": indicator_type:"Per hundred thousand", numerator:"#{maternalDeaths}", denominator:"#{liveBirths}".
+- "Total malaria cases (a plain sum)": indicator_type:"Number (Factor 1)", numerator:"#{malariaConfirmed} + #{malariaClinical}", denominator:"1".
 `;
   }
 
@@ -10213,6 +10323,11 @@ async function executeTool(name, args) {
     return await executeManageOrgUnits(args);
   }
 
+  // ── manage_indicators ──
+  if (name === 'manage_indicators') {
+    return await executeManageIndicators(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -10871,6 +10986,320 @@ async function createOrgUnit(args) {
       openingDate: ouObj.openingDate, closedDate: ouObj.closedDate || null,
     },
     message: `Created org unit "${name}" (${id}) under "${parentResp.displayName}" at level ${expectedLevel}.`,
+  };
+}
+
+// ── manage_indicators: CRUD for DHIS2 aggregate indicators (numerator/denominator formulas) ──
+//
+// An aggregate INDICATOR is a calculated value: (numerator / denominator) ×
+// the indicatorType factor (1, 100, 1000, …). numerator and denominator are
+// DHIS2 aggregate expressions over data-element operands #{de} / #{de.coc},
+// reporting rates R{ds.REPORTING_RATE}, program indicators I{pi}, constants
+// C{const} and numeric literals. This tool reuses the SAME server-side
+// validator already used for validation-rule sides (describeValidationExpression
+// → GET /api/expressions/description), which the 2.43 playground confirmed
+// accepts the full indicator grammar (#{}, R{}, I{}, numbers/operators). The
+// indicatorType is resolved + verified (by UID or exact name) before any write.
+// All shared helpers are reused with their existing signatures — no shared code
+// is modified.
+
+// Resolve an indicatorType by UID or exact name → { id, name, factor } or { _error }.
+async function resolveIndicatorType(idOrName) {
+  const v = String(idOrName ?? '').trim();
+  if (!v) return { _error: 'indicator_type is required (an indicatorType UID or exact name, e.g. "Number (Factor 1)" or "Per cent").' };
+  if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(v)) {
+    const resp = await safeDhis2Fetch(`indicatorTypes/${v}?fields=id,name,factor`);
+    if (resp?._status === 404) return { _error: `indicatorType "${v}" does not exist (404).`, _hint: 'List the available types with dhis2_query GET indicatorTypes, or pass the type name instead.' };
+    if (resp?._error) return { _error: `Could not load indicatorType ${v}: ${resp._error}` };
+    return { id: resp.id, name: resp.name, factor: resp.factor };
+  }
+  const resp = await safeDhis2Fetch(`indicatorTypes?filter=name:eq:${encodeURIComponent(v)}&fields=id,name,factor&paging=false`);
+  if (resp?._error) return { _error: `Could not look up indicatorType "${v}": ${resp._error}` };
+  const types = resp.indicatorTypes || [];
+  if (types.length === 0) return { _error: `No indicatorType named "${v}".`, _hint: 'Common types: "Number (Factor 1)", "Per cent", "Per thousand", "Per ten thousand", "Per hundred thousand". List all with dhis2_query GET indicatorTypes.' };
+  return { id: types[0].id, name: types[0].name, factor: types[0].factor };
+}
+
+async function executeManageIndicators(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create, update, delete.' };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.indicator_type) {
+      const it = await resolveIndicatorType(args.indicator_type);
+      if (it._error) return it;
+      filters.push(`indicatorType.id:eq:${it.id}`);
+    }
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `indicators?fields=id,displayName,indicatorType[id,name,factor],annualized,numerator,denominator&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `indicators list failed: ${resp._error}` };
+    const indicators = (resp.indicators || []).map(i => ({
+      id: i.id,
+      name: i.displayName,
+      indicatorType: i.indicatorType?.name,
+      factor: i.indicatorType?.factor,
+      annualized: i.annualized,
+      numerator: i.numerator,
+      denominator: i.denominator,
+    }));
+    return {
+      success: true,
+      total: indicators.length,
+      pager_total: resp.pager?.total ?? null,
+      indicators,
+    };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const id = args.indicator_id || args.object_id;
+    if (!id) return { _error: 'indicator_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `indicators/${id}?fields=id,displayName,description,shortName,indicatorType[id,name,factor],annualized,decimals,` +
+      `numerator,numeratorDescription,denominator,denominatorDescription,sharing,access`
+    );
+    if (resp?._status === 404) return { _error: `indicators with id "${id}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load indicator ${id}: ${resp._error}` };
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      shortName: resp.shortName,
+      description: resp.description,
+      indicatorType: resp.indicatorType,
+      annualized: resp.annualized,
+      decimals: resp.decimals,
+      numerator: resp.numerator,
+      numeratorDescription: resp.numeratorDescription,
+      denominator: resp.denominator,
+      denominatorDescription: resp.denominatorDescription,
+      access: resp.access,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_indicators', 'create');
+    if (_gate) return _gate;
+    return await createIndicator(args);
+  }
+
+  // ── update ────────────────────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_indicators', 'update', { indicator_id: args.indicator_id });
+    if (_gate) return _gate;
+    const id = args.indicator_id || args.object_id;
+    if (!id) return { _error: 'indicator_id required for update' };
+    if (!args.indicator || typeof args.indicator !== 'object') {
+      return {
+        _error: 'indicator object required for update',
+        _hint: 'Pass indicator:{ name?, short_name?, description?, indicator_type?, annualized?, decimals?, numerator?, numerator_description?, denominator?, denominator_description? }',
+      };
+    }
+    const exists = await verifyTargetExists('indicators', id, 'manage_indicators', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+
+    const ownerResp = await safeDhis2Fetch(`indicators/${id}?fields=:owner`);
+    if (ownerResp?._error) return { _error: `Could not load indicator ${id}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || id;
+
+    // Validate field values + any new expressions/type BEFORE snapshotting/mutating,
+    // so an invalid patch never triggers a backup or a half-applied write.
+    const ind = args.indicator;
+    let resolvedType = null;
+    if (ind.indicator_type !== undefined) {
+      resolvedType = await resolveIndicatorType(ind.indicator_type);
+      if (resolvedType._error) return resolvedType;
+    }
+    if (ind.decimals !== undefined && ind.decimals !== null) {
+      const d = Number(ind.decimals);
+      if (!Number.isInteger(d) || d < 0 || d > 5) return { _error: 'decimals must be an integer 0–5 (or null to inherit the system default).' };
+    }
+    for (const [field, expr] of [['numerator', ind.numerator], ['denominator', ind.denominator]]) {
+      if (expr !== undefined) {
+        if (typeof expr !== 'string' || !expr.trim()) return { _error: `${field} must be a non-empty string.` };
+        const chk = await describeValidationExpression(expr);
+        if (!chk.ok) return { _error: `${field} rejected by DHIS2: ${chk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} / R{dsUid.REPORTING_RATE} / I{programIndicatorUid} exists (use search_metadata) and the syntax is well-formed, then retry.' };
+      }
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_indicator', tool: 'manage_indicators', action: 'update', reason: `Update indicator ${objName}` },
+      [{ object_type: 'indicators', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (ind.name !== undefined) { ownerResp.name = ind.name; applied.name = ind.name; }
+    if (ind.short_name !== undefined) { ownerResp.shortName = String(ind.short_name).slice(0, 50); applied.shortName = ownerResp.shortName; }
+    if (ind.description !== undefined) { ownerResp.description = ind.description; applied.description = ind.description; }
+    if (resolvedType) { ownerResp.indicatorType = { id: resolvedType.id }; applied.indicatorType = resolvedType.name; }
+    if (ind.annualized !== undefined) { ownerResp.annualized = !!ind.annualized; applied.annualized = !!ind.annualized; }
+    if (ind.decimals !== undefined) { ownerResp.decimals = ind.decimals == null ? null : Number(ind.decimals); applied.decimals = ownerResp.decimals; }
+    if (ind.numerator !== undefined) { ownerResp.numerator = ind.numerator; applied.numerator = ind.numerator; }
+    if (ind.numerator_description !== undefined) { ownerResp.numeratorDescription = ind.numerator_description; applied.numeratorDescription = ind.numerator_description; }
+    if (ind.denominator !== undefined) { ownerResp.denominator = ind.denominator; applied.denominator = ind.denominator; }
+    if (ind.denominator_description !== undefined) { ownerResp.denominatorDescription = ind.denominator_description; applied.denominatorDescription = ind.denominator_description; }
+
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'indicator supplied no recognized fields to update.', backup: backup.block };
+    }
+
+    const putResp = await safeDhis2Fetch(`indicators/${id}`, { method: 'PUT', body: ownerResp });
+    if (putResp?._error) return { _error: `Failed to update indicator: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', indicator_id: id, indicator_name: objName, applied, backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_indicators', 'delete', { indicator_id: args.indicator_id });
+    if (_gate) return _gate;
+    const id = args.indicator_id || args.object_id;
+    if (!id) return { _error: 'indicator_id required for delete' };
+    const exists = await verifyTargetExists('indicators', id, 'manage_indicators', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || id;
+
+    // indicators is an unmapped type in checkMetadataReferences → returns
+    // has_references:false; DHIS2's atomic DELETE is the authoritative net for
+    // any remaining association (dataSets, visualizations, indicatorGroups,
+    // predictors) and its exact reason is surfaced below.
+    const refsResult = await checkMetadataReferences('indicators', id);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete indicator "${objName}" — it has active references.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('indicators', id, refsResult.references),
+      };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_indicator', tool: 'manage_indicators', action: 'delete', reason: `Deleting indicator ${objName} (${id})` },
+      [{ object_type: 'indicators', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { indicators: [{ id }] },
+    });
+    if (delResp?._error) return { _error: `Indicator deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'indicators', id, name: objName },
+        message: `Successfully deleted indicator "${objName}".`,
+        backup: backup.block,
+      };
+    }
+    // Surface DHIS2's exact blocking reason (referenced by a dataSet /
+    // visualization / indicatorGroup / predictor) instead of a generic message.
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Indicator "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'The indicator is still referenced by another object (a dataSet, visualization, indicatorGroup, or predictor). Remove those references first, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_indicators.`,
+    _hint: 'One of: list, get, create, update, delete.',
+  };
+}
+
+async function createIndicator(args) {
+  const ind = args.indicator;
+  if (!ind || typeof ind !== 'object') {
+    return {
+      _error: 'indicator object required for create',
+      _hint: 'Pass indicator:{ name, indicator_type, numerator, denominator, short_name?, annualized?, decimals?, ... }',
+    };
+  }
+  if (!ind.name || !String(ind.name).trim()) return { _error: 'indicator.name is required.' };
+  if (!ind.numerator || !String(ind.numerator).trim()) return { _error: 'indicator.numerator is required (a DHIS2 expression, e.g. "#{deUid}" or "#{deA} + #{deB}").' };
+  if (!ind.denominator || !String(ind.denominator).trim()) return { _error: 'indicator.denominator is required (use "1" for a plain count/sum).' };
+  if (ind.indicator_type === undefined || ind.indicator_type === null || !String(ind.indicator_type).trim()) {
+    return { _error: 'indicator.indicator_type is required (a UID or exact name such as "Number (Factor 1)" for a raw ratio, or "Per cent" for a percentage).' };
+  }
+  if (ind.decimals !== undefined && ind.decimals !== null) {
+    const d = Number(ind.decimals);
+    if (!Number.isInteger(d) || d < 0 || d > 5) return { _error: 'decimals must be an integer 0–5 (or omit to inherit the system default).' };
+  }
+
+  // Resolve + verify the indicatorType BEFORE any expression work, so a bad
+  // type gives a clean error rather than a deep import-report failure.
+  const itype = await resolveIndicatorType(ind.indicator_type);
+  if (itype._error) return itype;
+
+  // Server-validate BOTH expressions before building the payload — a broken
+  // reference is caught here with the parser's exact error, not silently saved.
+  const numChk = await describeValidationExpression(ind.numerator);
+  if (!numChk.ok) return { _error: `numerator rejected by DHIS2: ${numChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} / R{dsUid.REPORTING_RATE} / I{programIndicatorUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+  const denChk = await describeValidationExpression(ind.denominator);
+  if (!denChk.ok) return { _error: `denominator rejected by DHIS2: ${denChk.error}`, _hint: 'Confirm each reference exists (use search_metadata) and the syntax is well-formed. For a plain count/sum use denominator "1".' };
+
+  const id = generateDhis2Uid();
+  const name = String(ind.name).trim();
+  const shortName = String(ind.short_name || name).slice(0, 50);
+  const indObj = {
+    id,
+    name,
+    shortName,
+    numerator: ind.numerator,
+    numeratorDescription: ind.numerator_description || numChk.description || 'Numerator',
+    denominator: ind.denominator,
+    denominatorDescription: ind.denominator_description || denChk.description || 'Denominator',
+    indicatorType: { id: itype.id },
+    annualized: !!ind.annualized,
+  };
+  if (ind.description) indObj.description = ind.description;
+  if (ind.decimals !== undefined && ind.decimals !== null) indObj.decimals = Number(ind.decimals);
+
+  const result = await postMetadataPayload({ indicators: [indObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return {
+      _error: result._error || 'Indicator create failed.',
+      phase: result.phase,
+      errors: result.errors,
+      _validated_expressions: { numerator: numChk.description, denominator: denChk.description },
+    };
+  }
+  if (args.dry_run_only) {
+    return {
+      success: true,
+      dry_run: true,
+      message: `Validation passed for "${name}". No indicator created (dry_run_only=true).`,
+      would_create: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, annualized: indObj.annualized },
+      numerator_meaning: numChk.description,
+      denominator_meaning: denChk.description,
+    };
+  }
+  return {
+    success: true,
+    action: 'create',
+    indicator_id: id,
+    indicator: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, numerator: indObj.numerator, denominator: indObj.denominator, annualized: indObj.annualized },
+    numerator_meaning: numChk.description,
+    denominator_meaning: denChk.description,
+    message: `Created indicator "${name}" (${id}) of type "${itype.name}" (factor ${itype.factor}).`,
   };
 }
 

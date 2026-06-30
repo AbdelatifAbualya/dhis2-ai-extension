@@ -2,3 +2,4 @@
 
 2026-06-30T09:57:18Z | node:ok | curl:ok | playground:ok@stable-2-43-0-1 | BUILT: manage_validation_rules tool (DHIS2 aggregate data-quality validation rules) — Add manage_validation_rules tool
 2026-06-30T12:23:12Z | node:ok | curl:ok | playground:ok@stable-2-43-0-1 | BUILT: manage_org_units tool (DHIS2 organisation-unit hierarchy CRUD) — Add manage_org_units tool
+2026-06-30T16:11:35Z | node:ok | curl:ok | playground:ok@stable-2-43-0-1 | BUILT: manage_indicators tool (DHIS2 aggregate indicators — numerator/denominator formulas) — Add manage_indicators tool
