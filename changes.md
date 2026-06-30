@@ -561,3 +561,73 @@ create→read-back→delete cycles run with pre-generated UIDs (VALIDATE then CO
 mixed missing-value-strategy rule with auto-derived side descriptions; read-back matched the payload exactly;
 all test objects (validation rule + 2 supporting data elements) deleted and verified gone (404). `node --check
 background.js` and `node --check sidepanel/panel.js` both pass.
+
+---
+
+## 11. New tool — `manage_org_units` (DHIS2 organisation-unit hierarchy CRUD)
+
+**File:** `background.js` (tool def, `TOOL_ROUTER`, `executeTool` dispatch, `executeManageOrgUnits` +
+`createOrgUnit` handlers, `normalizeOuDate` / `isValidOuDate` helpers, `getContextualTools`,
+`buildSystemPrompt` KB); `sidepanel/panel.js` (iconMap / toolLabels / detail).
+
+**What was missing:** The chatbot could read org units (they show up as context and in analytics) but had
+**no** first-class way to author the **org-unit hierarchy** itself — the tree of facilities / chiefdoms /
+districts that every program, dataset, data value and enrollment hangs off. The only path was hand-assembling
+`/api/metadata` POST/PUT bodies via `dhis2_query`, with no parent verification, no cycle guard on a move, no
+children check before a delete, and no auto-backup.
+
+**New capability — `manage_org_units`** with actions `list / get / create / update / delete`:
+- **create** requires `name`, `parent_id`, `opening_date`; it **verifies the parent exists** first (clear 404
+  message + reports the *derived* level), generates the UID, and imports through the shared
+  `postMetadataPayload` VALIDATE-then-COMMIT path (which also catches a parent reference that vanishes between
+  the probe and the import, E5002). `level`/`path` are left for DHIS2 to derive from the parent — the tool
+  never sets them. Supports `dry_run_only`. Creating a new **root** is intentionally unsupported (it would
+  split the hierarchy).
+- **update** patches any field and supports a safe **move (re-parent)**: it validates the new parent exists,
+  rejects setting a unit as its own parent, and **rejects a move under the unit's own descendant** (cycle
+  guard via a `path` check) — all *before* it auto-snapshots a backup (`ensureBackupOrBail`, restorable via
+  `manage_backups`) and PUTs the `:owner` object. DHIS2 then re-computes level/path for the unit and every
+  descendant.
+- **delete** refuses any unit that still has **children** (precise message + how to re-parent/clear them),
+  runs the existing reference check + auto-backup, deletes via `metadata?importStrategy=DELETE&atomicMode=ALL`,
+  and on a `deleted:0` result **surfaces DHIS2's exact blocking reason** (e.g. E4030 "associated with another
+  object", or captured data values / program-dataset assignment) instead of a generic message.
+- **list/get** are read-only summaries (parent, level, path, child count, opening/closed dates, contact info).
+
+Dates accept `YYYY-MM-DD` (normalized to the full ISO form DHIS2 stores) or a full timestamp; an invalid date
+is rejected up-front.
+
+**Wiring (every layer):** `TOOLS` array → `TOOL_ROUTER` → `executeTool` dispatch → handler →
+`getContextualTools` (surfaced **only** on an explicit, conservative `wantsOrgUnitIntent`, plus
+`search_metadata` for resolving parent UIDs; added to `writeCapableNames` so `manage_backups` is offered after
+a write; added to the save-error-diagnosis read-only strip list) → `buildSystemPrompt` (an Org-Unit KB block
+gated on the matching `wantsOrgUnitPrompt`) → `panel.js` iconMap (`🏢`), toolLabels and a `detail` renderer.
+
+**No-regression analysis:**
+- Purely **additive**. The tool is surfaced ONLY on explicit org-unit intent, so it adds nothing to — and
+  cannot crowd or mis-route — any existing analytics / dataset / tracker flow. The intent regex was tested
+  against a 25-phrase battery: all 13 org-unit phrasings fire and **all 12 unrelated analytics phrasings
+  ("create a chart for the facility", "how many enrollments in this facility", "render a map of facilities",
+  …) correctly do NOT fire** — zero false positives, so routing for existing tools is unchanged. The
+  facility-verb clause requires the management verb immediately before the facility noun, which is what keeps
+  "create a **chart** for the facility" from matching.
+- Touches **no shared code's behavior**: it only *calls* `safeDhis2Fetch`, `requireWriteAuth`,
+  `verifyTargetExists`, `ensureBackupOrBail`, `checkMetadataReferences`, `buildDeletionHint`,
+  `postMetadataPayload` and `generateDhis2Uid` with their existing signatures — no edits to any of them. New
+  module-level identifiers (`OU_DATE_ONLY_RE`, `normalizeOuDate`, `isValidOuDate`, `executeManageOrgUnits`,
+  `createOrgUnit`) were confirmed collision-free. `organisationUnits` is already a `backupableType`, so the
+  auto-backup/restore machinery supports the tool out of the box.
+  `checkMetadataReferences('organisationUnits', …)` is an unmapped type → returns `has_references:false`,
+  after which the explicit children-count guard plus DHIS2's atomic DELETE report any genuine blocker
+  (identical in spirit to how `manage_validation_rules` delete behaves).
+- `panel.js` changes are additive (iconMap/toolLabels lookups fall back by default; the new `else if` branch
+  precedes `manage_backups`), so every existing tool still renders.
+
+**Verification (DHIS2 2.43 playground, `stable-2-43-0-1`):** Proved the full hierarchy logic with the tool's
+exact field projections and payloads before and after writing the code — create under a level-3 chiefdom
+(level auto-derived to 4, path auto-derived), bad parent rejected (E5002 "Invalid reference"), rename +
+closedDate via `:owner` PUT, **re-parent a child from one parent to another (path/level recomputed for the
+moved node)**, a parent-with-children delete correctly blocked (E4030), and a clean leaf delete (`deleted:1`)
+→ read-back 404. Every test object was deleted and a name sweep confirmed **zero residue**. `node --check
+background.js` and `node --check sidepanel/panel.js` both pass; the 25-case intent-routing test passes with
+zero false positives.

@@ -4933,6 +4933,53 @@ NEVER invent dataElement/constant UIDs — reuse UIDs from search_metadata / man
   {
     type: 'function',
     function: {
+      name: 'manage_org_units',
+      description: `CRUD for DHIS2 Organisation Units — the facilities/chiefdoms/districts that make up the org-unit HIERARCHY (the tree every program, dataset, data value and enrollment is attached to). Use this tool for ALL org-unit structure work — creating a new facility under a parent, renaming/closing one, MOVING (re-parenting) a unit or subtree, or deleting a leaf — NEVER hand-assemble raw /metadata POST/PUT bodies via dhis2_query.
+Actions: list / get / create / update / delete.
+Hierarchy rules the tool enforces for you: every unit except the single root has exactly one parent; \`level\` and \`path\` are DERIVED by DHIS2 from the parent (you never set them) — a child of a level-3 chiefdom becomes level 4 automatically, and moving a unit re-computes level/path for it AND every descendant. create verifies the parent exists first; update validates a re-parent target (rejecting a move under the unit's own descendant, which would create a cycle) and auto-snapshots a backup before writing; delete refuses any unit that still has CHILDREN (re-parent or remove them first) and lets DHIS2's atomic delete block units that still hold data values / program assignments, surfacing the exact reason.
+Dates: openingDate is required on create; openingDate/closedDate accept YYYY-MM-DD. NEVER invent parent UIDs — resolve them with manage_org_units(action=list) or search_metadata.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete'],
+            description: 'list=paginated org-unit list (optional name/level/parent filters); get=one unit with parent, child count, dates and contact info; create=new child unit under a parent; update=patch fields and/or move (re-parent); delete=remove a childless leaf unit.'
+          },
+          org_unit_id: { type: 'string', description: 'Existing org-unit UID (required for get, update, delete).' },
+          parent_id: { type: 'string', description: 'For list: only return direct children of this parent UID. For create: the parent the new unit is placed under (can also be set inside org_unit).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on org-unit name.' },
+          level: { type: 'integer', description: 'For list: filter to a single hierarchy level (1=root/national, 2=district, …).' },
+          limit: { type: 'integer', description: 'For list: max units to return (1–200, default 50).' },
+          org_unit: {
+            type: 'object',
+            description: 'Org-unit definition (required for create; pass only the changed fields for update).',
+            properties: {
+              name: { type: 'string', description: 'Unit name (unique within DHIS2).' },
+              short_name: { type: 'string', description: 'Short name (≤50 chars, unique). Defaults to name on create if omitted.' },
+              parent_id: { type: 'string', description: 'Parent org-unit UID. REQUIRED on create. On update, supplying it MOVES (re-parents) the unit and all its descendants.' },
+              opening_date: { type: 'string', description: 'Date the unit opened, YYYY-MM-DD. REQUIRED on create.' },
+              closed_date: { type: 'string', description: 'Date the unit closed, YYYY-MM-DD. On update, pass an empty string to clear it.' },
+              code: { type: 'string', description: 'Optional unique code.' },
+              description: { type: 'string' },
+              comment: { type: 'string' },
+              address: { type: 'string' },
+              email: { type: 'string' },
+              phone_number: { type: 'string' },
+              contact_person: { type: 'string' },
+              url: { type: 'string' }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create: validate the metadata import (incl. parent reference) without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -4991,6 +5038,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_custom_translations: true,
   manage_growth_chart_plugin: true,
   manage_validation_rules: true,
+  manage_org_units: true,
   manage_backups: true,
 });
 
@@ -5087,6 +5135,17 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
         && /\b(rule|check|validat|dataset|data\s*set|data\s*element|aggregate|expression)\b/.test(combinedText))
     || (/\bvalidat(e|ion)\b/.test(combinedText)
         && /\b(left\s*side|right\s*side|leftside|rightside|compulsory\s*pair|exclusive\s*pair|greater\s*than|less\s*than|data\s*set|dataset|aggregate\s*data)\b/.test(combinedText));
+  // ── Org-unit (hierarchy) intent ──
+  // Explicit "org/organisation unit(s)" or "OU/org hierarchy/tree" terms, OR a
+  // management verb directly on a facility/chiefdom noun (verb immediately before
+  // the noun, so "create a chart for the facility" does NOT match), OR a facility
+  // noun coupled with a hierarchy/parent/re-parent term. Conservative on purpose:
+  // bare "facility"/"district" in an analytics question never surfaces the tool.
+  const wantsOrgUnitIntent =
+    /\b(organi[sz]ation\s*units?|org\s*units?|orgunits?|sub-?units?)\b/.test(combinedText)
+    || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/.test(combinedText)
+    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinic|hospital|chiefdom|catchment\s*area|sub[-\s]?district)\b/.test(combinedText)
+    || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/.test(combinedText);
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5252,6 +5311,14 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Org-unit hierarchy authoring — surfaced only on explicit org-unit intent
+  //    so it never crowds unrelated analytics/dataset/tracker flows. search_metadata
+  //    is the companion for resolving parent / target OU UIDs. ──
+  if (wantsOrgUnitIntent) {
+    selected.add('manage_org_units');
+    selected.add('search_metadata');
+  }
+
   // ── Intent-driven override: if the user explicitly asks to create or manage
   //    metadata, the full authoring kit must be available regardless of page.
   //    This fixes the failure mode where a user on Data Visualizer / Maps / a
@@ -5296,7 +5363,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const writeCapableNames = new Set([
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
-    'manage_custom_forms', 'manage_validation_rules',
+    'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5332,6 +5399,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_datasets');
     selected.delete('manage_custom_forms');
     selected.delete('manage_validation_rules');
+    selected.delete('manage_org_units');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5414,6 +5482,11 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
         && /\b(rule|check|validat|dataset|data\s*set|data\s*element|aggregate|expression)\b/i.test(text))
     || (/\bvalidat(e|ion)\b/i.test(text)
         && /\b(left\s*side|right\s*side|leftside|rightside|compulsory\s*pair|exclusive\s*pair|greater\s*than|less\s*than|data\s*set|dataset|aggregate\s*data)\b/i.test(text));
+  const wantsOrgUnitPrompt =
+    /\b(organi[sz]ation\s*units?|org\s*units?|orgunits?|sub-?units?)\b/i.test(text)
+    || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/i.test(text)
+    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinic|hospital|chiefdom|catchment\s*area|sub[-\s]?district)\b/i.test(text)
+    || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/i.test(text);
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -5971,6 +6044,39 @@ equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_
 - "Inpatient days must not exceed available bed-days (monthly)": create rule { name, operator:"less_than_or_equal_to", period_type:"Monthly", left_expression:"#{inpatientDaysUid}", right_expression:"#{bedDaysUid}", importance:"MEDIUM" }.
 - "ANC 4th visits should never exceed ANC 1st visits": operator "less_than_or_equal_to", left=#{anc4}, right=#{anc1}.
 - "Sex sub-totals must equal the grand total": operator "equal_to", left="#{deMale} + #{deFemale}", right="#{deTotal}".
+`;
+  }
+
+  // ── Org-Unit hierarchy KB — organisationUnits (manage_org_units) ──
+  if (wantsOrgUnitPrompt) {
+    p += `
+## DHIS2 Organisation Units (manage_org_units)
+The org-unit hierarchy is the tree of facilities/chiefdoms/districts/countries that EVERY program, dataset, data value and enrollment is attached to. Use **manage_org_units** for ALL org-unit STRUCTURE work (create a facility under a parent, rename/close one, MOVE/re-parent a unit or subtree, delete a leaf) — never hand-write /metadata bodies via dhis2_query.
+
+### Actions
+list (filter by name/level/parent_id), get, create, update, delete.
+
+### The one rule that trips people up: level & path are DERIVED, never set
+- A unit's \`level\` and \`path\` come from its parent — DHIS2 computes them. You pass only \`parent_id\`; a child of a level-3 chiefdom automatically becomes level 4 with path = parentPath + "/" + newId.
+- NEVER put level or path in the org_unit object, and never "fix" them by hand — that is not how the hierarchy works.
+
+### create
+- Required: org_unit.name, org_unit.parent_id, org_unit.opening_date (YYYY-MM-DD). short_name defaults to name (≤50 chars).
+- The tool verifies the parent exists first and reports the derived level. Resolve the parent UID with manage_org_units(action=list) or search_metadata — NEVER invent it. Creating a new ROOT is intentionally unsupported (it would split the hierarchy).
+- Use dry_run_only:true to validate (incl. the parent reference) without committing.
+
+### update / move (re-parent)
+- Patch any field (name, short_name, opening_date, closed_date — pass "" to clear closed_date — code, description, comment, contact fields).
+- Supplying org_unit.parent_id MOVES the unit; DHIS2 re-computes level/path for it AND all descendants. The tool rejects a move under the unit's own descendant (cycle) and under itself.
+- update auto-snapshots a backup first (restore via manage_backups).
+
+### delete
+- Only LEAF units delete. The tool refuses a unit that still has children (re-parent or delete them bottom-up first) and lets DHIS2 block any unit still holding data values / program-dataset assignments / user scope, surfacing the exact reason. Auto-backup is taken first.
+
+### Examples
+- "Add a new facility 'Bo CHC' under Badjia chiefdom (opened 2015-01-01)": create with org_unit:{ name:"Bo CHC", parent_id:"<BadjiaUID>", opening_date:"2015-01-01" }.
+- "Move the Ngelehun clinic under Kakua chiefdom instead": update org_unit_id=<clinic> org_unit:{ parent_id:"<KakuaUID>" }.
+- "Close facility X as of 2024-12-31": update org_unit:{ closed_date:"2024-12-31" }.
 `;
   }
 
@@ -10102,6 +10208,11 @@ async function executeTool(name, args) {
     return await executeManageValidationRules(args);
   }
 
+  // ── manage_org_units ──
+  if (name === 'manage_org_units') {
+    return await executeManageOrgUnits(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -10420,6 +10531,346 @@ async function createValidationRule(args) {
     left_meaning: leftChk.description,
     right_meaning: rightChk.description,
     message: `Created validation rule "${ruleObj.name}" (${id}).`,
+  };
+}
+
+// ── manage_org_units: CRUD for DHIS2 organisationUnits (the OU hierarchy) ──
+//
+// level + path are DERIVED by DHIS2 from the parent — this tool never sets
+// them. create verifies the parent first; update validates a re-parent target
+// (and rejects cycles) and auto-snapshots before writing; delete refuses any
+// unit that still has children and surfaces DHIS2's exact blocking reason for
+// units that still hold data/assignments. All shared helpers are reused with
+// their existing signatures — no shared code is modified.
+
+const OU_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+function normalizeOuDate(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  return OU_DATE_ONLY_RE.test(s) ? `${s}T00:00:00.000` : s;
+}
+function isValidOuDate(value) {
+  const s = String(value ?? '').trim();
+  return OU_DATE_ONLY_RE.test(s) || /^\d{4}-\d{2}-\d{2}T/.test(s);
+}
+
+async function executeManageOrgUnits(args) {
+  const action = args?.action;
+  if (!action) {
+    return {
+      _error: 'Missing required parameter: action',
+      _hint: 'One of: list, get, create, update, delete.',
+    };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.level != null && Number.isFinite(Number(args.level))) filters.push(`level:eq:${Number(args.level)}`);
+    if (args.parent_id) filters.push(`parent.id:eq:${encodeURIComponent(args.parent_id)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `organisationUnits?fields=id,displayName,level,path,parent[id,displayName],children~size,openingDate,closedDate&pageSize=${pageSize}${fp}&order=path:asc`
+    );
+    if (resp?._error) return { _error: `organisationUnits list failed: ${resp._error}` };
+    const ous = (resp.organisationUnits || []).map(o => ({
+      id: o.id,
+      name: o.displayName,
+      level: o.level,
+      path: o.path,
+      parent: o.parent ? { id: o.parent.id, name: o.parent.displayName } : null,
+      children: o.children ?? 0,
+      openingDate: o.openingDate,
+      closedDate: o.closedDate || null,
+    }));
+    return {
+      success: true,
+      total: ous.length,
+      pager_total: resp.pager?.total ?? null,
+      org_units: ous,
+    };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const id = args.org_unit_id || args.object_id;
+    if (!id) return { _error: 'org_unit_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `organisationUnits/${id}?fields=id,displayName,shortName,code,level,path,parent[id,displayName,level],` +
+      `children~size,openingDate,closedDate,description,comment,address,email,phoneNumber,url,contactPerson,featureType,access`
+    );
+    if (resp?._status === 404) return { _error: `organisationUnits with id "${id}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load org unit ${id}: ${resp._error}` };
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      shortName: resp.shortName,
+      code: resp.code || null,
+      level: resp.level,
+      path: resp.path,
+      parent: resp.parent ? { id: resp.parent.id, name: resp.parent.displayName, level: resp.parent.level } : null,
+      childCount: resp.children ?? 0,
+      openingDate: resp.openingDate,
+      closedDate: resp.closedDate || null,
+      description: resp.description || null,
+      comment: resp.comment || null,
+      contact: {
+        address: resp.address || null,
+        email: resp.email || null,
+        phoneNumber: resp.phoneNumber || null,
+        contactPerson: resp.contactPerson || null,
+        url: resp.url || null,
+      },
+      featureType: resp.featureType || null,
+      access: resp.access,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_org_units', 'create');
+    if (_gate) return _gate;
+    return await createOrgUnit(args);
+  }
+
+  // ── update ────────────────────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_org_units', 'update', { org_unit_id: args.org_unit_id });
+    if (_gate) return _gate;
+    const id = args.org_unit_id || args.object_id;
+    if (!id) return { _error: 'org_unit_id required for update' };
+    if (!args.org_unit || typeof args.org_unit !== 'object') {
+      return {
+        _error: 'org_unit object required for update',
+        _hint: 'Pass org_unit:{ name?, short_name?, parent_id?, opening_date?, closed_date?, code?, description?, comment?, address?, email?, phone_number?, contact_person?, url? }',
+      };
+    }
+    const exists = await verifyTargetExists('organisationUnits', id, 'manage_org_units', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+
+    const o = args.org_unit;
+    // Validate field values + any re-parent target BEFORE snapshotting/mutating,
+    // so an invalid patch never triggers a backup or a half-applied write.
+    if (o.opening_date !== undefined && !isValidOuDate(o.opening_date)) {
+      return { _error: `Invalid opening_date "${o.opening_date}". Use YYYY-MM-DD.` };
+    }
+    if (o.closed_date !== undefined && o.closed_date !== null && String(o.closed_date).trim() !== '' && !isValidOuDate(o.closed_date)) {
+      return { _error: `Invalid closed_date "${o.closed_date}". Use YYYY-MM-DD (or "" to clear).` };
+    }
+
+    let newParent = null;
+    if (o.parent_id !== undefined && o.parent_id !== null && String(o.parent_id).trim() !== '') {
+      const newParentId = String(o.parent_id).trim();
+      if (newParentId === id) return { _error: 'Cannot set an org unit as its own parent.' };
+      const pResp = await safeDhis2Fetch(`organisationUnits/${newParentId}?fields=id,displayName,level,path`);
+      if (pResp?._status === 404) return { _error: `New parent org unit "${newParentId}" does not exist (404).`, _hint: 'Confirm the parent UID via manage_org_units(action=list) or search_metadata.' };
+      if (pResp?._error) return { _error: `Could not load new parent ${newParentId}: ${pResp._error}` };
+      // Cycle guard: the new parent must NOT be this unit's own descendant.
+      if (pResp.path && pResp.path.split('/').includes(id)) {
+        return { _error: `Cannot move org unit ${id} under "${pResp.displayName}" — that target is a descendant of this org unit (would create a cycle).` };
+      }
+      newParent = pResp;
+    }
+
+    const objResp = await safeDhis2Fetch(`organisationUnits/${id}?fields=:owner`);
+    if (objResp?._error) return { _error: `Could not load org unit ${id}: ${objResp._error}` };
+    const objName = objResp.name || objResp.displayName || id;
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_org_unit', tool: 'manage_org_units', action: 'update', reason: `Update org unit ${objName}` },
+      [{ object_type: 'organisationUnits', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (o.name !== undefined) { objResp.name = String(o.name).trim(); applied.name = objResp.name; }
+    if (o.short_name !== undefined || o.shortName !== undefined) {
+      objResp.shortName = String(o.short_name ?? o.shortName).trim().slice(0, 50);
+      applied.shortName = objResp.shortName;
+    }
+    if (o.opening_date !== undefined) { objResp.openingDate = normalizeOuDate(o.opening_date); applied.openingDate = objResp.openingDate; }
+    if (o.closed_date !== undefined) {
+      if (o.closed_date === null || String(o.closed_date).trim() === '') { delete objResp.closedDate; applied.closedDate = null; }
+      else { objResp.closedDate = normalizeOuDate(o.closed_date); applied.closedDate = objResp.closedDate; }
+    }
+    if (o.code !== undefined) { if (o.code) { objResp.code = String(o.code).trim(); } else { delete objResp.code; } applied.code = objResp.code || null; }
+    if (o.description !== undefined) { objResp.description = o.description; applied.description = o.description; }
+    if (o.comment !== undefined) { objResp.comment = o.comment; applied.comment = o.comment; }
+    for (const [field, src] of [['address', 'address'], ['email', 'email'], ['phoneNumber', 'phone_number'], ['url', 'url'], ['contactPerson', 'contact_person']]) {
+      if (o[src] !== undefined) { objResp[field] = o[src]; applied[field] = o[src]; }
+    }
+    if (newParent) { objResp.parent = { id: newParent.id }; applied.parent = { id: newParent.id, name: newParent.displayName }; }
+
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'org_unit supplied no recognized fields to update.', backup: backup.block };
+    }
+
+    const putResp = await safeDhis2Fetch(`organisationUnits/${id}`, { method: 'PUT', body: objResp });
+    if (putResp?._error) return { _error: `Failed to update org unit: ${putResp._error}`, backup: backup.block };
+    const result = { success: true, action: 'update', org_unit_id: id, org_unit_name: objName, applied, backup: backup.block };
+    if (newParent) result.note = `Moved under "${newParent.displayName}". DHIS2 recomputes level/path for this org unit and all its descendants automatically.`;
+    return result;
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_org_units', 'delete', { org_unit_id: args.org_unit_id });
+    if (_gate) return _gate;
+    const id = args.org_unit_id || args.object_id;
+    if (!id) return { _error: 'org_unit_id required for delete' };
+    const exists = await verifyTargetExists('organisationUnits', id, 'manage_org_units', 'delete', 'id,displayName,children~size,path');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || id;
+    const childCount = exists.data?.children ?? 0;
+
+    // Hard guard: never delete a non-leaf unit. DHIS2 blocks it (E4030) anyway,
+    // but refusing up-front gives a precise, actionable message and avoids
+    // snapshotting a node that cannot be removed.
+    if (childCount > 0) {
+      return {
+        _error: `Cannot delete org unit "${objName}" — it has ${childCount} child org unit(s).`,
+        _hint: `Re-parent or delete its children first: manage_org_units(action=list, parent_id="${id}") to see them, then either move each (action=update, org_unit:{parent_id:"<other OU>"}) or delete the leaves bottom-up.`,
+        child_count: childCount,
+      };
+    }
+
+    // organisationUnits is an unmapped type in checkMetadataReferences → returns
+    // has_references:false; DHIS2's atomic DELETE is the authoritative net for any
+    // remaining association (assigned programs/datasets, captured data values,
+    // users' org-unit scope) and is surfaced explicitly below.
+    const refsResult = await checkMetadataReferences('organisationUnits', id);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete org unit "${objName}" — it has active references.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('organisationUnits', id, refsResult.references),
+      };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_org_unit', tool: 'manage_org_units', action: 'delete', reason: `Deleting org unit ${objName} (${id})` },
+      [{ object_type: 'organisationUnits', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { organisationUnits: [{ id }] },
+    });
+    if (delResp?._error) return { _error: `Org unit deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'organisationUnits', id, name: objName },
+        message: `Successfully deleted org unit "${objName}".`,
+        backup: backup.block,
+      };
+    }
+    // Surface DHIS2's exact blocking reason (E4030 "associated with another
+    // object", data values, program assignment) instead of a generic message.
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Org unit "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'The unit is still associated with other objects (assigned programs/datasets, captured data values, or users’ org-unit scope). Remove those associations, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_org_units.`,
+    _hint: 'One of: list, get, create, update, delete.',
+  };
+}
+
+async function createOrgUnit(args) {
+  const o = args.org_unit;
+  if (!o || typeof o !== 'object') {
+    return {
+      _error: 'org_unit object required for create',
+      _hint: 'Pass org_unit:{ name, parent_id, opening_date, short_name?, code?, description?, ... }',
+    };
+  }
+  if (!o.name || !String(o.name).trim()) return { _error: 'org_unit.name is required.' };
+
+  const parentId = (o.parent_id || args.parent_id) ? String(o.parent_id || args.parent_id).trim() : '';
+  if (!parentId) {
+    return {
+      _error: 'org_unit.parent_id is required.',
+      _hint: 'Every org unit except the single root has a parent. Pass the parent OU UID (find it with manage_org_units(action=list) or search_metadata). Creating a NEW root is intentionally not supported by this tool to avoid splitting the hierarchy.',
+    };
+  }
+
+  const openingRaw = o.opening_date ?? o.openingDate;
+  if (!openingRaw) return { _error: 'org_unit.opening_date is required (YYYY-MM-DD).' };
+  if (!isValidOuDate(openingRaw)) return { _error: `Invalid opening_date "${openingRaw}". Use YYYY-MM-DD.` };
+  const closedRaw = o.closed_date ?? o.closedDate;
+  if (closedRaw && !isValidOuDate(closedRaw)) return { _error: `Invalid closed_date "${closedRaw}". Use YYYY-MM-DD.` };
+
+  // Verify the parent exists up-front: gives a clear error + lets us report the
+  // derived level. postMetadataPayload's VALIDATE pass is the backstop for a
+  // reference that vanishes between this check and the import (E5002).
+  const parentResp = await safeDhis2Fetch(`organisationUnits/${parentId}?fields=id,displayName,level,path`);
+  if (parentResp?._status === 404) {
+    return { _error: `Parent org unit "${parentId}" does not exist (404).`, _hint: 'Confirm the parent UID via manage_org_units(action=list) or search_metadata before creating a child.' };
+  }
+  if (parentResp?._error) return { _error: `Could not load parent org unit ${parentId}: ${parentResp._error}` };
+
+  const id = generateDhis2Uid();
+  const name = String(o.name).trim();
+  const shortName = String(o.short_name || o.shortName || name).trim().slice(0, 50);
+  const ouObj = {
+    id,
+    name,
+    shortName,
+    openingDate: normalizeOuDate(openingRaw),
+    parent: { id: parentId },
+  };
+  if (closedRaw) ouObj.closedDate = normalizeOuDate(closedRaw);
+  if (o.code) ouObj.code = String(o.code).trim();
+  if (o.description) ouObj.description = String(o.description);
+  if (o.comment) ouObj.comment = String(o.comment);
+  for (const [field, src] of [['address', 'address'], ['email', 'email'], ['phoneNumber', 'phone_number'], ['url', 'url'], ['contactPerson', 'contact_person']]) {
+    const v = o[src] ?? o[field];
+    if (v) ouObj[field] = String(v);
+  }
+
+  const result = await postMetadataPayload({ organisationUnits: [ouObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return { _error: result._error || 'Org unit create failed.', phase: result.phase, errors: result.errors };
+  }
+
+  const expectedLevel = (parentResp.level || 0) + 1;
+  if (args.dry_run_only) {
+    return {
+      success: true,
+      dry_run: true,
+      message: `Validation passed for "${name}". No org unit created (dry_run_only=true).`,
+      would_create: { id, name, shortName, parent: { id: parentId, name: parentResp.displayName }, expected_level: expectedLevel },
+    };
+  }
+  return {
+    success: true,
+    action: 'create',
+    org_unit_id: id,
+    org_unit: {
+      id, name, shortName, level: expectedLevel,
+      parent: { id: parentId, name: parentResp.displayName },
+      openingDate: ouObj.openingDate, closedDate: ouObj.closedDate || null,
+    },
+    message: `Created org unit "${name}" (${id}) under "${parentResp.displayName}" at level ${expectedLevel}.`,
   };
 }
 

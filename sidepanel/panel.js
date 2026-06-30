@@ -1586,6 +1586,7 @@ ${turnXml}
       manage_custom_translations: { cls: 'tool-icon-create', icon: '\u{1F310}' },
       manage_growth_chart_plugin: { cls: 'tool-icon-create', icon: '\u{1F4C8}' },
       manage_validation_rules: { cls: 'tool-icon-info', icon: '\u{2705}' },
+      manage_org_units: { cls: 'tool-icon-create', icon: '\u{1F3E2}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1617,6 +1618,7 @@ ${turnXml}
       manage_custom_translations: 'Managing custom translations',
       manage_growth_chart_plugin: 'Setting up growth chart plugin',
       manage_validation_rules: 'Managing validation rules',
+      manage_org_units: 'Managing org units',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1779,6 +1781,18 @@ ${turnXml}
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.importance && !(args.rule && args.rule.importance)) parts.push(args.importance);
       if (args.period_type) parts.push(`pe: ${args.period_type}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_org_units') {
+      const parts = [args.action || 'unknown'];
+      if (args.org_unit_id) parts.push(`id: ${String(args.org_unit_id).slice(0, 11)}`);
+      if (args.org_unit && typeof args.org_unit === 'object') {
+        if (args.org_unit.name) parts.push(`"${String(args.org_unit.name).slice(0, 30)}"`);
+        if (args.org_unit.parent_id) parts.push(`parent: ${String(args.org_unit.parent_id).slice(0, 11)}`);
+      }
+      if (args.parent_id && !(args.org_unit && args.org_unit.parent_id)) parts.push(`parent: ${String(args.parent_id).slice(0, 11)}`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.level != null) parts.push(`level: ${args.level}`);
       if (args.dry_run_only) parts.push('DRY RUN');
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {
