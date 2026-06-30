@@ -5127,6 +5127,84 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
   {
     type: 'function',
     function: {
+      name: 'manage_dashboards',
+      description: `Build and inspect DHIS2 **analytics dashboards and visualizations** — the charts, pivot tables and single-value tiles shown in the Dashboard app, and the dashboards that arrange them. Use this tool for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata visualizations or dashboards bodies via dhis2_query (a raw POST that only sets columns/rows/filters silently imports an EMPTY, un-renderable chart — DHIS2 stores the layout as columnDimensions/rowDimensions/filterDimensions and the data as dataDimensionItems / relativePeriods / organisationUnits; this tool assembles that exact structure for you).
+Actions: list / get / create_visualization / create_dashboard.
+- create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (indicator / dataElement / programIndicator UIDs — their types are auto-resolved AND verified to exist), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed.
+- create_dashboard: a whole dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). New visualizations and the dashboard are imported together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back — nothing half-built is left behind.
+- list / get: list dashboards (optional name filter) / read one dashboard with its items and their visualizations.
+To DELETE a dashboard or visualization, or change its sharing, use manage_metadata (object_type "dashboards" / "visualizations"). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create_visualization', 'create_dashboard'],
+            description: 'list=paginated dashboard list (optional name filter); get=one dashboard with its items + visualizations; create_visualization=one chart/pivot/single-value; create_dashboard=a dashboard with items (existing UIDs and/or inline-created visualizations), atomically.'
+          },
+          dashboard_id: { type: 'string', description: 'Existing dashboard UID (required for get).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on dashboard name.' },
+          limit: { type: 'integer', description: 'For list: max dashboards to return (1–200, default 50).' },
+          visualization: {
+            type: 'object',
+            description: 'For create_visualization: the visualization spec.',
+            properties: {
+              name: { type: 'string', description: 'Visualization display name (required).' },
+              vis_type: { type: 'string', description: 'Chart type: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, STACKED_AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, YEAR_OVER_YEAR_COLUMN, SCATTER, BUBBLE. Default COLUMN.' },
+              data_items: { type: 'array', items: { type: 'string' }, description: 'Indicator / dataElement / programIndicator UIDs to plot (the dx dimension). Types are auto-resolved and existence-verified.' },
+              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) and/or fixed ISO periods (202401, 2025Q1, 2025).' },
+              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2).' },
+              short_name: { type: 'string', description: 'Optional short name (max 50 chars).' },
+              description: { type: 'string', description: 'Optional description.' },
+              layout: {
+                type: 'object',
+                description: 'Optional layout override — which dimensions sit on each axis. Each is a subset of ["dx","pe","ou"]. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → columns[dx] rows[pe] filters[ou].',
+                properties: {
+                  columns: { type: 'array', items: { type: 'string' } },
+                  rows: { type: 'array', items: { type: 'string' } },
+                  filters: { type: 'array', items: { type: 'string' } }
+                }
+              }
+            }
+          },
+          dashboard: {
+            type: 'object',
+            description: 'For create_dashboard: the dashboard\'s own fields.',
+            properties: {
+              name: { type: 'string', description: 'Dashboard display name (required).' },
+              description: { type: 'string', description: 'Optional description.' }
+            }
+          },
+          items: {
+            type: 'array',
+            description: 'For create_dashboard: the items to place on the dashboard. Each entry either references an existing object OR inline-creates a new visualization.',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map.' },
+                visualization_id: { type: 'string', description: 'UID of an EXISTING visualization to embed (type VISUALIZATION).' },
+                map_id: { type: 'string', description: 'UID of an EXISTING map to embed (type MAP).' },
+                text: { type: 'string', description: 'Tile text (type TEXT).' },
+                new_visualization: {
+                  type: 'object',
+                  description: 'Inline-create a NEW visualization for this item (same fields as the create_visualization "visualization" spec): name, vis_type, data_items, periods, org_units, short_name, description, layout.'
+                },
+                x: { type: 'integer', description: 'Optional grid x (0–58). Auto-placed if omitted.' },
+                y: { type: 'integer', description: 'Optional grid y. Auto-placed if omitted.' },
+                width: { type: 'integer', description: 'Optional grid width (default 29 = half row).' },
+                height: { type: 'integer', description: 'Optional grid height (default 20).' }
+              }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create_visualization / create_dashboard: validate the metadata import without committing. Default false.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -5189,6 +5267,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_indicators: true,
   manage_option_sets: true,
   manage_legend_sets: true,
+  manage_dashboards: true,
   manage_backups: true,
 });
 
@@ -5336,6 +5415,22 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
           || /\bcolou?r\s+(?:band|scale|ramp|range|gradient)s?\b/.test(combinedText)
           || /\b(?:value\s+)?thresholds?\b/.test(combinedText))
         && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/.test(combinedText));
+  // ── Dashboard / visualization authoring intent ──
+  // Reusable analytics dashboards and the charts/pivots/single-value tiles on
+  // them. Conservative AND disjoint from render_chart (the inline preview tool):
+  // fires on an explicit "dashboard" mention, OR a PERSISTENCE verb (create /
+  // build / make / save / design / set up) coupled with a saved-visualization
+  // noun (visualization / pivot table / single value / gauge / saved chart) —
+  // so "show me a chart" / "plot this" stays with render_chart and never
+  // surfaces this tool. Being on the Dashboard app also surfaces it.
+  const wantsDashboardIntent =
+    /\bdashboards?\b/.test(combinedText)
+    || (/\b(create|build|make|save|design|set\s*up|setup|add|new|assemble|put\s*together)\b/.test(combinedText)
+        && (/\bvisuali[sz]ations?\b/.test(combinedText)
+            || /\bpivot\s*tables?\b/.test(combinedText)
+            || /\bsingle[-\s]?value\b/.test(combinedText)
+            || /\bgauge\s*(chart|visuali[sz]ation)?\b/.test(combinedText)
+            || /\b(saved|reusable|favou?rite)\s+(chart|graph|visuali[sz]ation|pivot)\b/.test(combinedText)));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5537,6 +5632,17 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Dashboard / visualization authoring — surfaced on explicit dashboard /
+  //    saved-visualization intent, OR whenever the user is on the Dashboard or
+  //    Data Visualizer app (where building/saving a chart or dashboard is the
+  //    obvious next step). search_metadata is the companion for resolving the
+  //    indicator / dataElement / programIndicator / OU UIDs the charts plot.
+  //    render_chart stays in the set, so inline-preview turns are unaffected. ──
+  if (wantsDashboardIntent || isDashboard || isDataViz) {
+    selected.add('manage_dashboards');
+    selected.add('search_metadata');
+  }
+
   // ── Intent-driven override: if the user explicitly asks to create or manage
   //    metadata, the full authoring kit must be available regardless of page.
   //    This fixes the failure mode where a user on Data Visualizer / Maps / a
@@ -5583,6 +5689,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
     'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
     'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
+    'manage_dashboards',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5622,6 +5729,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_indicators');
     selected.delete('manage_option_sets');
     selected.delete('manage_legend_sets');
+    selected.delete('manage_dashboards');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5730,6 +5838,17 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
           || /\bcolou?r\s+(?:band|scale|ramp|range|gradient)s?\b/i.test(text)
           || /\b(?:value\s+)?thresholds?\b/i.test(text))
         && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/i.test(text));
+
+  // Dashboard / visualization authoring KB — surfaced on explicit dashboard /
+  // saved-visualization intent, or whenever the user is on the Dashboard or
+  // Data Visualizer app.
+  const wantsDashboardPrompt =
+    /\bdashboards?\b/i.test(text)
+    || ctx.appType === 'Dashboard'
+    || ctx.appType === 'Data Visualizer'
+    || (/\b(create|build|make|save|design|set\s*up|assemble)\b/i.test(text)
+        && (/\bvisuali[sz]ations?\b/i.test(text) || /\bpivot\s*tables?\b/i.test(text)
+            || /\bsingle[-\s]?value\b/i.test(text) || /\b(saved|reusable|favou?rite)\s+(chart|graph|visuali[sz]ation|pivot)\b/i.test(text)));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -6410,6 +6529,37 @@ A **legend set** is a reusable, ordered list of colour **bands** that renders nu
 - "Make a coverage legend, red→green, 0 to 100 in 5 bands": create legend_set:{ name:"Coverage 0–100" }, auto_bands:{ start:0, end:100, count:5 }.
 - "Create a stockout legend: 0 red, 1–10 amber, 11+ green": create legend_set:{ name:"Stock status", legends:[{name:"Out",startValue:0,endValue:1,color:"#D32F2F"},{name:"Low",startValue:1,endValue:11,color:"#FBC02D"},{name:"OK",startValue:11,endValue:1000000,color:"#388E3C"}] }.
 - "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].
+`;
+  }
+
+  // ── Dashboards & Visualizations KB — analytics dashboard builder (manage_dashboards) ──
+  if (wantsDashboardPrompt) {
+    p += `
+## DHIS2 Dashboards & Visualizations (manage_dashboards)
+A **visualization** is a saved chart, pivot table or single-value tile (the analytics output shown in the Dashboard app and Data Visualizer). A **dashboard** arranges several visualizations (and maps / text tiles) on a grid. Use **manage_dashboards** for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata \`visualizations\` or \`dashboards\` bodies via dhis2_query.
+
+### Why a raw POST silently fails (and this tool does not)
+DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/\`filterDimensions\` (lists of dimension ids) and its DATA as \`dataDimensionItems\` (typed dx items) + \`relativePeriods\`/\`periods\` (pe) + \`organisationUnits\`/\`organisationUnitLevels\`/\`userOrganisationUnit\` (ou). The \`columns\`/\`rows\`/\`filters\` arrays are DERIVED read-only views — a raw POST that only sets them imports an EMPTY, un-renderable chart. This tool assembles the correct structure (verified VALIDATE+COMMIT on the live server).
+
+### Actions
+- **list** (optional name_filter) and **get** (dashboard_id → its items + each item's visualization) are read-only.
+- **create_visualization** — one chart/pivot/single-value: \`visualization:{ name, vis_type, data_items:[…UIDs], periods:[…], org_units:[…] }\`. data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped.
+- **create_dashboard** — a whole dashboard atomically: \`dashboard:{ name }\` + \`items:[…]\`. Each item EITHER references an existing object (\`{ visualization_id }\` or \`{ type:"MAP", map_id }\` or \`{ type:"TEXT", text }\`) OR inline-creates a new chart (\`{ new_visualization:{ name, vis_type, data_items, periods, org_units } }\`). New visualizations + the dashboard import together, so one bad UID rolls the whole thing back. Items are auto-arranged on the 58-column grid (override per item with x/y/width/height).
+
+### Fields
+- **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
+- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025).
+- **org_units**: UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2 = all level-2 OUs).
+- **layout** (optional): which of dx/pe/ou sit on columns/rows/filters. Sensible per-type defaults apply (pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → cols[dx]/rows[pe]).
+
+### Rules
+- NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / list / get first.
+- To DELETE a dashboard/visualization or change its sharing, use **manage_metadata** (object_type "dashboards" / "visualizations"); manage_dashboards only creates and reads.
+- Use **render_chart** for a quick inline chart preview in chat; use **manage_dashboards** to SAVE a reusable visualization/dashboard in DHIS2. They are different jobs.
+
+### Examples
+- "Build an ANC dashboard with a coverage chart, a pivot and a single value": create_dashboard dashboard:{ name:"ANC Programme" }, items:[ {new_visualization:{name:"ANC Coverage by Month",vis_type:"COLUMN",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC Coverage Pivot",vis_type:"PIVOT_TABLE",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC 1 This Year",vis_type:"SINGLE_VALUE",data_items:["<anc1>"],periods:["THIS_YEAR"],org_units:["<ou>"]}} ].
+- "Make me a column chart of malaria cases by district last year": create_visualization visualization:{ name:"Malaria cases by district", vis_type:"COLUMN", data_items:["<de>"], periods:["LAST_YEAR"], org_units:["LEVEL-2"] }.
 `;
   }
 
@@ -10619,6 +10769,11 @@ async function executeTool(name, args) {
     return await executeManageLegendSets(args);
   }
 
+  // ── manage_dashboards ──
+  if (name === 'manage_dashboards') {
+    return await executeManageDashboards(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -12354,6 +12509,403 @@ async function createLegendSet(args) {
     legend_set: { id: setId, name, code: setObj.code, legends: legendObjs.map(l => ({ id: l.id, name: l.name, startValue: l.startValue, endValue: l.endValue, color: l.color || null })) },
     message: `Created legend set "${name}" (${setId}) with ${legendObjs.length} band(s).`,
     warnings: warnings.length ? warnings : undefined,
+  };
+}
+
+// ── manage_dashboards: build + inspect DHIS2 analytics dashboards & visualizations ──
+//
+// CRITICAL structural facts, proven on the 2.43 playground BEFORE writing this
+// (VALIDATE+COMMIT, read-back, render-check) so the chatbot can never ship a
+// silently-empty chart:
+//  • A visualization's LAYOUT is stored as columnDimensions / rowDimensions /
+//    filterDimensions (lists of dimension ids like "dx"/"pe"/"ou"). The
+//    columns/rows/filters item arrays are DERIVED read-only views — POSTing
+//    them does NOTHING (they import back as []), so a naive raw /metadata POST
+//    that only sets columns/rows/filters yields an empty, un-renderable chart.
+//  • The dx data is carried by dataDimensionItems (typed: INDICATOR /
+//    DATA_ELEMENT / PROGRAM_INDICATOR). pe is carried by relativePeriods
+//    (boolean flags) + periods (fixed ISO). ou is carried by organisationUnits
+//    (UID list) + organisationUnitLevels (PLAIN INTEGER list — [2], not
+//    [{level:2}]) + userOrganisationUnit / userOrganisationUnitChildren flags.
+//  • A dashboard's tiles are dashboardItems[{ type, visualization|map|text,
+//    x,y,width,height }]; the 58-column grid is auto-packed here.
+// All shared helpers (generateDhis2Uid, postMetadataPayload, safeDhis2Fetch,
+// requireWriteAuth) are reused with their existing signatures — no shared
+// code's behaviour changes.
+
+const VIZ_TYPES = new Set([
+  'COLUMN', 'STACKED_COLUMN', 'BAR', 'STACKED_BAR', 'LINE', 'AREA', 'STACKED_AREA',
+  'PIE', 'RADAR', 'GAUGE', 'SINGLE_VALUE', 'PIVOT_TABLE', 'YEAR_OVER_YEAR_LINE',
+  'YEAR_OVER_YEAR_COLUMN', 'SCATTER', 'BUBBLE',
+]);
+
+// Relative-period keyword → relativePeriods flag (DHIS2 camelCase).
+const VIZ_REL_PERIOD_FLAG = Object.freeze({
+  THIS_DAY: 'thisDay', YESTERDAY: 'yesterday', LAST_3_DAYS: 'last3Days', LAST_7_DAYS: 'last7Days',
+  LAST_14_DAYS: 'last14Days', LAST_30_DAYS: 'last30Days', LAST_60_DAYS: 'last60Days',
+  LAST_90_DAYS: 'last90Days', LAST_180_DAYS: 'last180Days',
+  THIS_WEEK: 'thisWeek', LAST_WEEK: 'lastWeek', THIS_BIWEEK: 'thisBiWeek', LAST_BIWEEK: 'lastBiWeek',
+  LAST_4_WEEKS: 'last4Weeks', LAST_4_BIWEEKS: 'last4BiWeeks', LAST_12_WEEKS: 'last12Weeks', LAST_52_WEEKS: 'last52Weeks',
+  WEEKS_THIS_YEAR: 'weeksThisYear',
+  THIS_MONTH: 'thisMonth', LAST_MONTH: 'lastMonth', LAST_3_MONTHS: 'last3Months', LAST_6_MONTHS: 'last6Months',
+  LAST_12_MONTHS: 'last12Months', MONTHS_THIS_YEAR: 'monthsThisYear', MONTHS_LAST_YEAR: 'monthsLastYear',
+  THIS_BIMONTH: 'thisBimonth', LAST_BIMONTH: 'lastBimonth', LAST_6_BIMONTHS: 'last6BiMonths', BIMONTHS_THIS_YEAR: 'biMonthsThisYear',
+  THIS_QUARTER: 'thisQuarter', LAST_QUARTER: 'lastQuarter', LAST_4_QUARTERS: 'last4Quarters',
+  QUARTERS_THIS_YEAR: 'quartersThisYear', QUARTERS_LAST_YEAR: 'quartersLastYear',
+  THIS_SIX_MONTH: 'thisSixMonth', LAST_SIX_MONTH: 'lastSixMonth', LAST_2_SIXMONTHS: 'last2SixMonths',
+  THIS_YEAR: 'thisYear', LAST_YEAR: 'lastYear', LAST_5_YEARS: 'last5Years', LAST_10_YEARS: 'last10Years',
+  THIS_FINANCIAL_YEAR: 'thisFinancialYear', LAST_FINANCIAL_YEAR: 'lastFinancialYear',
+  LAST_5_FINANCIAL_YEARS: 'last5FinancialYears', LAST_10_FINANCIAL_YEARS: 'last10FinancialYears',
+});
+const VIZ_REL_OU = Object.freeze({
+  USER_ORGUNIT: 'userOrganisationUnit',
+  USER_ORGUNIT_CHILDREN: 'userOrganisationUnitChildren',
+  USER_ORGUNIT_GRANDCHILDREN: 'userOrganisationUnitGrandChildren',
+});
+const VIZ_DDI_KEY = Object.freeze({
+  INDICATOR: 'indicator', DATA_ELEMENT: 'dataElement', PROGRAM_INDICATOR: 'programIndicator',
+});
+
+// Default dx/pe/ou placement per visualization type.
+function vizDefaultLayout(type) {
+  switch (type) {
+    case 'PIVOT_TABLE':
+      return { columns: ['pe'], rows: ['dx'], filters: ['ou'] };
+    case 'SINGLE_VALUE':
+    case 'GAUGE':
+    case 'PIE':
+    case 'RADAR':
+      return { columns: ['dx'], rows: [], filters: ['pe', 'ou'] };
+    default: // COLUMN / BAR / LINE / AREA family
+      return { columns: ['dx'], rows: ['pe'], filters: ['ou'] };
+  }
+}
+
+// Resolve each data-item UID to its DHIS2 type AND verify it exists. Looks the
+// UIDs up across indicators / dataElements / programIndicators in parallel.
+// Returns { typeMap, unresolved:[…] }. Any UID found in none is unresolved.
+async function resolveDataItemTypes(uids) {
+  const list = [...new Set((uids || []).map(u => String(u).trim()).filter(Boolean))];
+  const typeMap = {};
+  if (!list.length) return { typeMap, unresolved: [] };
+  const inFilter = `id:in:[${list.join(',')}]`;
+  const [indResp, deResp, piResp] = await Promise.all([
+    safeDhis2Fetch(`indicators.json?filter=${inFilter}&fields=id&paging=false`),
+    safeDhis2Fetch(`dataElements.json?filter=${inFilter}&fields=id&paging=false`),
+    safeDhis2Fetch(`programIndicators.json?filter=${inFilter}&fields=id&paging=false`),
+  ]);
+  for (const o of (indResp?.indicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'INDICATOR';
+  for (const o of (deResp?.dataElements || [])) if (!typeMap[o.id]) typeMap[o.id] = 'DATA_ELEMENT';
+  for (const o of (piResp?.programIndicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'PROGRAM_INDICATOR';
+  const unresolved = list.filter(u => !typeMap[u]);
+  return { typeMap, unresolved };
+}
+
+// Build a complete, render-correct visualization object from a friendly spec.
+// typeMap must already contain a resolved type for every data_items UID.
+// Returns { ok:true, id, viz } or { _error }. Pure/synchronous.
+function buildVisualizationObject(spec, typeMap) {
+  if (!spec || typeof spec !== 'object') return { _error: 'visualization spec object is required.' };
+  const type = String(spec.vis_type || spec.type || 'COLUMN').toUpperCase();
+  if (!VIZ_TYPES.has(type)) return { _error: `Unsupported vis_type "${type}". One of: ${[...VIZ_TYPES].join(', ')}.` };
+  const name = String(spec.name || '').trim();
+  if (!name) return { _error: 'visualization name is required.' };
+
+  const dataItems = (Array.isArray(spec.data_items) ? spec.data_items : []).map(u => String(u).trim()).filter(Boolean);
+  if (!dataItems.length) return { _error: 'data_items must list at least one indicator / data element / program indicator UID.' };
+  const periods = (Array.isArray(spec.periods) ? spec.periods : []).map(p => String(p).trim()).filter(Boolean);
+  if (!periods.length) return { _error: 'periods must list at least one period (relative keyword like LAST_12_MONTHS or fixed like 202401).' };
+  const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : []).map(o => String(o).trim()).filter(Boolean);
+  if (!orgUnits.length) return { _error: 'org_units must list at least one org-unit UID or relative keyword (USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2).' };
+
+  const id = spec.id || generateDhis2Uid();
+
+  // dx — typed dataDimensionItems (+ dimension presence)
+  const dataDimensionItems = [];
+  const seenDx = new Set();
+  for (const u of dataItems) {
+    if (seenDx.has(u)) continue;
+    seenDx.add(u);
+    const t = typeMap[u];
+    if (!t) return { _error: `Could not resolve data item "${u}" to a known type. Verify the UID with search_metadata.` };
+    const key = VIZ_DDI_KEY[t];
+    if (!key) return { _error: `Data item "${u}" has unsupported type ${t} for a visualization.` };
+    dataDimensionItems.push({ dataDimensionItemType: t, [key]: { id: u } });
+  }
+
+  // pe — relative flags + fixed periods
+  const relativePeriods = {};
+  const fixedPeriods = [];
+  let hasPe = false;
+  for (const p of periods) {
+    const flag = VIZ_REL_PERIOD_FLAG[p.toUpperCase()];
+    if (flag) { relativePeriods[flag] = true; hasPe = true; }
+    else { fixedPeriods.push({ id: p }); hasPe = true; } // fixed ISO period (e.g. 202401, 2025Q1, 2025)
+  }
+
+  // ou — fixed UIDs + relative keywords + levels
+  const organisationUnits = [];
+  const organisationUnitLevels = [];
+  let userOrganisationUnit = false, userOrganisationUnitChildren = false, userOrganisationUnitGrandChildren = false;
+  let hasOu = false;
+  for (const o of orgUnits) {
+    const up = o.toUpperCase();
+    if (VIZ_REL_OU[up]) {
+      if (up === 'USER_ORGUNIT') userOrganisationUnit = true;
+      else if (up === 'USER_ORGUNIT_CHILDREN') userOrganisationUnitChildren = true;
+      else userOrganisationUnitGrandChildren = true;
+      hasOu = true;
+    } else {
+      const m = up.match(/^LEVEL-(\d+)$/);
+      if (m) { const lvl = Number(m[1]); if (!organisationUnitLevels.includes(lvl)) organisationUnitLevels.push(lvl); hasOu = true; }
+      else { organisationUnits.push({ id: o }); hasOu = true; }
+    }
+  }
+
+  // Layout — store dimension lists; only include a dimension that has data.
+  const hasData = { dx: dataDimensionItems.length > 0, pe: hasPe, ou: hasOu };
+  const layoutSpec = spec.layout && typeof spec.layout === 'object' ? spec.layout : vizDefaultLayout(type);
+  const ALLOWED_DIMS = new Set(['dx', 'pe', 'ou']);
+  const axisDims = (dims) => (Array.isArray(dims) ? dims : [])
+    .map(d => String(d).toLowerCase())
+    .filter(d => ALLOWED_DIMS.has(d) && hasData[d]);
+  // Guarantee every present dimension is placed exactly once; if a custom
+  // layout omits one, fall back to the type default so no data is orphaned.
+  const placed = new Set([...axisDims(layoutSpec.columns), ...axisDims(layoutSpec.rows), ...axisDims(layoutSpec.filters)]);
+  const def = vizDefaultLayout(type);
+  const fallbackFilters = [];
+  for (const d of ['dx', 'pe', 'ou']) {
+    if (hasData[d] && !placed.has(d)) fallbackFilters.push(d);
+  }
+  const columnDimensions = axisDims(layoutSpec.columns);
+  const rowDimensions = axisDims(layoutSpec.rows);
+  const filterDimensions = [...axisDims(layoutSpec.filters), ...fallbackFilters];
+  // A visualization must have at least one column dimension to render.
+  if (!columnDimensions.length) {
+    const firstPresent = ['dx', 'pe', 'ou'].find(d => hasData[d]);
+    if (firstPresent) {
+      columnDimensions.push(firstPresent);
+      const fi = filterDimensions.indexOf(firstPresent);
+      if (fi >= 0) filterDimensions.splice(fi, 1);
+      const ri = rowDimensions.indexOf(firstPresent);
+      if (ri >= 0) rowDimensions.splice(ri, 1);
+    }
+  }
+
+  const viz = {
+    id, name, type,
+    dataDimensionItems,
+    columnDimensions, rowDimensions, filterDimensions,
+    organisationUnits,
+    organisationUnitLevels: organisationUnitLevels.slice(),
+    userOrganisationUnit, userOrganisationUnitChildren, userOrganisationUnitGrandChildren,
+    relativePeriods,
+    periods: fixedPeriods,
+  };
+  if (spec.short_name) viz.shortName = String(spec.short_name).slice(0, 50);
+  if (spec.description) viz.description = String(spec.description);
+  return { ok: true, id, viz };
+}
+
+async function executeManageDashboards(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create_visualization, create_dashboard.' };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `dashboards?fields=id,displayName,dashboardItems~size,access&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `dashboards list failed: ${resp._error}` };
+    const dashboards = (resp.dashboards || []).map(d => ({
+      id: d.id,
+      name: d.displayName,
+      items: d.dashboardItems ?? 0,
+      canEdit: !!d.access?.update,
+    }));
+    return { success: true, total: dashboards.length, pager_total: resp.pager?.total ?? null, dashboards };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `dashboards/${dId}?fields=id,displayName,description,` +
+      `dashboardItems[id,type,x,y,width,height,text,visualization[id,displayName,type],map[id,displayName]]`
+    );
+    if (resp?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load dashboard ${dId}: ${resp._error}` };
+    const items = (resp.dashboardItems || []).map(it => ({
+      id: it.id,
+      type: it.type,
+      visualization: it.visualization ? { id: it.visualization.id, name: it.visualization.displayName, type: it.visualization.type } : undefined,
+      map: it.map ? { id: it.map.id, name: it.map.displayName } : undefined,
+      text: it.text || undefined,
+      layout: { x: it.x, y: it.y, width: it.width, height: it.height },
+    }));
+    return { success: true, id: resp.id, name: resp.displayName, description: resp.description || null, item_count: items.length, items };
+  }
+
+  // ── create_visualization ────────────────────────────────────────────────
+  if (action === 'create_visualization') {
+    const _gate = requireWriteAuth('manage_dashboards', 'create_visualization');
+    if (_gate) return _gate;
+    const spec = args.visualization;
+    if (!spec || typeof spec !== 'object') {
+      return { _error: 'visualization object required for create_visualization', _hint: 'Pass visualization:{ name, vis_type, data_items:[…], periods:[…], org_units:[…] }.' };
+    }
+    const { typeMap, unresolved } = await resolveDataItemTypes(spec.data_items);
+    if (unresolved.length) {
+      return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${unresolved.join(', ')}.`, _hint: 'Resolve the correct UIDs with search_metadata first; never invent UIDs.' };
+    }
+    const built = buildVisualizationObject(spec, typeMap);
+    if (built._error) return built;
+    const result = await postMetadataPayload({ visualizations: [built.viz] }, !!args.dry_run_only);
+    if (!result.success) return { _error: result._error || 'Visualization create failed.', phase: result.phase, errors: result.errors };
+    if (args.dry_run_only) {
+      return { success: true, dry_run: true, message: `Validation passed for "${built.viz.name}". No visualization created (dry_run_only=true).`, would_create: { id: built.id, name: built.viz.name, type: built.viz.type } };
+    }
+    return {
+      success: true,
+      action: 'create_visualization',
+      visualization: { id: built.id, name: built.viz.name, type: built.viz.type, data_items: built.viz.dataDimensionItems.length },
+      message: `Created ${built.viz.type} visualization "${built.viz.name}" (${built.id}).`,
+    };
+  }
+
+  // ── create_dashboard ──────────────────────────────────────────────────
+  if (action === 'create_dashboard') {
+    const _gate = requireWriteAuth('manage_dashboards', 'create_dashboard');
+    if (_gate) return _gate;
+    const dash = args.dashboard;
+    if (!dash || typeof dash !== 'object' || !String(dash.name || '').trim()) {
+      return { _error: 'dashboard:{ name } is required for create_dashboard.' };
+    }
+    const items = Array.isArray(args.items) ? args.items : [];
+    if (!items.length) {
+      return { _error: 'items must list at least one dashboard item (existing visualization/map UID, inline new_visualization, or text).' };
+    }
+
+    // First pass: collect every data_items UID across all inline visualizations
+    // so we resolve their types in ONE batched lookup.
+    const inlineSpecs = [];
+    const allDataItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      if (it.new_visualization && typeof it.new_visualization === 'object') {
+        inlineSpecs.push({ index: i, spec: it.new_visualization });
+        for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
+      }
+    }
+    let typeMap = {};
+    if (allDataItems.length) {
+      const res = await resolveDataItemTypes(allDataItems);
+      if (res.unresolved.length) {
+        return { _error: `These data_items UIDs (across the dashboard's new visualizations) do not exist: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
+      }
+      typeMap = res.typeMap;
+    }
+
+    // Build inline visualizations.
+    const newVisualizations = [];
+    const inlineVizIdByIndex = {};
+    for (const { index, spec } of inlineSpecs) {
+      const built = buildVisualizationObject(spec, typeMap);
+      if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
+      newVisualizations.push(built.viz);
+      inlineVizIdByIndex[index] = built.id;
+    }
+
+    // Assemble dashboardItems with auto grid-packing (58-col grid, default
+    // 29×20 tiles, 2 per row) unless explicit x/y/width/height are given.
+    const GRID_W = 58, DEF_W = 29, DEF_H = 20;
+    let cursorX = 0, cursorY = 0, rowH = 0;
+    const dashboardItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
+      const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
+      let x, y;
+      if (Number.isFinite(Number(it.x)) && Number.isFinite(Number(it.y))) {
+        x = Number(it.x); y = Number(it.y);
+      } else {
+        if (cursorX + w > GRID_W) { cursorX = 0; cursorY += rowH; rowH = 0; }
+        x = cursorX; y = cursorY;
+        cursorX += w; rowH = Math.max(rowH, h);
+      }
+      const di = { id: generateDhis2Uid(), type: itType, x, y, width: w, height: h };
+      if (itType === 'VISUALIZATION') {
+        const vizId = inlineVizIdByIndex[i] || it.visualization_id;
+        if (!vizId) return { _error: `Item ${i + 1} is a VISUALIZATION but has neither new_visualization nor visualization_id.` };
+        di.visualization = { id: vizId };
+      } else if (itType === 'MAP') {
+        if (!it.map_id) return { _error: `Item ${i + 1} is a MAP but has no map_id.` };
+        di.map = { id: it.map_id };
+      } else if (itType === 'TEXT') {
+        di.text = String(it.text || '');
+      } else {
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT.` };
+      }
+      dashboardItems.push(di);
+    }
+
+    // Verify referenced (existing) visualizations and maps exist, so a bad UID
+    // fails clearly instead of importing a dashboard with a dangling tile.
+    const refVizIds = [...new Set(items
+      .map((it, i) => (String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase() === 'VISUALIZATION' && !inlineVizIdByIndex[i]) ? it.visualization_id : null)
+      .filter(Boolean))];
+    if (refVizIds.length) {
+      const vr = await safeDhis2Fetch(`visualizations.json?filter=id:in:[${refVizIds.join(',')}]&fields=id&paging=false`);
+      const found = new Set((vr?.visualizations || []).map(o => o.id));
+      const missing = refVizIds.filter(id => !found.has(id));
+      if (missing.length) return { _error: `These referenced visualization UIDs do not exist: ${missing.join(', ')}.`, _hint: 'Create them first (new_visualization) or fix the UIDs via search_metadata / list.' };
+    }
+    const refMapIds = [...new Set(items.filter(it => String(it.type || '').toUpperCase() === 'MAP').map(it => it.map_id).filter(Boolean))];
+    if (refMapIds.length) {
+      const mr = await safeDhis2Fetch(`maps.json?filter=id:in:[${refMapIds.join(',')}]&fields=id&paging=false`);
+      const foundM = new Set((mr?.maps || []).map(o => o.id));
+      const missingM = refMapIds.filter(id => !foundM.has(id));
+      if (missingM.length) return { _error: `These referenced map UIDs do not exist: ${missingM.join(', ')}.` };
+    }
+
+    const dashId = generateDhis2Uid();
+    const dashObj = { id: dashId, name: String(dash.name).trim(), dashboardItems };
+    if (dash.description) dashObj.description = String(dash.description);
+
+    const payload = {};
+    if (newVisualizations.length) payload.visualizations = newVisualizations;
+    payload.dashboards = [dashObj];
+
+    const result = await postMetadataPayload(payload, !!args.dry_run_only);
+    if (!result.success) return { _error: result._error || 'Dashboard create failed.', phase: result.phase, errors: result.errors };
+    if (args.dry_run_only) {
+      return {
+        success: true, dry_run: true,
+        message: `Validation passed for dashboard "${dashObj.name}" (${dashboardItems.length} item(s), ${newVisualizations.length} new visualization(s)). Nothing created (dry_run_only=true).`,
+        would_create: { dashboard_id: dashId, name: dashObj.name, items: dashboardItems.length, new_visualizations: newVisualizations.length },
+      };
+    }
+    return {
+      success: true,
+      action: 'create_dashboard',
+      dashboard: { id: dashId, name: dashObj.name },
+      items: dashboardItems.length,
+      new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
+      message: `Created dashboard "${dashObj.name}" (${dashId}) with ${dashboardItems.length} item(s)${newVisualizations.length ? `, including ${newVisualizations.length} new visualization(s)` : ''}.`,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_dashboards.`,
+    _hint: 'One of: list, get, create_visualization, create_dashboard.',
   };
 }
 

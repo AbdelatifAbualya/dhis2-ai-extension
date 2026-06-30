@@ -1590,6 +1590,7 @@ ${turnXml}
       manage_indicators: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
       manage_option_sets: { cls: 'tool-icon-create', icon: '\u{1F5C2}' },
       manage_legend_sets: { cls: 'tool-icon-create', icon: '\u{1F3A8}' },
+      manage_dashboards: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1625,6 +1626,7 @@ ${turnXml}
       manage_indicators: 'Managing indicators',
       manage_option_sets: 'Managing option sets',
       manage_legend_sets: 'Managing legend sets',
+      manage_dashboards: 'Building dashboards',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1842,6 +1844,20 @@ ${turnXml}
       if (Array.isArray(args.legends)) parts.push(`+${args.legends.length} band(s)`);
       if (Array.isArray(args.legend_names)) parts.push(`-${args.legend_names.length} name(s)`);
       else if (Array.isArray(args.legend_ids)) parts.push(`-${args.legend_ids.length} id(s)`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_dashboards') {
+      const parts = [args.action || 'unknown'];
+      if (args.dashboard_id) parts.push(`id: ${String(args.dashboard_id).slice(0, 11)}`);
+      if (args.visualization && typeof args.visualization === 'object') {
+        if (args.visualization.vis_type) parts.push(String(args.visualization.vis_type));
+        if (args.visualization.name) parts.push(`"${String(args.visualization.name).slice(0, 30)}"`);
+      }
+      if (args.dashboard && typeof args.dashboard === 'object' && args.dashboard.name) {
+        parts.push(`"${String(args.dashboard.name).slice(0, 30)}"`);
+      }
+      if (Array.isArray(args.items)) parts.push(`${args.items.length} item(s)`);
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.dry_run_only) parts.push('DRY RUN');
       detail = parts.join(', ');

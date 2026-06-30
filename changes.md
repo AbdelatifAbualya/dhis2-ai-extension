@@ -928,3 +928,66 @@ On local (Ollama) patient-level tools become usable, matching the owner's intent
 (8 patient-data vectors blocked, 6 aggregate/metadata/count cases allowed) and 4/4 on gate behavior
 (cloud+patient → blocked with `_privacy_block`; local+patient → allowed; cloud+metadata → allowed;
 local+patient via dhis2_query → allowed).
+
+---
+
+## 16. New tool — `manage_dashboards` (DHIS2 analytics dashboards & visualizations builder)
+
+**File:** `background.js` — new `manage_dashboards` tool (TOOLS array, TOOL_ROUTER, `executeTool`
+dispatch), new helpers `resolveDataItemTypes` / `buildVisualizationObject` / `executeManageDashboards`
+and constants `VIZ_TYPES` / `VIZ_REL_PERIOD_FLAG` / `VIZ_REL_OU` / `VIZ_DDI_KEY` / `vizDefaultLayout`;
+`getContextualTools` gains a `wantsDashboardIntent` selector (also surfaces on the Dashboard / Data
+Visualizer apps) and adds `manage_dashboards` to `writeCapableNames` and the save-failure strip;
+`buildSystemPrompt` gains a `wantsDashboardPrompt` flag + a Dashboards & Visualizations KB section.
+`sidepanel/panel.js` — icon (📊), label ("Building dashboards"), and detail renderer.
+**Version:** 2.5.0 → 2.6.0.
+
+**The gap it closes:** the extension had read-only viz tooling (`get_visualization_details`,
+`get_map_details`) and `manage_metadata` could only DELETE/share dashboards & visualizations — but
+there was NO tool to CREATE a visualization or a dashboard. For "build me an ANC dashboard" the
+chatbot had to hand-assemble raw `/metadata` `visualizations`/`dashboards` POSTs through
+`dhis2_query`, the exact error-prone path every other authoring tool warns against.
+
+**The trap it avoids (proven on the 2.43 playground BEFORE writing):** a naive visualization POST that
+sets only `columns`/`rows`/`filters` imports with status OK but reads back EMPTY — those arrays are
+DERIVED read-only views. DHIS2 stores the LAYOUT as `columnDimensions`/`rowDimensions`/
+`filterDimensions` (dimension-id lists) and the DATA as `dataDimensionItems` (typed INDICATOR /
+DATA_ELEMENT / PROGRAM_INDICATOR), `relativePeriods` (boolean flags) + `periods` (fixed ISO), and
+`organisationUnits` + `organisationUnitLevels` (PLAIN INTEGER list — `[2]`, not `[{level:2}]`) +
+`userOrganisationUnit*` flags. A raw POST that gets any of this wrong yields a silently un-renderable
+chart. `buildVisualizationObject` assembles the exact correct structure.
+
+**Actions:** `list` / `get` (read-only) · `create_visualization` (one chart / pivot / single-value) ·
+`create_dashboard` (a whole dashboard atomically — each item references an existing visualization/map
+by UID, embeds free text, or inline-creates a new visualization; items auto-packed on the 58-column
+grid). 16 vis types supported (COLUMN, STACKED_COLUMN, BAR, LINE, AREA, PIE, RADAR, GAUGE,
+SINGLE_VALUE, PIVOT_TABLE, YoY, …); friendly `periods` (relative keywords + fixed ISO) and `org_units`
+(UIDs + USER_ORGUNIT / USER_ORGUNIT_CHILDREN / LEVEL-n); sensible per-type layout defaults with an
+optional `layout` override.
+
+**Safety:** both create actions are gated by `requireWriteAuth`; data-item UIDs are existence-verified
+via `resolveDataItemTypes` (and a hallucinated UID is rejected, not silently dropped); referenced
+existing visualization/map UIDs are verified before import; create_dashboard imports the new
+visualizations and the dashboard in ONE atomic `VALIDATE`-then-`COMMIT` (`postMetadataPayload`), so one
+bad UID rolls the whole thing back — nothing half-built is left behind. DELETE / sharing remain with
+`manage_metadata`. The tool reads/creates only AGGREGATE visualization + indicator/DE/PI/OU metadata —
+it never touches patient-level data, so it is correctly NOT a `PATIENT_DATA_TOOL_NAMES` member; the
+`enforcePatientDataPrivacyGate` choke point still runs ahead of it and passes it through.
+
+**Scope of impact:** purely additive. No existing tool, prompt path, contextual selection, or safeguard
+was modified (verified: the diff touches no safeguard code; collision check shows every new symbol is
+unique). `render_chart` (inline preview) and `get_visualization_details` remain in the tool set and the
+dashboard intent is conservative and disjoint from them (it requires the word "dashboard", or a
+persistence verb + a saved-visualization noun), so it never steals an inline-chart turn.
+
+**Verification:** `node --check` passes on both JS files. The SHIPPED `buildVisualizationObject` was
+extracted and run in Node: it produced valid COLUMN / PIVOT_TABLE / SINGLE_VALUE / LINE payloads that
+imported on the live 2.43 playground (`VALIDATE` OK → `COMMIT` OK) and read back with correct
+`columnDimensions`/`rowDimensions`/`filterDimensions`, `dataDimensionItems`, `relativePeriods`, fixed
+`periods`, `organisationUnitLevels:[2]` and `userOrganisationUnit*` flags; its three error paths
+(bad vis_type, missing UID, empty name) returned `_error` instead of throwing. The SHIPPED
+`executeManageDashboards` create_dashboard path was run with stubbed network helpers and produced a
+correct mixed payload (inline new viz + existing-viz reference + TEXT tile, grid-packed 0/29/wrap);
+that payload (pointed at a real existing viz) imported end-to-end on the playground and read back as a
+3-item dashboard. Every test object was deleted and a `name:like:ZZAITEST` sweep confirmed ZERO
+residue (visualizations + dashboards).
