@@ -5073,6 +5073,60 @@ NEVER invent option-set or option UIDs — reuse UIDs from search_metadata / get
   {
     type: 'function',
     function: {
+      name: 'manage_legend_sets',
+      description: `Full lifecycle CRUD for DHIS2 **legend sets** — the reusable colour-coded value bands that data elements, indicators, visualisations and maps use to render numeric values as a traffic-light / heat-map scale (e.g. ANC coverage shaded red 0–50, amber 50–80, green 80–100). Use this tool for ALL standalone legend-set work — NEVER hand-assemble /metadata legendSets bodies via dhis2_query.
+Actions: list / get / create / add_legends / remove_legends / update / delete.
+A legend set owns an ORDERED-by-value list of **legends**, each a { name, startValue, endValue, color } band. Ranges are half-open [startValue, endValue): a band covers values >= startValue and < endValue, so endValue of one band may equal startValue of the next without overlapping. \`color\` is an optional 6-digit hex (#RRGGBB). DHIS2 does NOT reject overlapping/gapped bands, so this tool WARNS about overlaps but never blocks on them.
+- create: a brand-new legend set + its bands, imported atomically (VALIDATE then COMMIT). Supply explicit \`legend_set.legends\`, OR pass \`auto_bands:{ start, end, count }\` to generate \`count\` equal-width contiguous bands spanning start→end, default-coloured on a red→amber→green ramp (low→high). \`auto_bands.colors\`/\`auto_bands.names\` (length must equal count) override the defaults.
+- add_legends / remove_legends: append bands to, or drop bands (by name or UID) from, an EXISTING set; refuses to remove the last remaining band.
+- update: patch the set's OWN fields (name / code) only — does NOT change the bands.
+- delete: remove the whole set (its legends cascade with it); refuses, with the exact blockers, if any data element, indicator, visualisation or map still uses it.
+Each add_legends/remove_legends/update/delete auto-snapshots a backup first (restore via manage_backups).
+NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'add_legends', 'remove_legends', 'update', 'delete'],
+            description: 'list=paginated legend-set list (optional name filter); get=one set with its bands in value order; create=new set + bands (explicit or auto_bands); add_legends=append bands; remove_legends=drop bands; update=patch the set\'s own fields; delete=remove the whole set + its bands.'
+          },
+          legend_set_id: { type: 'string', description: 'Existing legend set UID (required for get, add_legends, remove_legends, update, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on legend-set name.' },
+          limit: { type: 'integer', description: 'For list: max legend sets to return (1–200, default 50).' },
+          legend_set: {
+            type: 'object',
+            description: 'Legend-set definition (required for create; for update pass only the changed OWN fields name/code).',
+            properties: {
+              name: { type: 'string', description: 'Unique legend-set name.' },
+              code: { type: 'string', description: 'Optional unique legend-set code.' },
+              legends: { type: 'array', description: 'For create (when auto_bands is not used): the colour bands. Each { name, startValue, endValue, color? }. endValue must be > startValue; band names must be unique within the set; color is an optional 6-digit hex.', items: { type: 'object', properties: { name: { type: 'string' }, startValue: { type: 'number' }, endValue: { type: 'number' }, color: { type: 'string', description: '6-digit hex like #FF0000 (optional).' } } } }
+            }
+          },
+          auto_bands: {
+            type: 'object',
+            description: 'For create: generate count equal-width contiguous bands spanning start→end (an alternative to listing legends explicitly). Default colours follow a red→amber→green ramp from low to high.',
+            properties: {
+              start: { type: 'number', description: 'Low end of the scale (first band startValue).' },
+              end: { type: 'number', description: 'High end of the scale (last band endValue). Must be > start.' },
+              count: { type: 'integer', description: 'Number of equal-width bands (1–50).' },
+              names: { type: 'array', description: 'Optional band names (length must equal count). Defaults to "start–end" range labels.', items: { type: 'string' } },
+              colors: { type: 'array', description: 'Optional 6-digit hex colours (length must equal count). Defaults to a red→amber→green ramp.', items: { type: 'string' } }
+            }
+          },
+          legends: { type: 'array', description: 'For add_legends: the new bands to append, each { name, startValue, endValue, color? }. New band names must not collide with the set\'s existing band names.', items: { type: 'object', properties: { name: { type: 'string' }, startValue: { type: 'number' }, endValue: { type: 'number' }, color: { type: 'string' } } } },
+          legend_names: { type: 'array', description: 'For remove_legends: the names of the bands to drop. (Use legend_ids to target by UID instead.)', items: { type: 'string' } },
+          legend_ids: { type: 'array', description: 'For remove_legends: band UIDs to drop (alternative to legend_names).', items: { type: 'string' } },
+          dry_run_only: { type: 'boolean', description: 'For create: validate the metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before add_legends/remove_legends/update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -5134,6 +5188,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_org_units: true,
   manage_indicators: true,
   manage_option_sets: true,
+  manage_legend_sets: true,
   manage_backups: true,
 });
 
@@ -5269,6 +5324,18 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
         && /\boptions?\b/.test(combinedText)
         && (/\b(drop[\s-]?down|pick[\s-]?list|picklist|code\s*list|choices?\s+list)\b/.test(combinedText)
             || /\b(?:the|this|that)\s+(?:[\w-]+\s+){0,2}set\b/.test(combinedText)));
+  // ── Legend-set intent ──
+  // Reusable colour-coded value bands for analytics styling. Conservative:
+  // fires on an explicit "legend set(s)" mention, OR a colour-coding / threshold
+  // term coupled with an authoring or visual-styling noun — so a bare "the chart
+  // legend" or "the legend of the map" never surfaces the tool on its own.
+  const wantsLegendSetIntent =
+    /\blegend\s*sets?\b/.test(combinedText)
+    || /\blegendsets?\b/.test(combinedText)
+    || ((/\bcolou?r[-\s]?cod/.test(combinedText)
+          || /\bcolou?r\s+(?:band|scale|ramp|range|gradient)s?\b/.test(combinedText)
+          || /\b(?:value\s+)?thresholds?\b/.test(combinedText))
+        && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/.test(combinedText));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5461,6 +5528,15 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Legend-set authoring — surfaced only on explicit legend-set intent so it
+  //    never crowds unrelated analytics/styling flows. search_metadata is the
+  //    companion for resolving the dataElement / indicator UIDs a legend set is
+  //    later attached to. Purely additive. ──
+  if (wantsLegendSetIntent) {
+    selected.add('manage_legend_sets');
+    selected.add('search_metadata');
+  }
+
   // ── Intent-driven override: if the user explicitly asks to create or manage
   //    metadata, the full authoring kit must be available regardless of page.
   //    This fixes the failure mode where a user on Data Visualizer / Maps / a
@@ -5506,7 +5582,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
     'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
-    'manage_indicators', 'manage_option_sets',
+    'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5545,6 +5621,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_org_units');
     selected.delete('manage_indicators');
     selected.delete('manage_option_sets');
+    selected.delete('manage_legend_sets');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5646,6 +5723,13 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
         && /\boptions?\b/i.test(text)
         && (/\b(drop[\s-]?down|pick[\s-]?list|picklist|code\s*list|choices?\s+list)\b/i.test(text)
             || /\b(?:the|this|that)\s+(?:[\w-]+\s+){0,2}set\b/i.test(text)));
+  const wantsLegendSetPrompt =
+    /\blegend\s*sets?\b/i.test(text)
+    || /\blegendsets?\b/i.test(text)
+    || ((/\bcolou?r[-\s]?cod/i.test(text)
+          || /\bcolou?r\s+(?:band|scale|ramp|range|gradient)s?\b/i.test(text)
+          || /\b(?:value\s+)?thresholds?\b/i.test(text))
+        && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/i.test(text));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -6293,6 +6377,37 @@ An **option set** is a reusable, ordered pick-list (drop-down) of \`{ code, name
 - "Create an HIV Result option set with Positive/Negative/Inconclusive": create option_set:{ name:"HIV Result", value_type:"TEXT", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INC",name:"Inconclusive"}] }.
 - "Add a 'Refused' choice to that set": add_options option_set_id:"<id>", options:[{code:"REF",name:"Refused"}].
 - "Put Negative before Positive": reorder_options option_set_id:"<id>", order:["NEG","POS","INC"].
+`;
+  }
+
+  // ── Legend Sets KB — reusable colour-coded value bands (manage_legend_sets) ──
+  if (wantsLegendSetPrompt) {
+    p += `
+## DHIS2 Legend Sets (manage_legend_sets)
+A **legend set** is a reusable, ordered list of colour **bands** that renders numeric values as a traffic-light / heat-map scale on data elements, indicators, visualisations and maps (e.g. ANC coverage shaded red 0–50, amber 50–80, green 80–100). Each band is \`{ name, startValue, endValue, color }\`. Use **manage_legend_sets** for ALL standalone legend-set work — never hand-write /metadata legendSets bodies via dhis2_query.
+
+### Ranges
+- Bands are **half-open [startValue, endValue)**: a band matches values >= startValue and < endValue, so a band's endValue may equal the next band's startValue without overlapping. endValue must be > startValue.
+- DHIS2 does NOT reject overlapping or gapped bands. This tool returns an overlap **warning** (it never blocks) — relay any warning to the user.
+- \`color\` is an optional 6-digit hex (#RRGGBB); the tool canonicalises "#rrggbb"/"rrggbb".
+
+### Actions
+- **list** (name filter) and **get** (bands in value order) are read-only.
+- **create** — a new set + its bands, imported atomically (VALIDATE then COMMIT). EITHER pass explicit \`legend_set:{ name, legends:[{name,startValue,endValue,color?},…] }\`, OR pass \`legend_set:{ name }\` + \`auto_bands:{ start, end, count }\` to auto-generate \`count\` equal-width contiguous bands on a red→amber→green (low→high) ramp. \`auto_bands.colors\` / \`auto_bands.names\` (length == count) override the defaults.
+- **add_legends** — append bands to an existing set: \`legend_set_id\` + \`legends:[…]\`. New band names must not collide with existing ones.
+- **remove_legends** — drop bands by \`legend_names:[…]\` or \`legend_ids:[…]\`; refuses to remove the last remaining band.
+- **update** — patch the set's OWN fields (name / code) only — never the bands.
+- **delete** — remove the whole set (its bands cascade); refuses with the exact blockers if any data element, indicator, visualisation or map still uses it.
+
+### Rules
+- add_legends / remove_legends / update / delete each auto-snapshot a backup first (restore via manage_backups).
+- NEVER invent legend-set or band UIDs — get them from search_metadata / action=get.
+- A legend set only defines the colour scale; ATTACHING it to a data element / indicator (their \`legendSets\`) or a visualisation / map layer (its \`legendSet\`) is done with manage_metadata or in the relevant app. This tool owns standalone legend-set CRUD.
+
+### Examples
+- "Make a coverage legend, red→green, 0 to 100 in 5 bands": create legend_set:{ name:"Coverage 0–100" }, auto_bands:{ start:0, end:100, count:5 }.
+- "Create a stockout legend: 0 red, 1–10 amber, 11+ green": create legend_set:{ name:"Stock status", legends:[{name:"Out",startValue:0,endValue:1,color:"#D32F2F"},{name:"Low",startValue:1,endValue:11,color:"#FBC02D"},{name:"OK",startValue:11,endValue:1000000,color:"#388E3C"}] }.
+- "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].
 `;
   }
 
@@ -10439,6 +10554,11 @@ async function executeTool(name, args) {
     return await executeManageOptionSets(args);
   }
 
+  // ── manage_legend_sets ──
+  if (name === 'manage_legend_sets') {
+    return await executeManageLegendSets(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -11783,6 +11903,397 @@ async function createOptionSet(args) {
     option_set_id: setId,
     option_set: { id: setId, name, valueType: vt, code: setObj.code, options: optionObjs.map(o => ({ id: o.id, code: o.code, name: o.name, sortOrder: o.sortOrder })) },
     message: `Created option set "${name}" (${setId}, ${vt}) with ${optionObjs.length} option(s).`,
+  };
+}
+
+// ── manage_legend_sets: full lifecycle CRUD for DHIS2 legend sets ──
+//
+// A legend set owns an ordered list of colour bands (legends). Each legend is an
+// EMBEDDED child of the set (DHIS2 2.43 has no standalone /api/legends collection
+// — confirmed 404), so unlike option sets there are no separate child objects to
+// DELETE: bands are added/removed by re-importing the set's full legends[] array
+// via its :owner snapshot (mergeMode REPLACE drops any band left out), and a set
+// delete cascades its legends. Proven on the 2.43 playground BEFORE writing:
+// create (legends embedded), shrink-re-import deletes a dropped band, colour is
+// optional, and a set referenced by a dataElement/indicator/visualisation/map is
+// blocked from deletion. All shared helpers are reused with their existing
+// signatures — no shared code's behaviour is changed.
+
+const LEGEND_HEX_COLOR_RE = /^#?[0-9a-fA-F]{6}$/;
+
+// Canonicalize an optional band colour. Returns a "#RRGGBB" string, undefined
+// (no colour), or { _error } for a malformed value.
+function normalizeLegendColor(c) {
+  if (c === undefined || c === null || String(c).trim() === '') return undefined;
+  let s = String(c).trim();
+  if (!s.startsWith('#')) s = '#' + s;
+  if (!LEGEND_HEX_COLOR_RE.test(s)) return { _error: `Invalid color "${c}". Use a 6-digit hex like #FF0000.` };
+  return '#' + s.slice(1).toUpperCase();
+}
+
+// Validate + normalize an array of { name, startValue, endValue, color? } bands.
+// Returns { ok:true, legends:[…] } or { _error }. Band names must be unique so
+// remove_legends-by-name is unambiguous.
+function normalizeLegendInputs(rawList, label = 'legends') {
+  if (!Array.isArray(rawList) || rawList.length === 0) {
+    return { _error: `${label} must be a non-empty array of { name, startValue, endValue, color? } objects.` };
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length; i++) {
+    const l = rawList[i] || {};
+    const name = String(l.name ?? '').trim();
+    if (!name) return { _error: `${label}[${i}] is missing a name.` };
+    if (seen.has(name.toLowerCase())) return { _error: `${label} contains duplicate band name "${name}". Band names must be unique within a legend set.` };
+    seen.add(name.toLowerCase());
+    const sv = Number(l.startValue);
+    const ev = Number(l.endValue);
+    if (!Number.isFinite(sv)) return { _error: `${label}[${i}] ("${name}") has a non-numeric startValue.` };
+    if (!Number.isFinite(ev)) return { _error: `${label}[${i}] ("${name}") has a non-numeric endValue.` };
+    if (ev <= sv) return { _error: `${label}[${i}] ("${name}") must have endValue (${ev}) greater than startValue (${sv}).` };
+    const band = { name, startValue: sv, endValue: ev };
+    const col = normalizeLegendColor(l.color);
+    if (col && col._error) return col;
+    if (col) band.color = col;
+    out.push(band);
+  }
+  return { ok: true, legends: out };
+}
+
+// Non-blocking data-quality check: report any pair of bands whose half-open
+// [start,end) ranges overlap. DHIS2 itself accepts overlaps, so these are
+// surfaced as warnings only.
+function detectLegendOverlaps(legends) {
+  const sorted = legends.slice().sort((a, b) => a.startValue - b.startValue);
+  const warnings = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1], cur = sorted[i];
+    if (cur.startValue < prev.endValue) {
+      warnings.push(`Bands "${prev.name}" (${prev.startValue}–${prev.endValue}) and "${cur.name}" (${cur.startValue}–${cur.endValue}) overlap.`);
+    }
+  }
+  return warnings;
+}
+
+// Interpolate a red→amber→green ramp (low→high) for default auto-band colours.
+function legendRampColor(i, count) {
+  if (count <= 1) return '#FBC02D';
+  const t = i / (count - 1);
+  const stops = [[211, 47, 47], [251, 192, 45], [56, 142, 60]]; // red, amber, green
+  const seg = t * (stops.length - 1);
+  const k = Math.min(Math.floor(seg), stops.length - 2);
+  const f = seg - k;
+  const c = [0, 1, 2].map(j => Math.round(stops[k][j] + (stops[k + 1][j] - stops[k][j]) * f));
+  return '#' + c.map(v => v.toString(16).padStart(2, '0').toUpperCase()).join('');
+}
+
+// Generate count equal-width contiguous bands spanning start→end. Endpoints are
+// pinned exactly (first startValue = start, last endValue = end) so floating
+// point drift never leaves a gap. Returns { ok:true, legends } or { _error }.
+function buildLegendAutoBands(cfg) {
+  const start = Number(cfg.start);
+  const end = Number(cfg.end);
+  const count = Math.floor(Number(cfg.count));
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return { _error: 'auto_bands requires numeric start and end.' };
+  if (end <= start) return { _error: `auto_bands end (${cfg.end}) must be greater than start (${cfg.start}).` };
+  if (!Number.isFinite(count) || count < 1 || count > 50) return { _error: 'auto_bands count must be an integer between 1 and 50.' };
+  const names = Array.isArray(cfg.names) ? cfg.names : null;
+  if (names && names.length !== count) return { _error: `auto_bands.names has ${names.length} entries but count is ${count}.` };
+  const colors = Array.isArray(cfg.colors) ? cfg.colors : null;
+  if (colors && colors.length !== count) return { _error: `auto_bands.colors has ${colors.length} entries but count is ${count}.` };
+  const round = (x) => Math.round(x * 1e6) / 1e6;
+  const width = (end - start) / count;
+  const legends = [];
+  const seenNames = new Set();
+  for (let i = 0; i < count; i++) {
+    const sv = i === 0 ? start : round(start + i * width);
+    const ev = i === count - 1 ? end : round(start + (i + 1) * width);
+    const name = names ? String(names[i] ?? '').trim() : `${sv}–${ev}`;
+    if (!name) return { _error: `auto_bands.names[${i}] is empty.` };
+    if (seenNames.has(name.toLowerCase())) return { _error: `auto_bands.names contains duplicate "${name}". Band names must be unique.` };
+    seenNames.add(name.toLowerCase());
+    const band = { name, startValue: sv, endValue: ev };
+    let color;
+    if (colors) { const c = normalizeLegendColor(colors[i]); if (c && c._error) return c; color = c; }
+    else color = legendRampColor(i, count);
+    if (color) band.color = color;
+    legends.push(band);
+  }
+  return { ok: true, legends };
+}
+
+async function executeManageLegendSets(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create, add_legends, remove_legends, update, delete.' };
+  }
+  const lsId = args.legend_set_id || args.object_id;
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `legendSets?fields=id,displayName,code,legends~size&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `legendSets list failed: ${resp._error}` };
+    const legendSets = (resp.legendSets || []).map(o => ({
+      id: o.id,
+      name: o.displayName,
+      code: o.code || null,
+      legends: o.legends ?? 0,
+    }));
+    return { success: true, total: legendSets.length, pager_total: resp.pager?.total ?? null, legendSets };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    if (!lsId) return { _error: 'legend_set_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `legendSets/${lsId}?fields=id,displayName,code,legends[id,displayName,startValue,endValue,color]`
+    );
+    if (resp?._status === 404) return { _error: `legendSet with id "${lsId}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load legend set ${lsId}: ${resp._error}` };
+    const legends = (resp.legends || [])
+      .slice()
+      .sort((a, b) => (a.startValue ?? 0) - (b.startValue ?? 0))
+      .map(l => ({ id: l.id, name: l.displayName, startValue: l.startValue, endValue: l.endValue, color: l.color || null }));
+    const warnings = detectLegendOverlaps(legends);
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      code: resp.code,
+      legend_count: legends.length,
+      legends,
+      warnings: warnings.length ? warnings : undefined,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'create');
+    if (_gate) return _gate;
+    return await createLegendSet(args);
+  }
+
+  // ── add_legends ─────────────────────────────────────────────────────────
+  if (action === 'add_legends') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'add_legends', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for add_legends' };
+    const norm = normalizeLegendInputs(args.legends, 'legends');
+    if (norm._error) return norm;
+    const ownerResp = await safeDhis2Fetch(`legendSets/${lsId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `legendSet with id "${lsId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load legend set ${lsId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || lsId;
+
+    // Band names must be unique within the set.
+    const existingNames = new Set((ownerResp.legends || []).map(l => String(l.name || '').toLowerCase()));
+    const collide = norm.legends.filter(l => existingNames.has(l.name.toLowerCase())).map(l => l.name);
+    if (collide.length) return { _error: `These band names already exist in "${objName}": ${collide.join(', ')}.`, _hint: 'Band names must be unique within a legend set. Choose different names, or remove the existing bands first.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'add_legends', tool: 'manage_legend_sets', action: 'add_legends', reason: `Add ${norm.legends.length} band(s) to ${objName}` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const newBands = norm.legends.map(l => ({ id: generateDhis2Uid(), ...l }));
+    ownerResp.legends = [...(ownerResp.legends || []), ...newBands];
+    const result = await postMetadataPayload({ legendSets: [ownerResp] }, false);
+    if (!result.success) return { _error: result._error || 'add_legends failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    const warnings = detectLegendOverlaps(ownerResp.legends.map(l => ({ name: l.name, startValue: Number(l.startValue), endValue: Number(l.endValue) })));
+    return {
+      success: true,
+      action: 'add_legends',
+      legend_set_id: lsId,
+      legend_set_name: objName,
+      added: newBands.map(l => ({ id: l.id, name: l.name, startValue: l.startValue, endValue: l.endValue, color: l.color || null })),
+      warnings: warnings.length ? warnings : undefined,
+      backup: backup.block,
+    };
+  }
+
+  // ── remove_legends ───────────────────────────────────────────────────────
+  if (action === 'remove_legends') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'remove_legends', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for remove_legends' };
+    const byId = Array.isArray(args.legend_ids) && args.legend_ids.length > 0;
+    const byName = Array.isArray(args.legend_names) && args.legend_names.length > 0;
+    if (!byId && !byName) return { _error: 'Provide legend_names[] or legend_ids[] for remove_legends.' };
+    const ownerResp = await safeDhis2Fetch(`legendSets/${lsId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `legendSet with id "${lsId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load legend set ${lsId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || lsId;
+    const setLegends = ownerResp.legends || [];
+    const targetIds = new Set();
+    const notFound = [];
+    if (byId) {
+      const idSet = new Set(setLegends.map(l => l.id));
+      for (const id of args.legend_ids) { if (idSet.has(id)) targetIds.add(id); else notFound.push(id); }
+    } else {
+      const nameToId = new Map(setLegends.map(l => [String(l.name || '').toLowerCase(), l.id]));
+      for (const n of args.legend_names) { const id = nameToId.get(String(n).toLowerCase()); if (id) targetIds.add(id); else notFound.push(n); }
+    }
+    if (notFound.length) return { _error: `These ${byId ? 'band ids' : 'band names'} are not in "${objName}": ${notFound.join(', ')}.`, _hint: 'Use action=get to list the set\'s current bands.' };
+    if (targetIds.size >= setLegends.length) return { _error: `Refusing to remove ALL ${setLegends.length} band(s) from "${objName}" — that would leave an empty legend set.`, _hint: 'Keep at least one band, or delete the whole set with action=delete.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'remove_legends', tool: 'manage_legend_sets', action: 'remove_legends', reason: `Remove ${targetIds.size} band(s) from ${objName}` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const removed = setLegends.filter(l => targetIds.has(l.id)).map(l => ({ id: l.id, name: l.name }));
+    ownerResp.legends = setLegends.filter(l => !targetIds.has(l.id));
+    const result = await postMetadataPayload({ legendSets: [ownerResp] }, false);
+    if (!result.success) return { _error: result._error || 'remove_legends failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'remove_legends', legend_set_id: lsId, legend_set_name: objName, removed_count: removed.length, removed, backup: backup.block };
+  }
+
+  // ── update (own fields only) ────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'update', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for update' };
+    const ls = args.legend_set;
+    if (!ls || typeof ls !== 'object') {
+      return { _error: 'legend_set object required for update', _hint: 'Pass legend_set:{ name?, code? }. To change the bands use add_legends / remove_legends.' };
+    }
+    const exists = await verifyTargetExists('legendSets', lsId, 'manage_legend_sets', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const ownerResp = await safeDhis2Fetch(`legendSets/${lsId}?fields=:owner`);
+    if (ownerResp?._error) return { _error: `Could not load legend set ${lsId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || lsId;
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_legend_set', tool: 'manage_legend_sets', action: 'update', reason: `Update legend set ${objName}` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (ls.name !== undefined) { ownerResp.name = ls.name; applied.name = ls.name; }
+    if (ls.code !== undefined) { ownerResp.code = ls.code; applied.code = ls.code; }
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'legend_set supplied no recognized own-fields to update.', _hint: 'Recognized: name, code. For bands use add_legends / remove_legends.', backup: backup.block };
+    }
+    const putResp = await safeDhis2Fetch(`legendSets/${lsId}`, { method: 'PUT', body: ownerResp });
+    if (putResp?._error) return { _error: `Failed to update legend set: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', legend_set_id: lsId, legend_set_name: objName, applied, backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'delete', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for delete' };
+    const exists = await verifyTargetExists('legendSets', lsId, 'manage_legend_sets', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || lsId;
+
+    // legendSets IS mapped in checkMetadataReferences (data elements / indicators /
+    // visualisations / maps that use it). If anything references it, refuse with
+    // the exact blockers — the legend set must be detached before deletion.
+    const refsResult = await checkMetadataReferences('legendSets', lsId);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete legend set "${objName}" — it is still in use.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('legendSets', lsId, refsResult.references),
+      };
+    }
+
+    // Legends are embedded children and cascade with the set, so a single
+    // legendSet snapshot (:owner includes legends) fully restores on undo.
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_legend_set', tool: 'manage_legend_sets', action: 'delete', reason: `Deleting legend set ${objName} (${lsId})` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { legendSets: [{ id: lsId }] },
+    });
+    if (delResp?._error) return { _error: `Legend set deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'legendSets', id: lsId, name: objName },
+        message: `Successfully deleted legend set "${objName}" and its bands.`,
+        backup: backup.block,
+      };
+    }
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Legend set "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'It may still be referenced by a data element, indicator, visualisation or map. Detach those first, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_legend_sets.`,
+    _hint: 'One of: list, get, create, add_legends, remove_legends, update, delete.',
+  };
+}
+
+async function createLegendSet(args) {
+  const ls = args.legend_set;
+  if (!ls || typeof ls !== 'object') {
+    return { _error: 'legend_set object required for create', _hint: 'Pass legend_set:{ name, legends:[{name,startValue,endValue,color?},…] } OR legend_set:{ name } with auto_bands:{ start, end, count }.' };
+  }
+  if (!ls.name || !String(ls.name).trim()) return { _error: 'legend_set.name is required.' };
+
+  let legends;
+  if (args.auto_bands && typeof args.auto_bands === 'object') {
+    const gen = buildLegendAutoBands(args.auto_bands);
+    if (gen._error) return gen;
+    legends = gen.legends;
+  } else {
+    const norm = normalizeLegendInputs(ls.legends, 'legend_set.legends');
+    if (norm._error) return norm;
+    legends = norm.legends;
+  }
+
+  const setId = generateDhis2Uid();
+  const name = String(ls.name).trim();
+  const legendObjs = legends.map(l => ({ id: generateDhis2Uid(), ...l }));
+  const setObj = { id: setId, name, legends: legendObjs };
+  if (ls.code) setObj.code = String(ls.code).trim();
+  const warnings = detectLegendOverlaps(legends);
+
+  const result = await postMetadataPayload({ legendSets: [setObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return { _error: result._error || 'Legend set create failed.', phase: result.phase, errors: result.errors };
+  }
+  if (args.dry_run_only) {
+    return { success: true, dry_run: true, message: `Validation passed for "${name}". No legend set created (dry_run_only=true).`, would_create: { id: setId, name, legend_count: legendObjs.length }, warnings: warnings.length ? warnings : undefined };
+  }
+  return {
+    success: true,
+    action: 'create',
+    legend_set_id: setId,
+    legend_set: { id: setId, name, code: setObj.code, legends: legendObjs.map(l => ({ id: l.id, name: l.name, startValue: l.startValue, endValue: l.endValue, color: l.color || null })) },
+    message: `Created legend set "${name}" (${setId}) with ${legendObjs.length} band(s).`,
+    warnings: warnings.length ? warnings : undefined,
   };
 }
 
@@ -16541,6 +17052,27 @@ async function checkMetadataReferences(objectType, objectId) {
     }
   }
 
+  if (objectType === 'legendSets') {
+    // Distinct ref keys (…_using_legendset) so buildDeletionHint can give
+    // legend-set-specific guidance without colliding with the option-set keys.
+    const deResp = await safeDhis2Fetch(`dataElements?filter=legendSets.id:eq:${id}&fields=id,name&paging=false`);
+    if (!deResp._error && deResp.dataElements?.length) {
+      refs.data_elements_using_legendset = deResp.dataElements.map(de => ({ id: de.id, name: de.name }));
+    }
+    const indResp = await safeDhis2Fetch(`indicators?filter=legendSets.id:eq:${id}&fields=id,name&paging=false`);
+    if (!indResp._error && indResp.indicators?.length) {
+      refs.indicators_using_legendset = indResp.indicators.map(x => ({ id: x.id, name: x.name }));
+    }
+    const visResp = await safeDhis2Fetch(`visualizations?filter=legendSet.id:eq:${id}&fields=id,name&paging=false`);
+    if (!visResp._error && visResp.visualizations?.length) {
+      refs.visualizations_using_legendset = visResp.visualizations.map(x => ({ id: x.id, name: x.name }));
+    }
+    const mapResp = await safeDhis2Fetch(`maps?filter=mapViews.legendSet.id:eq:${id}&fields=id,name&paging=false`);
+    if (!mapResp._error && mapResp.maps?.length) {
+      refs.maps_using_legendset = mapResp.maps.map(x => ({ id: x.id, name: x.name }));
+    }
+  }
+
   if (objectType === 'trackedEntityAttributes') {
     const ptaResp = await safeDhis2Fetch(
       `programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:eq:${id}&fields=id,name&paging=false`
@@ -16595,6 +17127,18 @@ function buildDeletionHint(objectType, objectId, refs) {
   }
   if (refs.programs_using_this?.length) {
     hints.push(`Remove this attribute from ${refs.programs_using_this.length} program(s): ${refs.programs_using_this.map(p => p.name).join(', ')}`);
+  }
+  if (refs.data_elements_using_legendset?.length) {
+    hints.push(`${refs.data_elements_using_legendset.length} data element(s) use this legend set — detach it from them first (manage_metadata): ${refs.data_elements_using_legendset.map(d => d.name).join(', ')}`);
+  }
+  if (refs.indicators_using_legendset?.length) {
+    hints.push(`${refs.indicators_using_legendset.length} indicator(s) use this legend set — detach it from them first: ${refs.indicators_using_legendset.map(d => d.name).join(', ')}`);
+  }
+  if (refs.visualizations_using_legendset?.length) {
+    hints.push(`${refs.visualizations_using_legendset.length} visualization(s) use this legend set — change their legend in Data Visualizer first: ${refs.visualizations_using_legendset.map(d => d.name).join(', ')}`);
+  }
+  if (refs.maps_using_legendset?.length) {
+    hints.push(`${refs.maps_using_legendset.length} map(s) use this legend set — change the layer legend in Maps first: ${refs.maps_using_legendset.map(d => d.name).join(', ')}`);
   }
   if (refs.parent_program) {
     hints.push(`This stage belongs to program "${refs.parent_program.name}" — removing it will affect all enrollments`);

@@ -790,3 +790,95 @@ reversed exactly); `remove_options` (direct `DELETE /options/{id}` auto-detached
 `update` (PUT `:owner` rename) returned OK; `delete` (child options then set) returned 200 each. A
 `name:like:ZZAITEST` sweep confirmed **zero residue** (0 optionSets, 0 options). `node --check background.js`
 and `node --check sidepanel/panel.js` both pass; the intent battery passes with zero false positives.
+
+---
+
+## 14. New tool — `manage_legend_sets` (DHIS2 legend sets — reusable colour-coded value bands)
+
+**File:** `background.js` (new `executeManageLegendSets` + `createLegendSet` + `normalizeLegendInputs`
++ `normalizeLegendColor` + `detectLegendOverlaps` + `legendRampColor` + `buildLegendAutoBands`
++ `LEGEND_HEX_COLOR_RE`, TOOLS entry, TOOL_ROUTER, dispatch, a `legendSets` branch in
+`checkMetadataReferences`, legend-set branches in `buildDeletionHint`, `getContextualTools`
+surfacing + `writeCapableNames` + save-diagnosis strip, `buildSystemPrompt` flag + KB block),
+`sidepanel/panel.js` (iconMap / toolLabels / detail renderer), `manifest.json` (version 2.4.4 → 2.4.5).
+
+**Type of change:** Added (new tool, purely additive).
+
+**What it does:**
+Adds full **standalone legend-set lifecycle management**. A DHIS2 *legend set* is the reusable, ordered
+list of colour **bands** that data elements, indicators, visualisations and maps use to render numeric
+values as a traffic-light / heat-map scale (e.g. ANC coverage shaded red 0–50, amber 50–80, green
+80–100). Before this run the chatbot could only **read** legend sets (inside `get_map_details`); it had
+**no way** to create one, add/remove bands, rename it, or delete it. `manage_legend_sets` closes that gap
+with seven actions:
+
+- **list / get** — read-only (get returns bands in value order and warns about any overlaps).
+- **create** — a new legendSet + its embedded legends, imported atomically (VALIDATE then COMMIT) through
+  the shared `postMetadataPayload`. Bands may be listed explicitly, **or** auto-generated with
+  `auto_bands:{ start, end, count }` — `count` equal-width, contiguous, gap-free bands spanning start→end
+  on a red→amber→green (low→high) ramp. `auto_bands.colors` / `auto_bands.names` (length must equal count)
+  override the defaults.
+- **add_legends / remove_legends** — append bands to, or drop bands (by name or UID) from, an existing
+  set via its `:owner` snapshot (mergeMode REPLACE deletes any band left out); refuses to remove the last
+  remaining band.
+- **update** — patch the set's OWN fields (name / code) only — never the bands.
+- **delete** — remove the whole set (its legends cascade); reference-checked against data elements,
+  indicators, visualisations and maps, refusing with the exact blockers if anything still uses it.
+
+Ranges are validated half-open **[startValue, endValue)** (endValue > startValue; a band's endValue may
+equal the next band's startValue without overlapping). Colours are canonicalised to `#RRGGBB`. Overlaps
+are **warned about, never blocked** — matching DHIS2's own server behaviour (proven below).
+
+**Wiring (every layer):** `TOOLS` array → `TOOL_ROUTER` → `executeTool` dispatch → handler →
+`getContextualTools` (surfaced **only** on an explicit `wantsLegendSetIntent`, plus `search_metadata`
+for resolving DE/indicator UIDs; added to `writeCapableNames` so `manage_backups` is offered after a
+write; added to the save-error-diagnosis read-only strip list) → `buildSystemPrompt` (a Legend Sets KB
+block gated on `wantsLegendSetPrompt`) → `panel.js` iconMap (`🎨`), toolLabels and a `detail` renderer.
+
+**No-regression analysis:**
+- **Purely additive.** The only `git diff` "deletions" are a one-line reflow that keeps
+  `manage_option_sets` in `writeCapableNames` while appending `manage_legend_sets` to the same line, and
+  the `manifest.json` version bump — no behavior removed. No existing function, prompt block, router
+  branch, reference-check branch, deletion-hint branch or contextual-selection rule was modified.
+- **Shared code touched only by ADDING mutually-exclusive branches.** The new
+  `if (objectType === 'legendSets')` branch in `checkMetadataReferences` runs only for that objectType, so
+  every existing caller (dataElements / optionSets / trackedEntityAttributes / programStages) is byte-for-
+  byte unchanged. It deliberately uses **distinct ref keys** (`*_using_legendset`) so it can never collide
+  with the option-set keys (`data_elements_using_this`); the four new `buildDeletionHint` branches key off
+  those distinct names, leaving every other type's hint output identical.
+- **Calls shared helpers with their existing signatures only** — `safeDhis2Fetch`, `requireWriteAuth`,
+  `verifyTargetExists`, `ensureBackupOrBail`, `postMetadataPayload`, `generateDhis2Uid`. No edits to any of
+  them. `getSnapshotFields` falls back to `:owner` for legendSets (the snapshot includes the legends, so
+  auto-backup/restore works out of the box); `postMetadataPayload`'s shortName-autofix list does **not**
+  include legendSets (which have no shortName), so it is a guaranteed no-op for this tool.
+- **Conservative, collision-free intent.** `wantsLegendSetIntent` / `wantsLegendSetPrompt` fire on an
+  explicit "legend set(s)" / "legendset(s)" mention, or a colour-coding / colour-band-scale-ramp-range /
+  value-threshold term coupled with an authoring or visual-styling noun. A 22-phrase battery passes with
+  **zero false positives** across 12 negatives (including adversarial "show me the legend of this chart",
+  "hide the legend on my visualization", "the threshold for the alert is too high, change the program
+  rule", "the legendary performance of this query") and 10/10 realistic positives. The selection only
+  *adds* `manage_legend_sets` (+`search_metadata`) to the chosen set — it can never remove or crowd out an
+  existing tool. The KB block defers *attaching* a legend set to a DE/indicator/visualisation to
+  `manage_metadata` and the relevant app, so it reinforces rather than contradicts existing guidance.
+- New module-level identifiers (`LEGEND_HEX_COLOR_RE`, `normalizeLegendColor`, `normalizeLegendInputs`,
+  `detectLegendOverlaps`, `legendRampColor`, `buildLegendAutoBands`, `executeManageLegendSets`,
+  `createLegendSet`) were confirmed collision-free; `panel.js` changes are additive (the new `else if`
+  branch precedes `manage_backups`; iconMap/toolLabels fall back by default), so every existing tool still
+  renders.
+
+**Verification (DHIS2 2.43 playground, `stable-2-43-0-1`):** The full lifecycle was proven via curl with
+the tool's exact paths/payloads BEFORE and AFTER writing the code — pre-generated UIDs; atomic create
+(legendSet with embedded legends) via `importMode=VALIDATE` (status OK) then COMMIT; read-back matched
+(3 bands, colours preserved, sorted by startValue); **colour confirmed optional** (a band with no colour
+imported as `color:null`); `add_legends` (full `:owner` + new band re-import → OK, grew 3→4);
+`remove_legends` (shrink the `:owner` legends array and re-import → the dropped band is **deleted**, no
+orphan — there is no standalone `/api/legends` collection in 2.43, confirmed 404); `update` (PUT `:owner`
+rename) returned OK; `delete` via `metadata?importStrategy=DELETE` returned `deleted:1` (legends cascade);
+**overlap is NOT rejected by the server** (a deliberately overlapping VALIDATE returned status OK), which
+is why the tool warns rather than blocks. The four delete-time reference filters were validated against a
+real in-use legend set (`legendSets.id` on dataElements + indicators, `legendSet.id` on visualizations,
+`mapViews.legendSet.id` on maps — returned 2 DEs and 11 visualizations). The `auto_bands` generator was
+unit-tested in Node (contiguous, gap-free, endpoints pinned exactly, red→amber→green ramp, colour-override
+and bad-colour rejection). A `name:like:ZZAITEST` + `code:like:ZZAITEST` sweep confirmed **zero residue**.
+`node --check background.js` and `node --check sidepanel/panel.js` both pass; the intent battery passes
+with zero false positives.

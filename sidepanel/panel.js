@@ -1589,6 +1589,7 @@ ${turnXml}
       manage_org_units: { cls: 'tool-icon-create', icon: '\u{1F3E2}' },
       manage_indicators: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
       manage_option_sets: { cls: 'tool-icon-create', icon: '\u{1F5C2}' },
+      manage_legend_sets: { cls: 'tool-icon-create', icon: '\u{1F3A8}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1623,6 +1624,7 @@ ${turnXml}
       manage_org_units: 'Managing org units',
       manage_indicators: 'Managing indicators',
       manage_option_sets: 'Managing option sets',
+      manage_legend_sets: 'Managing legend sets',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1822,6 +1824,24 @@ ${turnXml}
       if (Array.isArray(args.option_codes)) parts.push(`-${args.option_codes.length} code(s)`);
       if (Array.isArray(args.order)) parts.push(`reorder ${args.order.length}`);
       else if (Array.isArray(args.option_ids)) parts.push(`${args.option_ids.length} id(s)`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_legend_sets') {
+      const parts = [args.action || 'unknown'];
+      if (args.legend_set_id) parts.push(`id: ${String(args.legend_set_id).slice(0, 11)}`);
+      if (args.legend_set && typeof args.legend_set === 'object') {
+        if (args.legend_set.name) parts.push(`"${String(args.legend_set.name).slice(0, 30)}"`);
+        if (Array.isArray(args.legend_set.legends)) parts.push(`${args.legend_set.legends.length} band(s)`);
+      }
+      if (args.auto_bands && typeof args.auto_bands === 'object') {
+        const a = args.auto_bands;
+        if (a.count != null) parts.push(`${a.count} band(s)`);
+        if (a.start != null && a.end != null) parts.push(`${a.start}–${a.end}`);
+      }
+      if (Array.isArray(args.legends)) parts.push(`+${args.legends.length} band(s)`);
+      if (Array.isArray(args.legend_names)) parts.push(`-${args.legend_names.length} name(s)`);
+      else if (Array.isArray(args.legend_ids)) parts.push(`-${args.legend_ids.length} id(s)`);
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.dry_run_only) parts.push('DRY RUN');
       detail = parts.join(', ');
