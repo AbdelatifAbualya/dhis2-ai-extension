@@ -4885,6 +4885,54 @@ Returns { success, ... , dashboard_attach } on success; { _error, _hint } on fai
   {
     type: 'function',
     function: {
+      name: 'manage_validation_rules',
+      description: `CRUD for DHIS2 Validation Rules — the aggregate-data quality checks that compare two expressions (leftSide vs rightSide) with an operator over a period, flagging data that violates the rule (e.g. "inpatient days ≤ available bed-days", "sum of sub-totals == grand total", "ANC 1st visits ≥ ANC 4th visits"). Use this tool for ALL validation-rule operations — NEVER assemble raw /metadata POST/PUT bodies via dhis2_query.
+Actions: list / get / create / update / delete.
+Both sides are DHIS2 expressions over data elements: #{dataElementUid} (all category-option-combos summed) or #{dataElementUid.cocUid} (one disaggregation); constants use C{constantUid}; numbers/operators (+ - * /) are allowed. The chatbot server-validates BOTH expressions via DHIS2's /expressions/description endpoint BEFORE saving — a malformed or unresolved expression is rejected at create/update time, never silently saved.
+operator: equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, compulsory_pair (both sides must have a value or neither), exclusive_pair (at most one side may have a value).
+importance: HIGH | MEDIUM | LOW. missingValueStrategy per side: NEVER_SKIP (default — missing treated as 0), SKIP_IF_ANY_VALUE_MISSING, SKIP_IF_ALL_VALUES_MISSING.
+NEVER invent dataElement/constant UIDs — reuse UIDs from search_metadata / manage_datasets / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete'],
+            description: 'list=paginated validation-rule list (optional name/importance/period filters); get=one rule with both sides; create=new rule; update=patch an existing rule; delete=remove a rule.'
+          },
+          rule_id: { type: 'string', description: 'Existing validation rule UID (required for get, update, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on rule name.' },
+          importance: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'], description: 'For list: filter by importance. (For create/update set it inside the rule object.)' },
+          period_type: { type: 'string', description: 'For list: filter by period type (Monthly, Quarterly, Yearly, … exact-case).' },
+          limit: { type: 'integer', description: 'For list: max rules to return (1–200, default 50).' },
+          rule: {
+            type: 'object',
+            description: 'Validation-rule definition (required for create; pass only the changed fields for update).',
+            properties: {
+              name: { type: 'string', description: 'Unique rule name.' },
+              description: { type: 'string' },
+              instruction: { type: 'string', description: 'Message shown when the rule is violated (what the user should do about it).' },
+              importance: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'], description: 'Default MEDIUM.' },
+              operator: { type: 'string', enum: ['equal_to', 'not_equal_to', 'greater_than', 'greater_than_or_equal_to', 'less_than', 'less_than_or_equal_to', 'compulsory_pair', 'exclusive_pair'], description: 'How leftSide is compared to rightSide.' },
+              period_type: { type: 'string', description: 'Evaluation period type (Monthly, Quarterly, …, same 20 exact-case values as datasets). Default Monthly.' },
+              left_expression: { type: 'string', description: 'leftSide expression, e.g. "#{deUid}" or "#{deUid.cocUid} + #{deUid2}".' },
+              left_description: { type: 'string', description: 'Human label for the left side (auto-derived from DHIS2 if omitted).' },
+              left_missing_strategy: { type: 'string', enum: ['NEVER_SKIP', 'SKIP_IF_ANY_VALUE_MISSING', 'SKIP_IF_ALL_VALUES_MISSING'], description: 'Default NEVER_SKIP.' },
+              right_expression: { type: 'string', description: 'rightSide expression.' },
+              right_description: { type: 'string', description: 'Human label for the right side (auto-derived from DHIS2 if omitted).' },
+              right_missing_strategy: { type: 'string', enum: ['NEVER_SKIP', 'SKIP_IF_ANY_VALUE_MISSING', 'SKIP_IF_ALL_VALUES_MISSING'], description: 'Default NEVER_SKIP.' }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create: validate expressions + metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -4942,6 +4990,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_custom_forms: true,
   manage_custom_translations: true,
   manage_growth_chart_plugin: true,
+  manage_validation_rules: true,
   manage_backups: true,
 });
 
@@ -5027,6 +5076,17 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const wantsGrowthChartIntent =
     /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/.test(combinedText)
     || (/\bgrowth\b/.test(combinedText) && /\b(plugin|chart|standard|percentile|z-?score)\b/.test(combinedText));
+  // ── Validation-rule intent ──
+  // "validation rule(s)", or a data-quality/consistency/plausibility check that
+  // co-occurs with rule/check/dataset/data-element terms. Conservative: the bare
+  // word "validate" only triggers alongside an aggregate-data noun, so unrelated
+  // "validate this expression / form" turns don't surface the tool.
+  const wantsValidationRuleIntent =
+    /\bvalidation\s*rules?\b/.test(combinedText)
+    || (/\b(data\s*quality|consistency|cross[-\s]?check|plausibility|sanity\s*check)\b/.test(combinedText)
+        && /\b(rule|check|validat|dataset|data\s*set|data\s*element|aggregate|expression)\b/.test(combinedText))
+    || (/\bvalidat(e|ion)\b/.test(combinedText)
+        && /\b(left\s*side|right\s*side|leftside|rightside|compulsory\s*pair|exclusive\s*pair|greater\s*than|less\s*than|data\s*set|dataset|aggregate\s*data)\b/.test(combinedText));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5184,6 +5244,14 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Validation-rule authoring — surfaced only on explicit validation-rule
+  //    intent so it never crowds unrelated dataset/tracker flows. search_metadata
+  //    is the companion for resolving the data-element UIDs the expressions need. ──
+  if (wantsValidationRuleIntent) {
+    selected.add('manage_validation_rules');
+    selected.add('search_metadata');
+  }
+
   // ── Intent-driven override: if the user explicitly asks to create or manage
   //    metadata, the full authoring kit must be available regardless of page.
   //    This fixes the failure mode where a user on Data Visualizer / Maps / a
@@ -5228,7 +5296,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const writeCapableNames = new Set([
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
-    'manage_custom_forms',
+    'manage_custom_forms', 'manage_validation_rules',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5263,6 +5331,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('create_metadata');
     selected.delete('manage_datasets');
     selected.delete('manage_custom_forms');
+    selected.delete('manage_validation_rules');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5339,6 +5408,12 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
   const wantsGrowthChartPrompt =
     /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/i.test(text)
     || (/\bgrowth\b/i.test(text) && /\b(plugin|chart|standard|percentile|z-?score)\b/i.test(text));
+  const wantsValidationRulePrompt =
+    /\bvalidation\s*rules?\b/i.test(text)
+    || (/\b(data\s*quality|consistency|cross[-\s]?check|plausibility|sanity\s*check)\b/i.test(text)
+        && /\b(rule|check|validat|dataset|data\s*set|data\s*element|aggregate|expression)\b/i.test(text))
+    || (/\bvalidat(e|ion)\b/i.test(text)
+        && /\b(left\s*side|right\s*side|leftside|rightside|compulsory\s*pair|exclusive\s*pair|greater\s*than|less\s*than|data\s*set|dataset|aggregate\s*data)\b/i.test(text));
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -5864,6 +5939,38 @@ A dataset only appears in a user's Data Entry app for the OUs assigned to it. Us
 - DataSet \`version\` auto-increments on save — never set it manually.
 - \`expiryDays = 0\` and \`openFuturePeriods = 0\` mean "never expires" and "no future periods open", NOT "expires immediately".
 - A dataset's "indicators" field is for DISPLAY indicators on the form (read-only sums). DON'T confuse with program indicators.
+`;
+  }
+
+  // ── Validation Rules KB — aggregate data-quality checks (manage_validation_rules) ──
+  if (wantsValidationRulePrompt) {
+    p += `
+## DHIS2 Validation Rules (manage_validation_rules)
+A **validationRule** is an aggregate data-quality check: it compares a **leftSide** expression to a **rightSide** expression with an **operator**, evaluated per period. When data violates it, DHIS2 surfaces it in the Data Quality / Validation Analysis app and in the Data Entry "Run validation" panel. Use **manage_validation_rules** for ALL validation-rule work — never hand-write /metadata bodies via dhis2_query.
+
+### Actions
+list (filter by name/importance/period_type), get, create, update, delete. Update auto-snapshots a backup first (restore via manage_backups); delete checks references first.
+
+### Expressions (both sides)
+- \`#{dataElementUid}\` = the data element summed across all its category-option-combos.
+- \`#{dataElementUid.categoryOptionComboUid}\` = one specific disaggregation cell.
+- \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed (e.g. \`#{de1} + #{de2}\`).
+- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving. A bad UID or malformed syntax is rejected at create/update time with the parser's exact error — fix the expression and retry, don't loop.
+- Look up data-element UIDs with search_metadata(object_type="dataElements") or manage_datasets(action=get) — NEVER invent UIDs.
+
+### operator (leftSide <op> rightSide)
+equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, compulsory_pair (both sides must have a value or neither), exclusive_pair (at most one side may have a value).
+
+### Other fields
+- importance: HIGH | MEDIUM | LOW (default MEDIUM).
+- period_type: same 20 exact-case values as datasets (Monthly, Quarterly, Yearly, …); default Monthly. Pick the period at which the compared totals are meaningful.
+- left_missing_strategy / right_missing_strategy: NEVER_SKIP (default — a missing value counts as 0), SKIP_IF_ANY_VALUE_MISSING, SKIP_IF_ALL_VALUES_MISSING. Use a SKIP_* strategy when a missing value should suppress the check instead of being treated as 0.
+- instruction: the message shown to the data-entry user when the rule fails — phrase it as what to check/fix.
+
+### Examples
+- "Inpatient days must not exceed available bed-days (monthly)": create rule { name, operator:"less_than_or_equal_to", period_type:"Monthly", left_expression:"#{inpatientDaysUid}", right_expression:"#{bedDaysUid}", importance:"MEDIUM" }.
+- "ANC 4th visits should never exceed ANC 1st visits": operator "less_than_or_equal_to", left=#{anc4}, right=#{anc1}.
+- "Sex sub-totals must equal the grand total": operator "equal_to", left="#{deMale} + #{deFemale}", right="#{deTotal}".
 `;
   }
 
@@ -9990,12 +10097,330 @@ async function executeTool(name, args) {
     return await executeManageGrowthChartPlugin(args);
   }
 
+  // ── manage_validation_rules ──
+  if (name === 'manage_validation_rules') {
+    return await executeManageValidationRules(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
   }
 
   return { _error: `Unhandled tool route: ${name}` };
+}
+
+// ── manage_validation_rules: CRUD for DHIS2 validationRules (aggregate data-quality checks) ──
+
+const VALIDATION_OPERATORS = new Set([
+  'equal_to', 'not_equal_to', 'greater_than', 'greater_than_or_equal_to',
+  'less_than', 'less_than_or_equal_to', 'compulsory_pair', 'exclusive_pair',
+]);
+const VALIDATION_IMPORTANCE = new Set(['HIGH', 'MEDIUM', 'LOW']);
+const VALIDATION_MISSING_STRATEGY = new Set([
+  'NEVER_SKIP', 'SKIP_IF_ANY_VALUE_MISSING', 'SKIP_IF_ALL_VALUES_MISSING',
+]);
+
+// Server-side validate a validation-rule side expression via DHIS2's
+// /api/expressions/description endpoint (GET). This is the authoritative
+// validator for validationRule left/right expressions — it confirms the
+// #{...} references resolve and the syntax is well-formed.
+// Returns { ok: true, description } or { ok: false, error }.
+async function describeValidationExpression(expression) {
+  const resp = await safeDhis2Fetch(
+    `expressions/description?expression=${encodeURIComponent(expression)}`
+  );
+  if (resp?._error) {
+    return { ok: false, error: `Could not reach the expression validator for "${expression}": ${resp._error}` };
+  }
+  const status = resp?.status;
+  if (status && status !== 'OK') {
+    return { ok: false, error: resp?.message || 'Expression is not well-formed' };
+  }
+  return { ok: true, description: resp?.description || '' };
+}
+
+async function executeManageValidationRules(args) {
+  const action = args?.action;
+  if (!action) {
+    return {
+      _error: 'Missing required parameter: action',
+      _hint: 'One of: list, get, create, update, delete.',
+    };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.importance && VALIDATION_IMPORTANCE.has(args.importance)) filters.push(`importance:eq:${args.importance}`);
+    if (args.period_type) filters.push(`periodType:eq:${encodeURIComponent(args.period_type)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `validationRules?fields=id,displayName,importance,operator,periodType,leftSide[expression],rightSide[expression]&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `validationRules list failed: ${resp._error}` };
+    const rules = (resp.validationRules || []).map(r => ({
+      id: r.id,
+      name: r.displayName,
+      importance: r.importance,
+      operator: r.operator,
+      periodType: r.periodType,
+      leftSide: r.leftSide?.expression,
+      rightSide: r.rightSide?.expression,
+    }));
+    return {
+      success: true,
+      total: rules.length,
+      pager_total: resp.pager?.total ?? null,
+      validation_rules: rules,
+    };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const id = args.rule_id || args.object_id;
+    if (!id) return { _error: 'rule_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `validationRules/${id}?fields=id,displayName,description,instruction,importance,operator,periodType,` +
+      `leftSide[expression,description,missingValueStrategy],rightSide[expression,description,missingValueStrategy],sharing,access`
+    );
+    if (resp?._status === 404) return { _error: `validationRules with id "${id}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load validation rule ${id}: ${resp._error}` };
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      description: resp.description,
+      instruction: resp.instruction,
+      importance: resp.importance,
+      operator: resp.operator,
+      periodType: resp.periodType,
+      leftSide: resp.leftSide,
+      rightSide: resp.rightSide,
+      access: resp.access,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_validation_rules', 'create');
+    if (_gate) return _gate;
+    return await createValidationRule(args);
+  }
+
+  // ── update ────────────────────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_validation_rules', 'update', { rule_id: args.rule_id });
+    if (_gate) return _gate;
+    const id = args.rule_id || args.object_id;
+    if (!id) return { _error: 'rule_id required for update' };
+    if (!args.rule || typeof args.rule !== 'object') {
+      return {
+        _error: 'rule object required for update',
+        _hint: 'Pass rule:{ name?, description?, instruction?, importance?, operator?, period_type?, left_expression?, left_description?, left_missing_strategy?, right_expression?, right_description?, right_missing_strategy? }',
+      };
+    }
+    const exists = await verifyTargetExists('validationRules', id, 'manage_validation_rules', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+
+    const vrResp = await safeDhis2Fetch(`validationRules/${id}?fields=:owner`);
+    if (vrResp?._error) return { _error: `Could not load validation rule ${id}: ${vrResp._error}` };
+    const objName = vrResp.name || vrResp.displayName || id;
+
+    // Validate field values + any new expressions BEFORE snapshotting/mutating,
+    // so an invalid patch never triggers a backup or a half-applied write.
+    const r = args.rule;
+    if (r.importance !== undefined && !VALIDATION_IMPORTANCE.has(r.importance)) {
+      return { _error: `Invalid importance "${r.importance}". One of: HIGH, MEDIUM, LOW.` };
+    }
+    if (r.operator !== undefined && !VALIDATION_OPERATORS.has(r.operator)) {
+      return { _error: `Invalid operator "${r.operator}". One of: ${[...VALIDATION_OPERATORS].join(', ')}.` };
+    }
+    if (r.period_type !== undefined && !VALID_PERIOD_TYPES.has(r.period_type)) {
+      return { _error: `Invalid period_type "${r.period_type}".`, _hint: `One of: ${[...VALID_PERIOD_TYPES].join(', ')}` };
+    }
+    for (const [side, strat] of [['left', r.left_missing_strategy], ['right', r.right_missing_strategy]]) {
+      if (strat !== undefined && !VALIDATION_MISSING_STRATEGY.has(strat)) {
+        return { _error: `Invalid ${side}_missing_strategy "${strat}". One of: ${[...VALIDATION_MISSING_STRATEGY].join(', ')}.` };
+      }
+    }
+    for (const [side, expr] of [['left', r.left_expression], ['right', r.right_expression]]) {
+      if (expr !== undefined) {
+        if (typeof expr !== 'string' || !expr.trim()) return { _error: `${side}_expression must be a non-empty string.` };
+        const chk = await describeValidationExpression(expr);
+        if (!chk.ok) return { _error: `${side}_expression rejected by DHIS2: ${chk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} exists (use search_metadata) and the syntax is well-formed, then retry.' };
+      }
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_validation_rule', tool: 'manage_validation_rules', action: 'update', reason: `Update validation rule ${objName}` },
+      [{ object_type: 'validationRules', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (r.name !== undefined) { vrResp.name = r.name; applied.name = r.name; }
+    if (r.description !== undefined) { vrResp.description = r.description; applied.description = r.description; }
+    if (r.instruction !== undefined) { vrResp.instruction = r.instruction; applied.instruction = r.instruction; }
+    if (r.importance !== undefined) { vrResp.importance = r.importance; applied.importance = r.importance; }
+    if (r.operator !== undefined) { vrResp.operator = r.operator; applied.operator = r.operator; }
+    if (r.period_type !== undefined) { vrResp.periodType = r.period_type; applied.periodType = r.period_type; }
+    vrResp.leftSide = vrResp.leftSide || {};
+    vrResp.rightSide = vrResp.rightSide || {};
+    if (r.left_expression !== undefined) { vrResp.leftSide.expression = r.left_expression; applied.leftSide_expression = r.left_expression; }
+    if (r.left_description !== undefined) { vrResp.leftSide.description = r.left_description; applied.leftSide_description = r.left_description; }
+    if (r.left_missing_strategy !== undefined) { vrResp.leftSide.missingValueStrategy = r.left_missing_strategy; applied.leftSide_missingValueStrategy = r.left_missing_strategy; }
+    if (r.right_expression !== undefined) { vrResp.rightSide.expression = r.right_expression; applied.rightSide_expression = r.right_expression; }
+    if (r.right_description !== undefined) { vrResp.rightSide.description = r.right_description; applied.rightSide_description = r.right_description; }
+    if (r.right_missing_strategy !== undefined) { vrResp.rightSide.missingValueStrategy = r.right_missing_strategy; applied.rightSide_missingValueStrategy = r.right_missing_strategy; }
+
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'rule supplied no recognized fields to update.', backup: backup.block };
+    }
+
+    const putResp = await safeDhis2Fetch(`validationRules/${id}`, { method: 'PUT', body: vrResp });
+    if (putResp?._error) return { _error: `Failed to update validation rule: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', rule_id: id, rule_name: objName, applied, backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_validation_rules', 'delete', { rule_id: args.rule_id });
+    if (_gate) return _gate;
+    const id = args.rule_id || args.object_id;
+    if (!id) return { _error: 'rule_id required for delete' };
+    const exists = await verifyTargetExists('validationRules', id, 'manage_validation_rules', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || id;
+
+    const refsResult = await checkMetadataReferences('validationRules', id);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete validation rule "${objName}" — it has active references.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('validationRules', id, refsResult.references),
+      };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_validation_rule', tool: 'manage_validation_rules', action: 'delete', reason: `Deleting validation rule ${objName} (${id})` },
+      [{ object_type: 'validationRules', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { validationRules: [{ id }] },
+    });
+    if (delResp?._error) return { _error: `Validation rule deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'validationRules', id, name: objName },
+        message: `Successfully deleted validation rule "${objName}".`,
+        backup: backup.block,
+      };
+    }
+    return { _error: 'Deletion did not remove the validation rule (deleted count 0). It may already be gone or still have references.', backup: backup.block };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_validation_rules.`,
+    _hint: 'One of: list, get, create, update, delete.',
+  };
+}
+
+async function createValidationRule(args) {
+  const r = args.rule;
+  if (!r || typeof r !== 'object') {
+    return {
+      _error: 'rule object required for create',
+      _hint: 'Pass rule:{ name, operator, left_expression, right_expression, importance?, period_type?, instruction?, ... }',
+    };
+  }
+  if (!r.name || !String(r.name).trim()) return { _error: 'rule.name is required.' };
+  if (!r.operator || !VALIDATION_OPERATORS.has(r.operator)) {
+    return { _error: `rule.operator is required and must be one of: ${[...VALIDATION_OPERATORS].join(', ')}.` };
+  }
+  if (!r.left_expression || !String(r.left_expression).trim()) return { _error: 'rule.left_expression is required.' };
+  if (!r.right_expression || !String(r.right_expression).trim()) return { _error: 'rule.right_expression is required.' };
+
+  const importance = r.importance || 'MEDIUM';
+  if (!VALIDATION_IMPORTANCE.has(importance)) return { _error: `Invalid importance "${importance}". One of: HIGH, MEDIUM, LOW.` };
+  const periodType = r.period_type || 'Monthly';
+  if (!VALID_PERIOD_TYPES.has(periodType)) return { _error: `Invalid period_type "${periodType}".`, _hint: `One of: ${[...VALID_PERIOD_TYPES].join(', ')}` };
+  const leftStrategy = r.left_missing_strategy || 'NEVER_SKIP';
+  const rightStrategy = r.right_missing_strategy || 'NEVER_SKIP';
+  for (const [side, strat] of [['left', leftStrategy], ['right', rightStrategy]]) {
+    if (!VALIDATION_MISSING_STRATEGY.has(strat)) {
+      return { _error: `Invalid ${side}_missing_strategy "${strat}". One of: ${[...VALIDATION_MISSING_STRATEGY].join(', ')}.` };
+    }
+  }
+
+  // Server-validate BOTH expressions before building the payload — a broken
+  // reference is caught here with the parser's exact error, not silently saved.
+  const leftChk = await describeValidationExpression(r.left_expression);
+  if (!leftChk.ok) return { _error: `left_expression rejected by DHIS2: ${leftChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+  const rightChk = await describeValidationExpression(r.right_expression);
+  if (!rightChk.ok) return { _error: `right_expression rejected by DHIS2: ${rightChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+
+  const id = generateDhis2Uid();
+  const leftSide = {
+    expression: r.left_expression,
+    description: r.left_description || leftChk.description || 'Left side',
+    missingValueStrategy: leftStrategy,
+  };
+  const rightSide = {
+    expression: r.right_expression,
+    description: r.right_description || rightChk.description || 'Right side',
+    missingValueStrategy: rightStrategy,
+  };
+  const ruleObj = {
+    id,
+    name: String(r.name).trim(),
+    importance,
+    operator: r.operator,
+    periodType,
+    leftSide,
+    rightSide,
+  };
+  if (r.description) ruleObj.description = r.description;
+  if (r.instruction) ruleObj.instruction = r.instruction;
+
+  const result = await postMetadataPayload({ validationRules: [ruleObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return {
+      _error: result._error || 'Validation rule create failed.',
+      phase: result.phase,
+      errors: result.errors,
+      _validated_expressions: { left: leftChk.description, right: rightChk.description },
+    };
+  }
+  if (args.dry_run_only) {
+    return {
+      success: true,
+      dry_run: true,
+      message: `Validation passed for "${r.name}". No rule created (dry_run_only=true).`,
+      would_create: { id, name: ruleObj.name, importance, operator: r.operator, periodType },
+      left_meaning: leftChk.description,
+      right_meaning: rightChk.description,
+    };
+  }
+  return {
+    success: true,
+    action: 'create',
+    rule_id: id,
+    rule: { id, name: ruleObj.name, importance, operator: r.operator, periodType, leftSide, rightSide },
+    left_meaning: leftChk.description,
+    right_meaning: rightChk.description,
+    message: `Created validation rule "${ruleObj.name}" (${id}).`,
+  };
 }
 
 // ── manage_datasets: full CRUD for DHIS2 dataSets (aggregate "programs") ──

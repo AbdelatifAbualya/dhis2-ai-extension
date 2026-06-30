@@ -1585,6 +1585,7 @@ ${turnXml}
       manage_custom_forms: { cls: 'tool-icon-create', icon: '\u{1F4DD}' },
       manage_custom_translations: { cls: 'tool-icon-create', icon: '\u{1F310}' },
       manage_growth_chart_plugin: { cls: 'tool-icon-create', icon: '\u{1F4C8}' },
+      manage_validation_rules: { cls: 'tool-icon-info', icon: '\u{2705}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1615,6 +1616,7 @@ ${turnXml}
       manage_custom_forms: 'Designing custom form',
       manage_custom_translations: 'Managing custom translations',
       manage_growth_chart_plugin: 'Setting up growth chart plugin',
+      manage_validation_rules: 'Managing validation rules',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1765,6 +1767,19 @@ ${turnXml}
       if (args.program_id) parts.push(`program: ${String(args.program_id).slice(0, 11)}`);
       if (args.program_stage_id) parts.push(`stage: ${String(args.program_stage_id).slice(0, 11)}`);
       if (args.org_unit_id) parts.push(`ou: ${String(args.org_unit_id).slice(0, 11)}`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_validation_rules') {
+      const parts = [args.action || 'unknown'];
+      if (args.rule_id) parts.push(`id: ${String(args.rule_id).slice(0, 11)}`);
+      if (args.rule && typeof args.rule === 'object') {
+        if (args.rule.name) parts.push(`"${String(args.rule.name).slice(0, 30)}"`);
+        if (args.rule.operator) parts.push(`op: ${args.rule.operator}`);
+        if (args.rule.importance) parts.push(args.rule.importance);
+      }
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.importance && !(args.rule && args.rule.importance)) parts.push(args.importance);
+      if (args.period_type) parts.push(`pe: ${args.period_type}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {
       const parts = [args.action || 'list'];

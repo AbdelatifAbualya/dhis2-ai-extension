@@ -500,3 +500,64 @@ are untouched. Fix 2 is prompt-only. No existing tool is regressed.
 `inferValueType` unit test 16/16; memory persistence/trim simulation confirms provider-valid
 pairing; value types VALIDATE-import cleanly on 2.43; live diagnosis run against the user's
 `stable-2-42-5-1` instance (test TEI created and deleted, no residue left behind).
+
+---
+
+## 10. New tool — `manage_validation_rules` (DHIS2 aggregate data-quality validation rules)
+
+**File:** `background.js` (tool def, `TOOL_ROUTER`, `executeTool` dispatch, `executeManageValidationRules` +
+`createValidationRule` + `describeValidationExpression` handlers, `getContextualTools`, `buildSystemPrompt`);
+`sidepanel/panel.js` (iconMap / toolLabels / detail).
+
+**What was missing:** The chatbot could create datasets, data elements, custom forms, program rules and
+program indicators, but had **no** first-class way to author DHIS2 **validation rules** — the aggregate
+data-quality checks that compare two expressions (`leftSide` vs `rightSide`) with an operator over a period
+(e.g. "inpatient days ≤ available bed-days", "ANC 4th visits ≤ ANC 1st visits", "sub-totals == grand total").
+Previously the only path was hand-assembling `/api/metadata` payloads via `dhis2_query`, with no expression
+validation and no safety rails.
+
+**New capability — `manage_validation_rules`** with actions `list / get / create / update / delete`:
+- **create** server-validates BOTH expressions via DHIS2's `/api/expressions/description` endpoint BEFORE
+  saving (a bad data-element UID or malformed `#{...}` syntax is rejected at create-time with the parser's
+  exact error, never silently saved), then imports through the shared `postMetadataPayload`
+  VALIDATE-then-COMMIT path. Side descriptions auto-derive from the validator when omitted. Supports
+  `dry_run_only`.
+- **update** validates field values + any new expressions first, then auto-snapshots a backup
+  (`ensureBackupOrBail`, restorable via `manage_backups`) before the PUT.
+- **delete** runs the existing reference check + auto-backup, then deletes via
+  `metadata?importStrategy=DELETE&atomicMode=ALL` and confirms `deleted >= 1`.
+- **list/get** are read-only summaries with both expressions, operator, importance, period and missing-value
+  strategies.
+
+Validated inputs: `operator` (8 DHIS2 operators incl. `compulsory_pair`/`exclusive_pair`), `importance`
+(HIGH/MEDIUM/LOW), `period_type` (reuses the dataset `VALID_PERIOD_TYPES` set), and per-side
+`missingValueStrategy` (NEVER_SKIP / SKIP_IF_ANY_VALUE_MISSING / SKIP_IF_ALL_VALUES_MISSING).
+
+**Wiring (every layer):** `TOOLS` array → `TOOL_ROUTER` → `executeTool` dispatch → handler →
+`getContextualTools` (surfaced **only** on an explicit, conservative `wantsValidationRuleIntent`, plus
+`search_metadata` for resolving DE UIDs; added to `writeCapableNames` so `manage_backups` is offered after a
+write; added to the save-error-diagnosis read-only strip list) → `buildSystemPrompt` (a Validation-Rules KB
+block gated on the matching `wantsValidationRulePrompt`) → `panel.js` iconMap (`✅`), toolLabels and a
+`detail` renderer.
+
+**No-regression analysis:**
+- Purely **additive**. The tool is surfaced ONLY on explicit validation-rule intent, so it adds nothing to —
+  and cannot crowd or mis-route — any existing dataset / tracker / maintenance flow. The intent regex is
+  conservative (bare "validate" only triggers alongside a validation-specific noun such as "left side",
+  "compulsory pair", "greater than", or "dataset").
+- Touches **no shared code's behavior**: it only *calls* `safeDhis2Fetch`, `requireWriteAuth`,
+  `verifyTargetExists`, `ensureBackupOrBail`, `checkMetadataReferences`, `buildDeletionHint`,
+  `postMetadataPayload` and `generateDhis2Uid` with their existing signatures — no edits to any of them. New
+  module-level identifiers (`VALIDATION_OPERATORS/IMPORTANCE/MISSING_STRATEGY`, the three new functions) were
+  confirmed collision-free. `checkMetadataReferences('validationRules', …)` is an unmapped type → returns
+  `has_references:false`, after which DHIS2's atomic DELETE reports any genuine blocking reference (identical
+  to how `manage_metadata` delete handles non-special types).
+- `panel.js` changes are additive (`iconMap`/`toolLabels` lookups fall back by default; the new `else if`
+  branch precedes `manage_backups`), so every existing tool still renders.
+
+**Verification (DHIS2 2.43 playground, `stable-2-43-0-1`):** `/api/expressions/description` confirmed as the
+authoritative validator (valid → status OK + description; bad UID / malformed → status ERROR). Two full
+create→read-back→delete cycles run with pre-generated UIDs (VALIDATE then COMMIT, ZERO errors), including a
+mixed missing-value-strategy rule with auto-derived side descriptions; read-back matched the payload exactly;
+all test objects (validation rule + 2 supporting data elements) deleted and verified gone (404). `node --check
+background.js` and `node --check sidepanel/panel.js` both pass.
