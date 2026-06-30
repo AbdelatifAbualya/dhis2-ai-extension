@@ -8865,12 +8865,21 @@ const PATIENT_DATA_TOOL_NAMES = new Set([
 function pathReadsPatientData(rawPath) {
   if (typeof rawPath !== 'string') return false;
   const base = rawPath.split('?')[0].replace(/^\//, '').replace(/^api\/\d+\//i, '').toLowerCase();
+  // Boundary `(\/|\.|$)` = the resource name is followed by a sub-path (`/`), a
+  // format/extension suffix (`.json`, `.csv`, `.xml`, `.geojson`, `.csv.gz`, …),
+  // or end-of-path. The extension form MUST be gated too: `tracker/events.csv`,
+  // `tracker/trackedEntities.json`, `analytics/events/query.csv` etc. return the
+  // exact same patient-level rows as the extension-less endpoint, so anchoring on
+  // `/` or `$` alone (the old patterns) let a `.csv`/`.json` suffix slip the gate.
+  // None of the de-identified/metadata endpoints (eventReports, eventCharts,
+  // analytics/events/aggregate, dataValueSets, …) begin with these exact resource
+  // names followed by `/`, `.`, or end, so the `.` boundary never over-gates them.
   // New Tracker API individual-record endpoints
-  if (/^tracker\/(events|enrollments|trackedentities|relationships)(\/|$)/.test(base)) return true;
+  if (/^tracker\/(events|enrollments|trackedentities|relationships)(\/|\.|$)/.test(base)) return true;
   // Legacy tracker endpoints
-  if (/^(events|enrollments|trackedentityinstances)(\/|\.json|$)/.test(base)) return true;
+  if (/^(events|enrollments|trackedentityinstances)(\/|\.|$)/.test(base)) return true;
   // Row-level (individual) event/enrollment analytics — aggregate is de-identified and allowed
-  if (/^analytics\/(events|enrollments)\/query(\/|$)/.test(base)) return true;
+  if (/^analytics\/(events|enrollments)\/query(\/|\.|$)/.test(base)) return true;
   return false;
 }
 // True when a tool call would read patient-level tracker data.

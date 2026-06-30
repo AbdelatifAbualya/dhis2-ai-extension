@@ -991,3 +991,49 @@ correct mixed payload (inline new viz + existing-viz reference + TEXT tile, grid
 that payload (pointed at a real existing viz) imported end-to-end on the playground and read back as a
 3-item dashboard. Every test object was deleted and a `name:like:ZZAITEST` sweep confirmed ZERO
 residue (visualizations + dashboards).
+
+## 17. Security hardening — close file-extension bypass in the patient-data privacy gate
+
+**File:** `background.js` — `pathReadsPatientData` (the path matcher behind the hard-coded
+`enforcePatientDataPrivacyGate` choke point in `executeTool`). The three endpoint-matching regexes
+had their segment-boundary alternation widened from `(\/|$)` / `(\/|\.json|$)` to `(\/|\.|$)`.
+**Version:** 2.6.0 → 2.6.1.
+
+**The hole it closes (proven on the live 2.43 playground BEFORE the fix):** DHIS2 endpoints serve the
+same record under a format/extension suffix as without it — `GET /api/tracker/trackedEntities.json`,
+`/api/tracker/events.csv`, `/api/tracker/enrollments.json`, `/api/tracker/relationships.xml` and
+`/api/analytics/events/query.csv` all return the exact same individual patient rows as their
+extension-less form. The old patterns anchored the resource name on `/` or end-of-path only
+(`tracker/(events|…)(\/|$)`), so a trailing `.json` / `.csv` / `.xml` made the path fall through the
+matcher and the privacy gate passed it to a remote/cloud model. Live confirmation against
+`stable-2-43-0-1`: `tracker/trackedEntities.json` → HTTP 200 with TEI UID + attributes (identical to
+the gated `tracker/trackedEntities`), and `tracker/events.csv` → HTTP 200, **367 KB of individual
+event rows** (occurredAt, orgUnit, enrollment, …). Both would have been exfiltrated to a third-party
+LLM with the old gate; both are now blocked.
+
+**The fix:** `(\/|\.|$)` treats a trailing dot-extension (`.json`, `.csv`, `.xml`, `.geojson`,
+`.csv.gz`, …) exactly like end-of-segment, so the suffix forms are gated identically to the bare
+endpoint. This is a strict superset — `(\/|$)` and `(\/|\.json|$)` are subsets of `(\/|\.|$)` — so the
+matcher gates everything it did before plus the extension variants, and *un-gates nothing*. The legacy
+pattern's narrower `(\/|\.json|$)` (which let `.csv`/`.xml` through) is likewise tightened to `(\/|\.|$)`.
+
+**Safety / invariant compliance:** this only STRENGTHENS the existing hard-coded safeguard #15 — no
+safeguard was weakened or removed, no patient-data tool was un-registered, and the local-vs-remote
+decision (`isLocalProvider`) is untouched. Purely additive gating.
+
+**Scope of impact:** `pathReadsPatientData` has exactly one caller — `toolReadsPatientData` (the
+`dhis2_query` branch) — which feeds only `enforcePatientDataPrivacyGate`. No tool, prompt path,
+contextual selection, or other safeguard is touched. None of the de-identified / metadata endpoints
+begin with one of the gated resource names followed by `/`, `.`, or end-of-path, so the `.` boundary
+never over-gates: `analytics/events/aggregate.json`, `eventReports(.json)`, `eventCharts.json`,
+`eventVisualizations.json`, `relationshipTypes.json`, `trackedEntityAttributes/Types.json`,
+`dataValueSets.json` etc. all still pass through unchanged.
+
+**Verification:** `node --check` passes on both JS files. The SHIPPED `pathReadsPatientData` was
+extracted and run in Node against a 36-case suite (22 MUST-BLOCK incl. every confirmed
+extension-suffix bypass + version-prefixed + double-extension forms; 14 MUST-ALLOW de-identified /
+metadata endpoints) → 36/36. The full gate chain (`pathReadsPatientData` → `toolReadsPatientData` →
+`enforcePatientDataPrivacyGate`) was run with stubbed provider configs: under a REMOTE provider it
+blocks `tracker/events.csv` and `tracker/trackedEntities.json` while still allowing
+`analytics/events/aggregate.json`; under a LOCAL (Ollama) provider it correctly allows the patient
+read. No playground objects were created (read-only GET probes), so there is nothing to clean up.
