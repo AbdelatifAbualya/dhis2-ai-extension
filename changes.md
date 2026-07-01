@@ -1247,3 +1247,83 @@ the chatbot must now produce on its own.
   lint, and the UID-verification gates are all untouched. No new tool was added.
 - The proven sequence re-VALIDATEs on the live playground with 0 errors (VALIDATE-only, nothing persisted);
   0 test residue left behind. `node --check` passes on `background.js` and `sidepanel/panel.js`.
+
+---
+
+## 21. Integration — reference an EXISTING option set from create_data_elements (option set → data element → dataset chain)
+
+**Files:** `background.js` (`create_data_elements` schema; new `resolveExistingOptionSetRef`; `createStandaloneDataElements` reference resolution; `buildDataElement` reference attach + valueType alignment; DE summary), `manifest.json` (2.6.4 → 2.6.5).
+
+**Goal of this phase:** perfect the ROUTER and the ORCHESTRATION/INTEGRATION of the EXISTING tools for
+MULTI-STEP goals — no new user-facing tool. This run targets a DIFFERENT multi-step scenario than the
+recent dashboard / org-unit / program-indicator runs: an **option set → data element → dataset chain** —
+*"Create an option set 'Malaria RDT Result' (Positive/Negative/Invalid), create an aggregate data element
+that uses that option set, and add it to the monthly malaria dataset."* The correct chain is
+`manage_option_sets(action=create)` → chain the returned `option_set_id` →
+`create_metadata(action=create_data_elements, data_elements:[{ …, option_set_id:<that id> }])` → chain the
+new DE id → `manage_datasets(action=add_data_elements, data_element_ids:[<DE id>])`.
+
+**What was reproduced first (the chatbot's own tools, traced end-to-end):** ROUTING was already correct —
+tracing the request through `getContextualTools` surfaced `manage_option_sets` (via `wantsOptionSetIntent`),
+`create_metadata` + the authoring kit (via `wantsCreateIntent`), `manage_datasets` + `manage_metadata`
+(via `wantsDatasetIntent`), and `search_metadata` (always). `buildSystemPrompt` fired `wantsMultiStepGoal`
+(create + "then"/"and" + ≥2 distinct build-nouns: option set, data element, dataset), so the orchestration
+playbook loaded. The gap was a hard **INTEGRATION** wall, not routing:
+- `create_metadata(action=create_data_elements)` could attach an option set ONLY by INLINING a brand-new
+  one (`data_elements[].option_set = { name, options:[…] }`). There was **no way to reference an EXISTING
+  option set by UID** — so the `option_set_id` returned by the immediately-preceding
+  `manage_option_sets(create)` step had nowhere to go. A model following the playbook literally would be
+  forced to either (a) re-inline the same options (creating a DUPLICATE option set with different
+  codes/UID — data-quality damage), or (b) abandon the tool and hand-roll a raw `dhis2_query` /metadata
+  POST (no write-auth gate, no backup, easy to get the DE↔optionSet valueType pairing wrong). The chain
+  literally could not be executed cleanly with the chatbot's own tools.
+
+**Gold sequence proven on the playground (stable-2-43-0-1) BEFORE editing:** created option set
+*ZZAITEST Malaria RDT Result* (POS/NEG/INV) via `metadata?importMode=VALIDATE&atomicMode=ALL` then `COMMIT`
+(0 errors); chained the returned set UID into an AGGREGATE data element (`optionSet:{id:<set>}`, VALIDATE +
+COMMIT, 0 errors); read back the DE and confirmed its `optionSet` link resolved to the new set; appended
+the DE to the *Child Health* dataset (`BfMAe6Itzgt`) via its `:owner` PUT (dataSetElements 31 → 32). Then
+fully reverted (dataset back to 31, DE deleted, option set deleted — cascading its options),
+`name:like:ZZAITEST` sweep = 0 residue across optionSets / dataElements / options. This is the exact
+dependency-ordered, ID-chaining sequence the chatbot must now produce on its own.
+
+**Fix (purely additive — reference-by-UID support + one prompt worked-chain; no routing/logic change to
+existing paths):**
+- New `data_elements[].option_set_id` (and `option_set_name`) on `create_data_elements` to attach an
+  EXISTING option set, documented as mutually exclusive with the inline `option_set`.
+- New async helper `resolveExistingOptionSetRef(id|name)` verifies the referenced set EXISTS (by UID, or by
+  exact name → UID, refusing 0-match / ambiguous-multi-match) and returns its `valueType`, so a DE never
+  silently points at a non-existent set and the DE↔set valueType pairing is always consistent.
+- `createStandaloneDataElements` resolves the reference per-DE (erroring cleanly if BOTH inline and
+  reference are supplied), stashing a transient `_optionSetRef` on the DE.
+- `buildDataElement` attaches `optionSet:{id}` from `_optionSetRef` (an `else if` after the inline branch)
+  and AUTHORITATIVELY aligns the DE `valueType` to the referenced set's own valueType (TEXT/MULTI_TEXT) —
+  a mismatch would make the DE unusable. Both are gated on `_optionSetRef`, which is set ONLY on this path.
+- The DE result `summary.dataElements[]` now also reports `optionSetId` so the model can confirm the link.
+- The multi-step playbook gains `manage_option_sets(create) → option_set_id` and
+  `create_metadata(create_data_elements) → summary.dataElements[].id` in its step-4 ID-capture list,
+  step-5 explains chaining `option_set_id` into a DE via `option_set_id` (NEVER re-inlining), and a new
+  worked chain walks option set → DE (by reference) → dataset add.
+
+**No-regression gate (all verified before commit):**
+- **Improvement:** the option set → data element → dataset chain is now executable end-to-end with the
+  chatbot's own tools — the `option_set_id` from step 1 flows into the DE in step 2 by reference (no
+  duplicate set, no raw-POST fallback), and the DE id flows into the dataset in step 3.
+- **Zero collateral:** `buildDataElement`'s valueType change is a ternary whose non-`_optionSetRef` branch
+  is byte-identical to the original expression, and the new `optionSet` attach is an `else if` — both fire
+  ONLY when `_optionSetRef` is set, which happens ONLY inside `createStandaloneDataElements` for the new
+  reference fields. The three OTHER `buildDataElement` callers (program-stage builders) never set it, so
+  their output is unchanged. In `createStandaloneDataElements`, for inputs without the new fields both new
+  `if`s are skipped and the inline-option-set block runs identically (same guard, just hoisted into
+  `hasInlineOptionSet`). The `summary` gains one additive field.
+- **No routing change:** `getContextualTools` was NOT touched — every request type surfaces exactly the
+  same tools as before (the scenario's tools were already surfaced; the gap was integration).
+- **Shared-code callers enumerated:** `buildDataElement` — callers at the program builder,
+  add-DE-to-stage, and standalone paths; only the standalone path sets `_optionSetRef`, the rest are
+  unchanged. `resolveExistingOptionSetRef` is new and called only from `createStandaloneDataElements`.
+- **No safeguard weakened:** `enforcePatientDataPrivacyGate`, `PATIENT_DATA_TOOL_NAMES`, `requireWriteAuth`
+  (still gates `create_data_elements`), `verifyTargetExists`, `ensureBackupOrBail`, and the UID-verification
+  gates are all untouched. No new tool was added.
+- The handler-shaped reference payload (DE with `optionSet:{id:<real existing set>}`, valueType aligned)
+  re-VALIDATEs on the live playground with 0 errors (VALIDATE-only, nothing persisted); 0 test residue
+  left behind. `node --check` passes on `background.js` and `sidepanel/panel.js`.

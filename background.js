@@ -4069,15 +4069,18 @@ If user enabled web browsing from UI, this tool should usually be called before 
                 use_default_combo: { type: 'boolean', description: 'Force this DE onto the system default categoryCombo (no disaggregation), even when the batch has an inline combo. Use for "no disaggregation" rows in a mixed dataset.' },
                 option_set: {
                   type: 'object',
+                  description: 'Inline option set to CREATE and attach to this DE. Use ONLY when the option set does not exist yet. To attach an EXISTING option set (e.g. one just created via manage_option_sets), use option_set_id instead — do NOT re-inline it (that makes a duplicate set).',
                   properties: {
                     name: { type: 'string' },
                     options: { type: 'array', items: { type: 'string' } }
                   }
-                }
+                },
+                option_set_id: { type: 'string', description: 'Attach an EXISTING option set to this DE by UID. Chain the option_set_id returned by manage_option_sets(action="create"). The DE valueType is auto-aligned to the referenced set (TEXT/MULTI_TEXT). Mutually exclusive with the inline option_set.' },
+                option_set_name: { type: 'string', description: 'Attach an EXISTING option set to this DE by exact name (resolved to its UID). Use option_set_id when you already have the UID. Mutually exclusive with the inline option_set.' }
               },
               required: ['name', 'value_type']
             },
-            description: 'Standalone data elements (for create_data_elements). Each DE can opt into the inline category_combo via use_category_combo:true, or stay on the default combo. Mix freely in one call.'
+            description: 'Standalone data elements (for create_data_elements). Each DE can opt into the inline category_combo via use_category_combo:true, or stay on the default combo. Attach an option set either inline (option_set — creates a new set) or by reference (option_set_id / option_set_name — reuses an existing set). Mix freely in one call.'
           },
           category_combo: {
             type: 'object',
@@ -6170,8 +6173,10 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
    - manage_program_indicators(action="create") → \`program_indicator_id\` (TRACKER/event indicator)
    - manage_dashboards(action="create_visualization") → \`visualization_id\`
    - manage_dashboards(action="create_dashboard") → \`dashboard_id\` (+ \`new_visualizations[]\`)
-   - create_metadata / manage_datasets / manage_org_units / manage_option_sets / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
-5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. (This is exactly the verified provenance the Verify-before-call rule demands.)
+   - manage_option_sets(action="create") → \`option_set_id\`
+   - create_metadata(action="create_data_elements") → each new DE's id in \`summary.dataElements[].id\`
+   - create_metadata / manage_datasets / manage_org_units / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
+5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. A new option set's \`option_set_id\` goes into a data element via create_metadata(action="create_data_elements", data_elements:[{ name, value_type, option_set_id:<option_set_id> }]) — pass \`option_set_id\` to REFERENCE the existing set (the DE valueType auto-aligns); NEVER re-inline the same options with \`option_set:{...}\` (that creates a DUPLICATE set). A new DE id then goes into manage_datasets(action="add_data_elements", dataset_id, data_element_ids:[<id>]). (This is exactly the verified provenance the Verify-before-call rule demands.)
 6. SHARE last: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). NEVER set sharing with a raw dhis2_query PUT — it fails.
 
 ### Worked chain — "build a malaria dashboard that needs new indicators, then make it public"
@@ -6179,6 +6184,11 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
 2. manage_indicators(action="create", indicator:{ name, numerator:"#{deathsUID}", denominator:"#{casesUID}", indicator_type:"Per cent" }) for EACH missing indicator → keep each returned \`indicator_id\`.
 3. manage_dashboards(action="create_dashboard", dashboard:{ name:"Malaria Surveillance" }, items:[ { new_visualization:{ name:"CFR by month", vis_type:"COLUMN", data_items:[<indicator_id #1>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } }, { new_visualization:{ name:"ACT coverage", vis_type:"SINGLE_VALUE", data_items:[<indicator_id #2>], periods:["THIS_YEAR"], org_units:["<ou>"] } } ]) — the inline visualizations and the dashboard import atomically; keep the returned \`dashboard_id\`.
 4. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------") so everyone can view it.
+
+### Worked chain — "create an option set for RDT results, a data element that uses it, and add it to the monthly malaria dataset"
+1. manage_option_sets(action="create", option_set:{ name:"Malaria RDT Result", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INV",name:"Invalid"}] }) → keep the returned \`option_set_id\`.
+2. create_metadata(action="create_data_elements", data_elements:[{ name:"Malaria RDT outcome", value_type:"TEXT", domain_type:"AGGREGATE", option_set_id:<option_set_id> }]) → the DE REFERENCES the set just created (do NOT re-inline the options); keep the new DE id from \`summary.dataElements[0].id\`.
+3. manage_datasets(action="add_data_elements", dataset_id:<the dataset UID>, data_element_ids:[<DE id>]) — resolve the dataset UID first via search_metadata(object_type="dataSets") if you don't have it in context.
 Run all steps without pausing. Only ask the user when a step is genuinely ambiguous (e.g. which data element represents "malaria cases").
 `;
   }
@@ -14257,13 +14267,20 @@ function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames
     domainType,
     // Explicit value_type always wins. When absent, infer from the name so
     // numeric fields are not silently created as TEXT — but never infer when an
-    // option set is attached (those are code-valued, keep TEXT default).
-    valueType: de.value_type || (de.option_set ? 'TEXT' : inferValueType(de.name, 'TEXT')),
+    // option set is attached (those are code-valued, keep TEXT default). When an
+    // EXISTING option set is referenced, the DE valueType is AUTHORITATIVELY the
+    // set's own valueType (TEXT/MULTI_TEXT) — a mismatch would make the DE
+    // unusable, so the referenced set wins over any inferred/passed value_type.
+    valueType: de._optionSetRef
+      ? (de._optionSetRef.valueType || 'TEXT')
+      : (de.value_type || (de.option_set ? 'TEXT' : inferValueType(de.name, 'TEXT'))),
     aggregationType,
     categoryCombo: { id: ccId },
   };
   if (de.option_set && optionSetUidMap[de.option_set.name]) {
     elem.optionSet = { id: optionSetUidMap[de.option_set.name] };
+  } else if (de._optionSetRef && de._optionSetRef.id) {
+    elem.optionSet = { id: de._optionSetRef.id };
   }
   if (de.code && typeof de.code === 'string' && de.code.trim()) {
     elem.code = de.code.trim();
@@ -20965,6 +20982,38 @@ async function createStandaloneOptionSet(args) {
   };
 }
 
+// Resolve an EXISTING option set for a data element that references one by UID
+// or exact name (as opposed to bundling a brand-new inline option_set). Returns
+// { id, valueType, name } on success or { _error } if it cannot be resolved — so
+// a DE never silently points at a non-existent set (which would fail the import
+// with an opaque message). Purely additive: DEs that pass only an inline
+// option_set (or none) never reach this path. This is what lets the
+// manage_option_sets(create) → create_data_elements chain compose — the DE step
+// can attach the just-created set by option_set_id instead of duplicating it.
+async function resolveExistingOptionSetRef(optionSetId, optionSetName) {
+  if (optionSetId) {
+    const id = String(optionSetId).trim();
+    const resp = await safeDhis2Fetch(`optionSets/${id}?fields=id,name,valueType`);
+    if (resp?._error || resp?._status === 404 || !resp?.id) {
+      return {
+        _error: `option_set_id "${id}" does not exist on this server.`,
+        _hint: 'Chain the option_set_id returned by manage_option_sets(action="create"), or pass an inline option_set:{name,options:[...]} to create a new one.',
+      };
+    }
+    return { id: resp.id, valueType: resp.valueType || 'TEXT', name: resp.name || id };
+  }
+  const nm = String(optionSetName || '').trim();
+  if (!nm) return { _error: 'option_set reference is empty (no option_set_id or option_set_name).' };
+  const probe = await safeDhis2Fetch(`optionSets?filter=name:eq:${encodeURIComponent(nm)}&fields=id,name,valueType&pageSize=2`);
+  const hits = probe?.optionSets || [];
+  if (!hits.length) return {
+    _error: `option_set_name "${nm}" not found on this server.`,
+    _hint: 'Create it first with manage_option_sets(action="create") and chain the returned option_set_id, or pass an inline option_set:{name,options:[...]}.',
+  };
+  if (hits.length > 1) return { _error: `option_set_name "${nm}" is ambiguous (${hits.length} matches). Pass option_set_id instead.` };
+  return { id: hits[0].id, valueType: hits[0].valueType || 'TEXT', name: hits[0].name || nm };
+}
+
 async function createStandaloneDataElements(args, defaultCatComboId) {
   if (!args.data_elements?.length) return { _error: 'Missing data_elements array' };
 
@@ -21015,8 +21064,24 @@ async function createStandaloneDataElements(args, defaultCatComboId) {
   const batchComboId = inlineComboUid || existingComboId || null;
 
   for (const de of args.data_elements) {
+    const hasInlineOptionSet = !!(de.option_set && de.option_set.name && de.option_set.options?.length);
+    const refIdRaw = de.option_set_id || de.optionSetId || null;
+    const refNameRaw = de.option_set_name || de.optionSetName || null;
+    // Reference an EXISTING option set by UID/name (the chaining path). Mutually
+    // exclusive with an inline option_set so intent is never ambiguous.
+    if ((refIdRaw || refNameRaw) && hasInlineOptionSet) {
+      return {
+        _error: `Data element "${de.name || '(unnamed)'}" specifies BOTH an inline option_set and an existing option_set_id/option_set_name.`,
+        _hint: 'Use inline option_set:{name,options} to CREATE a new set, OR option_set_id/option_set_name to REFERENCE an existing one — not both.',
+      };
+    }
+    if (refIdRaw || refNameRaw) {
+      const ref = await resolveExistingOptionSetRef(refIdRaw, refNameRaw);
+      if (ref._error) return ref;
+      de._optionSetRef = { id: ref.id, valueType: ref.valueType };
+    }
     // Inline option set bundling (existing behavior — preserved verbatim).
-    if (de.option_set && de.option_set.name && de.option_set.options?.length) {
+    if (hasInlineOptionSet) {
       if (!optionSetUidMap[de.option_set.name]) {
         const { optionSet, options, osUid } = buildOptionSetAndOptions(de.option_set, de.value_type);
         allOptions.push(...options);
@@ -21087,6 +21152,7 @@ async function createStandaloneDataElements(args, defaultCatComboId) {
         domainType: de.domainType,
         aggregationType: de.aggregationType,
         categoryComboId: de.categoryCombo?.id,
+        optionSetId: de.optionSet?.id || null,
       })),
       optionSets: Object.entries(optionSetUidMap).map(([name, id]) => ({ name, id })),
       categoryCombo: inlineComboUid
