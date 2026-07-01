@@ -1403,3 +1403,31 @@ option_set_id precedent from entry 21):**
   the indicator was confirmed to carry the legend set, and ALL test objects were deleted (verified 404).
   The handler-shaped attach payload independently re-VALIDATEs with 0 errors and 0 residue. `node --check`
   passes on `background.js` and `sidepanel/panel.js`.
+
+---
+
+## 23. Dashboard data-loss fix — safe `add_items`/`remove_item`/`update`/`delete` on manage_dashboards + destructive-write guard + backups
+
+**Files:** `background.js`, `sidepanel/panel.js`, `manifest.json` (2.6.6 → 2.6.7). See `CHANGES_dashboards.md` for the full writeup.
+
+### The disaster this closes
+
+`manage_dashboards` (entry 16) could CREATE dashboards/visualizations but had **no way to add a chart to an EXISTING dashboard**. So "add this visualization to my dashboard" still forced the model down a raw `dhis2_query` PUT `/dashboards/{id}` — and a dashboard PUT is a **whole-object replace**: any dashboardItem not in the body is permanently destroyed (verified on 2.43: a partial PUT silently took a 2-item dashboard to 1, HTTP 200). Dashboards were also not in the backup set, so there was no undo.
+
+### What changed (purely additive to the existing manage_dashboards)
+
+1. **New actions** `add_items`, `remove_item`, `update`, `delete`:
+   - `add_items` reads the FULL current dashboard (`?fields=:owner`), appends the new tiles (grid-packed BELOW existing ones on the same 58-col grid), and writes the COMPLETE item set back via `postMetadataPayload` — existing tiles are always preserved. Accepts existing `{ visualization_id }`, inline `{ new_visualization:{…} }` (built with the same `buildVisualizationObject`, so no empty charts), `{ type:"MAP", map_id }`, `{ type:"TEXT", text }`. Verifies every referenced object exists (no broken tiles).
+   - `remove_item`/`update` are read-modify-write; `delete` uses importStrategy=DELETE.
+   - **All four snapshot the dashboard to backups BEFORE writing** (`ensureBackupOrBail`), so every change is reversible via `manage_backups`.
+2. **Destructive-write guard** in the `dhis2_query` handler: raw `PUT`/`PATCH dashboards/{id}`, `POST /metadata` with a `dashboards[]` entry that has an existing id + `dashboardItems`, and raw `POST .../items` are refused and redirected to `manage_dashboards`. The append endpoint, item-level ops, and GETs are untouched.
+3. **Backup coverage**: `SNAPSHOT_FIELDS.dashboards` (full dashboardItems + all content refs) and `dashboards/visualizations/maps/eventCharts/eventReports/eventVisualizations/charts/reportTables` added to `backupableTypes`. Restore rebuilds a wiped dashboard exactly.
+4. **Cross-version (2.34 → 2.43+ with pre-2.34 fallback)**: `resolveAnalyticsFavorite` probes `visualizations`→`charts`→`reportTables` so `add_items` references the object under whatever endpoint the server actually uses; `getDhis2MinorVersion` is available for version branching. (The remote's `create_visualization` already targets `visualizations`, correct for 2.34+.)
+5. **Wiring**: action enum + `item_id`/`skip_backup` params + description updated; system-prompt dashboard KB block gained `add_items`/`remove_item`/`update`/`delete` guidance and an example; `sidepanel/panel.js` detail branch gained `item_id`.
+
+**Scope / no-regression:** the existing `list`/`get`/`create_visualization`/`create_dashboard` actions are byte-for-byte unchanged (regression-tested); this only ADDS actions + a guard + backup coverage. No other tool changes behavior. Confirmed the remote's `create_visualization` field-shape finding (a viz set only via `columns`/`rows`/`filters` reads back with empty `columnDimensions`/`organisationUnits`) and kept their correct builder rather than my earlier columns/rows/filters approach.
+
+**Verification:**
+- `node --check` on both JS files; `manifest.json` valid.
+- Merged-logic tests 19/19 (add_items preserves all existing items + backs up + posts the full set; inline-viz build has `columnDimensions`/`userOrganisationUnit`; missing-ref refusal; pre-2.34 CHART fallback; remove_item; delete snapshot; **create_visualization regression guard**). Guard-classification 9/9.
+- **Live 2.43 playground:** full `add_items` operation (POST /metadata with the new viz + the full appended dashboard) 1→2 items, both tiles present, appended viz reads back with `columnDimensions:["dx"]` + `userOrganisationUnit:true` (renderable, not empty). Partial-PUT data loss reproduced (2→1). All ZZAITEST objects deleted; residue sweep returned 0 for visualizations and dashboards.

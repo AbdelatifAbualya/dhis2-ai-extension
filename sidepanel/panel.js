@@ -1858,6 +1858,7 @@ ${turnXml}
         parts.push(`"${String(args.dashboard.name).slice(0, 30)}"`);
       }
       if (Array.isArray(args.items)) parts.push(`${args.items.length} item(s)`);
+      if (args.item_id) parts.push(`item: ${String(args.item_id).slice(0, 11)}`);
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.dry_run_only) parts.push('DRY RUN');
       detail = parts.join(', ');

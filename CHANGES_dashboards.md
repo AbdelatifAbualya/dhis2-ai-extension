@@ -84,3 +84,45 @@ TOOLS array · TOOL_ROUTER · `executeTool` dispatch · `executeManageDashboards
 - The 409 `E7144` on `/visualizations/{id}/data.json` during testing is an instance limitation
   (analytics tables not generated on this playground — a pre-existing real viz 409s identically), not a
   structural defect: the built visualizations are shape-identical to native Data Visualizer output.
+
+---
+
+## Update (v2.6.7) — safe mutation of EXISTING dashboards + data-loss guard
+
+The initial tool could CREATE dashboards/visualizations but not safely modify an existing dashboard.
+Adding a chart to an existing dashboard therefore still fell back to a raw `dhis2_query` PUT
+`/dashboards/{id}` — a **whole-object replace** that silently wipes every tile not in the body
+(verified on 2.43: a partial PUT took a 2-item dashboard to 1, HTTP 200, no error). This update
+closes that gap.
+
+### New actions (additive; list/get/create_visualization/create_dashboard unchanged)
+
+- **`add_items`** (`dashboard_id` + `items[]`) — the ONLY safe way to add to an existing dashboard.
+  Reads the full dashboard (`?fields=:owner`), appends the new tiles grid-packed BELOW the existing
+  ones, and writes the COMPLETE item set back (via `postMetadataPayload`). Existing tiles are always
+  preserved. Items may be existing `{ visualization_id }`, inline `{ new_visualization:{…} }` (same
+  `buildVisualizationObject`, so never an empty chart), `{ type:"MAP", map_id }`, or `{ type:"TEXT", text }`.
+  Every referenced object is existence-checked (no broken tiles). **Snapshots to backups first.**
+- **`remove_item`** (`dashboard_id` + `item_id`), **`update`** (`dashboard_id` + `dashboard:{name?,description?}`),
+  **`delete`** (`dashboard_id`) — read-modify-write / DELETE, each **snapshotted first** → all reversible
+  via `manage_backups`.
+
+### Guard + backups + cross-version
+
+- The `dhis2_query` handler now **blocks** raw `PUT`/`PATCH dashboards/{id}`, `POST /metadata` that
+  replaces an existing dashboard's items, and raw `POST .../items`, redirecting to `manage_dashboards`.
+  The append endpoint, item-level ops, and GETs are unaffected.
+- `SNAPSHOT_FIELDS.dashboards` + `dashboards`/`visualizations`/`maps`/`eventCharts`/`eventReports`/
+  `eventVisualizations`/`charts`/`reportTables` added to `backupableTypes`. Restore rebuilds a wiped
+  dashboard exactly (proven: re-POST of the snapshot brought a wiped dashboard back to full items).
+- `resolveAnalyticsFavorite` probes `visualizations`→`charts`→`reportTables`, so `add_items` works on
+  2.34+ (unified `visualizations`) AND older servers (`charts`/`reportTables`), storing the item with the
+  right type (`VISUALIZATION` vs `CHART`/`REPORT_TABLE`).
+
+### Verification (v2.6.7)
+
+- 19/19 merged-logic assertions (incl. a regression guard that create_visualization is unchanged) +
+  9/9 guard-classification assertions.
+- Live 2.43: full `add_items` operation 1→2 items with both tiles present; the appended viz reads back
+  with `columnDimensions:["dx"]` + `userOrganisationUnit:true` (renderable). Partial-PUT loss (2→1)
+  reproduced; ZZAITEST residue sweep = 0.

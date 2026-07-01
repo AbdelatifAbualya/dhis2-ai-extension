@@ -1135,6 +1135,16 @@ const SNAPSHOT_FIELDS = {
   indicators:
     'id,name,shortName,code,description,indicatorType[id],numerator,numeratorDescription,' +
     'denominator,denominatorDescription,decimals,annualized,url',
+  // Dashboards are the highest-risk restore target: their whole value lives in
+  // the dashboardItems collection, and a careless full-object PUT that omits an
+  // item permanently drops it. Spell the items out in full (every content-type
+  // reference + grid geometry) so a restore re-creates the dashboard exactly.
+  dashboards:
+    'id,name,description,favorite,restrictFilters,allowedFilters,layout,itemConfig,' +
+    'dashboardItems[id,type,x,y,width,height,shape,appKey,text,messages,' +
+    'visualization[id],eventVisualization[id],eventChart[id],eventReport[id],map[id],' +
+    'chart[id],reportTable[id],reports[id],resources[id],users[id]],' +
+    'sharing',
 };
 
 function getSnapshotFields(objectType) {
@@ -5135,20 +5145,23 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
     function: {
       name: 'manage_dashboards',
       description: `Build and inspect DHIS2 **analytics dashboards and visualizations** — the charts, pivot tables and single-value tiles shown in the Dashboard app, and the dashboards that arrange them. Use this tool for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata visualizations or dashboards bodies via dhis2_query (a raw POST that only sets columns/rows/filters silently imports an EMPTY, un-renderable chart — DHIS2 stores the layout as columnDimensions/rowDimensions/filterDimensions and the data as dataDimensionItems / relativePeriods / organisationUnits; this tool assembles that exact structure for you).
-Actions: list / get / create_visualization / create_dashboard.
+Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
 - create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (indicator / dataElement / programIndicator UIDs — their types are auto-resolved AND verified to exist), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed.
-- create_dashboard: a whole dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). New visualizations and the dashboard are imported together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back — nothing half-built is left behind.
-- list / get: list dashboards (optional name filter) / read one dashboard with its items and their visualizations.
-To DELETE a dashboard or visualization, or change its sharing, use manage_metadata (object_type "dashboards" / "visualizations"). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
+- create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
+- add_items: add chart(s)/map(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
+- remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
+- list / get: list dashboards (optional name filter) / read one dashboard with its items (each item's id, type, and referenced visualization/map).
+Every mutating action is backed up first (undo via manage_backups). For sharing use manage_metadata(action=update_sharing). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['list', 'get', 'create_visualization', 'create_dashboard'],
-            description: 'list=paginated dashboard list (optional name filter); get=one dashboard with its items + visualizations; create_visualization=one chart/pivot/single-value; create_dashboard=a dashboard with items (existing UIDs and/or inline-created visualizations), atomically.'
+            enum: ['list', 'get', 'create_visualization', 'create_dashboard', 'add_items', 'remove_item', 'update', 'delete'],
+            description: 'list=dashboard list; get=one dashboard with items; create_visualization=one chart/pivot/single-value; create_dashboard=a NEW dashboard with items; add_items=safely APPEND item(s) to an EXISTING dashboard (never wipes existing tiles); remove_item=drop one tile; update=edit dashboard name/description; delete=remove a whole dashboard. All mutating actions snapshot to backups first.'
           },
-          dashboard_id: { type: 'string', description: 'Existing dashboard UID (required for get).' },
+          dashboard_id: { type: 'string', description: 'Existing dashboard UID (required for get, add_items, remove_item, update, delete).' },
+          item_id: { type: 'string', description: 'For remove_item: the dashboardItem UID to drop (see action=get for item ids).' },
           name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on dashboard name.' },
           limit: { type: 'integer', description: 'For list: max dashboards to return (1–200, default 50).' },
           visualization: {
@@ -5175,15 +5188,15 @@ To DELETE a dashboard or visualization, or change its sharing, use manage_metada
           },
           dashboard: {
             type: 'object',
-            description: 'For create_dashboard: the dashboard\'s own fields.',
+            description: 'For create_dashboard (name required) and update (name and/or description to change).',
             properties: {
-              name: { type: 'string', description: 'Dashboard display name (required).' },
+              name: { type: 'string', description: 'Dashboard display name.' },
               description: { type: 'string', description: 'Optional description.' }
             }
           },
           items: {
             type: 'array',
-            description: 'For create_dashboard: the items to place on the dashboard. Each entry either references an existing object OR inline-creates a new visualization.',
+            description: 'For create_dashboard (items to place on a NEW dashboard) AND add_items (items to APPEND to an existing dashboard). Each entry either references an existing object OR inline-creates a new visualization.',
             items: {
               type: 'object',
               properties: {
@@ -5202,7 +5215,8 @@ To DELETE a dashboard or visualization, or change its sharing, use manage_metada
               }
             }
           },
-          dry_run_only: { type: 'boolean', description: 'For create_visualization / create_dashboard: validate the metadata import without committing. Default false.' }
+          dry_run_only: { type: 'boolean', description: 'For create_visualization / create_dashboard: validate the metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the mandatory pre-write snapshot on add_items/remove_item/update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
         },
         required: ['action']
       }
@@ -6650,7 +6664,9 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 ### Actions
 - **list** (optional name_filter) and **get** (dashboard_id → its items + each item's visualization) are read-only.
 - **create_visualization** — one chart/pivot/single-value: \`visualization:{ name, vis_type, data_items:[…UIDs], periods:[…], org_units:[…] }\`. data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped.
-- **create_dashboard** — a whole dashboard atomically: \`dashboard:{ name }\` + \`items:[…]\`. Each item EITHER references an existing object (\`{ visualization_id }\` or \`{ type:"MAP", map_id }\` or \`{ type:"TEXT", text }\`) OR inline-creates a new chart (\`{ new_visualization:{ name, vis_type, data_items, periods, org_units } }\`). New visualizations + the dashboard import together, so one bad UID rolls the whole thing back. Items are auto-arranged on the 58-column grid (override per item with x/y/width/height).
+- **create_dashboard** — a whole NEW dashboard atomically: \`dashboard:{ name }\` + \`items:[…]\`. Each item EITHER references an existing object (\`{ visualization_id }\` or \`{ type:"MAP", map_id }\` or \`{ type:"TEXT", text }\`) OR inline-creates a new chart (\`{ new_visualization:{ name, vis_type, data_items, periods, org_units } }\`). New visualizations + the dashboard import together, so one bad UID rolls the whole thing back. Items are auto-arranged on the 58-column grid (override per item with x/y/width/height).
+- **add_items** — add tile(s) to an EXISTING dashboard: \`dashboard_id\` + \`items:[…]\` (same item shapes as create_dashboard). THIS IS THE ONLY SAFE WAY to add to a dashboard that already exists. It reads the full dashboard, appends below the current tiles, and writes the COMPLETE item set back, snapshotting to backups first. NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} or a /metadata dashboards[] body — a dashboard PUT is a whole-object REPLACE and permanently wipes every existing tile (this is what made dashboards "go missing"; it's now blocked in code).
+- **remove_item** (\`dashboard_id\` + \`item_id\`), **update** (\`dashboard_id\` + \`dashboard:{ name?, description? }\`), **delete** (\`dashboard_id\`) — each snapshots first; undo any of them via manage_backups.
 
 ### Fields
 - **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
@@ -6660,12 +6676,13 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 
 ### Rules
 - NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / list / get first.
-- To DELETE a dashboard/visualization or change its sharing, use **manage_metadata** (object_type "dashboards" / "visualizations"); manage_dashboards only creates and reads.
+- To delete a whole dashboard use manage_dashboards(action="delete") (it snapshots first, so it's restorable). To delete a standalone visualization/map, or to change sharing on either, use **manage_metadata** (object_type "dashboards" / "visualizations" / "maps").
 - Use **render_chart** for a quick inline chart preview in chat; use **manage_dashboards** to SAVE a reusable visualization/dashboard in DHIS2. They are different jobs.
 
 ### Examples
 - "Build an ANC dashboard with a coverage chart, a pivot and a single value": create_dashboard dashboard:{ name:"ANC Programme" }, items:[ {new_visualization:{name:"ANC Coverage by Month",vis_type:"COLUMN",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC Coverage Pivot",vis_type:"PIVOT_TABLE",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC 1 This Year",vis_type:"SINGLE_VALUE",data_items:["<anc1>"],periods:["THIS_YEAR"],org_units:["<ou>"]}} ].
 - "Make me a column chart of malaria cases by district last year": create_visualization visualization:{ name:"Malaria cases by district", vis_type:"COLUMN", data_items:["<de>"], periods:["LAST_YEAR"], org_units:["LEVEL-2"] }.
+- "Add a coverage chart for this new indicator to my National Overview dashboard": add_items dashboard_id:"<dashId>", items:[ { new_visualization:{ name:"ANC coverage", vis_type:"COLUMN", data_items:["<indicatorId>"], periods:["LAST_12_MONTHS"], org_units:["USER_ORGUNIT"] } } ] — this APPENDS; the dashboard's existing tiles are preserved and snapshotted.
 `;
   }
 
@@ -9203,6 +9220,50 @@ async function executeTool(name, args) {
       }
     }
 
+    // Guard: DASHBOARD DATA-LOSS PREVENTION. The single most destructive thing
+    // the model has ever done: to "add a chart to a dashboard" it did a full
+    // PUT /dashboards/{id} (or POST /metadata with a dashboards[] entry) whose
+    // body carried only the NEW item — DHIS2 treats a dashboard PUT as a
+    // whole-object replace, so every pre-existing dashboardItem was wiped and
+    // the dashboard "went missing" (verified on the 2.43 playground: HTTP 200,
+    // silent data loss). These raw writes are now refused and routed to
+    // manage_dashboards(action=add_items), which snapshots first and APPENDS
+    // without touching existing items. (Item-level ops like
+    // PUT dashboards/{id}/items/{itemId} and the append endpoint
+    // dashboards/{id}/items/content are left alone.)
+    if (method === 'PUT' || method === 'PATCH' || method === 'POST') {
+      const dashItemMatch = safePath.match(/^dashboards\/([A-Za-z][A-Za-z0-9]{10})(\b|\/|\?|$)/);
+      const isContentAppend = /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/content(\b|\?|$)/.test(safePath);
+      const isItemLevel = /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/[A-Za-z][A-Za-z0-9]{10}/.test(safePath);
+      if ((method === 'PUT' || method === 'PATCH') && dashItemMatch && !isContentAppend && !isItemLevel) {
+        return {
+          _error: `Blocked: ${method} dashboards/${dashItemMatch[1]} via dhis2_query REPLACES the entire dashboard object. If the body does not carry every existing dashboardItem, the whole dashboard's contents are permanently destroyed — this is exactly how dashboards "went missing" before. Never hand-write a dashboard PUT.`,
+          _hint: `Use manage_dashboards — it snapshots the dashboard first, then APPENDS without touching existing items:\n• Add existing/new charts to a dashboard: manage_dashboards(action="add_items", dashboard_id="${dashItemMatch[1]}", items=[{ visualization_id:"<vizId>" }])\n• Remove one tile: manage_dashboards(action="remove_item", dashboard_id="${dashItemMatch[1]}", item_id="<itemId>").\n• Rename: manage_dashboards(action="update"). To restore a wiped one: manage_backups(action="list") then restore.`,
+          _redirect: 'manage_dashboards',
+        };
+      }
+      if (method === 'POST' && /^metadata(\?|$)/.test(safePath)) {
+        try {
+          const parsedMeta = typeof args.body === 'string' ? JSON.parse(args.body) : args.body;
+          const dashArr = parsedMeta && Array.isArray(parsedMeta.dashboards) ? parsedMeta.dashboards : null;
+          if (dashArr && dashArr.some(d => d && d.id && Array.isArray(d.dashboardItems))) {
+            return {
+              _error: `Blocked: POST /metadata with a dashboards[] entry that has an existing id and a dashboardItems array replaces that dashboard's items wholesale — the classic "dashboard vanished" data-loss path.`,
+              _hint: `Use manage_dashboards(action="add_items", dashboard_id="<id>", items=[…]) to append safely (it snapshots first), or action="create_dashboard" for a brand-new dashboard.`,
+              _redirect: 'manage_dashboards',
+            };
+          }
+        } catch { /* non-JSON body — fall through */ }
+      }
+      if (method === 'POST' && dashItemMatch && /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/?(\?|$)/.test(safePath)) {
+        return {
+          _error: `Blocked: POST dashboards/${dashItemMatch[1]}/items is not the correct way to add a dashboard item and can fail silently.`,
+          _hint: `Use manage_dashboards(action="add_items", dashboard_id="${dashItemMatch[1]}", items=[{ visualization_id:"<vizId>" }]).`,
+          _redirect: 'manage_dashboards',
+        };
+      }
+    }
+
     // Guard: redirect raw programNotificationTemplates writes to manage_program_notifications.
     // DHIS2 2.36+ reality: no `url` / `webhookUrl` field on the schema → silently dropped on POST,
     // PATCH returns 400. Linking needs POST /api/programs/{id}/notificationTemplates/{templateId},
@@ -9336,6 +9397,12 @@ async function executeTool(name, args) {
         'optionSets', 'options', 'trackedEntityTypes',
         'categoryCombos', 'categories', 'categoryOptions',
         'userGroups', 'dataSets', 'sections', 'indicators',
+        // Analytics-app objects. Dashboards especially: a raw PUT replaces the
+        // whole object, so a pre-write snapshot is the only safety net if the
+        // model slips past the redirect guard with skip_backup off.
+        'dashboards', 'visualizations', 'maps',
+        'eventCharts', 'eventReports', 'eventVisualizations',
+        'charts', 'reportTables', // legacy (pre-2.34) analytics favorites
       ]);
       if (itemMatch && backupableTypes.has(itemMatch[1])) {
         const itemBackup = await ensureBackupOrBail(
@@ -12719,6 +12786,36 @@ async function createLegendSet(args) {
 // requireWriteAuth) are reused with their existing signatures — no shared
 // code's behaviour changes.
 
+// DHIS2 minor version as a number (e.g. 42), or null if unknown. dhis2.apiVersion
+// is set to info.version.split('.')[1] on connect, so it is already the minor.
+function getDhis2MinorVersion() {
+  const v = parseInt(dhis2.apiVersion, 10);
+  return Number.isFinite(v) ? v : null;
+}
+
+// Locate an existing analytics favorite (chart / pivot) regardless of DHIS2
+// version. 2.34+ unifies them under `visualizations`; older servers split them
+// into `charts` and `reportTables`. Probing modern→legacy means one round-trip
+// on current servers and graceful fall-through on old ones. Returns the
+// dashboardItem type + property to use, or {_notFound}/{_error}.
+async function resolveAnalyticsFavorite(id) {
+  const candidates = [
+    { resource: 'visualizations', itemType: 'VISUALIZATION', prop: 'visualization' },
+    { resource: 'charts', itemType: 'CHART', prop: 'chart' },
+    { resource: 'reportTables', itemType: 'REPORT_TABLE', prop: 'reportTable' },
+  ];
+  for (const c of candidates) {
+    const r = await safeDhis2Fetch(`${c.resource}/${id}?fields=id,displayName`);
+    if (r && !r._error) return { ...c, displayName: r.displayName || null };
+    // A non-404 error (403 sharing, 500) is a real problem — surface it rather
+    // than masking it as "not found". A 404 just means "try the next candidate".
+    if (r && r._status && r._status !== 404) {
+      return { _error: `could not verify analytics favorite ${id}: ${r._error}` };
+    }
+  }
+  return { _notFound: true };
+}
+
 const VIZ_TYPES = new Set([
   'COLUMN', 'STACKED_COLUMN', 'BAR', 'STACKED_BAR', 'LINE', 'AREA', 'STACKED_AREA',
   'PIE', 'RADAR', 'GAUGE', 'SINGLE_VALUE', 'PIVOT_TABLE', 'YEAR_OVER_YEAR_LINE',
@@ -12896,7 +12993,7 @@ function buildVisualizationObject(spec, typeMap) {
 async function executeManageDashboards(args) {
   const action = args?.action;
   if (!action) {
-    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create_visualization, create_dashboard.' };
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, remove_item, update, delete.' };
   }
 
   // ── list ──────────────────────────────────────────────────────────────
@@ -13097,9 +13194,218 @@ async function executeManageDashboards(args) {
     };
   }
 
+  // ── add_items (SAFE, NON-DESTRUCTIVE append to an EXISTING dashboard) ──────
+  // This is the fix for "each time it added a chart, the whole dashboard went
+  // missing": we read the FULL current dashboard, append, and write the
+  // COMPLETE item set back (never a partial replace), snapshotting first so any
+  // slip is one manage_backups(restore) away.
+  if (action === 'add_items') {
+    const _gate = requireWriteAuth('manage_dashboards', 'add_items', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for add_items' };
+    const items = Array.isArray(args.items) ? args.items : [];
+    if (!items.length) {
+      return { _error: 'items[] required for add_items', _hint: 'Each item: { visualization_id } | { type:"MAP", map_id } | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.' };
+    }
+    // Read the FULL current object so every existing item is preserved on write.
+    const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
+    if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
+    const dashName = owner.name || owner.displayName || dId;
+    const existingItems = Array.isArray(owner.dashboardItems) ? owner.dashboardItems : [];
+
+    // Resolve inline new_visualizations (reuse the create builder + batched type lookup).
+    const inlineSpecs = [];
+    const allDataItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      if (it.new_visualization && typeof it.new_visualization === 'object') {
+        inlineSpecs.push({ index: i, spec: it.new_visualization });
+        for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
+      }
+    }
+    let typeMap = {};
+    if (allDataItems.length) {
+      const res = await resolveDataItemTypes(allDataItems);
+      if (res.unresolved.length) return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
+      typeMap = res.typeMap;
+    }
+    const newVisualizations = [];
+    const inlineVizIdByIndex = {};
+    for (const { index, spec } of inlineSpecs) {
+      const built = buildVisualizationObject(spec, typeMap);
+      if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
+      newVisualizations.push(built.viz);
+      inlineVizIdByIndex[index] = built.id;
+    }
+
+    // Build the NEW dashboardItems, grid-packed BELOW existing tiles (same
+    // 58-col / 29×20 convention as create_dashboard) so nothing overlaps.
+    const GRID_W = 58, DEF_W = 29, DEF_H = 20;
+    let startY = 0;
+    for (const it of existingItems) { const y = Number(it.y) || 0, h = Number(it.height) || 0; if (y + h > startY) startY = y + h; }
+    let cursorX = 0, cursorY = startY, rowH = 0;
+    const newItems = [];
+    const summary = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
+      const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
+      let x, y;
+      if (Number.isFinite(Number(it.x)) && Number.isFinite(Number(it.y))) { x = Number(it.x); y = Number(it.y); }
+      else { if (cursorX + w > GRID_W) { cursorX = 0; cursorY += rowH; rowH = 0; } x = cursorX; y = cursorY; cursorX += w; rowH = Math.max(rowH, h); }
+      const di = { id: generateDhis2Uid(), type: itType, x, y, width: w, height: h };
+      if (itType === 'VISUALIZATION' || itType === 'CHART' || itType === 'REPORT_TABLE') {
+        if (inlineVizIdByIndex[i] !== undefined) {
+          di.type = 'VISUALIZATION';
+          di.visualization = { id: inlineVizIdByIndex[i] };
+          summary.push({ item_id: di.id, type: 'VISUALIZATION', object_id: di.visualization.id, inline: true });
+        } else {
+          const vizId = it.visualization_id || it.id;
+          if (!vizId) return { _error: `Item ${i + 1} is a visualization but has neither new_visualization nor visualization_id.` };
+          // Cross-version: resolve the ACTUAL type (visualization on 2.34+,
+          // chart/reportTable on older) so we never add a dead tile.
+          const fav = await resolveAnalyticsFavorite(vizId);
+          if (fav._error) return { _error: `Item ${i + 1}: ${fav._error}` };
+          if (fav._notFound) return { _error: `Item ${i + 1}: visualization/chart/report-table "${vizId}" does not exist (404). Not adding it — that would create a broken dashboard tile.`, _hint: 'Confirm the UID (search_metadata / action=list) or inline-create it with new_visualization.' };
+          di.type = fav.itemType;
+          di[fav.prop] = { id: vizId };
+          summary.push({ item_id: di.id, type: fav.itemType, object_id: vizId, object_name: fav.displayName || null });
+        }
+      } else if (itType === 'MAP') {
+        const mapId = it.map_id || it.id;
+        if (!mapId) return { _error: `Item ${i + 1} is a MAP but has no map_id.` };
+        const mr = await safeDhis2Fetch(`maps/${mapId}?fields=id,displayName`);
+        if (mr?._status === 404) return { _error: `Item ${i + 1}: map "${mapId}" does not exist (404). Not adding a broken tile.` };
+        if (mr?._error) return { _error: `Item ${i + 1}: could not verify map ${mapId}: ${mr._error}` };
+        di.map = { id: mapId };
+        summary.push({ item_id: di.id, type: 'MAP', object_id: mapId, object_name: mr.displayName || null });
+      } else if (itType === 'TEXT') {
+        di.text = String(it.text || '');
+        summary.push({ item_id: di.id, type: 'TEXT' });
+      } else {
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT (or new_visualization).` };
+      }
+      newItems.push(di);
+    }
+
+    // Snapshot BEFORE the write (mandatory unless the user waived it).
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'manage_dashboards', action: 'add_items', reason: `Append ${newItems.length} item(s) to dashboard ${dashName}` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    owner.dashboardItems = [...existingItems, ...newItems];
+    const payload = {};
+    if (newVisualizations.length) payload.visualizations = newVisualizations;
+    payload.dashboards = [owner];
+    const result = await postMetadataPayload(payload, false);
+    if (!result.success) return { _error: result._error || 'add_items failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+
+    const verify = await safeDhis2Fetch(`dashboards/${dId}?fields=dashboardItems~size`);
+    const after = verify && !verify._error ? (verify.dashboardItems ?? null) : null;
+    return {
+      success: true,
+      action: 'add_items',
+      dashboard_id: dId,
+      dashboard_name: dashName,
+      items_before: existingItems.length,
+      items_added: newItems.length,
+      items_after: after,
+      new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
+      added: summary,
+      backup: backup.block,
+      _note: (after !== null && after !== existingItems.length + newItems.length)
+        ? `Warning: expected ${existingItems.length + newItems.length} items but server reports ${after}. Verify with action=get.`
+        : undefined,
+    };
+  }
+
+  // ── remove_item (drop one tile; preserves the rest; snapshots first) ──────
+  if (action === 'remove_item') {
+    const _gate = requireWriteAuth('manage_dashboards', 'remove_item', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for remove_item' };
+    if (!args.item_id) return { _error: 'item_id required for remove_item', _hint: 'Call action=get first to see each item id.' };
+    const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
+    if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
+    const dashName = owner.name || owner.displayName || dId;
+    const existingItems = Array.isArray(owner.dashboardItems) ? owner.dashboardItems : [];
+    if (!existingItems.some(it => it.id === args.item_id)) {
+      return { _error: `Dashboard "${dashName}" has no item with id "${args.item_id}".`, _hint: 'Use action=get to list current item ids.' };
+    }
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'manage_dashboards', action: 'remove_item', reason: `Remove item ${args.item_id} from dashboard ${dashName}` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    owner.dashboardItems = existingItems.filter(it => it.id !== args.item_id);
+    const result = await postMetadataPayload({ dashboards: [owner] }, false);
+    if (!result.success) return { _error: result._error || 'remove_item failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'remove_item', dashboard_id: dId, dashboard_name: dashName, removed_item_id: args.item_id, items_after: owner.dashboardItems.length, backup: backup.block };
+  }
+
+  // ── update (own fields only: name / description; snapshots first) ──────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_dashboards', 'update', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for update' };
+    const d = args.dashboard;
+    if (!d || typeof d !== 'object') return { _error: 'dashboard object required for update', _hint: 'Pass dashboard:{ name?, description? }. To add/remove tiles use add_items / remove_item.' };
+    const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
+    if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
+    const dashName = owner.name || owner.displayName || dId;
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'manage_dashboards', action: 'update', reason: `Update dashboard ${dashName}` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    const applied = {};
+    if (d.name !== undefined) { owner.name = String(d.name); applied.name = owner.name; }
+    if (d.description !== undefined) { owner.description = String(d.description); applied.description = owner.description; }
+    if (Object.keys(applied).length === 0) return { _error: 'dashboard supplied no recognized own-fields to update.', _hint: 'Recognized: name, description. For tiles use add_items / remove_item.', backup: backup.block };
+    const result = await postMetadataPayload({ dashboards: [owner] }, false);
+    if (!result.success) return { _error: result._error || 'update failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'update', dashboard_id: dId, dashboard_name: dashName, applied, backup: backup.block };
+  }
+
+  // ── delete (whole dashboard; snapshots first — fully restorable) ───────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_dashboards', 'delete', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for delete' };
+    const exists = await verifyTargetExists('dashboards', dId, 'manage_dashboards', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const dashName = exists.data?.displayName || dId;
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete', tool: 'manage_dashboards', action: 'delete', reason: `Deleting dashboard ${dashName} (${dId})` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', { method: 'POST', body: { dashboards: [{ id: dId }] } });
+    if (delResp?._error) return { _error: `Dashboard deletion failed: ${delResp._error}`, backup: backup.block };
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return { success: true, deleted: { type: 'dashboards', id: dId, name: dashName }, message: `Deleted dashboard "${dashName}". Restore with manage_backups(action="restore", backup_key="${backup.block?.key}").`, backup: backup.block };
+    }
+    return { _error: `Dashboard "${dashName}" was not deleted (deleted count 0).`, backup: backup.block };
+  }
+
   return {
     _error: `Unknown action "${action}" for manage_dashboards.`,
-    _hint: 'One of: list, get, create_visualization, create_dashboard.',
+    _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, remove_item, update, delete.',
   };
 }
 
