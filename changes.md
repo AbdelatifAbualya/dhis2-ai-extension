@@ -1109,3 +1109,69 @@ dashboard, share-follow-up, count question) passed every assertion: the canonica
 `manage_metadata` and shows the orchestration playbook, while every control is unchanged. Both gold
 payloads re-VALIDATE on the live playground with 0 errors. `node --check` passes on `background.js` and
 `sidepanel/panel.js`.
+
+## 19. Router — org-unit provisioning multi-step goals (surface `manage_org_units` for "register N facilities")
+
+**Files:** `background.js` (getContextualTools router `wantsOrgUnitIntent`; buildSystemPrompt `wantsOrgUnitPrompt`), `manifest.json` (2.6.2 → 2.6.3).
+
+**Goal of this phase:** perfect the ROUTER and orchestration of the EXISTING tools for MULTI-STEP goals —
+no new user-facing tool. This run targets a DIFFERENT multi-step scenario than the recent dashboard runs:
+an **org-unit provisioning chain** — *"Register three new health facilities under Badjia district, then
+assign our malaria dataset to them so they can start reporting."* The correct chain is
+`manage_org_units(action=create)` ×3 → chain each returned `org_unit_id` →
+`manage_datasets(action=assign_org_units, org_unit_ids=[…], merge_mode="add")`.
+
+**What was reproduced first (the chatbot's own tools, traced end-to-end):** tracing the request through
+`getContextualTools`, the FIRST (leaf) step of the chain had **no tool surfaced** — a routing miss. The
+org-unit intent's facility-creation alternative used
+`(?:a|an|the|new|this|that)*(?:\w+\s+){0,1}(facility|health facility|clinic|hospital|chiefdom|…)`, which:
+1. **Two-word determiner gap:** a numeral immediately followed by "new" (e.g. "three **new** health
+   facilities", "create **two new** health facilities", "build **5 new** facilities") consumed BOTH
+   determiner slots, so the facility noun fell outside the single free-word window → `wantsOrgUnitIntent`
+   was **FALSE** and `manage_org_units` + `search_metadata` were never surfaced. The model would fall
+   back to hand-rolled `dhis2_query` metadata POSTs (no parent-exists check, no level/path derivation,
+   no auto-backup).
+2. **Singular-only nouns:** "clinic"/"hospital"/"chiefdom"/"catchment area"/"sub-district" had no plural
+   form, so "register new **clinics**", "delete three **hospitals**", "add four **catchment areas**" all
+   missed. (`facility/facilities` already had both forms; the others did not.)
+
+Both defects existed identically in the router (`wantsOrgUnitIntent`) AND in the prompt-side
+`wantsOrgUnitPrompt` (which loads the org-unit KB), so the KB guidance was also withheld on these turns.
+
+**Gold sequence proven on the playground (stable-2-43-0-1) BEFORE editing:** created 3 facilities under
+*Badjia* (`YuQRtpLP10I`, L3) at level 4 via `metadata?importMode=VALIDATE&atomicMode=ALL` then `COMMIT`
+(0 errors), then chained the 3 returned UIDs into the *ART monthly summary* dataset's `organisationUnits`
+(1096 → 1099), read back the level-4 placement, then fully reverted (dataset back to 1096, all 3
+facilities deleted, `name:like:ZZAITEST` sweep = 0 residue). This is the exact dependency-ordered,
+ID-chaining sequence the chatbot must now produce on its own.
+
+**Fix (purely additive widening — one regex alternative, mirrored in both `wantsOrgUnitIntent` and
+`wantsOrgUnitPrompt`):**
+- Determiner group gained `some|several|multiple|\d+|one…ten` so a quantifier ("three", "5", "several")
+  and "new" can BOTH precede the facility noun.
+- Noun group pluralised: `clinics?|hospitals?|chiefdoms?|catchment areas?|sub-districts?`.
+- The single free-word window `(?:\w+\s+){0,1}` and every OTHER alternative are UNCHANGED, so this only
+  ADDS matches — no previously-matching request stops matching.
+
+**No-regression gate (all proven with node before commit):**
+- **Improvement:** the org-unit provisioning request now surfaces `manage_org_units` + `search_metadata`
+  in the router AND loads the org-unit KB in the prompt, so the full create-then-assign chain is
+  reachable in one turn.
+- **Zero collateral / no crowding-out:** the change is confined to ONE alternative of the org-unit OR.
+  When it fires it only does `selected.add('manage_org_units'); selected.add('search_metadata')` — it
+  REMOVES nothing and alters no other branch, so every other request type surfaces exactly the same
+  tools as before. A 10-case false-positive control suite (e.g. "compare 3 facilities by ANC coverage",
+  "list the top 5 facilities", "which 3 districts have the most cases", "make a pivot of 5 hospitals",
+  "add data elements to the dataset", "build a dashboard of clinic performance") stays **FALSE** — pure
+  analytics/count/dataset/dashboard turns never gain the org-unit tool — while a 5-case provisioning
+  suite now correctly matches. The old-vs-new diff test confirmed every previously-TRUE case is still
+  TRUE.
+- **Integration verified:** `manage_org_units(action=create)` returns top-level `org_unit_id` and
+  `manage_datasets(action=assign_org_units)` consumes `org_unit_ids[]` — the ID-chain composes cleanly,
+  matching the proven playground sequence.
+- **No safeguard weakened:** `enforcePatientDataPrivacyGate`, `PATIENT_DATA_TOOL_NAMES`,
+  `requireWriteAuth`, `verifyTargetExists`, `ensureBackupOrBail`, and the UID-verification gates are
+  untouched (org-unit create/update/delete still route through their existing write-auth + backup gates).
+  No new tool was added.
+- The gold create payload re-VALIDATEs on the live playground with 0 errors; 0 test residue left behind.
+  `node --check` passes on `background.js` and `sidepanel/panel.js`.

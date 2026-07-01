@@ -5371,14 +5371,17 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
         && /\b(left\s*side|right\s*side|leftside|rightside|compulsory\s*pair|exclusive\s*pair|greater\s*than|less\s*than|data\s*set|dataset|aggregate\s*data)\b/.test(combinedText));
   // ── Org-unit (hierarchy) intent ──
   // Explicit "org/organisation unit(s)" or "OU/org hierarchy/tree" terms, OR a
-  // management verb directly on a facility/chiefdom noun (verb immediately before
-  // the noun, so "create a chart for the facility" does NOT match), OR a facility
-  // noun coupled with a hierarchy/parent/re-parent term. Conservative on purpose:
-  // bare "facility"/"district" in an analytics question never surfaces the tool.
+  // management verb on a facility/chiefdom noun, optionally preceded by
+  // determiners/quantifiers (a/the/new/several/"three"/"5", singular OR plural
+  // facility|clinic|hospital|…), with at most ONE free intervening word — so
+  // "register three new health facilities" and "close 2 clinics" DO match while
+  // "create a chart for the facility" does NOT — OR a facility noun coupled with a
+  // hierarchy/parent/re-parent term. Conservative on purpose: bare "facility"/
+  // "district" in an analytics question never surfaces the tool.
   const wantsOrgUnitIntent =
     /\b(organi[sz]ation\s*units?|org\s*units?|orgunits?|sub-?units?)\b/.test(combinedText)
     || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/.test(combinedText)
-    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinic|hospital|chiefdom|catchment\s*area|sub[-\s]?district)\b/.test(combinedText)
+    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+|some\s+|several\s+|multiple\s+|\d+\s+|(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinics?|hospitals?|chiefdoms?|catchment\s*areas?|sub[-\s]?districts?)\b/.test(combinedText)
     || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/.test(combinedText);
   // ── Aggregate-indicator intent ──
   // Aggregate indicators = (numerator / denominator) × factor, surfaced in
@@ -5832,7 +5835,7 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
   const wantsOrgUnitPrompt =
     /\b(organi[sz]ation\s*units?|org\s*units?|orgunits?|sub-?units?)\b/i.test(text)
     || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/i.test(text)
-    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinic|hospital|chiefdom|catchment\s*area|sub[-\s]?district)\b/i.test(text)
+    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+|some\s+|several\s+|multiple\s+|\d+\s+|(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinics?|hospitals?|chiefdoms?|catchment\s*areas?|sub[-\s]?districts?)\b/i.test(text)
     || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/i.test(text);
   const wantsIndicatorPrompt =
     !/\bprogram\s+indicators?\b/i.test(text) && (
