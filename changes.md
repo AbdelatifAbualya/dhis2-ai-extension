@@ -1327,3 +1327,79 @@ existing paths):**
 - The handler-shaped reference payload (DE with `optionSet:{id:<real existing set>}`, valueType aligned)
   re-VALIDATEs on the live playground with 0 errors (VALIDATE-only, nothing persisted); 0 test residue
   left behind. `node --check` passes on `background.js` and `sidepanel/panel.js`.
+
+## 22. Router + integration — attach a legend set to an indicator (legend set → indicator → dashboard chain)
+
+**Files:** `background.js` (`manage_indicators` schema: new `indicator.legend_set_id` / `legend_set_ids` / `legend_set_name`; new `resolveLegendSetRefs` helper; `createIndicator` legend attach + result surfacing; `manage_indicators` update legend attach/detach; `get` returns `legendSets`; `wantsLegendSetIntent` routing widened; Legend-Sets KB corrected; multi-step playbook + new worked chain), `manifest.json` (2.6.5 → 2.6.6).
+
+**Goal of this phase:** perfect the ROUTER and the ORCHESTRATION/INTEGRATION of the EXISTING tools for
+MULTI-STEP goals — no new user-facing tool. This run targets a DIFFERENT multi-step scenario than the
+recent dashboard / org-unit / program-indicator / option-set runs: a **legend set → indicator → dashboard
+chain** — *"Create an ANC coverage indicator, give it a traffic-light legend (red/amber/green, 0–100), and
+add it to a new 'ANC Coverage' dashboard shared with everyone."* The gold-standard chain is
+`manage_legend_sets(action=create, auto_bands)` → chain the returned `legend_set_id` →
+`manage_indicators(action=create, indicator:{…, legend_set_id})` → chain `indicator_id` →
+`manage_dashboards(action=create_dashboard, items:[{new_visualization:{data_items:[indicator_id]}}])` →
+`manage_metadata(action=update_sharing, public_access="r-------")`.
+
+**Two gaps found by tracing the request through the chatbot's own tools FIRST:**
+1. **ROUTING miss** — `getContextualTools`'s `wantsLegendSetIntent` did NOT fire on natural colour-scale
+   phrasings ("give it a **traffic-light** legend", "a **red/amber/green** legend", "a **colour-coded**
+   legend", "a **heat-map** legend") because the colour branch required the literal tokens "colour-coded" /
+   "colour band/scale/…" / "threshold". So `manage_legend_sets` was never surfaced and the model could not
+   create the legend at all.
+2. **INTEGRATION gap** — there was NO way to attach a legend set to an indicator with the chatbot's own
+   tools. `manage_metadata` has no legend action (only `update_style` = icon/color), yet the Legend-Sets KB
+   FALSELY claimed "ATTACHING it to a data element / indicator … is done with manage_metadata". The chain
+   was therefore unfinishable: the model could create the set and the indicator but never link them, and
+   following the KB it would waste a round on a manage_metadata call that has no such capability (or fall
+   back to a raw dhis2_query PATCH the guidance elsewhere forbids).
+
+**Fix (purely additive — reference-by-UID chaining + routing widening + prompt truth-up; mirrors the
+option_set_id precedent from entry 21):**
+- New `indicator.legend_set_id` (single), `legend_set_ids` (array), `legend_set_name` (exact-name) on
+  `manage_indicators` create/update — attach an EXISTING legend set so the indicator renders colour-coded
+  everywhere. Chaining-only: the set must already exist.
+- New async helper `resolveLegendSetRefs(id, ids, name)` verifies every referenced set EXISTS (by UID, or
+  by exact name → UID, refusing 0-match / ambiguous multi-match), de-duplicates, and returns `{ids, names}`
+  — so an indicator never silently points at a non-existent legend set.
+- `createIndicator` resolves the reference and attaches `legendSets:[{id}]` to the atomic import payload
+  (an `if (legendRefs.ids.length)` after the DE-shape build — skipped entirely when no legend ref given);
+  the create result now reports `legend_sets[]` / `indicator.legendSetIds` and the success message names the
+  attached set, so a multi-step caller confirms the link with no second round.
+- `manage_indicators(update)` resolves the reference in the pre-backup VALIDATE block (invalid ref never
+  triggers a backup or half-write) and applies `legendSets` in the patch; an explicit `legend_set_ids:[]`
+  detaches all. The `get` action now returns `legendSets[]` so the model can read the current link.
+- `wantsLegendSetIntent` gains a branch: the word "legend" coupled with an explicit colour-scale signal
+  (traffic-light / heat-map / colour-coded / thresholds / a red↔amber/orange/yellow↔green triple). A bare
+  "the chart legend" / "hide the map legend" / "move the legend" stays FALSE (verified).
+- Legend-Sets KB corrected to state the truth: attach to an indicator via `manage_indicators` `legend_set_id`;
+  attach to a DE / visualisation / map layer in the relevant app; NEVER via manage_metadata (no legend
+  action) or a raw dhis2_query PATCH.
+- Multi-step playbook: `manage_legend_sets(create) → legend_set_id` added to the step-4 ID-capture list,
+  step-5 explains chaining `legend_set_id` into an indicator, and a full new worked chain walks
+  legend set → indicator → dashboard → sharing.
+
+**No-regression gate (all verified before commit):**
+- **Improvement:** the legend set → indicator → dashboard chain is now executable end-to-end with the
+  chatbot's own tools — the `legend_set_id` from step 1 flows into the indicator in step 2 in ONE call, and
+  the router now surfaces `manage_legend_sets` on natural traffic-light phrasing.
+- **Zero collateral (routing):** the new `wantsLegendSetIntent` branch is purely ADDITIVE — it only adds
+  `manage_legend_sets` + `search_metadata` to the tool set and removes nothing. 14/14 unit cases pass
+  (7 new-true colour-scale phrasings fire; 7 controls — bare chart/map legend, plain indicator/dashboard/
+  chart turns — stay false), so no other request type is crowded or mis-routed.
+- **Zero collateral (handler):** `resolveLegendSetRefs(undefined,…)` returns `{ids:[],names:[]}` with no
+  error and no attach, so an indicator create/update WITHOUT a legend field is byte-identical to before
+  (no extra network call is even made on update — gated by `_touchesLegend`). On update, `ownerResp` is
+  loaded with `:owner` (which includes `legendSets`), so a name-only update preserves the existing legend.
+- **Shared-code callers enumerated:** `resolveLegendSetRefs` is new, called only from `createIndicator` and
+  the `manage_indicators` update branch. `createIndicator` is called only from the create branch. No other
+  caller touched.
+- **No safeguard weakened:** `enforcePatientDataPrivacyGate`, `PATIENT_DATA_TOOL_NAMES`, `requireWriteAuth`
+  (still gates `manage_indicators` create/update), `verifyTargetExists`, `ensureBackupOrBail` (still runs
+  before the update PUT), and the UID-verification gates are all untouched. No new tool was added.
+- The full gold-standard sequence (legend set → indicator with `legendSets:[{id}]` → visualization →
+  dashboard → public sharing) was executed on the live 2.43 playground (VALIDATE then COMMIT, 0 errors),
+  the indicator was confirmed to carry the legend set, and ALL test objects were deleted (verified 404).
+  The handler-shaped attach payload independently re-VALIDATEs with 0 errors and 0 residue. `node --check`
+  passes on `background.js` and `sidepanel/panel.js`.

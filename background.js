@@ -5003,7 +5003,7 @@ NEVER invent dataElement / dataSet / programIndicator / constant UIDs — reuse 
           limit: { type: 'integer', description: 'For list: max indicators to return (1–200, default 50).' },
           indicator: {
             type: 'object',
-            description: 'Indicator definition (required for create; pass only the changed fields for update).',
+            description: 'Indicator definition (required for create; pass only the changed fields for update). To render the indicator colour-coded (traffic-light) on dashboards/pivots/maps, chain an existing legend set via legend_set_id (create it first with manage_legend_sets).',
             properties: {
               name: { type: 'string', description: 'Unique indicator name.' },
               short_name: { type: 'string', description: 'Short name (≤50 chars). Defaults to name on create if omitted.' },
@@ -5014,7 +5014,10 @@ NEVER invent dataElement / dataSet / programIndicator / constant UIDs — reuse 
               denominator: { type: 'string', description: 'Denominator expression. Use "1" for a plain count/sum. REQUIRED on create.' },
               denominator_description: { type: 'string', description: 'Human label for the denominator (auto-derived from DHIS2 if omitted).' },
               annualized: { type: 'boolean', description: 'Annualize the value (scale to a full year based on the selected period). Default false.' },
-              decimals: { type: 'integer', description: 'Fixed number of output decimals (0–5). Omit/null to inherit the system default.' }
+              decimals: { type: 'integer', description: 'Fixed number of output decimals (0–5). Omit/null to inherit the system default.' },
+              legend_set_id: { type: 'string', description: 'Attach an EXISTING legend set (its colour bands) so this indicator renders color-coded / traffic-light in dashboards, pivot tables and maps. Pass the `legend_set_id` returned by manage_legend_sets(action="create") — this is the legend-set → indicator chaining path. The set MUST already exist (verified before write); NEVER invent the UID and NEVER attempt the attach via a raw dhis2_query PATCH or manage_metadata (it has no legend action).' },
+              legend_set_ids: { type: 'array', items: { type: 'string' }, description: 'Attach MULTIPLE existing legend sets (uncommon). Each entry must be an existing legend-set UID. On update, an empty array [] detaches all legend sets.' },
+              legend_set_name: { type: 'string', description: 'Alternative to legend_set_id: attach an existing legend set by its EXACT unique name (resolved to a UID; refuses a 0-match or ambiguous multi-match).' }
             }
           },
           dry_run_only: { type: 'boolean', description: 'For create: validate expressions + indicatorType + metadata import without committing. Default false.' },
@@ -5425,7 +5428,18 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     || ((/\bcolou?r[-\s]?cod/.test(combinedText)
           || /\bcolou?r\s+(?:band|scale|ramp|range|gradient)s?\b/.test(combinedText)
           || /\b(?:value\s+)?thresholds?\b/.test(combinedText))
-        && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/.test(combinedText));
+        && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/.test(combinedText))
+    // The word "legend" coupled with an explicit colour-scale signal — so
+    // "give it a traffic-light legend", "a red/amber/green legend", "a
+    // colour-coded legend", "a heat-map legend" all surface the tool, while a
+    // bare "the chart/map legend" (no colour-scale intent) stays FALSE.
+    || (/\blegends?\b/.test(combinedText)
+        && (/\btraffic[-\s]?light/.test(combinedText)
+            || /\bheat[-\s]?map/.test(combinedText)
+            || /\bcolou?r[-\s]?cod/.test(combinedText)
+            || /\b(?:value\s+)?thresholds?\b/.test(combinedText)
+            || /\bred\b[-\s\/,]*(?:to\s+)?(?:amber|orange|yellow)\b[-\s\/,]*(?:to\s+)?\bgreen\b/.test(combinedText)
+            || /\bgreen\b[-\s\/,]*(?:to\s+)?(?:amber|orange|yellow)\b[-\s\/,]*(?:to\s+)?\bred\b/.test(combinedText)));
   // ── Dashboard / visualization authoring intent ──
   // Reusable analytics dashboards and the charts/pivots/single-value tiles on
   // them. Conservative AND disjoint from render_chart (the inline preview tool):
@@ -6174,9 +6188,10 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
    - manage_dashboards(action="create_visualization") → \`visualization_id\`
    - manage_dashboards(action="create_dashboard") → \`dashboard_id\` (+ \`new_visualizations[]\`)
    - manage_option_sets(action="create") → \`option_set_id\`
+   - manage_legend_sets(action="create") → \`legend_set_id\` (a reusable colour band scale)
    - create_metadata(action="create_data_elements") → each new DE's id in \`summary.dataElements[].id\`
    - create_metadata / manage_datasets / manage_org_units / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
-5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. A new option set's \`option_set_id\` goes into a data element via create_metadata(action="create_data_elements", data_elements:[{ name, value_type, option_set_id:<option_set_id> }]) — pass \`option_set_id\` to REFERENCE the existing set (the DE valueType auto-aligns); NEVER re-inline the same options with \`option_set:{...}\` (that creates a DUPLICATE set). A new DE id then goes into manage_datasets(action="add_data_elements", dataset_id, data_element_ids:[<id>]). (This is exactly the verified provenance the Verify-before-call rule demands.)
+5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. A new option set's \`option_set_id\` goes into a data element via create_metadata(action="create_data_elements", data_elements:[{ name, value_type, option_set_id:<option_set_id> }]) — pass \`option_set_id\` to REFERENCE the existing set (the DE valueType auto-aligns); NEVER re-inline the same options with \`option_set:{...}\` (that creates a DUPLICATE set). A new DE id then goes into manage_datasets(action="add_data_elements", dataset_id, data_element_ids:[<id>]). A new legend set's \`legend_set_id\` goes into an aggregate indicator via manage_indicators(action="create", indicator:{ …, legend_set_id:<legend_set_id> }) — so the indicator renders colour-coded (traffic-light) on the dashboard; NEVER attach a legend with a raw dhis2_query PATCH and NEVER via manage_metadata (it has no legend action). (This is exactly the verified provenance the Verify-before-call rule demands.)
 6. SHARE last: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). NEVER set sharing with a raw dhis2_query PUT — it fails.
 
 ### Worked chain — "build a malaria dashboard that needs new indicators, then make it public"
@@ -6184,6 +6199,13 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
 2. manage_indicators(action="create", indicator:{ name, numerator:"#{deathsUID}", denominator:"#{casesUID}", indicator_type:"Per cent" }) for EACH missing indicator → keep each returned \`indicator_id\`.
 3. manage_dashboards(action="create_dashboard", dashboard:{ name:"Malaria Surveillance" }, items:[ { new_visualization:{ name:"CFR by month", vis_type:"COLUMN", data_items:[<indicator_id #1>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } }, { new_visualization:{ name:"ACT coverage", vis_type:"SINGLE_VALUE", data_items:[<indicator_id #2>], periods:["THIS_YEAR"], org_units:["<ou>"] } } ]) — the inline visualizations and the dashboard import atomically; keep the returned \`dashboard_id\`.
 4. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------") so everyone can view it.
+
+### Worked chain — "build a colour-coded ANC coverage indicator with a traffic-light legend and put it on a public dashboard"
+1. search_metadata(object_type="dataElements", query=…) → the numerator/denominator DE UIDs (e.g. ANC 1st visit, expected pregnancies).
+2. manage_legend_sets(action="create", legend_set:{ name:"Coverage 0–100 (RAG)" }, auto_bands:{ start:0, end:100, count:3 }) → keep the returned \`legend_set_id\` (red→amber→green low→high).
+3. manage_indicators(action="create", indicator:{ name:"ANC 1st visit coverage", numerator:"#{anc1Uid}", denominator:"#{expectedUid}", indicator_type:"Per cent", legend_set_id:<legend_set_id> }) → the indicator is created AND the legend attached in ONE call; keep \`indicator_id\`.
+4. manage_dashboards(action="create_dashboard", dashboard:{ name:"ANC Coverage" }, items:[ { new_visualization:{ name:"ANC coverage by month", vis_type:"COLUMN", data_items:[<indicator_id>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } } ]) → keep \`dashboard_id\`.
+5. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------").
 
 ### Worked chain — "create an option set for RDT results, a data element that uses it, and add it to the monthly malaria dataset"
 1. manage_option_sets(action="create", option_set:{ name:"Malaria RDT Result", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INV",name:"Invalid"}] }) → keep the returned \`option_set_id\`.
@@ -6607,7 +6629,7 @@ A **legend set** is a reusable, ordered list of colour **bands** that renders nu
 ### Rules
 - add_legends / remove_legends / update / delete each auto-snapshot a backup first (restore via manage_backups).
 - NEVER invent legend-set or band UIDs — get them from search_metadata / action=get.
-- A legend set only defines the colour scale; ATTACHING it to a data element / indicator (their \`legendSets\`) or a visualisation / map layer (its \`legendSet\`) is done with manage_metadata or in the relevant app. This tool owns standalone legend-set CRUD.
+- A legend set only defines the colour scale; ATTACHING it is a SEPARATE step. To an aggregate **indicator** (so it renders colour-coded in every dashboard/pivot/map): pass the set's UID as \`legend_set_id\` to manage_indicators(action="create" — or "update" to add it later). This is the legend-set → indicator chain. For a data element, visualisation or map layer, set the legend in the relevant app — the extension does not (yet) automate those attach points. NEVER attempt any legend attach via a raw dhis2_query PATCH or manage_metadata (it has NO legend action). This tool owns standalone legend-set CRUD.
 
 ### Examples
 - "Make a coverage legend, red→green, 0 to 100 in 5 bands": create legend_set:{ name:"Coverage 0–100" }, auto_bands:{ start:0, end:100, count:5 }.
@@ -11603,7 +11625,7 @@ async function executeManageIndicators(args) {
     if (!id) return { _error: 'indicator_id required for get' };
     const resp = await safeDhis2Fetch(
       `indicators/${id}?fields=id,displayName,description,shortName,indicatorType[id,name,factor],annualized,decimals,` +
-      `numerator,numeratorDescription,denominator,denominatorDescription,sharing,access`
+      `numerator,numeratorDescription,denominator,denominatorDescription,legendSets[id,displayName],sharing,access`
     );
     if (resp?._status === 404) return { _error: `indicators with id "${id}" does not exist (404).` };
     if (resp?._error) return { _error: `Could not load indicator ${id}: ${resp._error}` };
@@ -11620,6 +11642,7 @@ async function executeManageIndicators(args) {
       numeratorDescription: resp.numeratorDescription,
       denominator: resp.denominator,
       denominatorDescription: resp.denominatorDescription,
+      legendSets: (resp.legendSets || []).map(ls => ({ id: ls.id, name: ls.displayName })),
       access: resp.access,
     };
   }
@@ -11640,7 +11663,7 @@ async function executeManageIndicators(args) {
     if (!args.indicator || typeof args.indicator !== 'object') {
       return {
         _error: 'indicator object required for update',
-        _hint: 'Pass indicator:{ name?, short_name?, description?, indicator_type?, annualized?, decimals?, numerator?, numerator_description?, denominator?, denominator_description? }',
+        _hint: 'Pass indicator:{ name?, short_name?, description?, indicator_type?, annualized?, decimals?, numerator?, numerator_description?, denominator?, denominator_description?, legend_set_id? (attach a colour legend), legend_set_ids? ([] detaches) }',
       };
     }
     const exists = await verifyTargetExists('indicators', id, 'manage_indicators', 'update', 'id,displayName');
@@ -11669,6 +11692,19 @@ async function executeManageIndicators(args) {
         if (!chk.ok) return { _error: `${field} rejected by DHIS2: ${chk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} / R{dsUid.REPORTING_RATE} / I{programIndicatorUid} exists (use search_metadata) and the syntax is well-formed, then retry.' };
       }
     }
+    // Legend-set attach/detach: resolve+verify BEFORE snapshotting/mutating, so an
+    // invalid reference never triggers a backup or a half-applied write. A supplied
+    // legend_set_id/legend_set_name attaches an existing set; an explicit
+    // legend_set_ids:[] detaches all. Left untouched when no legend field is given.
+    let resolvedLegendSets; // undefined = field not supplied → leave legendSets as-is
+    const _touchesLegend = (ind.legend_set_id && String(ind.legend_set_id).trim())
+      || Array.isArray(ind.legend_set_ids)
+      || (ind.legend_set_name && String(ind.legend_set_name).trim());
+    if (_touchesLegend) {
+      const legendRefs = await resolveLegendSetRefs(ind.legend_set_id, ind.legend_set_ids, ind.legend_set_name);
+      if (legendRefs._error) return legendRefs;
+      resolvedLegendSets = legendRefs;
+    }
 
     const backup = await ensureBackupOrBail(
       { operation: 'update_indicator', tool: 'manage_indicators', action: 'update', reason: `Update indicator ${objName}` },
@@ -11688,6 +11724,10 @@ async function executeManageIndicators(args) {
     if (ind.numerator_description !== undefined) { ownerResp.numeratorDescription = ind.numerator_description; applied.numeratorDescription = ind.numerator_description; }
     if (ind.denominator !== undefined) { ownerResp.denominator = ind.denominator; applied.denominator = ind.denominator; }
     if (ind.denominator_description !== undefined) { ownerResp.denominatorDescription = ind.denominator_description; applied.denominatorDescription = ind.denominator_description; }
+    if (resolvedLegendSets) {
+      ownerResp.legendSets = resolvedLegendSets.ids.map(lid => ({ id: lid }));
+      applied.legendSets = resolvedLegendSets.ids.length ? resolvedLegendSets.names : '(detached all)';
+    }
 
     if (Object.keys(applied).length === 0) {
       return { _error: 'indicator supplied no recognized fields to update.', backup: backup.block };
@@ -11764,6 +11804,48 @@ async function executeManageIndicators(args) {
   };
 }
 
+// Resolve + verify EXISTING legend-set reference(s) for attaching to an
+// indicator (its `legendSets` array). Mirrors resolveExistingOptionSetRef: a
+// reference must point at a set that ALREADY exists — by UID (single/array) or
+// by exact unique name — so an indicator never silently points at a
+// non-existent legend set. Returns { ids:[...], names:[...] } (de-duplicated,
+// order-preserving) or { _error, _hint }. An empty result means "no legend
+// reference supplied" (caller decides whether that clears or leaves as-is).
+async function resolveLegendSetRefs(legendSetId, legendSetIds, legendSetName) {
+  const refs = [];
+  if (Array.isArray(legendSetIds)) {
+    for (const x of legendSetIds) { const v = String(x || '').trim(); if (v) refs.push({ id: v }); }
+  }
+  if (legendSetId && String(legendSetId).trim()) refs.push({ id: String(legendSetId).trim() });
+  if (legendSetName && String(legendSetName).trim()) refs.push({ name: String(legendSetName).trim() });
+
+  const ids = [];
+  const names = [];
+  const seen = new Set();
+  for (const r of refs) {
+    if (r.id) {
+      const resp = await safeDhis2Fetch(`legendSets/${r.id}?fields=id,name`);
+      if (resp?._error || resp?._status === 404 || !resp?.id) {
+        return {
+          _error: `legend_set_id "${r.id}" does not exist on this server.`,
+          _hint: 'Chain the legend_set_id returned by manage_legend_sets(action="create"), or omit the legend reference.',
+        };
+      }
+      if (!seen.has(resp.id)) { seen.add(resp.id); ids.push(resp.id); names.push(resp.name || resp.id); }
+    } else if (r.name) {
+      const probe = await safeDhis2Fetch(`legendSets?filter=name:eq:${encodeURIComponent(r.name)}&fields=id,name&pageSize=2`);
+      const hits = probe?.legendSets || [];
+      if (!hits.length) return {
+        _error: `legend_set_name "${r.name}" not found on this server.`,
+        _hint: 'Create it first with manage_legend_sets(action="create") and chain the returned legend_set_id.',
+      };
+      if (hits.length > 1) return { _error: `legend_set_name "${r.name}" is ambiguous (${hits.length} matches). Pass legend_set_id instead.` };
+      if (!seen.has(hits[0].id)) { seen.add(hits[0].id); ids.push(hits[0].id); names.push(hits[0].name || r.name); }
+    }
+  }
+  return { ids, names };
+}
+
 async function createIndicator(args) {
   const ind = args.indicator;
   if (!ind || typeof ind !== 'object') {
@@ -11812,6 +11894,14 @@ async function createIndicator(args) {
   if (ind.description) indObj.description = ind.description;
   if (ind.decimals !== undefined && ind.decimals !== null) indObj.decimals = Number(ind.decimals);
 
+  // Optional: attach EXISTING legend set(s) so the indicator renders color-coded
+  // (traffic-light) everywhere it appears — the legend-set → indicator chaining
+  // path. Resolve+verify each set EXISTS before writing (never invent a UID).
+  // Purely additive: skipped entirely when no legend reference is supplied.
+  const legendRefs = await resolveLegendSetRefs(ind.legend_set_id, ind.legend_set_ids, ind.legend_set_name);
+  if (legendRefs._error) return legendRefs;
+  if (legendRefs.ids.length) indObj.legendSets = legendRefs.ids.map(id => ({ id }));
+
   const result = await postMetadataPayload({ indicators: [indObj] }, !!args.dry_run_only);
   if (!result.success) {
     return {
@@ -11826,7 +11916,7 @@ async function createIndicator(args) {
       success: true,
       dry_run: true,
       message: `Validation passed for "${name}". No indicator created (dry_run_only=true).`,
-      would_create: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, annualized: indObj.annualized },
+      would_create: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, annualized: indObj.annualized, legendSetIds: legendRefs.ids.length ? legendRefs.ids : undefined },
       numerator_meaning: numChk.description,
       denominator_meaning: denChk.description,
     };
@@ -11835,10 +11925,13 @@ async function createIndicator(args) {
     success: true,
     action: 'create',
     indicator_id: id,
-    indicator: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, numerator: indObj.numerator, denominator: indObj.denominator, annualized: indObj.annualized },
+    indicator: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, numerator: indObj.numerator, denominator: indObj.denominator, annualized: indObj.annualized, legendSetIds: legendRefs.ids.length ? legendRefs.ids : undefined },
+    // Confirm the attached legend set(s) so a multi-step caller can report the
+    // color-coding link (and never needs a second attach round).
+    legend_sets: legendRefs.ids.length ? legendRefs.ids.map((lid, i) => ({ id: lid, name: legendRefs.names[i] })) : undefined,
     numerator_meaning: numChk.description,
     denominator_meaning: denChk.description,
-    message: `Created indicator "${name}" (${id}) of type "${itype.name}" (factor ${itype.factor}).`,
+    message: `Created indicator "${name}" (${id}) of type "${itype.name}" (factor ${itype.factor})${legendRefs.ids.length ? ` with legend set "${legendRefs.names[0]}"${legendRefs.ids.length > 1 ? ` (+${legendRefs.ids.length - 1} more)` : ''}` : ''}.`,
   };
 }
 
