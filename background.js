@@ -6166,11 +6166,12 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
 2. Walk the dependencies BACKWARDS: a dashboard needs visualizations; a visualization needs data items (indicators / data elements / program indicators); an aggregate indicator needs the data elements in its numerator/denominator. For each piece, check whether it already exists (search_metadata or a list action) or must be CREATED first.
 3. ORDER the steps so every input exists before it is referenced — create the missing LEAF metadata FIRST, then the objects that reference it, and do SHARING/access LAST.
 4. EXECUTE each step and READ ITS RESULT. Capture the new UID the tool returns:
-   - manage_indicators(action="create") → \`indicator_id\`
+   - manage_indicators(action="create") → \`indicator_id\` (AGGREGATE indicator)
+   - manage_program_indicators(action="create") → \`program_indicator_id\` (TRACKER/event indicator)
    - manage_dashboards(action="create_visualization") → \`visualization_id\`
    - manage_dashboards(action="create_dashboard") → \`dashboard_id\` (+ \`new_visualizations[]\`)
    - create_metadata / manage_datasets / manage_org_units / manage_option_sets / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
-5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` goes into the dashboard's \`new_visualization.data_items\`; a saved visualization's id goes into a dashboard item's \`visualization_id\`. (This is exactly the verified provenance the Verify-before-call rule demands.)
+5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. (This is exactly the verified provenance the Verify-before-call rule demands.)
 6. SHARE last: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). NEVER set sharing with a raw dhis2_query PUT — it fails.
 
 ### Worked chain — "build a malaria dashboard that needs new indicators, then make it public"
@@ -20929,7 +20930,18 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   }
 
   const result = await postMetadataPayload({ programIndicators: [pi] }, false);
-  return { ...result, summary: { indicator: { id: uid, name: indicator.name } } };
+  const out = { ...result, summary: { indicator: { id: uid, name: indicator.name } } };
+  // Mirror the top-level *_id convention every other write tool already exposes
+  // (manage_indicators → indicator_id, manage_dashboards → visualization_id /
+  // dashboard_id, manage_org_units → org_unit_id, manage_datasets → dataset_id)
+  // so a multi-step caller can chain this program indicator's UID STRAIGHT into
+  // the next tool — e.g. a dashboard visualization's data_items, where it is
+  // auto-resolved as PROGRAM_INDICATOR — without having to dig into the nested
+  // summary object. Purely additive: summary.indicator.id is preserved for any
+  // existing reader. Only surfaced on a successful import so a failed create can
+  // never yield a chainable-but-nonexistent UID.
+  if (result && result.success) out.program_indicator_id = uid;
+  return out;
 }
 
 async function createStandaloneOptionSet(args) {

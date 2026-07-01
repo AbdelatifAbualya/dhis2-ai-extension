@@ -1175,3 +1175,75 @@ ID-chaining sequence the chatbot must now produce on its own.
   No new tool was added.
 - The gold create payload re-VALIDATEs on the live playground with 0 errors; 0 test residue left behind.
   `node --check` passes on `background.js` and `sidepanel/panel.js`.
+
+---
+
+## 20. Integration + orchestration — chain a NEW program indicator into a dashboard (tracker-PI → dashboard → sharing)
+
+**Files:** `background.js` (`_buildAndPostProgramIndicator` create/update return; multi-step orchestration playbook in `buildSystemPrompt`), `manifest.json` (2.6.3 → 2.6.4).
+
+**Goal of this phase:** perfect the ROUTER and the ORCHESTRATION/INTEGRATION of the EXISTING tools for
+MULTI-STEP goals — no new user-facing tool. This run targets a DIFFERENT multi-step scenario than the
+recent dashboard/org-unit runs: a **tracker-program-indicator → dashboard → sharing chain** —
+*"On the malaria case tracker program, create a program indicator that counts confirmed malaria cases,
+then build a dashboard with a monthly column chart of that indicator and make the dashboard public."*
+The correct chain is `manage_program_indicators(action=create)` → chain the new PI UID →
+`manage_dashboards(action=create_dashboard, items:[{new_visualization:{data_items:[<PI UID>]}}])` (the UID
+auto-resolves as `PROGRAM_INDICATOR`) → `manage_metadata(action=update_sharing, object_type="dashboards")`.
+
+**What was reproduced first (the chatbot's own tools, traced end-to-end):** routing was already correct —
+tracing the request through `getContextualTools` surfaced `manage_program_indicators` (via
+`wantsProgramIndicatorsIntent`), `manage_dashboards` + `manage_metadata` (via `wantsDashboardIntent`),
+`manage_metadata` (via `wantsSharingIntent`), the authoring kit + `get_program_info` (via
+`wantsCreateIntent`), and `search_metadata` (always). `buildSystemPrompt` fired `wantsMultiStepGoal`, so
+the orchestration playbook loaded. The gaps were in **integration + orchestration guidance**, not routing:
+1. **Integration inconsistency (buried chain-UID):** every other write tool returns its new object's UID
+   at a top-level `*_id` field (`manage_indicators → indicator_id`, `manage_dashboards → visualization_id`
+   / `dashboard_id`, `manage_org_units → org_unit_id`, `manage_datasets → dataset_id`), and the playbook
+   tells the model to "capture the `*_id` the tool returns". But `manage_program_indicators(action=create)`
+   returned the new PI UID ONLY at the nested `summary.indicator.id` — no top-level `*_id`. A model
+   following the playbook literally would find no `*_id` and could fail to chain the PI into the dashboard.
+2. **Orchestration guidance gap:** the playbook's step-4 ID-capture list omitted
+   `manage_program_indicators` entirely, and its worked example covered only AGGREGATE indicators — so a
+   tracker/event program indicator → dashboard chain (a very realistic compound goal) had no guidance that
+   a `programIndicator` UID plots on a dashboard exactly like an aggregate indicator UID.
+
+**Gold sequence proven on the playground (stable-2-43-0-1) BEFORE editing:** created a program indicator
+(`V{event_count}`, EVENT/COUNT) on the *Malaria case diagnosis…* tracker program (`qDkgAbB5Jlk`) via
+`metadata?importMode=VALIDATE&atomicMode=ALL` then `COMMIT` (0 errors); chained the returned PI UID into a
+`COLUMN` visualization's `dataDimensionItems` as `PROGRAM_INDICATOR`; assembled a dashboard tile from that
+visualization; set the dashboard `publicAccess` to `r-------` via `/sharing?type=dashboard`. Read back all
+three objects (PI on program, viz plotting the PI, dashboard embedding the viz, sharing = `r-------`), then
+fully cleaned up (dashboard + viz + PI deleted, `name:like:ZZAITEST` sweep = 0 residue across
+programIndicators/visualizations/dashboards). This is the exact dependency-ordered, ID-chaining sequence
+the chatbot must now produce on its own.
+
+**Fix (purely additive — one return field + prompt-text guidance; no routing/logic change):**
+- `_buildAndPostProgramIndicator` now returns a top-level `program_indicator_id` (the PI UID) alongside
+  the preserved `summary.indicator.id`, mirroring the `*_id` convention of every other write tool. It is
+  added ONLY when `postMetadataPayload` reports `success` (`if (result && result.success)`), so a failed
+  create never yields a chainable-but-nonexistent UID.
+- The multi-step orchestration playbook now lists `manage_program_indicators(action="create") →
+  program_indicator_id` in its step-4 ID-capture table, and step-5 explains that `data_items` accepts
+  aggregate-indicator, dataElement AND programIndicator UIDs interchangeably (types auto-resolved), so a
+  tracker program indicator plots on a dashboard exactly like an aggregate one.
+
+**No-regression gate (all verified before commit):**
+- **Improvement:** a newly-created tracker program indicator's UID is now exposed at the same top-level
+  `*_id` slot the playbook teaches, and the playbook explicitly covers chaining it into a dashboard — so
+  the full PI → dashboard → sharing chain is reachable in one uninterrupted turn.
+- **Zero collateral:** the return change is `out = { ...result, summary }` then a conditional additive
+  field — `summary.indicator.id` and every existing key are byte-for-byte unchanged, so every existing
+  reader of the create/update return is unaffected. The playbook edit is prompt STRING text inside the
+  existing `if (wantsMultiStepGoal)` block — no regex, flag, or control-flow change.
+- **No routing change:** `getContextualTools` was NOT touched, so every request type surfaces exactly the
+  same tools as before — no crowding-out, no mis-route. (The scenario's tools were already surfaced
+  correctly; the gap was integration/orchestration, not routing.)
+- **Shared-code callers enumerated:** `_buildAndPostProgramIndicator` is called ONLY by
+  `manage_program_indicators` create and update; both return its output verbatim to the executor, and no
+  downstream code enumerates its keys — both paths are unchanged-or-improved (additive field on success).
+- **No safeguard weakened:** `enforcePatientDataPrivacyGate`, `PATIENT_DATA_TOOL_NAMES`, `requireWriteAuth`
+  (still gates PI create/update/delete), `verifyTargetExists`, `ensureBackupOrBail`, the expression/filter
+  lint, and the UID-verification gates are all untouched. No new tool was added.
+- The proven sequence re-VALIDATEs on the live playground with 0 errors (VALIDATE-only, nothing persisted);
+  0 test residue left behind. `node --check` passes on `background.js` and `sidepanel/panel.js`.
