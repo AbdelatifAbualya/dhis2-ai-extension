@@ -157,6 +157,17 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   + 'fix|fixes?|repair|patch|correct|update|modify|change|edit|rewrite|overwrite'
   + '|delete|remove|drop|destroy|wipe|prune|sweep|purge|cleanup|clean ?up'
   + '|create|build|make|set ?up|setup|add|insert'
+  // Write verbs that used to be missing: "Set a custom form on the Quick Check
+  // stage" was classified read_only (worse: the stage NAME "Quick Check"
+  // matched the diagnostic regex) and the write was refused. Verified live
+  // 2026-07-01. Ambiguous verbs (set/apply) only count in imperative form
+  // (followed by an article/pronoun) so problem reports like "the value isn't
+  // set" or "the rule doesn't apply" stay read_only. Deliberately NOT added:
+  // save/write/import/register — they dominate problem reports ("the save
+  // failed") and would weaken the gate.
+  + '|set\\s+(?:a|an|the|this|that|it|up|new|custom|public|sharing)\\b|configure|apply\\s+(?:a|an|the|this|that|it)\\b'
+  + '|install|uninstall|author|generate|translate|relabel'
+  + '|restore|revert|roll ?back|undo|link|unlink'
   + '|enable|disable|turn (?:on|off)|share|grant|revoke|merge|split|rename|migrate|swap|convert|attach|assign|unassign|detach'
   + '|approve|confirm|proceed|do it|do this|go ahead|just do it'
   + '|yes(?:,?\\s*(?:please|do it|go ahead|fix(?: it)?|update|delete|remove))?'
@@ -9943,12 +9954,32 @@ async function executeTool(name, args) {
       return await safeDhis2Fetch(`${type}/${args.id}?fields=${fields}`);
     }
 
+    // Accept the aliases models actually use. `query` was previously IGNORED,
+    // so search_metadata(query="X") returned the ENTIRE collection and the
+    // model could act on an arbitrary first row — observed live steering a
+    // delete toward the wrong program (2026-07-01).
+    const nameFilter = args.name_filter || args.query || args.name || args.search || null;
+
     let path = `${type}?fields=${fields}&pageSize=${args.page_size || 50}`;
-    if (args.name_filter) path += `&filter=displayName:ilike:${encodeURIComponent(args.name_filter)}`;
+    if (nameFilter) path += `&filter=displayName:ilike:${encodeURIComponent(nameFilter)}`;
     if (args.filters?.length) {
       for (const f of args.filters) path += `&filter=${f}`;
     }
-    return await safeDhis2Fetch(path);
+    const resp = await safeDhis2Fetch(path);
+    // Rank exact displayName matches first, then prefix matches, so "the
+    // first result" is the least-surprising object when the model follows up
+    // with a destructive action on it.
+    if (resp && !resp._error && nameFilter && Array.isArray(resp[type])) {
+      const q = String(nameFilter).toLowerCase();
+      const rank = (o) => {
+        const n = String(o.displayName || '').toLowerCase();
+        if (n === q) return 0;
+        if (n.startsWith(q)) return 1;
+        return 2;
+      };
+      resp[type] = resp[type].slice().sort((a, b) => rank(a) - rank(b));
+    }
+    return resp;
   }
 
   // ── resolve_option_codes ──
@@ -15008,24 +15039,58 @@ function escapeCustomFormHtml(value) {
 
 // A single data-entry cell DHIS2 binds to. The id is the only thing that matters for
 // binding; title/value mirror what the Maintenance custom-form designer emits.
+// width:100% + max-width keeps the rendered control sized by its table cell —
+// Capture swaps the <input> for its own component but honors the cell's box.
 function customFormInputCell(inputId) {
-  return `<input id="${escapeCustomFormHtml(inputId)}" title="" value="">`;
+  return `<input id="${escapeCustomFormHtml(inputId)}" title="" value="" style="width:100%;max-width:430px;box-sizing:border-box">`;
 }
 
-// Build a clean, readable two-column custom-form htmlCode from grouped field rows.
-// groups: [{ heading?, rows: [{ inputId, label }] }]
+// Build a clean, responsive two-column custom-form htmlCode from grouped field rows.
+// groups: [{ heading?, rows: [{ inputId, label, hint? }] }]
+//
+// Layout rules (all verified by rendering in Capture 2.42 event view/edit AND the
+// aggregate Data Entry app, 2026-07-01):
+// - EVERYTHING is inline styles. <style> blocks are unreliable: the aggregate Data
+//   Entry app injects htmlCode into an existing DOM (a stylesheet leaks globally),
+//   and sanitizers may strip them.
+// - The old generator emitted a bare <table border="1"> with no width control: the
+//   table shrank to hug its content (too narrow in Capture's wide card) or, when a
+//   long label/validation message appeared, stretched unpredictably (too wide /
+//   layout jumping). Fix: a max-width wrapper + width:100% fixed-layout table with
+//   an explicit 40/60 colgroup — fills narrow containers, caps on wide ones, and
+//   never reflows on content changes.
+// - Inputs get width:100%;max-width:430px;box-sizing:border-box so Capture's
+//   replaced components line up regardless of value type.
 function buildCustomFormHtml(title, groups) {
+  const esc = escapeCustomFormHtml;
   const parts = [];
-  if (title) parts.push(`<h3>${escapeCustomFormHtml(title)}</h3>`);
+  parts.push('<div style="width:100%;max-width:920px;margin:0 auto;font-family:inherit">');
+  if (title) parts.push(`<h3 style="margin:0 0 12px;font-size:20px;color:#212934">${esc(title)}</h3>`);
   for (const group of groups) {
-    if (group.heading) parts.push(`<h4>${escapeCustomFormHtml(group.heading)}</h4>`);
-    parts.push('<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">');
-    parts.push('<tr><th align="left">Field</th><th align="left">Value</th></tr>');
-    for (const row of group.rows) {
-      parts.push(`<tr><td>${escapeCustomFormHtml(row.label)}</td><td>${customFormInputCell(row.inputId)}</td></tr>`);
+    parts.push('<div style="border:1px solid #d5dde5;border-radius:8px;margin-bottom:16px;overflow:hidden;background:#fff">');
+    if (group.heading) {
+      parts.push(`<h4 style="margin:0;padding:10px 14px;font-size:14px;background:#f3f5f7;border-bottom:1px solid #d5dde5;border-left:4px solid #1976d2;color:#212934">${esc(group.heading)}</h4>`);
     }
+    parts.push('<table style="width:100%;border-collapse:collapse;table-layout:fixed">');
+    parts.push('<colgroup><col style="width:40%"><col style="width:60%"></colgroup>');
+    parts.push('<tbody>');
+    let i = 0;
+    for (const row of group.rows) {
+      const shade = i % 2 === 1 ? 'background:#fafbfc;' : '';
+      const hint = row.hint
+        ? `<div style="font-size:12px;color:#8a93a0;margin-top:2px">${esc(row.hint)}</div>`
+        : '';
+      parts.push(
+        `<tr><td style="padding:10px 14px;border-bottom:1px solid #eef1f4;vertical-align:middle;font-size:14px;color:#40464e;word-wrap:break-word;${shade}">${esc(row.label)}${hint}</td>`
+        + `<td style="padding:10px 14px;border-bottom:1px solid #eef1f4;${shade}">${customFormInputCell(row.inputId)}</td></tr>`
+      );
+      i++;
+    }
+    parts.push('</tbody>');
     parts.push('</table>');
+    parts.push('</div>');
   }
+  parts.push('</div>');
   return parts.join('\n');
 }
 
@@ -15336,7 +15401,8 @@ async function setStageCustomForm(args) {
 
   const hints = [];
   if (unknownDes.length) hints.push(`htmlCode references ${unknownDes.length} input(s) whose DE is not on this stage (${unknownDes.slice(0, 5).join(', ')}); those cells will not save.`);
-  hints.push('Custom program-stage forms render in the new Capture app; verify in Capture > new event/enrollment for this program.');
+  hints.push('Custom program-stage forms render in the new Capture app when VIEWING or EDITING an existing event — the "New event" flow renders the DEFAULT layout in current Capture versions (verified on 2.42). Verify by opening an existing event of this stage.');
+  hints.push('⚠️ Capture caches program metadata in IndexedDB. A form saved AFTER the user opened Capture will NOT appear until they hard-refresh the Capture tab (Ctrl+Shift+R / Cmd+Shift+R; if it still shows the old layout, DevTools > Application > Clear storage). TELL THE USER THIS — "the form does not show" is almost always this cache, not a save failure.');
 
   return {
     success: true,
@@ -16491,9 +16557,18 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // Resolve sharing — build the sharing block that will be attached to the program
   // (and optionally to stages / DEs / option sets). Shape matches the new sharing
   // format DHIS2 expects on metadata POST: { public, external, users, userGroups }.
-  const sharingInput = args.sharing || null;
+  // Sharing ALWAYS gets built — even when the model passes no sharing argument.
+  // DHIS2's server default for new programs is metadata-only ("rw------"),
+  // which means NOBODY (not even the creating admin) has data write access:
+  // every enrollment/event import bounces with E1091/E1095/E1096 and Capture's
+  // Save silently fails. Verified live on play 2.42.5.1 (2026-07-01): a program
+  // created without a sharing block was born unusable for data entry. Default
+  // to public "rwrw----" on the program + stages (the two data-shareable
+  // classes) so tracker data entry works out of the box — same convention
+  // manage_datasets has always used.
+  const sharingInput = args.sharing || {};
   let sharingBlock = null;
-  if (sharingInput) {
+  {
     // Normalize: any model-supplied access string is coerced to a canonical
     // 8-char [rw-] form here. Without this, "r--------" (9 chars) leaks into
     // program.publicAccess and DHIS2 rejects the entire atomic import.
@@ -16643,13 +16718,19 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   }
   let finalOptions = allOptions.filter(opt => !skippedOptionIds.has(opt.id));
 
-  // 3 + 4 + 5. Run options / DE / TEA name probes in parallel — they have no
-  // ordering dependency on each other, only on Step 1 above.
-  const optionBatches = [];
-  if (finalOptions.length > 0) {
-    const optNameList = finalOptions.map(o => o.name);
-    for (let i = 0; i < optNameList.length; i += 50) optionBatches.push(optNameList.slice(i, i + 50));
-  }
+  // 3 + 4. Run DE / TEA name probes in parallel — they have no ordering
+  // dependency on each other, only on Step 1 above.
+  //
+  // ⚠️ Options are deliberately NOT deduplicated against the server by name.
+  // A DHIS2 Option belongs to exactly ONE optionSet (options.optionsetid FK).
+  // The old "reuse an existing option with the same name" logic rewired a NEW
+  // option set to reference options owned by OTHER option sets ("None",
+  // "Negative", "Live birth", …) and the metadata import silently RE-PARENTED
+  // them — ripping the option out of its original set and corrupting unrelated
+  // metadata with no backup. Verified live on play 2.42.5.1 (2026-07-01): a new
+  // set referencing an existing "None"/"Mild" stole both options from the set
+  // that owned them. Same-name options across different sets are normal and
+  // correct in DHIS2 — every new set must get ITS OWN option rows.
   const deBatches = [];
   if (allDataElements.length > 0) {
     const deNames = allDataElements.map(d => d.name);
@@ -16661,11 +16742,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     for (let i = 0; i < teaNames.length; i += 50) teaBatches.push(teaNames.slice(i, i + 50));
   }
 
-  const [optResponses, deResponses, teaResponses] = await Promise.all([
-    Promise.all(optionBatches.map(batch => {
-      const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
-      return safeDhis2Fetch(`options?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
-    })),
+  const [deResponses, teaResponses] = await Promise.all([
     Promise.all(deBatches.map(batch => {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
       return safeDhis2Fetch(`dataElements?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
@@ -16675,23 +16752,6 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       return safeDhis2Fetch(`trackedEntityAttributes?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
     })),
   ]);
-
-  // Apply options dedup
-  for (const resp of optResponses) {
-    for (const ex of (resp?.options || [])) {
-      const newOpt = finalOptions.find(o => o.name === ex.name && !o._skip);
-      if (newOpt) {
-        const oldOptId = newOpt.id;
-        newOpt.id = ex.id;
-        newOpt._skip = true;
-        for (const os of filteredOptionSets) {
-          const ref = os.options?.find(r => r.id === oldOptId);
-          if (ref) ref.id = ex.id;
-        }
-      }
-    }
-  }
-  finalOptions = finalOptions.filter(o => !o._skip);
 
   // Apply DE dedup
   for (const resp of deResponses) {
@@ -20033,6 +20093,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   // Index program DEs by sanitized display name AND by which stage(s) they live in.
   const deBySanitized = new Map();  // sanitized(displayName) → { id, displayName, valueType, optionSet, stageIds:[] }
   const deByDisplayName = new Map(); // raw displayName → same
+  const deById = new Map();          // deId → same entry (for ASSIGN option-code checks)
   for (const ps of (progResp.programStages || [])) {
     for (const psde of (ps.programStageDataElements || [])) {
       const de = psde.dataElement;
@@ -20044,6 +20105,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
         deBySanitized.set(sKey, entry);
         deByDisplayName.set(de.displayName, entry);
       }
+      deById.set(de.id, entry);
       if (!entry.stageIds.includes(ps.id)) entry.stageIds.push(ps.id);
     }
   }
@@ -20203,11 +20265,26 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       if (!ok) unresolved.push({ rule: rule.name, reference: `#{${name}}`, suggestions: collectSuggestions(name) });
     }
 
-    // A{ref}: if ref is a UID, pass through unchanged. Otherwise try to rewrite to A{uid}
-    // using TEA displayName match; if no match, flag as unresolved.
+    // A{ref}: DHIS2's grammar accepts BOTH a TEA UID and the NAME of a
+    // TEI_ATTRIBUTE-sourced programRuleVariable (the demo DB's own rules use
+    // e.g. d2:yearsBetween(A{born}, V{current_date}) where "born" is a PRV).
+    // Resolution order:
+    //   1. UID → pass through.
+    //   2. Existing PRV with that name, or a variables:[] entry the model
+    //      supplied in THIS rule (source_type TEI_ATTRIBUTE) → keep A{name},
+    //      creating the PRV if it came from variables:[]. (Previously this
+    //      path was missing: the tool's own error hint told the model to pass
+    //      variables:[], then ignored them for A{} refs and refused the POST.)
+    //   3. TEA displayName match → rewrite to A{uid}.
+    //   4. Otherwise unresolved.
     for (const ref of attrRefs) {
       if (isDhis2Uid(ref) && teaById.has(ref)) continue;
       if (isDhis2Uid(ref)) continue;  // Leave unknown UIDs alone — DHIS2 will resolve at runtime.
+      if (existingPRVs.has(ref.toLowerCase()) || newPRVsByName.has(ref.toLowerCase())) continue;
+      const suppliedVar = (rule.variables || []).find(v =>
+        String(v.name || '').toLowerCase() === ref.toLowerCase()
+        && (v.source_type === 'TEI_ATTRIBUTE' || v.tei_attribute_id));
+      if (suppliedVar && ensureVarForRule(ref, rule)) continue;
       const teaEntry = teaBySanitized.get(ref.toLowerCase()) || teaBySanitized.get(sanitizeVariableName(ref));
       if (teaEntry) {
         const before = `A{${ref}}`;
@@ -20263,6 +20340,58 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       unresolved,
       _hint: `Every #{name} must resolve to a programRuleVariable. Either (a) pass variables:[{name, source_type:"DATAELEMENT_CURRENT_EVENT"|"DATAELEMENT_NEWEST_EVENT_PROGRAM"|"TEI_ATTRIBUTE", value_type, data_element_id|tei_attribute_id}] inside the rule, (b) rename the reference to match an existing data element's sanitized display name (lowercase, non-alphanumerics → "_") so it can auto-resolve, or (c) first call manage_program_rules(action=list_variables, program_id=...) to see what variables already exist. A{name} references must use a tracked-entity-attribute UID or a displayName that matches a TEA on the program.`,
     };
+  }
+
+  // ── ASSIGN → option-set DE: the assigned literal MUST be an option CODE ──
+  // The server-side rule engine (2.42+ runs ASSIGN on tracker import) and the
+  // tracker importer validate assigned values against the option set's CODES,
+  // not names. A rule assigning 'Moderate' to a DE whose option codes are
+  // MILD/MODERATE/SEVERE bounces every event save with E1125. Verified live on
+  // play 2.42.5.1 (2026-07-01). Auto-map a name → its code; reject unknowns
+  // with the valid code list so the model can self-correct in one iteration.
+  {
+    const assignsByOptionSet = new Map(); // optionSetId → [pra]
+    for (const pra of allPRAs) {
+      if (pra.programRuleActionType !== 'ASSIGN' || !pra.dataElement?.id) continue;
+      const deEntry = deById.get(pra.dataElement.id);
+      const osId = deEntry?.optionSet?.id;
+      if (!osId) continue;
+      const literal = typeof pra.data === 'string' && pra.data.trim().match(/^'([^']*)'$|^"([^"]*)"$/);
+      if (!literal) continue; // dynamic expression — can't statically check
+      if (!assignsByOptionSet.has(osId)) assignsByOptionSet.set(osId, []);
+      assignsByOptionSet.get(osId).push(pra);
+    }
+    if (assignsByOptionSet.size) {
+      const optionSetIds = [...assignsByOptionSet.keys()];
+      const optResps = await Promise.all(optionSetIds.map(id =>
+        safeDhis2Fetch(`optionSets/${id}?fields=id,name,options[name,code]`)));
+      const codeErrors = [];
+      for (let i = 0; i < optionSetIds.length; i++) {
+        const os = optResps[i];
+        if (!os || os._error) continue; // can't verify — let the server decide
+        const byCode = new Map((os.options || []).map(o => [String(o.code), o]));
+        const byName = new Map((os.options || []).map(o => [String(o.name).toLowerCase(), o]));
+        for (const pra of assignsByOptionSet.get(optionSetIds[i])) {
+          const raw = pra.data.trim();
+          const value = raw.slice(1, -1);
+          if (byCode.has(value)) continue;
+          const named = byName.get(value.toLowerCase());
+          if (named) {
+            pra.data = `'${named.code}'`; // auto-map display name → code
+          } else {
+            codeErrors.push(`ASSIGN to "${deById.get(pra.dataElement.id)?.displayName}" uses '${value}', which is neither an option code nor an option name of option set "${os.name}". Valid codes: ${(os.options || []).map(o => o.code).join(', ')}`);
+          }
+        }
+      }
+      if (codeErrors.length) {
+        return {
+          success: false,
+          _error: `ASSIGN value(s) do not match the target data element's option set: ${codeErrors.join(' | ')}`,
+          phase: 'assign_option_code_check',
+          _hint: 'ASSIGN writes the raw value into the field; for an option-set data element the value must be an option CODE (names are auto-mapped when they match). Fix the data expression to one of the listed codes and retry.',
+        };
+      }
+    }
   }
 
   const payload = {};
