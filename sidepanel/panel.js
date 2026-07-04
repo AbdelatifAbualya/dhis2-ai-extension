@@ -1591,6 +1591,7 @@ ${turnXml}
       manage_option_sets: { cls: 'tool-icon-create', icon: '\u{1F5C2}' },
       manage_legend_sets: { cls: 'tool-icon-create', icon: '\u{1F3A8}' },
       manage_dashboards: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
+      manage_maps: { cls: 'tool-icon-create', icon: '\u{1F5FA}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1627,6 +1628,7 @@ ${turnXml}
       manage_option_sets: 'Managing option sets',
       manage_legend_sets: 'Managing legend sets',
       manage_dashboards: 'Building dashboards',
+      manage_maps: 'Building maps',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1861,6 +1863,15 @@ ${turnXml}
       if (args.item_id) parts.push(`item: ${String(args.item_id).slice(0, 11)}`);
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_maps') {
+      const parts = [args.action || 'unknown'];
+      if (args.name) parts.push(`"${String(args.name).slice(0, 30)}"`);
+      if (args.map_id) parts.push(`id: ${String(args.map_id).slice(0, 11)}`);
+      if (args.data_item) parts.push(`dx: ${String(args.data_item).slice(0, 11)}`);
+      if (args.org_unit_level != null) parts.push(`level ${args.org_unit_level}`);
+      if (args.thematic_map_type) parts.push(String(args.thematic_map_type));
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {
       const parts = [args.action || 'list'];

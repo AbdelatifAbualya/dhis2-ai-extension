@@ -167,6 +167,14 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   // failed") and would weaken the gate.
   + '|set\\s+(?:a|an|the|this|that|it|up|new|custom|public|sharing)\\b|configure|apply\\s+(?:a|an|the|this|that|it)\\b'
   + '|install|uninstall|author|generate|translate|relabel'
+  // Form/layout authoring verbs. "Design a custom form for this stage" is the
+  // tool's OWN documented trigger phrase, yet was classified read_only and the
+  // write refused (verified live 2026-07-03). Constrain the ambiguous ones
+  // (design/customize/style/lay out) to imperative form — followed by an
+  // article/pronoun — so a problem report like "the form design is broken" or
+  // "the style is off" stays read_only. redesign is unambiguous → unconstrained.
+  + '|design\\s+(?:a|an|the|this|that|it|new|custom)\\b|redesign|customi[sz]e\\s+(?:a|an|the|this|that|it|new)\\b'
+  + '|style\\s+(?:a|an|the|this|that|it)\\b|lay\\s?out\\s+(?:a|an|the|this)\\b'
   + '|restore|revert|roll ?back|undo|link|unlink'
   + '|enable|disable|turn (?:on|off)|share|grant|revoke|merge|split|rename|migrate|swap|convert|attach|assign|unassign|detach'
   + '|approve|confirm|proceed|do it|do this|go ahead|just do it'
@@ -5236,6 +5244,43 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
   {
     type: 'function',
     function: {
+      name: 'manage_maps',
+      description: `Create and inspect DHIS2 **thematic maps** (choropleth / bubble layers) — the shaded-by-value maps shown in the Maps app and embedded on dashboards. Use this tool for ALL map CREATION — DHIS2 has NO simple "create map" object, so NEVER hand-assemble a /api/maps body via dhis2_query (the layer's data goes on the mapView's columns[dx]/rows[ou]/filters[pe], with organisationUnitLevels, and a program attached for program-indicator layers — this tool assembles that exact structure, verified on play 2.43.0.1).
+- create: one thematic map layer. Supply name, data_item (ONE indicator / dataElement / programIndicator UID — its type is auto-resolved AND verified, and the owning program is auto-attached for a program indicator), org_unit_level (e.g. 2 to shade every district) and/or org_units (parent UIDs or USER_ORGUNIT as the boundary), period (relative keyword like LAST_12_MONTHS or fixed like 202401), optional legend_set_id (create it first with manage_legend_sets for fixed colour bands — otherwise equal-interval auto colours), optional thematic_map_type (CHOROPLETH default, or BUBBLE), classes, color_scale, basemap. Returns map_id.
+- list / get: list maps (optional name filter) / read one map with its layers, data item, org-unit levels, program and legend set.
+- delete: remove a map (snapshots a backup first; restore via manage_backups).
+To place a new map on a dashboard, pass its map_id to manage_dashboards(action="add_items", items=[{ type:"MAP", map_id }]) or reference it in a create_dashboard item. NEVER invent map, data-item or legend-set UIDs — resolve them via search_metadata / a prior tool result. For non-thematic layers (facilities, boundaries, Earth Engine) use the Maps app UI.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'delete'],
+            description: 'list=recent maps (optional name filter); get=one map with its layers; create=new thematic map; delete=remove a map (auto-backup first).'
+          },
+          map_id: { type: 'string', description: 'Map UID (required for get / delete). A Maps app URL is also accepted.' },
+          name: { type: 'string', description: 'For create: the map display name (required).' },
+          data_item: { type: 'string', description: 'For create: the ONE indicator / data element / program indicator UID to shade the map by (the dx dimension). Type auto-resolved + existence-verified; the program is auto-attached for a program indicator.' },
+          org_unit_level: { type: 'integer', description: 'For create: the org-unit LEVEL to shade (e.g. 2 = districts, 3 = chiefdoms). Every OU at this level under the boundary gets a colour.' },
+          org_units: { type: 'array', items: { type: 'string' }, description: 'For create: boundary/parent org units — UIDs and/or USER_ORGUNIT / LEVEL-<n>. Combine with org_unit_level to shade that level within these parents. Defaults to shading the given level nationwide if omitted.' },
+          period: { type: 'string', description: 'For create: a single period — relative keyword (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) or fixed ISO (202401, 2025Q1, 2025). Default LAST_12_MONTHS.' },
+          legend_set_id: { type: 'string', description: 'For create (optional): a legend set UID for fixed colour bands (make one with manage_legend_sets). Omit for equal-interval auto colours.' },
+          thematic_map_type: { type: 'string', enum: ['CHOROPLETH', 'BUBBLE'], description: 'For create: CHOROPLETH (shaded areas, default) or BUBBLE (proportional circles).' },
+          classes: { type: 'integer', description: 'For create (optional): number of colour classes for auto (equal-interval) legends. Default 5.' },
+          color_scale: { type: 'string', description: 'For create (optional): DHIS2 colour scale id (e.g. YlOrRd, Blues, Reds). Default YlOrRd.' },
+          basemap: { type: 'string', description: 'For create (optional): basemap id (osmLight default, osmDetailed, …).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on map name.' },
+          limit: { type: 'integer', description: 'For list: max maps to return (1–200, default 50).' },
+          program_id: { type: 'string', description: 'For create (optional): owning program UID for a program-indicator/event layer. Auto-derived from a program indicator when omitted.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -5299,6 +5344,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_option_sets: true,
   manage_legend_sets: true,
   manage_dashboards: true,
+  manage_maps: true,
   manage_backups: true,
 });
 
@@ -5481,6 +5527,15 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
             || /\bsingle[-\s]?value\b/.test(combinedText)
             || /\bgauge\s*(chart|visuali[sz]ation)?\b/.test(combinedText)
             || /\b(saved|reusable|favou?rite)\s+(chart|graph|visuali[sz]ation|pivot)\b/.test(combinedText)));
+  // Map AUTHORING intent — creating a thematic (choropleth/bubble) map, or a map
+  // to place on a dashboard. Constrained to an authoring verb / thematic keyword
+  // (or the Maps app) so plain words like "roadmap"/"heat map"/"map out" don't
+  // trip it. Reads ("explain this map") stay with get_map_details.
+  const wantsMapIntent =
+    (/\bmaps?\b/.test(combinedText)
+      && (/\b(create|build|make|save|design|set\s*up|setup|add|new|choropleth|bubble|thematic|shade[ds]?|colou?r[- ]?cod)\b/.test(combinedText)))
+    || /\bchoropleth\b/.test(combinedText)
+    || /\bthematic\s+maps?\b/.test(combinedText);
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5682,6 +5737,15 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Thematic map authoring — surfaced on explicit map-creation intent or when
+  //    the user is in the Maps app. search_metadata resolves the data item /
+  //    OU UIDs; legend sets pair naturally with choropleth colour bands. ──
+  if (wantsMapIntent || isMaps) {
+    selected.add('manage_maps');
+    selected.add('search_metadata');
+    selected.add('manage_legend_sets');
+  }
+
   // ── Dashboard / visualization authoring — surfaced on explicit dashboard /
   //    saved-visualization intent, OR whenever the user is on the Dashboard or
   //    Data Visualizer app (where building/saving a chart or dashboard is the
@@ -5691,6 +5755,9 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   if (wantsDashboardIntent || isDashboard || isDataViz) {
     selected.add('manage_dashboards');
     selected.add('search_metadata');
+    // Maps commonly ride onto dashboards ("…and a map of X by district"), so the
+    // map authoring tool travels with dashboard intent too.
+    selected.add('manage_maps');
     // Dashboard/visualization SHARING and DELETION live in manage_metadata
     // (manage_dashboards only CREATES and READS). The canonical multi-step
     // dashboard goal ends in a "share it" / "make it public" step, so the
@@ -5749,7 +5816,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
     'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
     'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
-    'manage_dashboards',
+    'manage_dashboards', 'manage_maps',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5790,6 +5857,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_option_sets');
     selected.delete('manage_legend_sets');
     selected.delete('manage_dashboards');
+    selected.delete('manage_maps');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -9014,6 +9082,16 @@ function pathReadsPatientData(rawPath) {
   if (/^(events|enrollments|trackedentityinstances)(\/|\.|$)/.test(base)) return true;
   // Row-level (individual) event/enrollment analytics — aggregate is de-identified and allowed
   if (/^analytics\/(events|enrollments)\/query(\/|\.|$)/.test(base)) return true;
+  // SQL view EXECUTION (…/data, …/execute). A saved SQL view can SELECT arbitrary
+  // columns — including patient identifiers — from any table (trackedentityinstance,
+  // event/programstageinstance, enrollment, trackedentityattributevalue, …), so
+  // executing one on a remote model could exfiltrate row-level tracker data past
+  // the endpoint checks above. Fail closed: gate the execution sub-endpoints. The
+  // view DEFINITION (…/sqlViews/{id}?fields=…, i.e. no /data|/execute) stays
+  // readable as metadata. A purely-aggregate view is over-gated on a remote model —
+  // run it on a local model or use aggregate analytics. Verified live 2026-07-03:
+  // sqlViews/{id}/data was NOT gated before this line (torture-test bypass probe).
+  if (/^sqlviews\/[a-z0-9]+\/(data|execute)(\/|\.|$)/i.test(base)) return true;
   return false;
 }
 // True when a tool call would read patient-level tracker data.
@@ -10985,6 +11063,11 @@ async function executeTool(name, args) {
   // ── manage_dashboards ──
   if (name === 'manage_dashboards') {
     return await executeManageDashboards(args);
+  }
+
+  // ── manage_maps ──
+  if (name === 'manage_maps') {
+    return await executeManageMaps(args);
   }
 
   // ── manage_backups ──
@@ -13019,6 +13102,167 @@ function buildVisualizationObject(spec, typeMap) {
   if (spec.short_name) viz.shortName = String(spec.short_name).slice(0, 50);
   if (spec.description) viz.description = String(spec.description);
   return { ok: true, id, viz };
+}
+
+// ── Thematic map authoring ──────────────────────────────────────────────────
+// DHIS2 has NO "create map" API object you can POST naively the way you might a
+// visualization; a map is a container with mapViews[] (layers). This builds a
+// single-layer THEMATIC (choropleth/bubble) map from a friendly spec and mirrors
+// the exact structure proven on play 2.43.0.1 (2026-07-03): the data item goes on
+// the mapView's `columns` dx dimension (typed dimensionItemType), the org units on
+// `rows` ou (LEVEL-n markers + parent UIDs) with organisationUnitLevels, and the
+// period on `filters` pe. Program is auto-attached for program-indicator/event
+// layers. Returns { ok, map } or { _error }.
+const MAP_THEMATIC_TYPES = new Set(['CHOROPLETH', 'BUBBLE']);
+function buildMapObject(spec, typeMap) {
+  if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
+  const name = String(spec.name || '').trim();
+  if (!name) return { _error: 'map name is required.' };
+  const item = String(spec.data_item || (Array.isArray(spec.data_items) ? spec.data_items[0] : '') || '').trim();
+  if (!item) return { _error: 'data_item (one indicator / data element / program indicator UID) is required for a thematic map.' };
+  const t = typeMap[item];
+  if (!t) return { _error: `Could not resolve data item "${item}" to a known type. Verify the UID with search_metadata.` };
+  const ddiKey = VIZ_DDI_KEY[t];
+  if (!ddiKey) return { _error: `Data item "${item}" has unsupported type ${t} for a map.` };
+
+  const period = String(spec.period || (Array.isArray(spec.periods) ? spec.periods[0] : '') || 'LAST_12_MONTHS').trim();
+  const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : (spec.org_units ? [spec.org_units] : [])).map(o => String(o).trim()).filter(Boolean);
+  const level = spec.org_unit_level != null ? Number(spec.org_unit_level) : null;
+
+  // ou dimension: LEVEL markers + parent UIDs + user-orgunit flags.
+  const ouItems = [];
+  const organisationUnits = [];
+  const organisationUnitLevels = [];
+  const ouFlags = {};
+  if (Number.isFinite(level) && level > 0) { organisationUnitLevels.push(level); ouItems.push({ id: `LEVEL-${level}` }); }
+  for (const o of orgUnits) {
+    const up = o.toUpperCase();
+    const m = up.match(/^LEVEL-(\d+)$/);
+    if (VIZ_REL_OU[up]) { ouFlags[VIZ_REL_OU[up]] = true; ouItems.push({ id: up }); }
+    else if (m) { const lvl = Number(m[1]); if (!organisationUnitLevels.includes(lvl)) organisationUnitLevels.push(lvl); ouItems.push({ id: up }); }
+    else { organisationUnits.push({ id: o }); ouItems.push({ id: o }); }
+  }
+  if (!ouItems.length) return { _error: 'A thematic map needs org units: pass org_unit_level (e.g. 2 for districts) and/or org_units (parent UIDs or USER_ORGUNIT).', _hint: 'Typical: org_unit_level:2 to shade every district, org_units:["<countryUid>"] as the boundary.' };
+  if (Number.isFinite(level) && level > 0 && !organisationUnits.length && !Object.keys(ouFlags).length) {
+    // A level with no parent boundary shades every OU at that level nationwide — allowed, but note it.
+  }
+
+  const thematicMapType = MAP_THEMATIC_TYPES.has(String(spec.thematic_map_type || '').toUpperCase())
+    ? String(spec.thematic_map_type).toUpperCase() : 'CHOROPLETH';
+  const mapViewId = generateDhis2Uid();
+  const mapView = {
+    id: mapViewId,
+    layer: 'thematic',
+    renderingStrategy: 'SINGLE',
+    thematicMapType,
+    classes: Number.isFinite(Number(spec.classes)) ? Number(spec.classes) : 5,
+    colorScale: spec.color_scale || 'YlOrRd',
+    aggregationType: spec.aggregation_type || 'DEFAULT',
+    opacity: spec.opacity != null ? Number(spec.opacity) : 0.9,
+    hideTitle: false,
+    columns: [{ dimension: 'dx', items: [{ id: item, dimensionItemType: t }] }],
+    rows: [{ dimension: 'ou', items: ouItems }],
+    filters: [{ dimension: 'pe', items: [{ id: period }] }],
+    organisationUnitSelectionMode: 'SELECTED',
+    organisationUnitLevels,
+    organisationUnits,
+    ...ouFlags,
+  };
+  if (spec.program_id) mapView.program = { id: spec.program_id };
+  // method 1 = predefined legend (legendSet); 2 = equal intervals (auto colours).
+  if (spec.legend_set_id) { mapView.legendSet = { id: spec.legend_set_id }; mapView.method = 1; }
+  else { mapView.method = 2; }
+
+  const map = {
+    id: spec.id || generateDhis2Uid(),
+    name,
+    basemap: spec.basemap || 'osmLight',
+    latitude: spec.latitude != null ? Number(spec.latitude) : 0,
+    longitude: spec.longitude != null ? Number(spec.longitude) : 0,
+    zoom: spec.zoom != null ? Number(spec.zoom) : 3,
+    mapViews: [mapView],
+  };
+  return { ok: true, map, needsProgram: t === 'PROGRAM_INDICATOR' && !spec.program_id, dataItemId: item };
+}
+
+// Resolve the owning program for a program-indicator data item (maps need it on
+// the layer). Returns the program UID or null.
+async function resolveProgramForProgramIndicator(piId) {
+  const resp = await safeDhis2Fetch(`programIndicators/${piId}?fields=program[id]`);
+  return resp?.program?.id || null;
+}
+
+async function executeManageMaps(args) {
+  const action = args.action;
+  if (!action) return { _error: 'action required', _hint: 'One of: list, get, create, delete.' };
+
+  if (action === 'list') {
+    const nameFilter = args.name_filter ? `&filter=name:ilike:${encodeURIComponent(args.name_filter)}` : '';
+    const limit = Math.max(1, Math.min(200, Number(args.limit) || 50));
+    const resp = await safeDhis2Fetch(`maps.json?fields=id,name,lastUpdated,mapViews[layer,thematicMapType]&order=lastUpdated:desc&pageSize=${limit}${nameFilter}`);
+    if (resp?._error) return resp;
+    return { maps: (resp.maps || []).map(m => ({ id: m.id, name: m.name, lastUpdated: m.lastUpdated, layers: (m.mapViews || []).length })), total: resp.pager?.total ?? (resp.maps || []).length };
+  }
+
+  if (action === 'get') {
+    const id = extractMapIdFromInput(args.map_id) || args.map_id;
+    if (!id) return { _error: 'map_id required for get.' };
+    const resp = await safeDhis2Fetch(`maps/${id}?fields=id,name,basemap,mapViews[id,layer,thematicMapType,columns[dimension,items[id,dimensionItemType]],organisationUnitLevels,program[id,name],legendSet[id,name]]`);
+    if (resp?._error) return resp;
+    return { map: resp };
+  }
+
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_maps', 'create');
+    if (_gate) return _gate;
+    const spec = args.map || args;
+    // Resolve the data item's type (+ existence) exactly like create_visualization.
+    const itemId = String(spec.data_item || (Array.isArray(spec.data_items) ? spec.data_items[0] : '') || '').trim();
+    if (!itemId) return { _error: 'data_item (one indicator / data element / program indicator UID) is required.' };
+    const { typeMap, unresolved } = await resolveDataItemTypes([itemId]);
+    if (unresolved.length) return { _error: `Data item not found: ${unresolved.join(', ')}. Verify the UID with search_metadata / a prior tool result.`, _scope: 'unresolved_data_item' };
+    // Auto-attach program for a program-indicator layer.
+    if (typeMap[itemId] === 'PROGRAM_INDICATOR' && !spec.program_id) {
+      const pid = await resolveProgramForProgramIndicator(itemId);
+      if (pid) spec.program_id = pid;
+    }
+    const built = buildMapObject(spec, typeMap);
+    if (built._error) return built;
+    const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
+    if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
+    const newId = resp?.response?.uid || built.map.id;
+    return {
+      success: true,
+      map_id: newId,
+      name: built.map.name,
+      layer: 'thematic',
+      thematic_map_type: built.map.mapViews[0].thematicMapType,
+      data_item: itemId,
+      org_unit_levels: built.map.mapViews[0].organisationUnitLevels,
+      period: built.map.mapViews[0].filters[0].items[0].id,
+      legend_set: spec.legend_set_id || null,
+      _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]) — or reference it in a new dashboard's items.`,
+    };
+  }
+
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_maps', 'delete', { map_id: args.map_id });
+    if (_gate) return _gate;
+    const id = extractMapIdFromInput(args.map_id) || args.map_id;
+    if (!id) return { _error: 'map_id required for delete.' };
+    const _verify = await verifyTargetExists('maps', id, 'manage_maps', 'delete', 'id,name');
+    if (!_verify.exists) return _verify.refusal;
+    // Snapshot before delete so it can be restored.
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_map', tool: 'manage_maps', action: 'delete', user_text: lastUserText },
+      [{ object_type: 'maps', object_id: id, role: 'primary' }], args);
+    if (!backup.ok) return backup.error;
+    const resp = await safeDhis2Fetch(`maps/${id}`, { method: 'DELETE' });
+    if (resp?._error) return { _error: `Map delete failed: ${resp._error}`, backup: backup.block };
+    return { success: true, deleted_map_id: id, backup: backup.block };
+  }
+
+  return { _error: `Unknown manage_maps action: ${action}`, _hint: 'One of: list, get, create, delete.' };
 }
 
 async function executeManageDashboards(args) {
@@ -17131,7 +17375,24 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     recordRecentCreation('program', args.program_name, programUid, summary);
   }
 
-  return { ...result, summary };
+  // Top-level ID handles for multi-step orchestration. The full detail stays in
+  // `summary`, but the very next step of a "create program → add rules/indicators
+  // → build a dashboard/map" chain needs the program + stage + DE UIDs without
+  // digging into nested summary shapes. Mirror the top-level id exposure that
+  // manage_program_indicators / manage_dashboards / manage_maps already provide,
+  // so the model reliably reuses REAL UIDs (never invents them). name→id maps let
+  // it target a stage/DE/attribute by the name it just asked for.
+  const stage_ids = {};
+  summary.stages.forEach((s) => { stage_ids[s.name] = s.id; });
+  return {
+    ...result,
+    program_id: programUid,
+    stage_ids,
+    data_element_ids: { ...deUidMap },
+    tracked_entity_attribute_ids: { ...teaUidMap },
+    option_set_ids: { ...optionSetUidMap },
+    summary,
+  };
 }
 
 async function addStageToProgram(args, defaultCatComboId) {
@@ -19126,6 +19387,19 @@ async function executeManageProgramRules(args, ctxProgramId) {
       allPRVs.push(prv);
     }
 
+    // Resolve any action target display names → UIDs (same as the create path).
+    // Without this a name-targeted ASSIGN/SETMANDATORYFIELD/HIDEFIELD would save
+    // target-less and DHIS2 would reject the whole update.
+    if (merged.actions) {
+      const _res = await resolveRuleActionTargetNames(pid, merged.actions);
+      if (_res.unresolved && _res.unresolved.length) {
+        return {
+          _error: `Rule action target name(s) could not be resolved on this program: ${_res.unresolved.map(u => `${u.kind} "${u.name}"`).join(', ')}.`,
+          _hint: 'Pass the exact data element / attribute display name as it appears on this program, or pass the UID directly (data_element_id / tei_attribute_id).',
+        };
+      }
+    }
+
     // Decide which actions to use
     const actionsToPost = merged.actions
       ? merged.actions  // new set provided — will replace old ones
@@ -19786,22 +20060,28 @@ function lintProgramIndicatorExpression(text, kind) {
   if (/\bI\{[^}]+\}/.test(t)) return { error: 'I{} (indicator) references are not valid in program indicators.', hint: 'Compose the calculation directly in this PI using #{stage.de} / A{tea}.' };
   if (/\bOUG\{[^}]+\}/.test(t)) return { error: 'OUG{} (org unit group) references are not valid in program indicators.', hint: 'Use d2:inOrgUnitGroup(\'<ougId>\') instead.' };
 
-  // MULTI_TEXT exact-match smell — multiple `==` against the SAME #{stage.de}
-  // is logically impossible (a column can only equal one literal string at a
-  // time). This is what the user's failed PI looked like after the model
-  // dropped d2:contains: `#{X.Y} == 'Diabetes' && #{X.Y} == 'HYPERTENSION'`.
-  // We can't tell from the text alone if the DE is MULTI_TEXT, but the
-  // pattern itself is wrong on any value type. Soft-warn with a hint.
+  // Same-field equality against two DIFFERENT literals is impossible ONLY when the
+  // comparisons are AND-ed: `#{X} == 'A' && #{X} == 'B'`. The OR form
+  // `#{X} == 'A' || #{X} == 'B'` is the NORMAL, correct way to match one of several
+  // option codes (RR/MDR profile, treatment-outcome cohorts, …) and must NOT be
+  // blocked. So evaluate the check PER OR-TERM (split on ||): within a single
+  // conjunction a field can equal only one literal; across OR-terms it can equal
+  // any of them. (The old check counted same-ref equalities across the whole
+  // filter and wrongly rejected valid `||` "field in set" filters.)
   if (kind === 'filter') {
-    const refEqRefEq = [...t.matchAll(/(#\{[^}]+\}|A\{[^}]+\})\s*==\s*'[^']+'/g)];
-    if (refEqRefEq.length >= 2) {
-      const refs = refEqRefEq.map(m => m[1]);
-      const sameRefTwice = refs.length !== new Set(refs).size;
-      if (sameRefTwice) {
-        return {
-          error: 'Filter compares the same field equal to two different literals (`#{X} == \'A\' && #{X} == \'B\'`) — logically impossible: a column can only equal one literal at a time.',
-          hint: 'If the field is MULTI_TEXT and you want "contains both A and B": this is NOT expressible in DHIS2 2.41 PI grammar. Either (a) restructure into separate BOOLEAN data elements and filter `#{stage.dm} == true && #{stage.htn} == true`, or (b) use the Line Listing app at query time. If the field is single-value, the user picked exactly one — pick which value to filter on.',
-        };
+    for (const term of t.split('||')) {
+      const byRef = new Map(); // ref → Set(distinct literals compared with ==)
+      for (const m of term.matchAll(/(#\{[^}]+\}|A\{[^}]+\})\s*==\s*'([^']*)'/g)) {
+        if (!byRef.has(m[1])) byRef.set(m[1], new Set());
+        byRef.get(m[1]).add(m[2]);
+      }
+      for (const [ref, lits] of byRef) {
+        if (lits.size >= 2) {
+          return {
+            error: `Filter requires the same field ${ref} to equal ${[...lits].map(l => `'${l}'`).join(' AND ')} simultaneously — logically impossible (within an AND a field can equal only one literal).`,
+            hint: 'To match ANY of several values use OR: `#{X} == \'A\' || #{X} == \'B\'`. For a MULTI_TEXT "contains both A and B" (not expressible in PI grammar): split into BOOLEAN data elements and filter `#{stage.a} == true && #{stage.b} == true`, or use the Line Listing app at query time.',
+          };
+        }
       }
     }
   }
@@ -20048,6 +20328,45 @@ async function applyRuleActionSugarSideEffects(plan, rules) {
 //      displayName — auto-creating a PRV when a DE match is found
 //   3. rewrites A{name} (non-UID) into A{UID} using the program's TEAs
 //   4. refuses the POST with a structured _hint when a reference cannot be resolved
+// Resolve rule-action target display names (data_element_name /
+// tracked_entity_attribute_name) to UIDs against a program's DEs + TEAs. Mutates
+// each action in place, filling data_element_id / tei_attribute_id when only a
+// name was supplied. Returns { unresolved:[{name,kind}] } for names that matched
+// nothing. Lets the manage_program_rules UPDATE path bind name-targeted actions
+// the same way the create path (_buildAndPostProgramRules) already does — without
+// it, an ASSIGN/SETMANDATORYFIELD/HIDEFIELD passed by name saved target-less and
+// DHIS2 rejected the bundle ("DataElement ... cannot be null").
+async function resolveRuleActionTargetNames(pid, actions) {
+  const needs = (actions || []).some(a => a && (
+    (a.data_element_name && !a.data_element_id) ||
+    (a.tracked_entity_attribute_name && !a.tei_attribute_id)));
+  if (!needs) return { unresolved: [] };
+  const prog = await safeDhis2Fetch(`programs/${pid}?fields=programStages[programStageDataElements[dataElement[id,displayName]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName]]`);
+  if (!prog || prog._error) return { unresolved: [], _fetchError: prog && prog._error };
+  const deByName = new Map(), deBySan = new Map();
+  for (const ps of (prog.programStages || [])) for (const psde of (ps.programStageDataElements || [])) {
+    const de = psde.dataElement; if (!de?.id) continue;
+    deByName.set(de.displayName, de.id); deBySan.set(sanitizeVariableName(de.displayName), de.id);
+  }
+  const teaByName = new Map(), teaBySan = new Map();
+  for (const pta of (prog.programTrackedEntityAttributes || [])) {
+    const tea = pta.trackedEntityAttribute; if (!tea?.id) continue;
+    teaByName.set(tea.displayName, tea.id); teaBySan.set(sanitizeVariableName(tea.displayName), tea.id);
+  }
+  const unresolved = [];
+  for (const a of (actions || [])) {
+    if (a.data_element_name && !a.data_element_id) {
+      const id = deByName.get(a.data_element_name) || deBySan.get(sanitizeVariableName(a.data_element_name));
+      if (id) a.data_element_id = id; else unresolved.push({ name: a.data_element_name, kind: 'dataElement' });
+    }
+    if (a.tracked_entity_attribute_name && !a.tei_attribute_id) {
+      const id = teaByName.get(a.tracked_entity_attribute_name) || teaBySan.get(sanitizeVariableName(a.tracked_entity_attribute_name));
+      if (id) a.tei_attribute_id = id; else unresolved.push({ name: a.tracked_entity_attribute_name, kind: 'trackedEntityAttribute' });
+    }
+  }
+  return { unresolved };
+}
+
 async function _buildAndPostProgramRules(programId, rules, dryRun) {
   // 1. Lint conditions for known-broken boolean patterns.
   const lintErrors = [];
@@ -20112,16 +20431,46 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
 
   // Index TEAs by sanitized display name and by UID for A{} rewriting.
   const teaBySanitized = new Map();
+  const teaByDisplayName = new Map(); // raw displayName → entry (for action target resolution)
   const teaById = new Map();
   for (const ptea of (progResp.programTrackedEntityAttributes || [])) {
     const tea = ptea.trackedEntityAttribute;
     if (!tea?.id) continue;
     const entry = { id: tea.id, displayName: tea.displayName, valueType: tea.valueType, optionSet: tea.optionSet };
     teaBySanitized.set(sanitizeVariableName(tea.displayName), entry);
+    teaByDisplayName.set(tea.displayName, entry);
     teaById.set(tea.id, entry);
   }
 
   const isDhis2Uid = (s) => /^[a-zA-Z][a-zA-Z0-9]{10}$/.test(s);
+
+  // Resolve a rule action's TARGET (the DE/TEA the action acts on) from either an
+  // explicit UID (data_element_id / tei_attribute_id) OR a display name
+  // (data_element_name / tracked_entity_attribute_name). The schema advertises the
+  // *_name fields as "resolved to ID automatically" and the create_metadata rule
+  // path already resolves them (via deUidMap) — this makes manage_program_rules
+  // behave identically, so ASSIGN / SETMANDATORYFIELD / HIDEFIELD written by name
+  // actually bind instead of bouncing with "DataElement ... cannot be null".
+  const resolveActionDeEntry = (act) => {
+    if (!act) return null;
+    if (act.data_element_id) return deById.get(act.data_element_id) || { id: act.data_element_id };
+    const nm = act.data_element_name;
+    if (!nm) return null;
+    return deByDisplayName.get(nm)
+      || deBySanitized.get(String(nm).toLowerCase())
+      || deBySanitized.get(sanitizeVariableName(nm))
+      || null;
+  };
+  const resolveActionTeaEntry = (act) => {
+    if (!act) return null;
+    if (act.tei_attribute_id) return teaById.get(act.tei_attribute_id) || { id: act.tei_attribute_id };
+    const nm = act.tracked_entity_attribute_name;
+    if (!nm) return null;
+    return teaByDisplayName.get(nm)
+      || teaBySanitized.get(String(nm).toLowerCase())
+      || teaBySanitized.get(sanitizeVariableName(nm))
+      || null;
+  };
 
   // 3. Build payload while resolving references per-rule.
   const allPRVs = [];
@@ -20137,13 +20486,11 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   const pickSourceType = (deEntry, rule) => {
     const actionStageIds = new Set();
     for (const act of (rule.actions || [])) {
-      if (act.data_element_id) {
-        // Find which stage this action DE is in.
-        for (const [_, e] of deBySanitized) {
-          if (e.id === act.data_element_id) {
-            for (const sid of e.stageIds) actionStageIds.add(sid);
-          }
-        }
+      // Resolve the action target by id OR name so name-targeted actions still
+      // steer the PRV toward CURRENT_EVENT when they act on the trigger's stage.
+      const tgt = resolveActionDeEntry(act);
+      if (tgt && Array.isArray(tgt.stageIds)) {
+        for (const sid of tgt.stageIds) actionStageIds.add(sid);
       }
       if (act.program_stage_id) actionStageIds.add(act.program_stage_id);
     }
@@ -20311,8 +20658,22 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       };
       if (act.content) pra.content = act.content;
       if (act.data) pra.data = act.data;
-      if (act.data_element_id) pra.dataElement = { id: act.data_element_id };
-      if (act.tei_attribute_id) pra.trackedEntityAttribute = { id: act.tei_attribute_id };
+      // Resolve the action's target DE/TEA by id OR by display name. Previously
+      // only *_id was honored, so a name-targeted ASSIGN/SETMANDATORYFIELD/HIDEFIELD
+      // saved with no target and DHIS2 rejected the whole bundle at validation.
+      const deTgt = resolveActionDeEntry(act);
+      const teaTgt = deTgt ? null : resolveActionTeaEntry(act);
+      if (deTgt && deTgt.id) pra.dataElement = { id: deTgt.id };
+      else if (teaTgt && teaTgt.id) pra.trackedEntityAttribute = { id: teaTgt.id };
+      // A name was supplied but did not resolve → surface it (fail loudly with
+      // suggestions) rather than posting a target-less action that bounces server-side.
+      if (!pra.dataElement && !pra.trackedEntityAttribute) {
+        if (act.data_element_name) {
+          unresolved.push({ rule: rule.name, reference: `action target data_element_name="${act.data_element_name}"`, suggestions: collectSuggestions(act.data_element_name) });
+        } else if (act.tracked_entity_attribute_name) {
+          unresolved.push({ rule: rule.name, reference: `action target tracked_entity_attribute_name="${act.tracked_entity_attribute_name}"`, suggestions: collectSuggestions(act.tracked_entity_attribute_name) });
+        }
+      }
       if (act.program_stage_id) pra.programStage = { id: act.program_stage_id };
       if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
       allPRAs.push(pra);
@@ -20394,6 +20755,81 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     }
   }
 
+  // ── Option-set CONDITION literals: rewrite option NAMES → CODES ──
+  // Auto-created option-set PRVs use useCodeForOptionSet=true, so the value the
+  // rule engine compares is the option CODE (this matches the DHIS2 demo DB
+  // convention, e.g. #{CaseClassifiedAs} != 'IMPORTED'). A condition that compares
+  // such a variable to an option NAME (…== 'Positive') lints clean, SAVES, and then
+  // NEVER FIRES — a silent failure. We already map ASSIGN data names→codes; do the
+  // same for conditions. This only ever rewrites a NAME literal to its CODE — it
+  // never touches '' (empty checks) or literals that are already valid codes, so it
+  // cannot break a condition that was already correct (it can only fix a broken one).
+  let conditionOptionAdvisories = [];
+  {
+    // varName(lower) → { optionSetId, useCode } for every option-set-backed PRV
+    // in scope (freshly built for this batch + already existing on the program).
+    const varOptionInfo = new Map();
+    const noteVar = (name, useCode, deId, teaId) => {
+      if (!name) return;
+      let osId = null;
+      if (deId) osId = deById.get(deId)?.optionSet?.id || null;
+      else if (teaId) osId = teaById.get(teaId)?.optionSet?.id || null;
+      if (osId) varOptionInfo.set(String(name).toLowerCase(), { optionSetId: osId, useCode: useCode !== false });
+    };
+    for (const prv of allPRVs) noteVar(prv.name, prv.useCodeForOptionSet, prv.dataElement?.id, prv.trackedEntityAttribute?.id);
+    for (const [, prv] of existingPRVs) noteVar(prv.name, prv.useCodeForOptionSet, prv.dataElement?.id, prv.trackedEntityAttribute?.id);
+
+    // Which option sets do the conditions actually reference (option vars w/ useCode)?
+    const neededOsIds = new Set();
+    for (const pr of allPRs) {
+      for (const m of (pr.condition.match(/#\{([^}]+)\}/g) || [])) {
+        const info = varOptionInfo.get(m.slice(2, -1).toLowerCase());
+        if (info && info.useCode) neededOsIds.add(info.optionSetId);
+      }
+    }
+    if (neededOsIds.size) {
+      const osIds = [...neededOsIds];
+      const resps = await Promise.all(osIds.map(id => safeDhis2Fetch(`optionSets/${id}?fields=id,name,options[name,code]`)));
+      const osMap = new Map(); // osId → { byCode:Set, byName:Map(lower→code), name, options }
+      for (let i = 0; i < osIds.length; i++) {
+        const o = resps[i];
+        if (!o || o._error) continue;
+        osMap.set(osIds[i], {
+          byCode: new Set((o.options || []).map(x => String(x.code))),
+          byName: new Map((o.options || []).map(x => [String(x.name).toLowerCase(), String(x.code)])),
+          name: o.name,
+          options: o.options || [],
+        });
+      }
+      for (const pr of allPRs) {
+        let cond = pr.condition;
+        const usedVars = new Set((cond.match(/#\{([^}]+)\}/g) || []).map(m => m.slice(2, -1)));
+        for (const vRaw of usedVars) {
+          const info = varOptionInfo.get(vRaw.toLowerCase());
+          if (!info || !info.useCode) continue;
+          const os = osMap.get(info.optionSetId);
+          if (!os) continue;
+          const varToken = `#{${vRaw}}`;
+          const esc = vRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          // `#{var} ==|!= 'literal'` in either order.
+          const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*#\\{${esc}\\}`, 'g');
+          cond = cond.replace(re, (full, op1, lit1, lit2, op2) => {
+            const lit = (lit1 !== undefined ? lit1 : lit2);
+            const op = op1 || op2;
+            if (lit === '') return full;         // empty-value check — leave alone
+            if (os.byCode.has(lit)) return full; // already a code — leave alone
+            const code = os.byName.get(lit.toLowerCase());
+            if (code) return op1 ? `${varToken} ${op} '${code}'` : `'${code}' ${op} ${varToken}`;
+            // Neither a code nor a name of this option set → advise (don't rewrite).
+            conditionOptionAdvisories.push(`Rule "${pr.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of option set "${os.name}" (codes: ${os.options.map(x => x.code).join(', ')}). This comparison will never match — verify the value.`);
+            return full;
+          });
+        }
+        pr.condition = cond;
+      }
+    }
+  }
+
   const payload = {};
   if (allPRVs.length) payload.programRuleVariables = allPRVs;
   if (allPRAs.length) payload.programRuleActions = allPRAs;
@@ -20411,6 +20847,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       ...(sugarSideEffects.stageUpdates.length ? { compulsory_flags_cleared: sugarSideEffects.stageUpdates } : {}),
       ...(sugarSideEffects.errors.length ? { compulsory_flag_errors: sugarSideEffects.errors } : {}),
       ...(sugarPlan.siblingMandateRules.length ? { auto_paired_mandate_rules: sugarPlan.siblingMandateRules.map(r => r.name) } : {}),
+      ...(conditionOptionAdvisories.length ? { condition_option_advisories: conditionOptionAdvisories } : {}),
     },
   };
 }
