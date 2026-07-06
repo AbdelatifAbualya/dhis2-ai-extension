@@ -394,25 +394,39 @@
   function cancelProgressWatchdog() {
     if (progressWatchdog) { clearTimeout(progressWatchdog); progressWatchdog = null; }
   }
+  function declareWorkerLost() {
+    if (!isSending) return;
+    removeThinking();
+    markAllToolsDone();
+    finalizeStream();
+    addMessage('error', 'The assistant stopped responding — the background worker was interrupted (service-worker restart or dropped provider connection). Tool calls marked ✓ above did complete; please verify in DHIS2. Your conversation is saved — send your message again to continue.');
+    isSending = false;
+    chatInput.disabled = false;
+    chatInput.focus();
+  }
   function startProgressWatchdog() {
     cancelProgressWatchdog();
     progressWatchdog = setTimeout(() => {
       progressWatchdog = null;
       if (!isSending) return;
-      removeThinking();
-      markAllToolsDone();
-      finalizeStream();
-      addMessage('error', 'The assistant stopped responding (background worker interrupted or upstream timeout). Any tool calls above that show ✓ did complete — please verify in DHIS2 and try again if needed.');
-      isSending = false;
-      chatInput.disabled = false;
-      chatInput.focus();
+      // Don't declare death on silence alone — broadcasts can be missed while
+      // the worker is still mid-task. Probe it: a busy worker (keepalive held)
+      // means the request is still running, so quietly keep waiting. No reply
+      // or a restarted worker (busy=false → in-flight state was lost) is real.
+      chrome.runtime.sendMessage({ type: 'AGENT_STATUS' }).then((r) => {
+        if (r && r.alive && r.busy && isSending) {
+          startProgressWatchdog();
+        } else {
+          declareWorkerLost();
+        }
+      }).catch(() => declareWorkerLost());
     }, WATCHDOG_MS);
   }
 
   // ── Background Messages ──────────────────────────────────────────────────
   const LIFE_SIGNALS = new Set([
     'AI_THINKING', 'AI_TOOL_CALL', 'AI_TOOL_DONE', 'AI_CHART',
-    'AI_STREAM_START', 'AI_STREAM_CHUNK',
+    'AI_STREAM_START', 'AI_STREAM_CHUNK', 'AI_HEARTBEAT',
   ]);
   function handleBackgroundMessage(msg) {
     // Any signal from the SW proves it's alive — reset the watchdog so a long

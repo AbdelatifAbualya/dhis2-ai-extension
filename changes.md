@@ -1494,3 +1494,54 @@ option_set_id precedent from entry 21):**
 5. **Security unchanged by construction**: write-auth gate, knownIds preflight, privacy gate, backups, bulk-delete confirmations, save-diagnosis read-only mode all untouched and see the same calls (the manual gate runs before preflight and makes no API call; it can only withhold execution, never grant it). Live-verified during testing: privacy gate + unknown-UID preflight refused exactly as before.
 
 **Verification (live on play 2.43.0.1, real `runAgenticLoop` with Fireworks kimi-k2p6):** full one-turn E2E of the target scenario — 32s, 5 tool calls, 2 manual deliveries, **0 failed calls**; program + 2 TEAs (existing demo TEAs reused) + 3-DE stage + OU + `rwrw----` + custom stage form (3 bound inputs) + 2 rules with auto-created `muac_in_cm` PRV; `manage_program_rules(action=audit)` **0/0 issues**. Multi-turn: turn-1 manual stubbed in history, gate re-fired turn 2, SETMANDATORYFIELD rule + `age_in_months` PRV created, audit clean. PRV fix proven 4 ways (fuzzy bind + refusal × create/add paths; refusals imported NOTHING). Read-only turns unaffected. `node --check` passes both files; 32 tools registered; all 16 manuals build. All test objects cleaned from the playground.
+
+---
+
+## 27. Repeated-failure guard, budget-exhaustion summary, liveness heartbeat + stream stall guard (v2.8.1)
+
+**Files:** `background.js`, `sidepanel/panel.js`, `manifest.json`
+**Full write-up:** `CHANGES_retry_guard_liveness.md`
+
+**Type of change:** New safety rail (agentic loop) + robustness fixes (streaming/panel watchdog)
+
+**Incident (2026-07-06, MCH tracker build):** `manage_program_indicators(create)` was rejected by
+DHIS2's expression validator and the model re-sent the IDENTICAL call ~48 times until the
+50-iteration budget died with *"Reached maximum iterations."* Root cause: the validator returns
+**HTTP 200 + `{status:"ERROR"}`**, so the existing 4xx/5xx brake (`noteHttpErrorFromResult`)
+never fired — nothing blocked HTTP-200 failures. A second incident: the panel's 90s watchdog
+declared *"assistant stopped responding"* during a long tool-argument generation (tool-call SSE
+deltas broadcast no life signals), then the run visibly resumed.
+
+**What changed:**
+
+1. **Per-turn repeated-failure guard** (`noteToolFailure`, `repeatedFailureStopOrNull`, wired
+   into `preflightCheckCall` + the post-flight section of the loop): every failed call (any
+   `_error`/`success:false`, regardless of HTTP status) is recorded by a stable signature of
+   (tool, args) and by (tool:action, normalized-error-family). Identical failing calls are
+   refused from the 2nd attempt (3rd for transient errors); hints escalate from the 2nd
+   same-family failure; the operation is hard-blocked for the turn after 4 same-family
+   failures with instructions to give the user a final answer. A success by ANY other call
+   re-allows one identical retry (prerequisite-fixed workflow). Blocked calls never reach the
+   network.
+2. **Budget-exhaustion summary** (end of `_runAgenticLoopInner`): on iteration-budget
+   exhaustion the loop makes one final TOOL-FREE provider call that streams a real summary
+   (what succeeded with IDs / what failed with exact errors / next step) instead of returning
+   the dead-end "Reached maximum iterations" string (now only a last-resort fallback).
+3. **Liveness heartbeat**: the keepalive interval now broadcasts `AI_HEARTBEAT` every 20s
+   while a task runs; `AGENT_STATUS` runtime message returns `{alive, busy}`; both SSE parsers
+   broadcast `Composing action… (~N tokens)` every 80 tool-arg deltas.
+4. **Stream stall guard** (`readSseChunkWithStallGuard`): 120s of zero bytes mid-stream
+   aborts the read instead of hanging forever; the loop transparently retries a stalled
+   iteration up to 2× when nothing has streamed to the panel yet.
+5. **Panel watchdog** (`sidepanel/panel.js`): `AI_HEARTBEAT` is a life signal; on timeout the
+   watchdog first probes `AGENT_STATUS` — alive+busy re-arms silently; only a dead or
+   restarted-idle worker surfaces the (reworded) error.
+
+**Verification:** 27 unit checks on the extracted guard; 15-check E2E replaying the disaster
+through the REAL `runAgenticLoop` against playground stable-2-43-0-1 (1 real execution instead
+of ~48, streamed final summary); 8-check happy-path E2E (valid create unhindered, normal end,
+probe answers, playground cleaned). `node --check` passes on both files.
+
+**Scope of impact:** No tool logic changed. Successful calls and legitimate fix-then-retry
+flows are unaffected (proven by the happy-path E2E + success-bypass unit checks). The guard
+only refuses calls that repeat a recorded failure.

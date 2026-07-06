@@ -447,12 +447,157 @@ function httpErrorStopOrNull(threshold = 3) {
   };
 }
 
+// ── Per-turn repeated-failure guard ─────────────────────────────────────────
+// The HTTP counter above only sees 4xx/5xx. Many deterministic failures come
+// back as HTTP 200 with an error payload — e.g. the program-indicator
+// /expression/description validator returns 200 + {status:"ERROR"} — so
+// nothing stopped the model from re-sending the EXACT same failing call until
+// the iteration budget was gone. This guard tracks every failed call by a
+// stable signature of (tool, args):
+//   • an identical call that already failed deterministically is refused on
+//     the 2nd attempt (transient network-ish errors get one identical retry);
+//   • the same tool+action failing with the same error FAMILY (args may
+//     differ) escalates the returned _hint from failure #2 and hard-blocks the
+//     operation after SAME_ERROR_FAMILY_LIMIT failures, instructing the model
+//     to give the user a final answer instead of hammering the server.
+
+const IDENTICAL_FAILURE_LIMIT = 1;   // deterministic error: block from the 2nd identical attempt
+const IDENTICAL_TRANSIENT_LIMIT = 2; // transient error: allow ONE identical retry, block the 3rd
+const SAME_ERROR_FAMILY_LIMIT = 4;   // same tool+action+error family, any args: hard block after 4
+
+// Deterministic stringify (sorted keys, recursively) so the same logical call
+// always produces the same signature regardless of key order in the model's JSON.
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined';
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  return '{' + Object.keys(value)
+    .filter(k => value[k] !== undefined)
+    .sort()
+    .map(k => JSON.stringify(k) + ':' + stableStringify(value[k]))
+    .join(',') + '}';
+}
+
+function failedCallSignature(toolName, args) {
+  return `${toolName}|${stableStringify(args || {})}`;
+}
+
+// Extract the failure text from a tool result, or '' when the result is not a
+// failure. Mirrors the loop's own success test (!_error && success !== false).
+function toolFailureText(result) {
+  if (!result || typeof result !== 'object') return '';
+  if (result._tool_manual || result._idempotent_replay) return '';
+  if (result._error) return String(result._error);
+  if (result.success === false) {
+    const e = Array.isArray(result.errors) && result.errors.length ? result.errors[0] : null;
+    return String(e || result.message || 'Operation failed (success=false)');
+  }
+  return '';
+}
+
+// Transient errors (network blips, rate limits, 5xx) may legitimately succeed
+// on an identical retry; everything else is treated as deterministic.
+function isTransientToolError(text) {
+  return /timed?\s?out|timeout|stall|network|failed to fetch|connection|socket|temporar|rate.?limit|too many requests|overloaded|busy|(^|\D)(429|500|502|503|504|529)(\D|$)/i
+    .test(String(text || ''));
+}
+
+// Collapse an error message into a "family" key: same message modulo UIDs,
+// numbers and whitespace. Lets us catch "same error, slightly different args".
+function toolErrorFamily(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\b[a-z][a-z0-9]{10}\b/gi, '<uid>')
+    .replace(/\d+/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+}
+
+// Record a failed tool call. Returns { famCount, error } when the result was a
+// failure (famCount = how many times this tool+action has failed with this
+// error family this turn), or null for successes.
+function noteToolFailure(toolName, args, result) {
+  const errText = toolFailureText(result);
+  if (!errText) return null;
+  if (!(dhis2.failedCallSigs instanceof Map)) dhis2.failedCallSigs = new Map();
+  if (!(dhis2.toolErrorFamilies instanceof Map)) dhis2.toolErrorFamilies = new Map();
+  const sig = failedCallSignature(toolName, args);
+  const entry = dhis2.failedCallSigs.get(sig) || { count: 0, blockedAttempts: 0 };
+  entry.count++;
+  entry.tool = toolName;
+  entry.error = errText.slice(0, 300);
+  entry.transient = isTransientToolError(errText);
+  // Snapshot the success counter: if some OTHER call succeeds after this
+  // failure (e.g. a missing prerequisite gets created), ONE identical retry
+  // is allowed again — the environment may have changed.
+  entry.successMark = dhis2.toolSuccessCount || 0;
+  dhis2.failedCallSigs.set(sig, entry);
+  const famKey = `${toolName}:${args?.action || ''}|${toolErrorFamily(errText)}`;
+  const famCount = (dhis2.toolErrorFamilies.get(famKey) || 0) + 1;
+  dhis2.toolErrorFamilies.set(famKey, famCount);
+  return { famCount, error: entry.error };
+}
+
+// Pre-flight refusal for calls that are doomed to repeat a known failure.
+function repeatedFailureStopOrNull(toolName, args) {
+  if (dhis2.failedCallSigs instanceof Map && dhis2.failedCallSigs.size) {
+    const prev = dhis2.failedCallSigs.get(failedCallSignature(toolName, args));
+    if (prev) {
+      // If a DIFFERENT call succeeded since this one last failed, the model may
+      // have fixed a prerequisite (created the missing option set, verified a
+      // UID, …) — allow ONE identical retry. A failed retry re-snapshots the
+      // mark in noteToolFailure, so it re-blocks unless something new succeeds.
+      if ((dhis2.toolSuccessCount || 0) > (prev.successMark ?? 0)) {
+        prev.successMark = dhis2.toolSuccessCount || 0;
+        return null;
+      }
+      const limit = prev.transient ? IDENTICAL_TRANSIENT_LIMIT : IDENTICAL_FAILURE_LIMIT;
+      if (prev.count >= limit) {
+        prev.blockedAttempts = (prev.blockedAttempts || 0) + 1;
+        return {
+          _error: `BLOCKED: this exact ${toolName} call already failed ${prev.count} time(s) this turn with: "${prev.error}". Identical retries are refused — the same input produces the same error.`,
+          _hint: prev.blockedAttempts >= 2
+            ? `You have re-sent this blocked call ${prev.blockedAttempts} times. STOP calling ${toolName} with these arguments. Give the user your final answer NOW: (1) what succeeded so far this turn (object names + IDs), (2) what failed and the exact error quoted above, (3) a corrected approach or one specific question for the user.`
+            : `Read the error message and CHANGE the failing input before calling again — e.g. rewrite the rejected expression/filter using only the allowed grammar, use different verified UIDs, or test with dry_run. If you cannot determine a fix from the error, stop and report it to the user instead of retrying.`,
+          _scope: 'repeated_identical_failure',
+          _previous_error: prev.error,
+          _identical_failures: prev.count,
+        };
+      }
+    }
+  }
+  if (dhis2.toolErrorFamilies instanceof Map && dhis2.toolErrorFamilies.size) {
+    const prefix = `${toolName}:${args?.action || ''}|`;
+    let worst = 0;
+    let worstFamily = null;
+    for (const [k, n] of dhis2.toolErrorFamilies) {
+      if (k.startsWith(prefix) && n > worst) { worst = n; worstFamily = k.slice(prefix.length); }
+    }
+    if (worst >= SAME_ERROR_FAMILY_LIMIT) {
+      return {
+        _error: `STOP: ${toolName}${args?.action ? `(action=${args.action})` : ''} has failed ${worst} times this turn with the same class of error ("${worstFamily}"). Further calls to this operation are blocked for this turn.`,
+        _hint: `This error is not going away by resending variations of the same attempt. Give the user your final answer NOW: (1) list everything successfully created this turn (names + IDs), (2) quote the exact server error for what failed, (3) recommend one concrete next step (e.g. show the corrected expression you would try and ask the user to confirm, or suggest skipping the failing objects). Do NOT call ${toolName} again this turn.`,
+        _scope: 'same_error_family_limit',
+        _family_error: worstFamily,
+        _family_failures: worst,
+      };
+    }
+  }
+  return null;
+}
+
 // Pre-flight check called before EVERY tool dispatch. Returns null when the
 // call is safe to proceed; else returns a structured refusal.
 function preflightCheckCall(toolName, args) {
   // Hard stop on cumulative HTTP errors — prevents runaway retry loops.
   const stop = httpErrorStopOrNull();
   if (stop) return stop;
+  // Refuse calls that repeat a known failure (identical args that already
+  // failed, or an operation stuck on the same error family). Applies to ALL
+  // tools — validation errors arrive as HTTP 200 payloads, so the HTTP
+  // counter above never sees them.
+  const repeatStop = repeatedFailureStopOrNull(toolName, args);
+  if (repeatStop) return repeatStop;
   // Skip UID validation when the seed set is empty (very first iteration with
   // no context) OR for read-only discovery tools whose job is to populate IDs.
   const DISCOVERY_TOOLS = new Set([
@@ -939,6 +1084,7 @@ const PER_TURN_DHIS2_FIELDS = new Set([
   'writeAuth',
   'destructive404Count', 'destructive404History',
   'httpErrorCount', 'httpErrorHistory',
+  'failedCallSigs', 'toolErrorFamilies', 'toolSuccessCount',
 ]);
 
 function snapshotDhis2ForPersistence() {
@@ -7491,6 +7637,30 @@ async function callFireworks(messages, useTools = true, tools = TOOLS) {
   }
 }
 
+// ── Stream stall guard ───────────────────────────────────────────────────────
+// reader.read() can hang forever on a half-dead connection (NAT drop, proxy
+// timeout that never sends FIN/RST). The connect timeout only covers headers,
+// so without this guard a mid-body stall left the whole agentic loop waiting
+// indefinitely. 120s with zero bytes while a generation is in flight means the
+// stream is dead — reject so the caller can retry or surface a clear error.
+const STREAM_STALL_MS = 120_000;
+async function readSseChunkWithStallGuard(reader, providerLabel) {
+  let stallTimer = null;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        stallTimer = setTimeout(
+          () => reject(new Error(`LLM stream stalled: no data from ${providerLabel} for ${STREAM_STALL_MS / 1000}s. The connection likely dropped — please retry.`)),
+          STREAM_STALL_MS
+        );
+      }),
+    ]);
+  } finally {
+    if (stallTimer) clearTimeout(stallTimer);
+  }
+}
+
 // ── Streaming Fireworks API call ─────────────────────────────────────────────
 // Uses SSE streaming so text appears progressively in the chat.
 // onTextChunk(text) is called for each content delta.
@@ -7618,9 +7788,17 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
   let thinkFilterDone = !needsThinkFilter;  // skip filtering for models without think blocks
   let thinkBuffer = '';         // accumulates content until </think> or stream end
   let thinkTokenCount = 0;      // tracks streaming deltas received during think block
+  let toolArgTokenCount = 0;    // tracks tool-argument deltas (progress signal for long payloads)
 
   while (true) {
-    const { done, value } = await reader.read();
+    let readResult;
+    try {
+      readResult = await readSseChunkWithStallGuard(reader, cfg.modelId || 'the LLM provider');
+    } catch (stallErr) {
+      try { reader.cancel(); } catch {}
+      throw stallErr;
+    }
+    const { done, value } = readResult;
     if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
@@ -7648,6 +7826,13 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
       // ── Tool call deltas ──
       if (delta.tool_calls) {
         hasToolCalls = true;
+        // Life/progress signal: big payloads (e.g. whole-program metadata)
+        // stream for minutes with no visible text — surface activity so the
+        // panel watchdog and the user both see the model is working.
+        toolArgTokenCount++;
+        if (toolArgTokenCount % 80 === 0) {
+          broadcast({ type: 'AI_THINKING', iteration: iteration + 1, label: `Composing action… (~${toolArgTokenCount} tokens)` });
+        }
         for (const tc of delta.tool_calls) {
           const idx = tc.index ?? 0;
           if (!toolCallMap[idx]) {
@@ -7961,9 +8146,17 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
   let thinkFilterDone = !needsThinkFilter;
   let thinkBuffer = '';
   let thinkTokenCount = 0;
+  let toolArgTokenCount = 0;
 
   while (true) {
-    const { done, value } = await reader.read();
+    let readResult;
+    try {
+      readResult = await readSseChunkWithStallGuard(reader, 'Anthropic');
+    } catch (stallErr) {
+      try { reader.cancel(); } catch {}
+      throw stallErr;
+    }
+    const { done, value } = readResult;
     if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
@@ -8022,6 +8215,11 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
           } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
             const tc = toolCallMap[event.index];
             if (tc) tc.function.arguments += delta.partial_json;
+            // Progress/life signal during long tool-payload generations.
+            toolArgTokenCount++;
+            if (toolArgTokenCount % 80 === 0) {
+              broadcast({ type: 'AI_THINKING', iteration: iteration + 1, label: `Composing action… (~${toolArgTokenCount} tokens)` });
+            }
           } else if (delta?.type === 'thinking' && delta.thinking) {
             // Anthropic extended thinking — skip (it's internal reasoning)
             thinkTokenCount++;
@@ -22769,6 +22967,10 @@ function acquireKeepalive() {
   if (swKeepaliveInterval) return;
   swKeepaliveInterval = setInterval(() => {
     try { chrome.runtime.getPlatformInfo().catch(() => {}); } catch {}
+    // Heartbeat to the side panel: proves the worker is alive during long
+    // silent phases (big tool-argument generations emit no stream chunks),
+    // so the panel's watchdog doesn't falsely declare "stopped responding".
+    broadcast({ type: 'AI_HEARTBEAT', at: Date.now() });
   }, 20_000);
 }
 function releaseKeepalive() {
@@ -22918,6 +23120,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   dhis2.destructive404History = [];
   dhis2.httpErrorCount = 0;
   dhis2.httpErrorHistory = [];
+  dhis2.failedCallSigs = new Map();
+  dhis2.toolErrorFamilies = new Map();
+  dhis2.toolSuccessCount = 0;
   console.log(`[AgenticLoop] writeAuth = ${dhis2.writeAuth.scope} (${dhis2.writeAuth.reason})`);
 
   const ctx = dhis2.pageContext || {};
@@ -23255,6 +23460,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   ];
   let lastToolName = null;
   let emptyResponseCount = 0; // Guard against infinite think-only loops
+  let providerStallRetries = 0; // Transparent retries for mid-stream stalls (nothing shown to the user yet)
 
   // Marker: everything in `messages` from this index on is THIS turn (the user
   // message + any prefetch + every assistant/tool message the loop adds). The
@@ -23288,15 +23494,32 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         chunkBuffer = '';
       }
     };
-    const result = await callProviderStreaming(messages, true, (chunk) => {
-      if (chunk === null) {
-        broadcast({ type: 'AI_STREAM_START' });
-        streamStartBroadcast = true;
-      } else if (streamStartBroadcast) {
-        chunkBuffer += chunk;
-        if (!flushTimer) flushTimer = setTimeout(flushChunks, FLUSH_MS);
+    let result;
+    try {
+      result = await callProviderStreaming(messages, true, (chunk) => {
+        if (chunk === null) {
+          broadcast({ type: 'AI_STREAM_START' });
+          streamStartBroadcast = true;
+        } else if (streamStartBroadcast) {
+          chunkBuffer += chunk;
+          if (!flushTimer) flushTimer = setTimeout(flushChunks, FLUSH_MS);
+        }
+      }, wireTools, i);
+    } catch (provErr) {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      chunkBuffer = '';
+      // A mid-stream stall before ANY text reached the panel can be retried
+      // transparently — `messages` was not mutated for this iteration, so the
+      // request is safely repeatable. If text already streamed, rethrow so the
+      // user sees the error rather than duplicated output.
+      if (/stream stalled/i.test(provErr?.message || '') && !streamStartBroadcast && providerStallRetries < 2) {
+        providerStallRetries++;
+        console.warn(`[AgenticLoop] provider stream stalled — retrying (${providerStallRetries}/2)`);
+        broadcast({ type: 'AI_THINKING', iteration: i + 1, label: `Connection dropped — retrying (${providerStallRetries}/2)` });
+        continue;
       }
-    }, wireTools, i);
+      throw provErr;
+    }
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (chunkBuffer) {
       broadcast({ type: 'AI_STREAM_CHUNK', text: chunkBuffer });
@@ -23372,6 +23595,19 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             //    can reference them, and bump the HTTP-error counter on 4xx/5xx. ──
             recordKnownIdsFromResult(toolResult);
             noteHttpErrorFromResult(tc.function.name, toolResult);
+            // Track EVERY failure (including HTTP-200 error payloads like
+            // rejected PI expressions) so preflight can refuse doomed retries.
+            // From the 2nd same-family failure, escalate the hint the model
+            // sees so it changes approach instead of resending variations.
+            const failNote = noteToolFailure(tc.function.name, args, toolResult);
+            if (failNote && failNote.famCount >= 2) {
+              toolResult._failure_streak = failNote.famCount;
+              toolResult._hint = `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of ${tc.function.name} with the same error this turn. Identical retries are BLOCKED. Change the failing part based on the exact error above (e.g. simplify the expression to the supported grammar, or test with dry_run). If you cannot fix it now, STOP calling ${tc.function.name}: give the user a final answer listing what succeeded (names + IDs), what failed with this exact error, and your recommended next step.`;
+            } else if (!failNote) {
+              // Success — unlocks ONE identical retry for previously failed
+              // calls (a prerequisite may have just been fixed).
+              dhis2.toolSuccessCount = (dhis2.toolSuccessCount || 0) + 1;
+            }
           }
         }
 
@@ -23593,8 +23829,58 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     }
   }
 
-  // Even when the loop exhausts its iteration budget, persist the action trail
-  // so the next turn still remembers the tool calls/IDs from this turn.
+  // Iteration budget exhausted. Instead of the dead-end "Reached maximum
+  // iterations" error (disastrous after a long build — the user gets no record
+  // of what WAS created), force ONE final tool-free completion so the model
+  // summarizes what succeeded (names + IDs), what failed (exact errors), and
+  // what to do next. The system nudge is transient — buildTurnHistory drops it.
+  try {
+    messages.push({
+      role: 'system',
+      content:
+        'TOOL BUDGET EXHAUSTED — you cannot make any more tool calls this turn. ' +
+        'Write your final answer to the user NOW, in plain language: ' +
+        '(1) what completed successfully this turn (object names + IDs), ' +
+        '(2) what failed — quote the exact error message(s), ' +
+        '(3) the most likely cause and one concrete recommended next step. ' +
+        'Do not promise to retry and do not output tool calls.',
+    });
+    broadcast({ type: 'AI_THINKING', iteration: 50, label: 'Summarizing results' });
+    let finalStreamStarted = false;
+    let finalBuf = '';
+    let finalTimer = null;
+    const flushFinal = () => {
+      finalTimer = null;
+      if (finalBuf) { broadcast({ type: 'AI_STREAM_CHUNK', text: finalBuf }); finalBuf = ''; }
+    };
+    const finalResult = await callProviderStreaming(messages, false, (chunk) => {
+      if (chunk === null) {
+        broadcast({ type: 'AI_STREAM_START' });
+        finalStreamStarted = true;
+      } else if (finalStreamStarted) {
+        finalBuf += chunk;
+        if (!finalTimer) finalTimer = setTimeout(flushFinal, 40);
+      }
+    }, [], 49);
+    if (finalTimer) { clearTimeout(finalTimer); finalTimer = null; }
+    if (finalBuf) { broadcast({ type: 'AI_STREAM_CHUNK', text: finalBuf }); finalBuf = ''; }
+    const finalText = finalResult?.choices?.[0]?.message?.content || '';
+    if (finalText.trim()) {
+      messages.push({ role: 'assistant', content: finalText });
+      if (finalStreamStarted) broadcast({ type: 'AI_STREAM_END', text: finalText });
+      const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
+      conversationHistory.push(...turnHist);
+      conversationHistory = trimConversationHistory(conversationHistory);
+      lastInteraction = { question: userText, apiCalls: apiCallsLog, answer: finalText };
+      saveState();
+      return { text: finalText, charts, streamed: finalStreamStarted };
+    }
+  } catch (e) {
+    console.warn('[AgenticLoop] budget-exhaustion summary failed:', e?.message || e);
+  }
+
+  // Fallback: persist the action trail so the next turn still remembers the
+  // tool calls/IDs from this turn, then return the generic message.
   try {
     const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
     if (turnHist.length) {
@@ -23603,7 +23889,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       saveState();
     }
   } catch {}
-  return { text: 'Reached maximum iterations. Try a more specific question.', charts };
+  return { text: 'Reached maximum iterations — I could not finish this request. The action log above shows what completed (✓) and what failed (✗).', charts };
 }
 
 // ── Image Cropping (OffscreenCanvas in service worker) ───────────────────────
@@ -23818,6 +24104,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'GET_STATE': {
       sendResponse({ state: getSerializableState() });
+      return true;
+    }
+
+    case 'AGENT_STATUS': {
+      // Liveness probe from the side panel's watchdog. `busy` distinguishes a
+      // worker that is still mid-task (keepalive held) from one that Chrome
+      // restarted and lost the in-flight request (refs reset to 0 on restart).
+      sendResponse({ alive: true, busy: swKeepaliveRefs > 0 });
       return true;
     }
 
