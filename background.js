@@ -1005,7 +1005,9 @@ function buildTurnHistory(messages, persistFromIdx, userContentOverride) {
     const m = messages[k];
     if (!m || m.role === 'system') continue; // transient nudges/reminders
     if (m.role === 'tool') {
-      out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: truncateToolContentForHistory(m.content) });
+      // Manual-gate results are stubbed (re-delivered on demand next turn);
+      // everything else gets the normal size cap.
+      out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: stubToolContentForHistory(m.content) });
     } else if (m.role === 'assistant') {
       const hasCalls = m.tool_calls && m.tool_calls.length;
       const hasText = m.content && String(m.content).trim();
@@ -5348,6 +5350,640 @@ const TOOL_ROUTER = Object.freeze({
   manage_backups: true,
 });
 
+// ── Lazy Tool Manuals (two-tier tool docs) ───────────────────────────────────
+// Progressive disclosure of tool documentation, so the per-iteration LLM
+// context is not filled with how-to instructions for tools the model has not
+// decided to use yet:
+//
+//   Tier 1 (always on the wire): every contextual tool is sent to the model,
+//   but MANUAL_TOOLS members get a SLIM definition — a short hand-written
+//   routing description (TOOL_SUMMARIES) + their real schema with long
+//   property prose truncated (enums/types/required stay intact; the `action`
+//   enum description is kept in full because it is routing information).
+//
+//   Tier 2 (delivered on use): the FULL manual — the tool's original rich
+//   description from TOOLS, plus the deep how-to KB text that used to live in
+//   buildSystemPrompt (MANUAL_EXTRAS), plus a complete parameter reference
+//   rendered from the original schema — is returned as the tool result of the
+//   FIRST call to that tool in a turn. That first call does NOT execute; the
+//   model reads the manual and re-issues the call, which then executes
+//   normally for the rest of the turn.
+//
+// Security/behavior invariants this design preserves BY CONSTRUCTION:
+//   - TOOLS stays the single source of truth; executors, TOOL_ROUTER,
+//     getContextualTools, write-auth gates, backups and preflight checks are
+//     untouched and see exactly the same calls as before.
+//   - A write-capable tool can never execute before the model has been handed
+//     its full instructions (the gate is deterministic, not best-effort).
+//   - No instruction text is lost — it moves from "always in context" to
+//     "in context from the moment the tool is first used".
+
+// Write-capable / complex tools that use slim wire definitions + the
+// first-call manual gate. Read tools (dhis2_query, search_metadata, counts,
+// analytics, architect_metadata, …) and manage_backups (recovery path must be
+// zero-friction) keep their full definitions on the wire.
+const MANUAL_TOOLS = new Set([
+  'create_metadata',
+  'manage_metadata',
+  'manage_program_rules',
+  'manage_program_indicators',
+  'manage_program_notifications',
+  'manage_datasets',
+  'manage_custom_forms',
+  'manage_validation_rules',
+  'manage_org_units',
+  'manage_indicators',
+  'manage_option_sets',
+  'manage_legend_sets',
+  'manage_dashboards',
+  'manage_maps',
+  'manage_custom_translations',
+  'manage_growth_chart_plugin',
+]);
+
+// Short routing descriptions sent on the wire for MANUAL_TOOLS. These carry
+// WHAT the tool does and WHEN to pick it (including the safety-critical
+// "never do this via dhis2_query" routing rules); HOW to call it lives in the
+// manual.
+const TOOL_SUMMARIES = {
+  create_metadata: 'Create DHIS2 metadata: programs (with stages, data elements, inline option sets, program rules, program indicators — ALL in ONE atomic create_program call), standalone option sets, standalone data elements (+ category combos for disaggregation), or add stages/DEs/rules to an existing program. Handles the full dependency chain and name→ID resolution; never create a program\'s components with separate calls.',
+  manage_metadata: 'Metadata lifecycle manager: remove DEs from a stage, delete objects with reference checking, check_references, update a program\'s org-unit assignment, update sharing/access, add TEAs to an existing program, set icon/color (discover_icons FIRST, then update_style), convert value types (e.g. to MULTI_TEXT multi-select, cascaded). Use INSTEAD of dhis2_query for all of these — raw sharing/style/TEA/delete writes fail on DHIS2.',
+  manage_program_rules: 'CRUD + audit for program rules, rule variables and rule actions on a program. Actions: list, get, create, update, delete, list_variables, audit, bulk_fix_conditions. For "broken / non-working rules" ALWAYS audit first, then bulk_fix_conditions. NEVER PUT/PATCH programRules via dhis2_query (409/415).',
+  manage_program_indicators: 'CRUD + audit + cross-program discovery + OU ranking for tracker/event PROGRAM indicators. Actions: list, get, create, update, delete, audit, bulk_fix, bulk_fix_expressions, discover (cross-program "complex/top/heavy indicators", no program_id needed), rank_ou ("which OUs/districts have the most data/events"). NEVER PUT/PATCH programIndicators via dhis2_query; never invent UIDs.',
+  manage_program_notifications: 'Program notification templates (webhook / email / SMS / dashboard message): list, get, create, update, delete, link, unlink, create_and_link (recommended one-shot: create + attach atomically with auto-rollback and dedup), orphan_sweep. Use INSTEAD of dhis2_query for any notification/webhook request — the payload shape and linking endpoint are non-obvious.',
+  manage_datasets: 'Manage DHIS2 dataSets — the aggregate-data "programs" ("monthly form", "reporting form", "aggregate program" all mean a dataSet): list, get, create (atomic with DEs, sections, OUs, sharing), update, delete, add/remove data elements, assign_org_units, update_sharing, section CRUD. NEVER write dataset bodies via dhis2_query.',
+  manage_custom_forms: 'Author CUSTOM (HTML) data-entry forms for a dataSet (pass dataset_id) or a tracker/event program STAGE (pass program_stage_id — the STAGE id, never the program id). Actions: get, preview_html (show generated HTML without saving), set_dataset_form, set_stage_form, remove_form. Omit html_code to auto-generate a clean table form from the target\'s data elements.',
+  manage_custom_translations: 'Translate or re-label the UI strings of any DHIS2 app (2.43+ "custom-translations" datastore): list, get, set, remove. Keeps the controller registry in sync automatically — NEVER write those datastore keys via dhis2_query. Source strings must match the on-screen text exactly.',
+  manage_growth_chart_plugin: 'Set up the WHO Capture Growth Chart plugin end-to-end: status (run first), install (from App Hub), scaffold_program (ready-made growth-monitoring tracker program), configure (auto-detects DOB/gender attributes + weight/height/head-circumference DEs and writes the plugin config), remove. NEVER hand-write its dataStore via dhis2_query.',
+  manage_validation_rules: 'CRUD for DHIS2 validation rules — aggregate data-quality checks comparing a leftSide vs rightSide expression per period (e.g. "ANC 4 ≤ ANC 1"): list, get, create, update, delete. Both expressions are server-validated before saving. NEVER assemble validationRule /metadata bodies via dhis2_query.',
+  manage_org_units: 'CRUD for organisation units (the facility/chiefdom/district hierarchy): list, get, create (needs name, parent_id, opening_date), update (incl. MOVE/re-parent — level/path are DERIVED from the parent, never set them), delete (leaf-only, reference-safe). NEVER hand-write org-unit /metadata bodies via dhis2_query.',
+  manage_indicators: 'CRUD for AGGREGATE indicators — (numerator ÷ denominator) × factor values shown on dashboards/pivots/maps: list, get, create, update, delete. Tracker/event PROGRAM indicators are a DIFFERENT object → manage_program_indicators. Expressions are server-validated before save; chain legend_set_id to render colour-coded. NEVER write indicator bodies via dhis2_query.',
+  manage_option_sets: 'Standalone option-set lifecycle (reusable ordered code/label drop-downs): list, get, create, update (own fields), add_options, remove_options, reorder_options, delete. For an option set inline on a NEW data element use create_metadata instead; to convert a set to MULTI_TEXT use manage_metadata(action=convert_value_type). NEVER hand-write option bodies via dhis2_query.',
+  manage_legend_sets: 'Standalone legend-set lifecycle (reusable colour bands for traffic-light / heat-map rendering): list, get, create (explicit legends or auto_bands red→amber→green), add_legends, remove_legends, update (own fields), delete. Attach to an aggregate indicator via manage_indicators(legend_set_id) — never via raw PATCH. NEVER hand-write legendSets bodies via dhis2_query.',
+  manage_dashboards: 'Build/inspect analytics dashboards and saved visualizations (charts, pivots, single-value tiles): list, get, create_visualization, create_dashboard (atomic, with inline new visualizations), add_items (the ONLY safe way to add to an EXISTING dashboard — a raw PUT wipes its tiles), remove_item, update, delete. NEVER hand-assemble visualizations/dashboards bodies via dhis2_query (they import as EMPTY charts). render_chart = inline chat preview; this tool SAVES to DHIS2.',
+  manage_maps: 'Create/inspect/delete thematic maps (choropleth / bubble): list, get, create (one data_item UID + org_unit_level/org_units + period, optional legend_set_id), delete. NEVER hand-assemble /api/maps bodies via dhis2_query. Place a map on a dashboard via manage_dashboards(action=add_items, items=[{type:"MAP", map_id}]).',
+};
+
+// ── Deep how-to KB text that used to live in buildSystemPrompt ──
+// Delivered inside the relevant tool manual(s) on first use instead of being
+// injected into every turn's system prompt. Shared blocks are defined once.
+
+const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
+- Condition: \`#{variable_name}\` for DEs (lowercase, underscores), \`A{attr_name}\` for TEAs, \`V{current_date}\` for system vars
+- ⚠ **\`A{attr_name}\` IS the correct, canonical way to reference a tracked-entity-attribute program rule variable** in BOTH conditions and ASSIGN/expression \`data\` — this matches DHIS2's own demo rules, e.g. \`d2:yearsBetween(A{born}, V{current_date})\` and \`A{Sex} == 'MALE'\`. \`#{...}\` is for DATA-ELEMENT-sourced variables only. **Do NOT "fix" a working \`A{tea}\` reference into \`#{tea}\`** — for a TEA variable that is a regression, not a fix, and it is NEVER the cause of a rule "not firing". Auto-calc-from-attribute patterns like \`ASSIGN d2:monthsBetween(A{dob}, V{current_date}) → "Age in months"\` are correct as written.
+- 🔎 **When a user says an auto-assign / calculation rule "isn't working", DIAGNOSE from real metadata — never guess a syntax cause.** First \`manage_program_rules(action=get)\` + \`action=list_variables\` and read the ACTUAL condition, the PRV source types, and the target DE's valueType. If the expression already matches a known-good pattern (A{tea} for attributes, V{current_date}, a valid d2: function, ASSIGN target DE that can hold the result), the rule is correct — say so. The real reasons an ASSIGN value looks "missing" are runtime/UX, not syntax: (a) the assigned value only appears once you open the stage event that contains the target DE and the source attribute already has a value; (b) the target field is read-only/auto-filled by design; (c) the target DE valueType cannot hold the computed value (e.g. a number assigned to a TEXT field). Explain the real cause and verify; do NOT invent "the reference doesn't resolve at runtime" without evidence.
+- HIDEFIELD on TEA: use \`tracked_entity_attribute_name\`; on DE: use \`data_element_name\`
+- Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, WARNINGONCOMPLETE, ERRORONCOMPLETE, SHOWWARNINGINFORMATION
+- Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
+- **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE / SHOWWARNINGINFORMATION** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
+- **DISPLAYTEXT** (instructions banner) takes \`content\` only — keep it static.
+- **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
+- **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
+- **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
+- HIDEPROGRAMSTAGE hides an entire stage tab (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section.
+- BOOLEAN / TRUE_ONLY: compare against unquoted \`true\` / \`false\`. Canonical forms:
+  • is Yes: \`#{flag} == true\`
+  • is empty or No: \`!d2:hasValue(#{flag}) || #{flag} != true\`
+  ⚠ Never write \`#{flag} == false\`, \`== 'true'\`, \`== 'Yes'\`, or \`== 'No'\` — these fail silently on DHIS2.
+- Option-set fields: set the rule variable's \`use_code_for_option_set: true\` and compare to the CODE in quotes, e.g. \`#{status} == 'APPROVED'\`.
+- ⚠ **Every \`#{name}\` MUST resolve to a programRuleVariable for the rule to fire.** For \`manage_program_rules(action=create)\` on an existing program: just use \`#{sanitized_de_display_name}\` (e.g. DE "Is breathing abnormal" → \`#{is_breathing_abnormal}\`) — the tool auto-creates the PRV by matching the sanitized name to the program's DEs and picks the correct sourceType (CURRENT_EVENT when the rule acts on the same stage, NEWEST_EVENT_PROGRAM otherwise) plus valueType + optionSet from the DE. Pass \`variables:[]\` only if you need to override the source_type, reference a DE whose displayName does not match, or wire a TEI_ATTRIBUTE variable. If a \`#{name}\` does not match any existing PRV or program DE, the tool refuses the POST and returns \`unresolved[]\` with suggestions — correct the name or add an explicit \`variables[]\` entry and retry.`;
+
+const KB_PI_GRAMMAR = `### Program-Indicator EXPRESSION GRAMMAR (DHIS2 2.41) — read this BEFORE writing any PI
+The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:\` syntax but have DIFFERENT function sets and different semantics. The chatbot lints every PI expression+filter both locally and via DHIS2's /expression/description endpoint before saving — broken PIs are rejected at create-time, not silently saved.
+
+**Refs (in expression OR filter):** \`#{stageId.deId}\` (data element in a stage), \`A{teaId}\` (tracked-entity attribute), \`V{var}\` (system variable: \`tei_count\`, \`event_count\`, \`enrollment_count\`, \`event_date\`, \`enrollment_date\`, \`enrollment_status\`, \`current_date\`, etc.), \`C{constantId}\` (constant). **Do NOT** use \`I{}\` (regular indicator), \`OUG{}\`, or \`subExpression(...)\` — those are for regular Indicators, not Program Indicators, and the parser rejects them.
+
+**Operators:** \`== != < > <= >=\` (==/= behave the same way — **exact-string match** for strings, even on MULTI_TEXT), \`&& ||\`, \`+ - * /\`. There is **NO** \`LIKE\`, \`ILIKE\`, \`IN\`, \`position()\`, \`regexp_match()\`, \`coalesce()\`, or \`~\` regex in PI grammar. The parser will say "Invalid string token 'LIKE'" or similar.
+
+**Allowed d2: functions in PI:** \`condition\`, \`count\`, \`countIfValue\`, \`countIfCondition\`, \`hasValue\`, \`daysBetween\`, \`weeksBetween\`, \`monthsBetween\`, \`yearsBetween\`, \`minutesBetween\`, \`oizp\`, \`zing\`, \`zpvc\`, \`relationshipCount\`, \`ceil\`, \`floor\`, \`round\`, \`modulus\`, \`addDays\`, \`left\`, \`right\`, \`substring\`, \`split\`, \`concatenate\`, \`length\`, \`validatePattern\`, \`inOrgUnitGroup\`, \`lastEventDate\`, \`zScoreHFA\`/\`WFA\`/\`WFH\`.
+
+**FORBIDDEN d2: functions in PI** (these exist only in Program Rules — using them in a PI filter creates a PI that **looks** saved but returns HTTP 409 from analytics forever after): \`d2:contains\`, \`d2:containsString\`, \`d2:inOrgUnit\` (use \`d2:inOrgUnitGroup\` instead), \`d2:hasUserRole\`, \`d2:removeMin\`.
+
+**Quoting inside d2:condition:** the first arg is a STRING. To embed a string literal you need different outer-quotes — use **double-quoted outer**: \`d2:condition("#{stage.de} == 'X'", 1, 0) == 1\`. Single-quoted outer with escaped inner does NOT parse.
+
+**MULTI_TEXT (multi-select) — read carefully:**
+- DHIS2 stores MULTI_TEXT as a single comma-separated string per row (e.g. \`Diabetes,HYPERTENSION\`).
+- In PI filters, \`==\` does **exact-string match** even on MULTI_TEXT — verified: a row stored as \`Diabetes,HYPERTENSION\` matches \`#{X.Y} == 'Diabetes,HYPERTENSION'\` but NOT \`#{X.Y} == 'Diabetes'\`. Order is whatever the user clicked first.
+- **There is NO native way to express "MULTI_TEXT contains both X and Y" in a 2.41 PI filter.** \`d2:contains\` is rule-engine-only. \`subExpression\` is not available for PIs in 2.41.
+- When the user asks for "women with both Diabetes and Hypertension" on a MULTI_TEXT field, recommend ONE of these THREE options up front and let the user choose:
+  1. **Restructure (best, durable):** convert the MULTI_TEXT into N separate BOOLEAN data elements (one per option), via \`create_metadata\` for new programs or by adding new BOOLEAN DEs and a program rule that mirrors the multi-select. Filter is then trivial: \`#{stage.de_dm} == true && #{stage.de_htn} == true\`.
+  2. **Line Listing app (no metadata change):** the Line Listing UI supports the IN operator with comma-list values which DOES match comma-separated MULTI_TEXT cells. Use \`line_listing_guide\` to walk the user through it.
+  3. **Brittle exact-match (stopgap):** \`#{stage.de} == 'Diabetes,HYPERTENSION'\` — only matches that exact string, order-dependent, breaks if a third risk factor was also selected. Disclose the limitation.
+- **NEVER** silently emit \`d2:contains(...)\` or \`#{X.Y} == 'A' && #{X.Y} == 'B'\` for the same ref — the lint blocks both.
+
+**aggregationType vs analyticsType:**
+- \`analyticsType\`: \`EVENT\` (one row per event) or \`ENROLLMENT\` (one row per enrollment, latest event values per stage).
+- \`aggregationType\`: \`COUNT\` for count-of-rows, \`SUM\`/\`AVERAGE\`/\`MIN\`/\`MAX\` for numeric aggregations.
+- "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{tei_count}\`. \`V{enrollment_count}\` is also valid; \`V{event_count}\` is for EVENT-type PIs.
+
+**Validation safety net (you don't manage this — it just runs):**
+- Every \`manage_program_indicators(action=create|update)\` call validates expression+filter via DHIS2's \`/programIndicators/expression/description\` and \`/filter/description\` endpoints BEFORE saving. If either returns \`status: ERROR\`, the create/update is refused and the parser's exact error string is returned to you in \`_error\` along with a hint in \`_hint\`. Read both, fix the expression, and retry — do NOT loop with the same broken filter.`;
+
+const KB_VALUE_TYPE_MAPPING = `**Value-type mapping** (use these exact DHIS2 valueTypes):
+- "Yes/No" / "boolean" → \`BOOLEAN\`
+- "Yes only" / "checkbox" → \`TRUE_ONLY\`
+- "date" → \`DATE\`
+- "date and time" → \`DATETIME\`
+- "number" → \`NUMBER\`, integer → \`INTEGER\`, positive integer → \`INTEGER_POSITIVE\`
+- "text" → \`TEXT\`, long text → \`LONG_TEXT\`
+- "option set / dropdown / select from list" (single-select) → \`TEXT\` with an inline \`option_set: { name, options: [...] }\`
+- "multi-select / multiple values / multiple selections / multi-select option set / text with multiple values / select multiple" → \`MULTI_TEXT\` with an inline \`option_set: { name, options: [...] }\`. The tool auto-aligns the option set's own valueType to \`MULTI_TEXT\` so the pair is consistent — never declare a multi-select DE with \`TEXT\`, even though the field stores comma-separated codes at runtime; the New Tracker Capture form only renders the multi-checkbox UI when the DE valueType is \`MULTI_TEXT\`. To **convert** an existing TEXT option set + DE into multi-select, use \`manage_metadata(action=convert_value_type, object_type="dataElements"|"optionSets", object_id=..., value_type="MULTI_TEXT")\` — it cascades the change to every DE/TEA referencing the option set.`;
+
+const KB_CREATE_PROGRAM_DETAILS = `### create_program — the ONE-CALL pattern in detail
+The tool handles the FULL dependency chain atomically and auto-resolves all internal references (option set names → IDs, DE names → IDs, TEA names → IDs). It also auto-checks for duplicate option sets, data elements, TEAs, and options by name and reuses existing IDs.
+
+**Input slots for the single create_program call:**
+- \`program_attributes\`: tracked entity attributes (with inline \`option_set\` if needed)
+- \`org_unit_ids\`: the org units the program should be assigned to for Capture/Tracker use. If the user mentions districts/facilities/org units, resolve them first and pass them here.
+- \`assign_all_org_units: true\`: use this WHEN THE USER SAYS "all OUs", "all org units", "all levels", "all facilities", "every org unit" — the tool fetches every org unit server-side in ONE call. DO NOT paginate org units yourself.
+- \`sharing\`: \`{ public_access: "rwrw----", include_current_user: true, user_ids: [...], user_group_ids: [...] }\`. Set \`include_current_user: true\` when the user says "include me", "share with me", "I should have access", etc. Sharing is auto-applied to stages + DEs + option sets + TEAs unless \`apply_to_children: false\`. **DHIS2 only permits data-level sharing (positions 3-4 of the access string) on Program + ProgramStage — DataElement, OptionSet, TrackedEntityAttribute, ProgramIndicator are metadata-only.** The tool strips the data bits automatically for those classes, so a single \`public_access: "rwrw----"\` is safe everywhere.
+- \`stages\`: data elements (with inline \`option_set\` if needed)
+- \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`)
+- \`program_indicators\`: indicators with expressions and filters
+
+**Internal dependency order** the tool enforces in the atomic payload (you never build this yourself — it's here so you understand recovery):
+Options → OptionSets → TrackedEntityAttributes → DataElements → Program + ProgramStages (stages carry programStageDataElements) → ProgramRuleVariables → ProgramRuleActions → ProgramRules → (follow-up POST) ProgramIndicators. Sharing attaches to Program/Stage in full; DE/OS/TEA/PI get metadata-only. OrgUnit assignment rides inside the Program object.
+
+**If create_program returns \`success: false\`, read \`errors[]\`:**
+- "Data sharing is not enabled for X" → the tool now strips data bits itself; if you still see this, a custom class changed — retry with \`sharing.apply_to_children: false\` and then run \`manage_metadata(action=update_sharing)\` per object.
+- "Property X is required" on a specific klass → add that field to the matching input slot and retry the WHOLE create_program (the rollback is atomic).
+- Validation rejects ONE stage (name clash, bad DE) → keep the other stage in a retry minus the bad one, then use \`add_stage\` / \`add_data_elements_to_stage\` afterwards to fix the rejected piece.
+- Option-set or DE already exists by name → the tool reuses it automatically; no action needed.
+Never retry by looping through children one-at-a-time when the single atomic retry can succeed. Decompose only on targeted rejection.
+
+### Category combos / disaggregation (create_category_combo, create_data_elements)
+**NEVER assemble raw /metadata POST payloads for category combos** — DHIS2 silently 409s on dependency-order mistakes (categoryOptions before categories before combos), missing \`dataDimensionType\`, or forgotten CoC regeneration. Instead:
+
+\`\`\`
+create_metadata(action="create_category_combo", category_combo:{
+  name: "HTS Result by Sex",
+  data_dimension_type: "DISAGGREGATION",   // or ATTRIBUTE
+  categories: [
+    { name: "HIV Result", options: ["Positive", "Negative"] },  // NEW — auto-creates options
+    { id: "cX5k9anHEHd" }                                        // EXISTING — reuse by id
+  ]
+}, sharing:{ public_access: "--------", user_group_ids: ["<gid>"], user_group_access: "rw------" })
+\`\`\`
+
+What the tool does for you (you DON'T do these by hand): reuses existing categories/options by exact name (no duplicates), POSTs categoryOptions + categories + categoryCombo in ONE atomic /metadata call in the correct dependency order, ALWAYS triggers \`/api/maintenance/categoryOptionComboUpdate\` so the CoC rows materialize (without this the form has no cells and Save silently drops values), and applies sharing via the legacy \`/api/sharing\` endpoint (the only path that works for metadata-only-shareable classes).
+
+Creating data elements that USE a (new or existing) combo — ONE atomic call:
+\`\`\`
+create_metadata(action="create_data_elements",
+  domain_type: "AGGREGATE",                  // or TRACKER (default)
+  aggregation_type: "SUM",
+  category_combo: { ...inline definition as above... },   // OR category_combo_id / category_combo_name
+  data_elements: [
+    { name: "Individuals Tested for HIV", value_type: "INTEGER", use_category_combo: true },
+    { name: "Referrals to Care Made",     value_type: "INTEGER", use_default_combo: true }   // no disagg
+  ])
+\`\`\`
+\`use_category_combo: true\` binds that DE to the inline/named combo; \`use_default_combo: true\` keeps it on the system default. DEs with neither flag inherit from the call's category_combo (or default if none). Attach an option set either inline (\`option_set\` — creates a new set) or by reference (\`option_set_id\` / \`option_set_name\` — reuses an existing set; the DE valueType auto-aligns). Mix freely in one call.
+
+### Adding to existing programs
+- DEs to an existing stage: create_metadata(action=add_data_elements_to_stage, stage_id=<id>, data_element_ids=[<id>]) — use \`data_elements:[{name, value_type, …}]\` instead to create NEW DEs onto the stage.
+- A new stage: create_metadata(action=add_stage, program_id=<id>, stage={ name, repeatable, data_elements:[…] }).
+- More rules: create_metadata(action=add_program_rules, program_id=<id>, program_rules=[…]).`;
+
+const KB_METADATA_DELETE_FLOW = `### Removing / deleting metadata
+⚠️ **NEVER** use dhis2_query with DELETE method for metadata objects. manage_metadata checks references and verifies deletion.
+**Workflow to remove a data element from a program and delete it:**
+1. \`manage_metadata(action=remove_from_stage, stage_id=<stageId>, data_element_ids=[<deId>])\` — removes DE from the stage (keeps DE in system)
+2. \`manage_metadata(action=delete, object_type=dataElements, object_id=<deId>)\` — deletes the DE after checking references
+**If deletion fails (409 / references exist):** the tool returns exactly which references block deletion (program stages, program rules, event data). Remove those references first, then retry.
+**Supported object types for delete:** dataElements, optionSets, options, trackedEntityAttributes, programStages, categoryOptions, categories, categoryCombos, indicators, dataElementGroups, indicatorGroups (plus programs, dataSets, dashboards, visualizations, maps for whole-object deletes).
+
+**Convert a single-select option set to multi-select (or any valueType change):**
+- \`manage_metadata(action=convert_value_type, object_type="dataElements", object_id="<deId>", value_type="MULTI_TEXT")\` — flips the DE valueType AND its attached optionSet AND every other DE/TEA referencing the same optionSet (so the pair is never inconsistent). Works on \`dataElements\`, \`trackedEntityAttributes\`, or \`optionSets\` directly. Idempotent — already-correct objects are skipped.
+- ⛔ **NEVER** PATCH only the DE's valueType to MULTI_TEXT and leave the optionSet at TEXT — the New Tracker Capture form will silently render single-select.`;
+
+const KB_METADATA_TEA_OU = `### Adding tracked-entity attributes to an EXISTING program
+\`manage_metadata(action=add_program_attributes, program_id="<id>", program_attributes=[
+  { name: "First name", searchable: true, display_in_list: true },
+  { name: "Age",        searchable: true, display_in_list: true }
+])\`
+- Each entry may supply \`id\` (reuse a known TEA), \`name\` alone (reuses one by that exact display name, or creates new if \`value_type\` is provided), or \`name + value_type [+ option_set]\` (creates fresh).
+- ⛔ **NEVER** try to PATCH \`programs/{id}\`, POST \`programTrackedEntityAttributes\`, or POST \`/metadata\` to attach TEAs — those routes return 415/404/409. Always use this action.
+
+### Updating which OUs a program is assigned to
+\`manage_metadata(action=update_program_org_units, program_id="<id>", org_unit_ids=["<ou1>","<ou2>"], merge_mode="replace")\`
+- \`replace\` = exact OU list; \`add\` = append; \`remove\` = remove from existing assignment.
+- OU assignment and sharing are SEPARATE: a program can have broad sharing but still be unusable at a facility that is not in \`program.organisationUnits\`.`;
+
+const KB_METADATA_ICON_FLOW = `### Icon / style updates — discover FIRST, then update_style
+DHIS2 ships a fixed library of ~900 icons. Many obvious-sounding names DO NOT EXIST: \`tuberculosis_positive\`, \`diabetes_positive\`, \`vaccine_positive\`, \`pregnancy_positive\` are all fabrications. Guessing burns tool round trips.
+**MANDATORY two-step flow — never skip step 1:**
+1. **Discover** — \`manage_metadata(action=discover_icons, keywords=["<root1>","<root2>",...])\`
+   - Pass 4-8 SHORT keyword roots, not full domain words. DHIS2 search is prefix-on-keyword: \`preg\` matches but \`pregnancy\` returns 0; \`respir\` matches but \`respiratory\` returns 0; \`tb\` works, \`tuberculosis\` doesn't.
+   - For a TB program: \`["lung","respir","tb","medical","clinic"]\`. For maternity: \`["preg","mater","baby","fem"]\`. For vaccines: \`["vacc","syring","needle","shield"]\`.
+   - The response gives you \`verified_keys[]\` — every real key that matched any of your roots.
+2. **Apply** — \`manage_metadata(action=update_style, object_type=..., object_id=..., icon=<exact key from verified_keys[]>, color="#...")\`
+   - Pass the icon key VERBATIM from step 1's response. \`update_style\` REFUSES any icon that wasn't verified this turn (\`_scope: "icon_not_verified"\`). \`color\` (optional hex) does not require discovery.
+**If discover_icons returns no matches**, retry with broader fallbacks: \`["medical","clinic","health","hospital","stethoscope","capsule"]\`. If still nothing, drop the icon and set only \`color\`.
+**Do NOT** PATCH \`/programs/{id}\` with dhis2_query using \`application/json\` — DHIS2 returns 415. update_style uses \`application/json-patch+json\`, verifies the result, and snapshots a backup first.`;
+
+const KB_METADATA_SHARING = `### Sharing & Access (update_sharing)
+When a program/object doesn't appear in an app (Capture, Data Entry, etc.) or a user reports "can't see" / "not showing":
+**Diagnosis:**
+1. For programs in Capture/Tracker, first check \`program.organisationUnits\` — if the target OU is missing, fix that with \`manage_metadata(action=update_program_org_units, ...)\`
+2. Fetch the object with \`?fields=id,displayName,sharing,access\` — check \`access.data.read\` and \`access.data.write\`
+3. DHIS2 access string format (8 chars): positions 1-2 = metadata access (r/w), positions 3-4 = data access (r/w)
+   - \`"rw------"\` = metadata read+write ONLY — **NO data access** → won't appear in Capture/Data Entry
+   - \`"rwrw----"\` = metadata + data read+write → full access, appears everywhere
+   - \`"r-rw----"\` = metadata read + data read+write → can capture data but can't edit program config
+   - \`"r-r-----"\` = metadata read + data read → view-only
+4. Also check \`sharing.userGroups\` — user groups can grant data access even if publicAccess doesn't
+5. OU assignment and sharing must both be correct for users to actually use a program in Capture.
+**Fix:** \`manage_metadata(action=update_sharing, object_type="programs", object_id="<id>", public_access="rwrw----")\` (+ user_group_accesses / user_accesses entries as needed)
+⚠️ **NEVER** use dhis2_query PUT/PATCH to modify sharing — it fails with 405/500. The DHIS2 sharing API is \`PUT /api/sharing?type={singularType}&id={id}\` — update_sharing handles this correctly.`;
+
+const KB_NOTIFICATIONS_DETAILS = `### DHIS2 schema reality (codified in the tool — don't relearn)
+- \`ProgramNotificationTemplate\` has **no** \`url\` / \`webhookUrl\` / \`hookUrl\` field. DHIS2 silently drops these keys on POST, then PATCH with \`url\` returns 400 because the property doesn't exist.
+- For \`notificationRecipient = WEB_HOOK\`, the URL goes in \`messageTemplate\` (server convention) and \`deliveryChannels\` is auto-set to \`[HTTP]\` by DHIS2's object-bundle hook. The tool's \`webhook_url\` arg handles placement.
+- \`subjectTemplate\` max length = 100 chars. Keep variable syntax tight (e.g. \`V{program_name} A{<teaUid>}\`) — the tool rejects overlong values with a hint.
+- Linking a template to a program uses a dedicated endpoint: \`POST /api/programs/{programId}/notificationTemplates/{templateId}\`. It is NOT a field on the program you can PATCH.
+
+**One-shot pattern** (most common — "create a webhook on enrollment"):
+\`manage_program_notifications(action="create_and_link", program_id="<pid>", name="<title>", trigger="ENROLLMENT", recipient="WEB_HOOK", webhook_url="https://...", message_content="Program: V{program_name} | OU: V{org_unit_name} | A{<teaUid1>}")\`
+
+Triggers: ENROLLMENT | COMPLETION | PROGRAM_RULE | SCHEDULED_DAYS_DUE_DATE | SCHEDULED_DAYS_INCIDENT_DATE | SCHEDULED_DAYS_ENROLLMENT_DATE (SCHEDULED_* requires \`relative_scheduled_days\`).
+Recipients: TRACKED_ENTITY_INSTANCE | ORGANISATION_UNIT_CONTACT | USERS_AT_ORGANISATION_UNIT | USER_GROUP (+recipient_user_group_id) | PROGRAM_ATTRIBUTE (+recipient_program_attribute_id) | DATA_ELEMENT (+recipient_data_element_id) | WEB_HOOK (+webhook_url).
+Template variables: V{program_name}, V{program_stage_name}, V{org_unit_name}, V{orgunit_id}, V{enrollment_id}, V{event_id}, V{current_date}, A{<teaUid>} for tracked-entity attribute values, #{<deUid>} for program-rule data elements.
+
+**Atomicity** — \`create_and_link\` is all-or-nothing: if the link step fails, the just-created template is auto-deleted so the server stays clean. If the call returns an error, inspect \`rollback.succeeded\` — \`true\` means state is unchanged and you can simply retry. Pre-flight dedup returns an existing same-name template rather than creating a duplicate. **Never** call \`create\` and \`link\` as two separate tool calls for this flow — use \`create_and_link\`.
+Leftover/duplicate templates from a prior failed run: \`action="orphan_sweep"\` lists unlinked templates; add \`delete=true\` to remove them.`;
+
+const KB_DATASETS_DETAILS = `### Required fields when creating
+- \`dataset_name\` (unique server-wide), \`short_name\` (≤ 50 chars), \`period_type\`, \`category_combo_id\` (defaults to the system "default" combo)
+- \`mobile\` is sent automatically as false (deprecated J2ME flag — schema-required)
+
+### period_type — exact case (one of these 20)
+Daily, Weekly, WeeklyWednesday, WeeklyThursday, WeeklySaturday, WeeklySunday, BiWeekly, Monthly, BiMonthly, Quarterly, QuarterlyNov, SixMonthly, SixMonthlyApril, SixMonthlyNov, Yearly, FinancialApril, FinancialJuly, FinancialSep, FinancialOct, FinancialNov
+
+### form_type
+DEFAULT (single table), SECTION (sectioned form, common for routine reporting), CUSTOM (uses dataEntryForm), SECTION_MULTIORG (sectioned across multiple OUs).
+
+### Category Combo (DISAGGREGATION)
+- Each dataset has ONE \`category_combo_id\`. Default is no disaggregation (the system "default" combo).
+- Each \`dataSetElement\` (DE attached to the dataset) can OPTIONALLY override with its own \`category_combo_id\`. Use this when one DE in the form has different disaggregation than the rest (e.g., the dataset uses "Sex" but a specific DE uses "Sex × Age").
+- Look up category combos via search_metadata(object_type="categoryCombos", name_filter=...) or dhis2_query path "categoryCombos?fields=id,displayName".
+- The default combo's UID differs per server. The chatbot resolves it automatically when creating; pass \`category_combo_id\` only to override.
+- To CREATE a new combo (+ categories + options) or aggregate DEs bound to one, use create_metadata (create_category_combo / create_data_elements) — its manual has the recipes.
+
+### "Can capture and view" sharing translation
+- DataSet (data-shareable): \`rwrw----\` for the user group
+- DataElement / CategoryCombo / Category / CategoryOption / OptionSet / TEA / ProgramIndicator (metadata-only-shareable): \`rw------\`
+- "Public access None": \`public_access: "--------"\`
+- "My user group": resolve via \`dhis2_query path="userGroups?filter=users.id:eq:<currentUserId>&fields=id,name"\` if the user said "my group", or ask the user to name the group.
+
+### Sharing — IMPORTANT FOR DATA ENTRY
+DataSets are data-shareable. The 8-char access string positions 3-4 control DATA write. To let users enter data into a dataset, public_access MUST be \`rwrw----\` (or grant rw at positions 3-4 to specific user groups). \`rw------\` allows metadata changes only — users will see the form but the Save button does nothing for them. The tool defaults new datasets to \`rwrw----\` so data entry works out of the box.
+
+### Org-unit assignment
+A dataset only appears in a user's Data Entry app for the OUs assigned to it. Use \`manage_datasets(action="assign_org_units", dataset_id, org_unit_ids, merge_mode)\` (merge_mode: replace | add | remove). Without an OU assigned that the user has access to, the dataset is invisible.
+
+### Sections vs Default form
+- DEFAULT form: one big table. Use when the dataset has < 20 DEs.
+- SECTION form: groups DEs into named sections. Provide \`sections: [{name, sort_order, data_element_ids:[...], indicator_ids:[...], show_row_totals, show_column_totals}]\` at create time, OR add later with action="create_section". Sections show up automatically when form_type="SECTION".
+
+### Common one-call recipes
+- "Create a monthly dataset for malaria reporting with these 5 data elements":
+  manage_datasets(action="create", dataset_name="Malaria Monthly", period_type="Monthly", form_type="SECTION", data_element_ids=[<de1>,...,<de5>], org_unit_ids=[<ouRoot>], sections=[{name:"Cases", data_element_ids:[<de1>,<de2>,<de3>]}, {name:"Deaths", data_element_ids:[<de4>,<de5>]}])
+- "Add these DEs to the current dataset": manage_datasets(action="add_data_elements", dataset_id="<datasetId from context>", data_element_ids=[...])
+- "List monthly datasets": manage_datasets(action="list", period_type="Monthly")
+- "Make this dataset entry available for users": manage_datasets(action="update_sharing", dataset_id, public_access="rwrw----")
+
+### Common pitfalls (hard-learned)
+- shortName must be ≤ 50 chars. The tool clamps automatically.
+- Sections cannot have a writable \`categoryCombo\` (DHIS2 derives it from the contained DEs).
+- "default" is NOT a valid category-combo id literal — the tool resolves the actual UID via /api/categoryCombos?filter=name:eq:default.
+- DataSet \`version\` auto-increments on save — never set it manually.
+- \`expiryDays = 0\` and \`openFuturePeriods = 0\` mean "never expires" and "no future periods open", NOT "expires immediately".
+- A dataset's "indicators" field is for DISPLAY indicators on the form (read-only sums). DON'T confuse with program indicators.`;
+
+const KB_CUSTOM_FORMS_DETAILS = `### Input-id binding (the ONLY thing that makes a cell save) — the tool builds these for you, but if you hand-write html_code they MUST be exact:
+- dataset cell:       \`<input id="<dataElementUID>-<categoryOptionComboUID>-val" title="" value="">\`
+- program-stage cell: \`<input id="<programStageUID>-<dataElementUID>-val" title="" value="">\`
+Everything else in the HTML (tables, headings, narrative text) renders verbatim.
+
+### Hard-learned quirks the tool already handles — do NOT try to do these by hand:
+- The dataEntryForm is created STANDALONE first (POST /api/dataEntryForms); it can never be embedded inline in a dataSet/programStage (E5002).
+- Linking to a program stage re-attaches the program reference on a full PUT (a PATCH/naive PUT loses it → "must reference a program").
+- A dataset custom form needs sharing rwrw---- + an assigned org unit before users can actually enter data. If the tool's \`_hints\` flag these, fix them with **manage_datasets** (update_sharing / assign_org_units).
+
+### Recipes
+- "Make a custom form for this dataset": manage_custom_forms(action="set_dataset_form", dataset_id="<id>")  // auto-generates from its DEs
+- "Design a custom form for this tracker stage": manage_custom_forms(action="set_stage_form", program_stage_id="<stageId>")
+- "Show me what the form would look like first": manage_custom_forms(action="preview_html", dataset_id|program_stage_id)
+- "Use my own HTML": pass html_code="..." with the correct id bindings above.`;
+
+const KB_VALIDATION_RULES_DETAILS = `### Expressions (both sides)
+- \`#{dataElementUid}\` = the data element summed across all its category-option-combos.
+- \`#{dataElementUid.categoryOptionComboUid}\` = one specific disaggregation cell.
+- \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed (e.g. \`#{de1} + #{de2}\`).
+- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving. A bad UID or malformed syntax is rejected at create/update time with the parser's exact error — fix the expression and retry, don't loop.
+- Look up data-element UIDs with search_metadata(object_type="dataElements") or manage_datasets(action=get) — NEVER invent UIDs.
+
+### operator (leftSide <op> rightSide)
+equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, compulsory_pair (both sides must have a value or neither), exclusive_pair (at most one side may have a value).
+
+### Other fields
+- importance: HIGH | MEDIUM | LOW (default MEDIUM).
+- period_type: same 20 exact-case values as datasets (Monthly, Quarterly, Yearly, …); default Monthly. Pick the period at which the compared totals are meaningful.
+- left_missing_strategy / right_missing_strategy: NEVER_SKIP (default — a missing value counts as 0), SKIP_IF_ANY_VALUE_MISSING, SKIP_IF_ALL_VALUES_MISSING. Use a SKIP_* strategy when a missing value should suppress the check instead of being treated as 0.
+- instruction: the message shown to the data-entry user when the rule fails — phrase it as what to check/fix.
+
+### Examples
+- "Inpatient days must not exceed available bed-days (monthly)": create rule { name, operator:"less_than_or_equal_to", period_type:"Monthly", left_expression:"#{inpatientDaysUid}", right_expression:"#{bedDaysUid}", importance:"MEDIUM" }.
+- "ANC 4th visits should never exceed ANC 1st visits": operator "less_than_or_equal_to", left=#{anc4}, right=#{anc1}.
+- "Sex sub-totals must equal the grand total": operator "equal_to", left="#{deMale} + #{deFemale}", right="#{deTotal}".`;
+
+const KB_ORG_UNITS_DETAILS = `### The one rule that trips people up: level & path are DERIVED, never set
+- A unit's \`level\` and \`path\` come from its parent — DHIS2 computes them. You pass only \`parent_id\`; a child of a level-3 chiefdom automatically becomes level 4 with path = parentPath + "/" + newId. NEVER put level or path in the org_unit object.
+
+### create
+- Required: org_unit.name, org_unit.parent_id, org_unit.opening_date (YYYY-MM-DD). short_name defaults to name (≤50 chars).
+- The tool verifies the parent exists first and reports the derived level. Resolve the parent UID with manage_org_units(action=list) or search_metadata — NEVER invent it. Creating a new ROOT is intentionally unsupported.
+- Use dry_run_only:true to validate (incl. the parent reference) without committing.
+
+### update / move (re-parent)
+- Patch any field (name, short_name, opening_date, closed_date — pass "" to clear closed_date — code, description, comment, contact fields).
+- Supplying org_unit.parent_id MOVES the unit; DHIS2 re-computes level/path for it AND all descendants. The tool rejects a move under the unit's own descendant (cycle) and under itself. Auto-backup first.
+
+### delete
+- Only LEAF units delete. The tool refuses a unit that still has children (re-parent or delete them bottom-up first) and lets DHIS2 block any unit still holding data values / program-dataset assignments / user scope, surfacing the exact reason. Auto-backup first.
+
+### Examples
+- "Add a new facility 'Bo CHC' under Badjia chiefdom (opened 2015-01-01)": create with org_unit:{ name:"Bo CHC", parent_id:"<BadjiaUID>", opening_date:"2015-01-01" }.
+- "Move the Ngelehun clinic under Kakua chiefdom instead": update org_unit_id=<clinic> org_unit:{ parent_id:"<KakuaUID>" }.
+- "Close facility X as of 2024-12-31": update org_unit:{ closed_date:"2024-12-31" }.`;
+
+const KB_INDICATORS_DETAILS = `### Expressions (numerator & denominator)
+- \`#{dataElementUid}\` = data element summed across all its category-option-combos; \`#{dataElementUid.cocUid}\` = one disaggregation cell.
+- \`R{dataSetUid.REPORTING_RATE}\` (also ACTUAL_REPORTS, EXPECTED_REPORTS, …) for reporting rates; \`I{programIndicatorUid}\` to reuse a program indicator; \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed.
+- For a plain count/sum, set denominator to \`"1"\`.
+- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving — fix and retry on rejection, don't loop.
+- Look up UIDs with search_metadata / manage_datasets(action=get) — NEVER invent them.
+
+### indicator_type (the scaling factor)
+Pass a UID or the exact name. Common types: **"Number (Factor 1)"** (×1 — raw ratio/count), **"Per cent"** (×100), **"Per thousand"**, **"Per ten thousand"**, **"Per hundred thousand"**. The tool resolves and verifies the type before writing.
+
+### Other fields
+- short_name: ≤50 chars (defaults to name). annualized: scale to a full year for the chosen period (default false). decimals: 0–5 fixed output decimals (omit to inherit the default). numerator_description / denominator_description: auto-derived from DHIS2 if omitted.
+- legend_set_id: attach an EXISTING legend set so the indicator renders colour-coded on dashboards/pivots/maps (create it first with manage_legend_sets).
+
+### Examples
+- "ANC 1 coverage as a percentage of expected pregnancies": create indicator:{ name:"ANC 1 Coverage", indicator_type:"Per cent", numerator:"#{anc1Uid}", denominator:"#{expectedPregnanciesUid}" }.
+- "Maternal deaths per 100,000 live births": indicator_type:"Per hundred thousand", numerator:"#{maternalDeaths}", denominator:"#{liveBirths}".
+- "Total malaria cases (a plain sum)": indicator_type:"Number (Factor 1)", numerator:"#{malariaConfirmed} + #{malariaClinical}", denominator:"1".`;
+
+const KB_OPTION_SETS_DETAILS = `### Actions in detail
+- **list** (name / value_type filters) and **get** (returns options in display order) are read-only.
+- **create** — a new standalone set + its options, imported atomically (VALIDATE then COMMIT). Pass \`option_set:{ name, value_type, options:[{code,name},…] }\`. value_type defaults to TEXT if omitted. Codes must be unique within the set.
+- **add_options** — append new options to an existing set: \`option_set_id\` + \`options:[{code,name},…]\`. New codes must not collide with existing ones.
+- **remove_options** — delete options from a set by \`option_codes:[…]\` or \`option_ids:[…]\`. Deletes the option objects (which auto-detaches them); refuses to remove the last remaining option.
+- **reorder_options** — set display order via \`order:[…]\` listing every current option's code (or UID) in the desired sequence.
+- **update** — patch the set's OWN fields (name / code / description / value_type) only — never membership.
+- **delete** — remove the whole set (and its options); refuses with the exact blockers if any data element or tracked-entity attribute still uses it.
+
+### Rules
+- update / add_options / remove_options / reorder_options / delete each auto-snapshot a backup first (restore via manage_backups).
+- NEVER invent option-set or option UIDs — get them from search_metadata / action=get.
+
+### Examples
+- "Create an HIV Result option set with Positive/Negative/Inconclusive": create option_set:{ name:"HIV Result", value_type:"TEXT", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INC",name:"Inconclusive"}] }.
+- "Add a 'Refused' choice to that set": add_options option_set_id:"<id>", options:[{code:"REF",name:"Refused"}].
+- "Put Negative before Positive": reorder_options option_set_id:"<id>", order:["NEG","POS","INC"].`;
+
+const KB_LEGEND_SETS_DETAILS = `### Ranges
+- Bands are **half-open [startValue, endValue)**: a band matches values >= startValue and < endValue, so a band's endValue may equal the next band's startValue without overlapping. endValue must be > startValue.
+- DHIS2 does NOT reject overlapping or gapped bands. This tool returns an overlap **warning** (it never blocks) — relay any warning to the user.
+- \`color\` is an optional 6-digit hex (#RRGGBB); the tool canonicalises "#rrggbb"/"rrggbb".
+
+### Actions in detail
+- **create** — EITHER pass explicit \`legend_set:{ name, legends:[{name,startValue,endValue,color?},…] }\`, OR pass \`legend_set:{ name }\` + \`auto_bands:{ start, end, count }\` to auto-generate \`count\` equal-width contiguous bands on a red→amber→green (low→high) ramp. \`auto_bands.colors\` / \`auto_bands.names\` (length == count) override the defaults.
+- **add_legends** — append bands (\`legend_set_id\` + \`legends:[…]\`; new names must not collide). **remove_legends** — drop bands by \`legend_names:[…]\` or \`legend_ids:[…]\`; refuses to remove the last band.
+- **update** — the set's OWN fields (name / code) only. **delete** — removes the whole set; refuses with exact blockers if still in use.
+- All mutating actions auto-snapshot a backup first (restore via manage_backups).
+
+### Attaching (a legend set only DEFINES the scale)
+To an aggregate **indicator**: pass the set's UID as \`legend_set_id\` to manage_indicators(action="create"|"update"). For a data element, visualisation or map layer, set the legend in the relevant app — NEVER attempt any legend attach via raw dhis2_query PATCH or manage_metadata (it has NO legend action).
+
+### Examples
+- "Make a coverage legend, red→green, 0 to 100 in 5 bands": create legend_set:{ name:"Coverage 0–100" }, auto_bands:{ start:0, end:100, count:5 }.
+- "Create a stockout legend: 0 red, 1–10 amber, 11+ green": create legend_set:{ name:"Stock status", legends:[{name:"Out",startValue:0,endValue:1,color:"#D32F2F"},{name:"Low",startValue:1,endValue:11,color:"#FBC02D"},{name:"OK",startValue:11,endValue:1000000,color:"#388E3C"}] }.
+- "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].`;
+
+const KB_DASHBOARDS_DETAILS = `### Why a raw POST silently fails (and this tool does not)
+DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/\`filterDimensions\` (lists of dimension ids) and its DATA as \`dataDimensionItems\` (typed dx items) + \`relativePeriods\`/\`periods\` (pe) + \`organisationUnits\`/\`organisationUnitLevels\`/\`userOrganisationUnit\` (ou). The \`columns\`/\`rows\`/\`filters\` arrays are DERIVED read-only views — a raw POST that only sets them imports an EMPTY, un-renderable chart. This tool assembles the correct structure (verified VALIDATE+COMMIT on the live server).
+
+### Fields
+- **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
+- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025).
+- **org_units**: UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2 = all level-2 OUs).
+- **layout** (optional): which of dx/pe/ou sit on columns/rows/filters. Sensible per-type defaults apply (pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → cols[dx]/rows[pe]).
+
+### Rules
+- data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped. NEVER invent visualization, map or data-item UIDs.
+- add_items reads the full dashboard, appends below the current tiles, and writes the COMPLETE item set back, snapshotting to backups first. NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} — a dashboard PUT is a whole-object REPLACE that permanently wipes every existing tile (now blocked in code).
+- Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.
+- To delete a whole dashboard use action="delete" (snapshots first). Sharing/deletion of standalone visualizations/maps → manage_metadata.
+
+### Examples
+- "Build an ANC dashboard with a coverage chart, a pivot and a single value": create_dashboard dashboard:{ name:"ANC Programme" }, items:[ {new_visualization:{name:"ANC Coverage by Month",vis_type:"COLUMN",data_items:["<anc1>","<anc2>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC 1 This Year",vis_type:"SINGLE_VALUE",data_items:["<anc1>"],periods:["THIS_YEAR"],org_units:["<ou>"]}} ].
+- "Make me a column chart of malaria cases by district last year": create_visualization visualization:{ name:"Malaria cases by district", vis_type:"COLUMN", data_items:["<de>"], periods:["LAST_YEAR"], org_units:["LEVEL-2"] }.
+- "Add a coverage chart to my National Overview dashboard": add_items dashboard_id:"<dashId>", items:[ { new_visualization:{ name:"ANC coverage", vis_type:"COLUMN", data_items:["<indicatorId>"], periods:["LAST_12_MONTHS"], org_units:["USER_ORGUNIT"] } } ] — this APPENDS; existing tiles are preserved and snapshotted.`;
+
+const KB_TRANSLATIONS_DETAILS = `### How the feature works (verified on 2.43 — the app fetches both keys at startup)
+- Registry key "controller": { "<appSlug>": ["<locale>", ...] }. If an app/locale is NOT registered here, the app never loads its translations (this tool keeps it in sync automatically).
+- Per app+locale key "<slug>__<locale>" (double underscore, e.g. capture__ar): { "<exact source string>": "<replacement>", ... }. The app swaps each matching source string at render time.
+
+### Two uses (identical mechanics — a literal source→target string map)
+- TRANSLATE: locale is another language (e.g. "ar","fr") → English source renders as the translation.
+- REWRITE same language: locale is the language already shown (e.g. "en") → relabel/reword in place, e.g. "Report data" → "Submit report".
+
+### Critical
+- Match each source string EXACTLY as shown on screen (capitalisation, punctuation, whitespace) — read the real UI text first; an inexact key is silently ignored.
+- The app slug is lowercase (capture, dashboard, data-visualizer, maps). The user must reload the app with that locale active to see changes.
+- Requires DHIS2 2.43+; the tool refuses on older servers.
+- DataStore keys are NOT covered by manage_backups. set/remove return previous_value / previous_controller for manual rollback — surface the key name to the user.
+
+### Recipes
+- "Translate Capture to Arabic": manage_custom_translations(action="set", app="capture", locale="ar", translations={"Report data":"...", ...})
+- "Rename a button in English": manage_custom_translations(action="set", app="capture", locale="en", translations={"Report data":"Submit report"})
+- "What translations exist?": action="list". "Undo the Arabic translation": action="remove", app="capture", locale="ar".`;
+
+const KB_GROWTH_CHART_DETAILS = `### Typical order
+status (run this first) → install (if needed) → configure(program_id) → relay the returned \`dashboard_attach\` steps.
+
+### Hard requirements (the tool validates and refuses with a list if unmet)
+The program MUST have a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If any of the three DEs is missing the chart will not display. If configure reports missing metadata, offer scaffold_program or ask the user for the exact attribute/DE ids.
+
+### Making it visible
+configure makes the plugin FUNCTION but does not place the widget. Relay the tool's \`dashboard_attach\` block: the plugin must be added to the enrollment dashboard via the Tracker Plugin Configurator app (or Capture's "Add plugin" with the returned plugin source URL). The tool deliberately does NOT write dataStore/capture (Capture-owned; risk of cache corruption).
+
+### Recipe
+- "Set up the growth chart plugin for <program>": status → install (if needed) → configure(program_id) → relay dashboard_attach steps.
+- "I have no program for it": scaffold_program(org_unit_id) → configure(created program) → install. defaultIndicator is one of: wfa, hcfa, lhfa, wflh.`;
+
+// Per-tool manual extras: the deep KB text appended to the tool's original
+// description when its manual is delivered. Shared grammar blocks appear in
+// every manual that needs them.
+const MANUAL_EXTRAS = {
+  create_metadata: [KB_CREATE_PROGRAM_DETAILS, KB_VALUE_TYPE_MAPPING, KB_PROGRAM_RULE_SYNTAX, KB_PI_GRAMMAR].join('\n\n'),
+  manage_metadata: [KB_METADATA_DELETE_FLOW, KB_METADATA_TEA_OU, KB_METADATA_ICON_FLOW, KB_METADATA_SHARING].join('\n\n'),
+  manage_program_rules: KB_PROGRAM_RULE_SYNTAX,
+  manage_program_indicators: KB_PI_GRAMMAR,
+  manage_program_notifications: KB_NOTIFICATIONS_DETAILS,
+  manage_datasets: KB_DATASETS_DETAILS,
+  manage_custom_forms: KB_CUSTOM_FORMS_DETAILS,
+  manage_validation_rules: KB_VALIDATION_RULES_DETAILS,
+  manage_org_units: KB_ORG_UNITS_DETAILS,
+  manage_indicators: KB_INDICATORS_DETAILS,
+  manage_option_sets: KB_OPTION_SETS_DETAILS,
+  manage_legend_sets: KB_LEGEND_SETS_DETAILS,
+  manage_dashboards: KB_DASHBOARDS_DETAILS,
+  manage_custom_translations: KB_TRANSLATIONS_DETAILS,
+  manage_growth_chart_plugin: KB_GROWTH_CHART_DETAILS,
+  // manage_maps: full description already covers usage; no extra KB.
+};
+
+// ── Slim wire definitions ──
+const SLIM_DESC_LIMIT = 180;
+const MANUAL_NOTE = ' ⓘ Two-tier docs: your FIRST call to this tool each turn returns its full usage manual instead of executing — read it, then immediately re-issue the (corrected) call.';
+
+function slimDescriptionText(text) {
+  const s = String(text || '');
+  if (s.length <= SLIM_DESC_LIMIT) return s;
+  const window = s.slice(0, SLIM_DESC_LIMIT);
+  const cut = window.lastIndexOf('. ');
+  const head = cut > 40 ? window.slice(0, cut + 1) : window.replace(/\s+\S*$/, '');
+  return head + ' …(details in the tool manual)';
+}
+
+// Build the slim wire schema: top-level property names, types, enums and
+// required list are preserved exactly; long prose is truncated; NESTED object
+// shapes are collapsed to a field-name list in the description (their full
+// spec is in the manual, which the gate guarantees the model reads before the
+// first real execution).
+function slimSchema(parameters) {
+  if (!parameters || typeof parameters !== 'object') return parameters;
+  const out = { type: parameters.type || 'object', properties: {} };
+  if (Array.isArray(parameters.required)) out.required = [...parameters.required];
+  for (const [name, def] of Object.entries(parameters.properties || {})) {
+    out.properties[name] = slimSchemaProp(def);
+  }
+  return out;
+}
+
+function slimSchemaProp(def) {
+  if (!def || typeof def !== 'object') return def;
+  const out = {};
+  if (def.type) out.type = def.type;
+  if (Array.isArray(def.enum)) out.enum = [...def.enum];
+  if (def.oneOf) out.oneOf = def.oneOf;
+  let desc = def.description ? slimDescriptionText(def.description) : '';
+  if (def.type === 'array' && def.items && typeof def.items === 'object') {
+    if (def.items.properties) {
+      out.items = { type: 'object' };
+      desc += (desc ? ' ' : '') + 'Item fields: ' + Object.keys(def.items.properties).join(', ') + ' — full spec in the manual.';
+    } else {
+      out.items = {};
+      if (def.items.type) out.items.type = def.items.type;
+      if (Array.isArray(def.items.enum)) out.items.enum = [...def.items.enum];
+    }
+  } else if (def.properties) {
+    desc += (desc ? ' ' : '') + 'Object fields: ' + Object.keys(def.properties).join(', ') + ' — full spec in the manual.';
+  } else if (def.additionalProperties) {
+    out.additionalProperties = def.additionalProperties;
+  }
+  if (desc) out.description = desc;
+  return out;
+}
+
+// Convert the contextual tool selection into what is actually sent to the
+// provider. Non-MANUAL_TOOLS pass through untouched; MANUAL_TOOLS get the slim
+// routing description + slimmed schema (with the `action` enum description
+// kept in full — it is routing information the model needs at decide time).
+function toWireTools(tools) {
+  return tools.map(t => {
+    const name = t?.function?.name;
+    if (!name || !MANUAL_TOOLS.has(name)) return t;
+    const orig = t.function;
+    const params = slimSchema(orig.parameters);
+    const origActionDesc = orig.parameters?.properties?.action?.description;
+    if (origActionDesc && params?.properties?.action) {
+      params.properties.action.description = origActionDesc;
+    }
+    return {
+      type: 'function',
+      function: {
+        name,
+        description: (TOOL_SUMMARIES[name] || slimDescriptionText(orig.description)) + MANUAL_NOTE,
+        parameters: params,
+      },
+    };
+  });
+}
+
+// Render a complete, readable parameter reference from the ORIGINAL schema so
+// the manual loses nothing relative to the old always-in-context definitions.
+function renderParamDocs(schema, indent = '') {
+  if (!schema || typeof schema !== 'object' || !schema.properties) return '';
+  let out = '';
+  const required = new Set(schema.required || []);
+  for (const [name, def] of Object.entries(schema.properties)) {
+    if (!def || typeof def !== 'object') continue;
+    const bits = [];
+    if (def.type) bits.push(def.type);
+    if (required.has(name)) bits.push('REQUIRED');
+    if (Array.isArray(def.enum)) bits.push('one of: ' + def.enum.join(' | '));
+    const itemEnum = def.items && Array.isArray(def.items.enum) ? ' (each one of: ' + def.items.enum.join(' | ') + ')' : '';
+    out += `${indent}- \`${name}\`${bits.length ? ' (' + bits.join(', ') + ')' : ''}${itemEnum}${def.description ? ': ' + def.description : ''}\n`;
+    const child = def.type === 'array' ? def.items : def;
+    if (child && typeof child === 'object' && child.properties) {
+      out += renderParamDocs(child, indent + '  ');
+    }
+  }
+  return out;
+}
+
+function buildToolManual(name) {
+  const tool = TOOLS.find(t => t.function.name === name);
+  if (!tool) return null;
+  const extras = MANUAL_EXTRAS[name];
+  return [
+    `# ${name} — FULL USAGE MANUAL`,
+    tool.function.description,
+    extras ? extras : null,
+    `## Parameter reference (${name})`,
+    renderParamDocs(tool.function.parameters) || '(no parameters)',
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildManualGateResult(name) {
+  return {
+    _tool_manual: name,
+    manual: buildToolManual(name),
+    _note: `First use of ${name} this turn — the full manual above was delivered INSTEAD of executing. Nothing was executed and no API call was made. This is the normal two-tier docs flow, NOT an error.`,
+    _next_step: `Check your intended arguments against the manual, correct anything that does not match it, and RE-ISSUE the ${name} tool call now — it will execute immediately. Do not mention this manual to the user.`,
+  };
+}
+
+// History persistence: a delivered manual is only needed for the turn it was
+// delivered in (the gate re-delivers next turn if the tool is used again), so
+// replace its bulk with a compact stub instead of dragging ~2k chars of
+// truncated manual through every subsequent request.
+function stubToolContentForHistory(content) {
+  if (typeof content === 'string' && content.startsWith('{"_tool_manual"')) {
+    try {
+      const name = JSON.parse(content)._tool_manual;
+      return JSON.stringify({ _tool_manual: name, note: 'Usage manual was delivered here (content omitted from history; it is re-delivered automatically on first use in a new turn).' });
+    } catch { /* fall through to normal truncation */ }
+  }
+  return truncateToolContentForHistory(content);
+}
+
 // ── Dynamic Tool Selection ────────────────────────────────────────────────────
 // Returns only tools relevant to the current context and user intent.
 // Keeping the tool list small prevents context-window overflow and helps
@@ -6038,6 +6674,7 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 14.1. For tracker write tasks, never invent TEI, enrollment, stage, or event IDs. Use the current context IDs exactly, or fetch them first.
 14.2. Never claim a tracker create/update/delete succeeded unless the tool result shows no validation errors and stats.created/stats.updated/stats.deleted is greater than 0.
 15. For sharing/access issues (program not appearing, "can't see", no data access): check the access field first, then use manage_metadata(action=update_sharing) to fix. NEVER use dhis2_query PUT/PATCH for sharing — it will fail.
+16. Two-tier tool docs: authoring/write tools carry a short routing description; their FULL usage manual is delivered automatically as the result of your FIRST call to them each turn (that first call does not execute — it is not an error). When you receive a manual, read it, then immediately re-issue the corrected tool call. Never tell the user about manuals or this mechanism.
 `;
 
   // ── Tracker Write Protocol — only when user wants to create/update/complete tracker data ──
@@ -6484,97 +7121,9 @@ Run all steps without pausing. Only ask the user when a step is genuinely ambigu
   if (hasDatasetCtx || inAggDataEntryCtx || wantsDatasetPrompt) {
     p += `
 ## DHIS2 Datasets (Aggregate "Programs")
-A DHIS2 **dataSet** is the aggregate-data equivalent of a tracker program. Users often say "aggregate program" / "monthly form" / "reporting form" — they mean a dataSet. Use the **manage_datasets** tool for ALL dataset operations; never write raw POST/PUT/PATCH bodies via dhis2_query.
-
-### Required fields when creating
-- \`dataset_name\` (unique server-wide), \`short_name\` (≤ 50 chars), \`period_type\`, \`category_combo_id\` (defaults to the system "default" combo)
-- \`mobile\` is sent automatically as false (deprecated J2ME flag — schema-required)
-
-### period_type — exact case (one of these 20)
-Daily, Weekly, WeeklyWednesday, WeeklyThursday, WeeklySaturday, WeeklySunday, BiWeekly, Monthly, BiMonthly, Quarterly, QuarterlyNov, SixMonthly, SixMonthlyApril, SixMonthlyNov, Yearly, FinancialApril, FinancialJuly, FinancialSep, FinancialOct, FinancialNov
-
-### form_type
-DEFAULT (single table), SECTION (sectioned form, common for routine reporting), CUSTOM (uses dataEntryForm), SECTION_MULTIORG (sectioned across multiple OUs).
-
-### Category Combo (DISAGGREGATION)
-- Each dataset has ONE \`category_combo_id\`. Default is no disaggregation (the system "default" combo).
-- Each \`dataSetElement\` (DE attached to the dataset) can OPTIONALLY override with its own \`category_combo_id\`. Use this when one DE in the form has different disaggregation than the rest (e.g., the dataset uses "Sex" but a specific DE uses "Sex × Age").
-- Look up category combos via search_metadata(object_type="categoryCombos", name_filter=...) or dhis2_query path "categoryCombos?fields=id,displayName".
-- The default combo's UID differs per server. The chatbot resolves it automatically when creating; pass \`category_combo_id\` only to override.
-
-### Creating disaggregation (NEW combo + new categories + new options)
-**NEVER assemble raw /metadata POST payloads for category combos** — DHIS2 silently 409s on dependency-order mistakes (categoryOptions before categories before combos), missing \`dataDimensionType\`, or forgotten CoC regeneration. Use the dedicated tool instead:
-
-\`\`\`
-create_metadata(action="create_category_combo", category_combo:{
-  name: "HTS Result by Sex",
-  data_dimension_type: "DISAGGREGATION",   // or ATTRIBUTE
-  categories: [
-    { name: "HIV Result", options: ["Positive", "Negative"] },  // NEW — auto-creates options
-    { id: "cX5k9anHEHd" }                                        // EXISTING — reuse Gender by id
-  ]
-}, sharing:{ public_access: "--------", user_group_ids: ["<gid>"], user_group_access: "rw------" })
-\`\`\`
-
-What the tool does for you (you DON'T do these by hand):
-1. Looks up each category by id OR exact name; reuses any existing one (no duplicates).
-2. Looks up each option by exact name; reuses any existing one (no "Male #2", "Female #2" duplicates).
-3. POSTs categoryOptions + categories + categoryCombo in ONE atomic /metadata call (correct dependency order).
-4. Triggers \`/api/maintenance/categoryOptionComboUpdate\` so the CategoryOptionCombo rows are materialized — without this the form has no cells to bind to and Save silently drops values. **The tool ALWAYS calls this. You don't.**
-5. Applies sharing via the legacy \`/api/sharing\` endpoint (the only path that works for metadata-only-shareable categoryCombo / category / categoryOption / dataElement — the per-resource \`/{type}/{id}/sharing\` PUT rejects them with E3016 even when access bits are metadata-only).
-
-### Creating data elements that USE a (new or existing) category combo
-Use ONE call — bundle everything atomically:
-
-\`\`\`
-create_metadata(action="create_data_elements",
-  domain_type: "AGGREGATE",                  // or TRACKER (default)
-  aggregation_type: "SUM",                   // SUM/AVERAGE/COUNT/...
-  category_combo: { ...inline definition as above... },   // OR category_combo_id / category_combo_name
-  data_elements: [
-    { name: "Individuals Tested for HIV", value_type: "INTEGER", use_category_combo: true },
-    { name: "Individuals Receiving Results", value_type: "INTEGER", use_category_combo: true },
-    { name: "Post-test Counseling Completed", value_type: "INTEGER", use_category_combo: true },
-    { name: "Referrals to Care Made", value_type: "INTEGER", use_default_combo: true }   // no disagg
-  ],
-  sharing: { public_access: "--------", user_group_ids: ["<gid>"], user_group_access: "rw------" }
-)
-\`\`\`
-
-\`use_category_combo: true\` binds that DE to the inline/named combo. \`use_default_combo: true\` keeps it on the system default (no disaggregation). DEs with neither flag inherit from the call's category_combo (or default if none). Mix freely in one call.
-
-### "Can capture and view" sharing translation
-- DataSet (data-shareable): \`rwrw----\` for the user group
-- DataElement / CategoryCombo / Category / CategoryOption / OptionSet / TEA / ProgramIndicator (metadata-only-shareable): \`rw------\`
-- "Public access None": \`public_access: "--------"\`
-- "My user group": resolve via \`dhis2_query path="userGroups?filter=users.id:eq:<currentUserId>&fields=id,name"\` if the user said "my group", or ask the user to name the group.
-
-### Sharing — IMPORTANT FOR DATA ENTRY
-DataSets are data-shareable. The 8-char access string positions 3-4 control DATA write. To let users enter data into a dataset, public_access MUST be \`rwrw----\` (or grant rw at positions 3-4 to specific user groups). \`rw------\` allows metadata changes only — users will see the form but the Save button does nothing for them. The tool defaults new datasets to \`rwrw----\` so data entry works out of the box.
-
-### Org-unit assignment
-A dataset only appears in a user's Data Entry app for the OUs assigned to it. Use \`manage_datasets(action="assign_org_units", dataset_id, org_unit_ids, merge_mode)\` (merge_mode: replace | add | remove). Without an OU assigned that the user has access to, the dataset is invisible.
-
-### Sections vs Default form
-- DEFAULT form: one big table. Use when the dataset has < 20 DEs.
-- SECTION form: groups DEs into named sections. Provide \`sections: [{name, sort_order, data_element_ids:[...], indicator_ids:[...], show_row_totals, show_column_totals}]\` at create time, OR add later with action="create_section". Sections show up automatically when form_type="SECTION".
-
-### Common one-call recipes
-- "Create a monthly dataset for malaria reporting with these 5 data elements":
-  manage_datasets(action="create", dataset_name="Malaria Monthly", period_type="Monthly", form_type="SECTION", data_element_ids=[<de1>,...,<de5>], org_unit_ids=[<ouRoot>], sections=[{name:"Cases", data_element_ids:[<de1>,<de2>,<de3>]}, {name:"Deaths", data_element_ids:[<de4>,<de5>]}])
-- "Add these DEs to the current dataset":
-  manage_datasets(action="add_data_elements", dataset_id="<datasetId from context>", data_element_ids=[...])
-- "What dataset am I in?": Already known — read the Dataset Context block above. Do NOT call any tool.
-- "List monthly datasets": manage_datasets(action="list", period_type="Monthly")
-- "Make this dataset entry available for users": manage_datasets(action="update_sharing", dataset_id, public_access="rwrw----")
-
-### Common pitfalls (hard-learned)
-- shortName must be ≤ 50 chars. The tool clamps automatically.
-- Sections cannot have a writable \`categoryCombo\` (DHIS2 derives it from the contained DEs).
-- "default" is NOT a valid category-combo id literal — the tool resolves the actual UID via /api/categoryCombos?filter=name:eq:default.
-- DataSet \`version\` auto-increments on save — never set it manually.
-- \`expiryDays = 0\` and \`openFuturePeriods = 0\` mean "never expires" and "no future periods open", NOT "expires immediately".
-- A dataset's "indicators" field is for DISPLAY indicators on the form (read-only sums). DON'T confuse with program indicators.
+A DHIS2 **dataSet** is the aggregate-data equivalent of a tracker program. Users saying "aggregate program" / "monthly form" / "reporting form" mean a dataSet. Use **manage_datasets** for ALL dataset operations (create/update/delete, DE membership, OU assignment, sharing, sections); NEVER write raw dataset bodies via dhis2_query. For data entry to work a dataset needs data-level sharing ("rwrw----") AND assigned org units — the tool defaults these correctly.
+- NEW disaggregation (category combos) → create_metadata(action="create_category_combo"); aggregate DEs (optionally bound to a combo) → create_metadata(action="create_data_elements", domain_type="AGGREGATE"). NEVER assemble raw category-combo /metadata POSTs.
+- "What dataset am I in?" → answer from the Dataset Context block above; do NOT call any tool.
 `;
   }
 
@@ -6582,31 +7131,7 @@ A dataset only appears in a user's Data Entry app for the OUs assigned to it. Us
   if (wantsValidationRulePrompt) {
     p += `
 ## DHIS2 Validation Rules (manage_validation_rules)
-A **validationRule** is an aggregate data-quality check: it compares a **leftSide** expression to a **rightSide** expression with an **operator**, evaluated per period. When data violates it, DHIS2 surfaces it in the Data Quality / Validation Analysis app and in the Data Entry "Run validation" panel. Use **manage_validation_rules** for ALL validation-rule work — never hand-write /metadata bodies via dhis2_query.
-
-### Actions
-list (filter by name/importance/period_type), get, create, update, delete. Update auto-snapshots a backup first (restore via manage_backups); delete checks references first.
-
-### Expressions (both sides)
-- \`#{dataElementUid}\` = the data element summed across all its category-option-combos.
-- \`#{dataElementUid.categoryOptionComboUid}\` = one specific disaggregation cell.
-- \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed (e.g. \`#{de1} + #{de2}\`).
-- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving. A bad UID or malformed syntax is rejected at create/update time with the parser's exact error — fix the expression and retry, don't loop.
-- Look up data-element UIDs with search_metadata(object_type="dataElements") or manage_datasets(action=get) — NEVER invent UIDs.
-
-### operator (leftSide <op> rightSide)
-equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, compulsory_pair (both sides must have a value or neither), exclusive_pair (at most one side may have a value).
-
-### Other fields
-- importance: HIGH | MEDIUM | LOW (default MEDIUM).
-- period_type: same 20 exact-case values as datasets (Monthly, Quarterly, Yearly, …); default Monthly. Pick the period at which the compared totals are meaningful.
-- left_missing_strategy / right_missing_strategy: NEVER_SKIP (default — a missing value counts as 0), SKIP_IF_ANY_VALUE_MISSING, SKIP_IF_ALL_VALUES_MISSING. Use a SKIP_* strategy when a missing value should suppress the check instead of being treated as 0.
-- instruction: the message shown to the data-entry user when the rule fails — phrase it as what to check/fix.
-
-### Examples
-- "Inpatient days must not exceed available bed-days (monthly)": create rule { name, operator:"less_than_or_equal_to", period_type:"Monthly", left_expression:"#{inpatientDaysUid}", right_expression:"#{bedDaysUid}", importance:"MEDIUM" }.
-- "ANC 4th visits should never exceed ANC 1st visits": operator "less_than_or_equal_to", left=#{anc4}, right=#{anc1}.
-- "Sex sub-totals must equal the grand total": operator "equal_to", left="#{deMale} + #{deFemale}", right="#{deTotal}".
+A **validationRule** is an aggregate data-quality check comparing a leftSide vs rightSide expression with an operator, evaluated per period. Use **manage_validation_rules** (list/get/create/update/delete) for ALL validation-rule work — never hand-write /metadata bodies via dhis2_query. Both expressions are server-validated before saving; resolve data-element UIDs via search_metadata / manage_datasets(action=get), never invent them.
 `;
   }
 
@@ -6614,32 +7139,7 @@ equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_
   if (wantsOrgUnitPrompt) {
     p += `
 ## DHIS2 Organisation Units (manage_org_units)
-The org-unit hierarchy is the tree of facilities/chiefdoms/districts/countries that EVERY program, dataset, data value and enrollment is attached to. Use **manage_org_units** for ALL org-unit STRUCTURE work (create a facility under a parent, rename/close one, MOVE/re-parent a unit or subtree, delete a leaf) — never hand-write /metadata bodies via dhis2_query.
-
-### Actions
-list (filter by name/level/parent_id), get, create, update, delete.
-
-### The one rule that trips people up: level & path are DERIVED, never set
-- A unit's \`level\` and \`path\` come from its parent — DHIS2 computes them. You pass only \`parent_id\`; a child of a level-3 chiefdom automatically becomes level 4 with path = parentPath + "/" + newId.
-- NEVER put level or path in the org_unit object, and never "fix" them by hand — that is not how the hierarchy works.
-
-### create
-- Required: org_unit.name, org_unit.parent_id, org_unit.opening_date (YYYY-MM-DD). short_name defaults to name (≤50 chars).
-- The tool verifies the parent exists first and reports the derived level. Resolve the parent UID with manage_org_units(action=list) or search_metadata — NEVER invent it. Creating a new ROOT is intentionally unsupported (it would split the hierarchy).
-- Use dry_run_only:true to validate (incl. the parent reference) without committing.
-
-### update / move (re-parent)
-- Patch any field (name, short_name, opening_date, closed_date — pass "" to clear closed_date — code, description, comment, contact fields).
-- Supplying org_unit.parent_id MOVES the unit; DHIS2 re-computes level/path for it AND all descendants. The tool rejects a move under the unit's own descendant (cycle) and under itself.
-- update auto-snapshots a backup first (restore via manage_backups).
-
-### delete
-- Only LEAF units delete. The tool refuses a unit that still has children (re-parent or delete them bottom-up first) and lets DHIS2 block any unit still holding data values / program-dataset assignments / user scope, surfacing the exact reason. Auto-backup is taken first.
-
-### Examples
-- "Add a new facility 'Bo CHC' under Badjia chiefdom (opened 2015-01-01)": create with org_unit:{ name:"Bo CHC", parent_id:"<BadjiaUID>", opening_date:"2015-01-01" }.
-- "Move the Ngelehun clinic under Kakua chiefdom instead": update org_unit_id=<clinic> org_unit:{ parent_id:"<KakuaUID>" }.
-- "Close facility X as of 2024-12-31": update org_unit:{ closed_date:"2024-12-31" }.
+The org-unit hierarchy is the tree of facilities/chiefdoms/districts every program, dataset and enrollment is attached to. Use **manage_org_units** (list/get/create/update/delete) for ALL org-unit STRUCTURE work — create under a parent, rename/close, MOVE/re-parent, delete a leaf — never hand-write /metadata bodies via dhis2_query. \`level\`/\`path\` are DERIVED from the parent (never set them); resolve parent UIDs via list/search_metadata, never invent them.
 `;
   }
 
@@ -6647,29 +7147,7 @@ list (filter by name/level/parent_id), get, create, update, delete.
   if (wantsIndicatorPrompt) {
     p += `
 ## DHIS2 Aggregate Indicators (manage_indicators)
-An aggregate **indicator** is a calculated value: **(numerator / denominator) × the indicatorType factor**. It is what dashboards, pivot tables and maps usually display (e.g. ANC coverage, case fatality rate, reporting rate). Use **manage_indicators** for ALL aggregate-indicator work — never hand-write /metadata bodies via dhis2_query.
-IMPORTANT: this tool is for **aggregate** indicators only. **Tracker / event program indicators** are a DIFFERENT object — use **manage_program_indicators** for those.
-
-### Actions
-list (filter by name / indicator_type), get, create, update, delete. Update auto-snapshots a backup first (restore via manage_backups); delete checks references then surfaces DHIS2's exact blocker (dataSet / visualization / indicatorGroup / predictor) if the indicator is still in use.
-
-### Expressions (numerator & denominator)
-- \`#{dataElementUid}\` = data element summed across all its category-option-combos; \`#{dataElementUid.cocUid}\` = one disaggregation cell.
-- \`R{dataSetUid.REPORTING_RATE}\` (also ACTUAL_REPORTS, EXPECTED_REPORTS, …) for reporting rates; \`I{programIndicatorUid}\` to reuse a program indicator; \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed.
-- For a plain count/sum, set denominator to \`"1"\`.
-- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving — a bad UID or malformed syntax is rejected at create/update time with the parser's exact error. Fix the expression and retry, don't loop.
-- Look up UIDs with search_metadata / manage_datasets(action=get) — NEVER invent them.
-
-### indicator_type (the scaling factor)
-Pass a UID or the exact name. Common types: **"Number (Factor 1)"** (×1 — raw ratio/count), **"Per cent"** (×100 — a percentage), **"Per thousand"**, **"Per ten thousand"**, **"Per hundred thousand"**. The tool resolves and verifies the type before writing.
-
-### Other fields
-- short_name: ≤50 chars (defaults to name). annualized: scale to a full year for the chosen period (default false). decimals: 0–5 fixed output decimals (omit to inherit the default). numerator_description / denominator_description: auto-derived from DHIS2 if omitted.
-
-### Examples
-- "ANC 1 coverage as a percentage of expected pregnancies": create indicator:{ name:"ANC 1 Coverage", indicator_type:"Per cent", numerator:"#{anc1Uid}", denominator:"#{expectedPregnanciesUid}" }.
-- "Maternal deaths per 100,000 live births": indicator_type:"Per hundred thousand", numerator:"#{maternalDeaths}", denominator:"#{liveBirths}".
-- "Total malaria cases (a plain sum)": indicator_type:"Number (Factor 1)", numerator:"#{malariaConfirmed} + #{malariaClinical}", denominator:"1".
+An aggregate **indicator** is (numerator / denominator) × the indicatorType factor — what dashboards, pivots and maps usually display. Use **manage_indicators** (list/get/create/update/delete) for ALL aggregate-indicator work — never hand-write /metadata bodies via dhis2_query. IMPORTANT: **tracker/event program indicators are a DIFFERENT object** — use manage_program_indicators for those. Expressions are server-validated before save; resolve UIDs via search_metadata, never invent them.
 `;
   }
 
@@ -6677,26 +7155,7 @@ Pass a UID or the exact name. Common types: **"Number (Factor 1)"** (×1 — raw
   if (wantsOptionSetPrompt) {
     p += `
 ## DHIS2 Option Sets (manage_option_sets)
-An **option set** is a reusable, ordered pick-list (drop-down) of \`{ code, name }\` pairs that constrains a data element or tracked-entity attribute to a fixed set of choices (e.g. HIV Result = Positive/Negative/Inconclusive). \`code\` is the value stored in data; \`name\` is the label shown to users. **Codes must be unique within a set.** Use **manage_option_sets** for ALL standalone option-set work — never hand-write /metadata option bodies via dhis2_query.
-
-### Actions
-- **list** (name / value_type filters) and **get** (returns options in display order) are read-only.
-- **create** — a new standalone set + its options, imported atomically (VALIDATE then COMMIT). Pass \`option_set:{ name, value_type, options:[{code,name},…] }\`. value_type defaults to TEXT if omitted.
-- **add_options** — append new options to an existing set: \`option_set_id\` + \`options:[{code,name},…]\`. New codes must not collide with existing ones.
-- **remove_options** — delete options from a set by \`option_codes:[…]\` or \`option_ids:[…]\`. Deletes the option objects (which auto-detaches them); refuses to remove the last remaining option.
-- **reorder_options** — set display order via \`order:[…]\` listing every current option's code (or UID) in the desired sequence.
-- **update** — patch the set's OWN fields (name / code / description / value_type) only — never membership.
-- **delete** — remove the whole set (and its options); refuses with the exact blockers if any data element or tracked-entity attribute still uses it.
-
-### Rules
-- update / add_options / remove_options / reorder_options / delete each auto-snapshot a backup first (restore via manage_backups).
-- NEVER invent option-set or option UIDs — get them from search_metadata / action=get.
-- To create an option set as part of a NEW data element in one shot, use create_metadata's inline \`option_set\` instead. To CONVERT a set to MULTI_TEXT (multi-select) and cascade the change to every DE/TEA using it, use manage_metadata(action=convert_value_type). This tool owns standalone option-set CRUD.
-
-### Examples
-- "Create an HIV Result option set with Positive/Negative/Inconclusive": create option_set:{ name:"HIV Result", value_type:"TEXT", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INC",name:"Inconclusive"}] }.
-- "Add a 'Refused' choice to that set": add_options option_set_id:"<id>", options:[{code:"REF",name:"Refused"}].
-- "Put Negative before Positive": reorder_options option_set_id:"<id>", order:["NEG","POS","INC"].
+An **option set** is a reusable, ordered pick-list of \`{ code, name }\` pairs constraining a DE or TEA to fixed choices. Use **manage_option_sets** (list/get/create/update/add_options/remove_options/reorder_options/delete) for ALL standalone option-set work — never hand-write option bodies via dhis2_query. For an option set inline on a NEW data element use create_metadata instead; to CONVERT a set to MULTI_TEXT (multi-select, cascaded) use manage_metadata(action=convert_value_type).
 `;
   }
 
@@ -6704,30 +7163,7 @@ An **option set** is a reusable, ordered pick-list (drop-down) of \`{ code, name
   if (wantsLegendSetPrompt) {
     p += `
 ## DHIS2 Legend Sets (manage_legend_sets)
-A **legend set** is a reusable, ordered list of colour **bands** that renders numeric values as a traffic-light / heat-map scale on data elements, indicators, visualisations and maps (e.g. ANC coverage shaded red 0–50, amber 50–80, green 80–100). Each band is \`{ name, startValue, endValue, color }\`. Use **manage_legend_sets** for ALL standalone legend-set work — never hand-write /metadata legendSets bodies via dhis2_query.
-
-### Ranges
-- Bands are **half-open [startValue, endValue)**: a band matches values >= startValue and < endValue, so a band's endValue may equal the next band's startValue without overlapping. endValue must be > startValue.
-- DHIS2 does NOT reject overlapping or gapped bands. This tool returns an overlap **warning** (it never blocks) — relay any warning to the user.
-- \`color\` is an optional 6-digit hex (#RRGGBB); the tool canonicalises "#rrggbb"/"rrggbb".
-
-### Actions
-- **list** (name filter) and **get** (bands in value order) are read-only.
-- **create** — a new set + its bands, imported atomically (VALIDATE then COMMIT). EITHER pass explicit \`legend_set:{ name, legends:[{name,startValue,endValue,color?},…] }\`, OR pass \`legend_set:{ name }\` + \`auto_bands:{ start, end, count }\` to auto-generate \`count\` equal-width contiguous bands on a red→amber→green (low→high) ramp. \`auto_bands.colors\` / \`auto_bands.names\` (length == count) override the defaults.
-- **add_legends** — append bands to an existing set: \`legend_set_id\` + \`legends:[…]\`. New band names must not collide with existing ones.
-- **remove_legends** — drop bands by \`legend_names:[…]\` or \`legend_ids:[…]\`; refuses to remove the last remaining band.
-- **update** — patch the set's OWN fields (name / code) only — never the bands.
-- **delete** — remove the whole set (its bands cascade); refuses with the exact blockers if any data element, indicator, visualisation or map still uses it.
-
-### Rules
-- add_legends / remove_legends / update / delete each auto-snapshot a backup first (restore via manage_backups).
-- NEVER invent legend-set or band UIDs — get them from search_metadata / action=get.
-- A legend set only defines the colour scale; ATTACHING it is a SEPARATE step. To an aggregate **indicator** (so it renders colour-coded in every dashboard/pivot/map): pass the set's UID as \`legend_set_id\` to manage_indicators(action="create" — or "update" to add it later). This is the legend-set → indicator chain. For a data element, visualisation or map layer, set the legend in the relevant app — the extension does not (yet) automate those attach points. NEVER attempt any legend attach via a raw dhis2_query PATCH or manage_metadata (it has NO legend action). This tool owns standalone legend-set CRUD.
-
-### Examples
-- "Make a coverage legend, red→green, 0 to 100 in 5 bands": create legend_set:{ name:"Coverage 0–100" }, auto_bands:{ start:0, end:100, count:5 }.
-- "Create a stockout legend: 0 red, 1–10 amber, 11+ green": create legend_set:{ name:"Stock status", legends:[{name:"Out",startValue:0,endValue:1,color:"#D32F2F"},{name:"Low",startValue:1,endValue:11,color:"#FBC02D"},{name:"OK",startValue:11,endValue:1000000,color:"#388E3C"}] }.
-- "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].
+A **legend set** is a reusable, ordered list of colour bands rendering numeric values as a traffic-light / heat-map scale. Use **manage_legend_sets** (list/get/create/add_legends/remove_legends/update/delete; create supports auto_bands for a red→amber→green ramp) — never hand-write legendSets bodies via dhis2_query. A legend set only DEFINES the scale; attach it to an aggregate indicator via manage_indicators(legend_set_id) — NEVER via raw dhis2_query PATCH or manage_metadata (no legend action).
 `;
   }
 
@@ -6735,33 +7171,7 @@ A **legend set** is a reusable, ordered list of colour **bands** that renders nu
   if (wantsDashboardPrompt) {
     p += `
 ## DHIS2 Dashboards & Visualizations (manage_dashboards)
-A **visualization** is a saved chart, pivot table or single-value tile (the analytics output shown in the Dashboard app and Data Visualizer). A **dashboard** arranges several visualizations (and maps / text tiles) on a grid. Use **manage_dashboards** for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata \`visualizations\` or \`dashboards\` bodies via dhis2_query.
-
-### Why a raw POST silently fails (and this tool does not)
-DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/\`filterDimensions\` (lists of dimension ids) and its DATA as \`dataDimensionItems\` (typed dx items) + \`relativePeriods\`/\`periods\` (pe) + \`organisationUnits\`/\`organisationUnitLevels\`/\`userOrganisationUnit\` (ou). The \`columns\`/\`rows\`/\`filters\` arrays are DERIVED read-only views — a raw POST that only sets them imports an EMPTY, un-renderable chart. This tool assembles the correct structure (verified VALIDATE+COMMIT on the live server).
-
-### Actions
-- **list** (optional name_filter) and **get** (dashboard_id → its items + each item's visualization) are read-only.
-- **create_visualization** — one chart/pivot/single-value: \`visualization:{ name, vis_type, data_items:[…UIDs], periods:[…], org_units:[…] }\`. data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped.
-- **create_dashboard** — a whole NEW dashboard atomically: \`dashboard:{ name }\` + \`items:[…]\`. Each item EITHER references an existing object (\`{ visualization_id }\` or \`{ type:"MAP", map_id }\` or \`{ type:"TEXT", text }\`) OR inline-creates a new chart (\`{ new_visualization:{ name, vis_type, data_items, periods, org_units } }\`). New visualizations + the dashboard import together, so one bad UID rolls the whole thing back. Items are auto-arranged on the 58-column grid (override per item with x/y/width/height).
-- **add_items** — add tile(s) to an EXISTING dashboard: \`dashboard_id\` + \`items:[…]\` (same item shapes as create_dashboard). THIS IS THE ONLY SAFE WAY to add to a dashboard that already exists. It reads the full dashboard, appends below the current tiles, and writes the COMPLETE item set back, snapshotting to backups first. NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} or a /metadata dashboards[] body — a dashboard PUT is a whole-object REPLACE and permanently wipes every existing tile (this is what made dashboards "go missing"; it's now blocked in code).
-- **remove_item** (\`dashboard_id\` + \`item_id\`), **update** (\`dashboard_id\` + \`dashboard:{ name?, description? }\`), **delete** (\`dashboard_id\`) — each snapshots first; undo any of them via manage_backups.
-
-### Fields
-- **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
-- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025).
-- **org_units**: UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2 = all level-2 OUs).
-- **layout** (optional): which of dx/pe/ou sit on columns/rows/filters. Sensible per-type defaults apply (pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → cols[dx]/rows[pe]).
-
-### Rules
-- NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / list / get first.
-- To delete a whole dashboard use manage_dashboards(action="delete") (it snapshots first, so it's restorable). To delete a standalone visualization/map, or to change sharing on either, use **manage_metadata** (object_type "dashboards" / "visualizations" / "maps").
-- Use **render_chart** for a quick inline chart preview in chat; use **manage_dashboards** to SAVE a reusable visualization/dashboard in DHIS2. They are different jobs.
-
-### Examples
-- "Build an ANC dashboard with a coverage chart, a pivot and a single value": create_dashboard dashboard:{ name:"ANC Programme" }, items:[ {new_visualization:{name:"ANC Coverage by Month",vis_type:"COLUMN",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC Coverage Pivot",vis_type:"PIVOT_TABLE",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC 1 This Year",vis_type:"SINGLE_VALUE",data_items:["<anc1>"],periods:["THIS_YEAR"],org_units:["<ou>"]}} ].
-- "Make me a column chart of malaria cases by district last year": create_visualization visualization:{ name:"Malaria cases by district", vis_type:"COLUMN", data_items:["<de>"], periods:["LAST_YEAR"], org_units:["LEVEL-2"] }.
-- "Add a coverage chart for this new indicator to my National Overview dashboard": add_items dashboard_id:"<dashId>", items:[ { new_visualization:{ name:"ANC coverage", vis_type:"COLUMN", data_items:["<indicatorId>"], periods:["LAST_12_MONTHS"], org_units:["USER_ORGUNIT"] } } ] — this APPENDS; the dashboard's existing tiles are preserved and snapshotted.
+A **visualization** is a saved chart/pivot/single-value tile; a **dashboard** arranges several of them (plus maps/text tiles). Use **manage_dashboards** for ALL dashboard/visualization CREATION — NEVER hand-assemble \`visualizations\`/\`dashboards\` bodies via dhis2_query (a raw POST imports an EMPTY, un-renderable chart; a raw dashboard PUT permanently WIPES its existing tiles). To add to an EXISTING dashboard, action="add_items" is the ONLY safe path. **render_chart** = quick inline preview in chat; **manage_dashboards** = SAVE a reusable visualization/dashboard in DHIS2 — different jobs. Sharing/deletion of standalone visualizations/maps → manage_metadata.
 `;
   }
 
@@ -6769,32 +7179,7 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
   if (wantsCustomFormPrompt || inTrackerCtx || hasDatasetCtx || inAggDataEntryCtx) {
     p += `
 ## DHIS2 Custom (HTML) Forms — use the **manage_custom_forms** tool
-A CUSTOM form is hand-laid-out HTML for data entry. It works for BOTH dataSets (renders in the Aggregate Data Entry app) and tracker/event program STAGES (renders in the new Capture app). Use **manage_custom_forms** for ALL of this — never assemble raw POST/PUT bodies via dhis2_query.
-
-### When to use
-- "create/design/build a custom form", "custom data entry form", "html form", "custom layout/form designer" → manage_custom_forms.
-- For a dataset → pass \`dataset_id\`. For a tracker/event program stage → pass \`program_stage_id\` (NOT the program id — a custom form lives on the STAGE).
-
-### Actions
-- \`preview_html\` — auto-generate a clean table form skeleton from the target's data elements and SHOW it (nothing saved). Good first step so the user can review/tweak.
-- \`set_dataset_form\` / \`set_stage_form\` — create/replace the form and flip formType to CUSTOM. Omit \`html_code\` to auto-generate; or pass your own \`html_code\`.
-- \`get\` — inspect the existing form. \`remove_form\` — revert to DEFAULT/SECTION.
-
-### Input-id binding (the ONLY thing that makes a cell save) — the tool builds these for you, but if you hand-write html_code they MUST be exact:
-- dataset cell:       \`<input id="<dataElementUID>-<categoryOptionComboUID>-val" title="" value="">\`
-- program-stage cell: \`<input id="<programStageUID>-<dataElementUID>-val" title="" value="">\`
-Everything else in the HTML (tables, headings, narrative text) renders verbatim.
-
-### Hard-learned quirks the tool already handles — do NOT try to do these by hand:
-- The dataEntryForm is created STANDALONE first (POST /api/dataEntryForms); it can never be embedded inline in a dataSet/programStage (E5002).
-- Linking to a program stage re-attaches the program reference on a full PUT (a PATCH/naive PUT loses it → "must reference a program").
-- A dataset custom form needs sharing rwrw---- + an assigned org unit before users can actually enter data. If the tool's \`_hints\` flag these, fix them with **manage_datasets** (update_sharing / assign_org_units).
-
-### Recipes
-- "Make a custom form for this dataset": manage_custom_forms(action="set_dataset_form", dataset_id="<id>")  // auto-generates from its DEs
-- "Design a custom form for this tracker stage": manage_custom_forms(action="set_stage_form", program_stage_id="<stageId>")
-- "Show me what the form would look like first": manage_custom_forms(action="preview_html", dataset_id|program_stage_id)
-- "Use my own HTML": pass html_code="..." with the correct id bindings above.
+A CUSTOM form is hand-laid-out HTML for data entry, for BOTH dataSets (Aggregate Data Entry app) and tracker/event program STAGES (Capture app). "Create/design a custom form", "html form", "custom layout" → **manage_custom_forms** — never assemble raw POST/PUT bodies via dhis2_query. For a dataset pass \`dataset_id\`; for a tracker/event stage pass \`program_stage_id\` (the STAGE id, NOT the program id — the form lives on the STAGE). action=preview_html shows the auto-generated form without saving; set_dataset_form / set_stage_form save it (omit html_code to auto-generate).
 `;
   }
 
@@ -6802,33 +7187,7 @@ Everything else in the HTML (tables, headings, narrative text) renders verbatim.
   if (wantsTranslationPrompt) {
     p += `
 ## DHIS2 Custom Translations — use the **manage_custom_translations** tool
-EXPERIMENTAL DHIS2 2.43+ feature. It translates or re-labels an app's UI strings via the "custom-translations" dataStore namespace — NO source-code changes. Use it whenever the user wants to translate an app (e.g. Capture → Arabic), or simply change/relabel a UI string. NEVER hand-write these dataStore keys via dhis2_query — use this tool so the controller registry stays in sync.
-
-### How the feature works (verified on 2.43 — the app fetches both keys at startup)
-- Registry key "controller": { "<appSlug>": ["<locale>", ...] }. If an app/locale is NOT registered here, the app never loads its translations.
-- Per app+locale key "<slug>__<locale>" (double underscore, e.g. capture__ar): { "<exact source string>": "<replacement>", ... }. The app swaps each matching source string at render time.
-
-### Two uses (identical mechanics — it's a literal source→target string map)
-- TRANSLATE: locale is another language (e.g. "ar","fr") → English source renders as the translation.
-- REWRITE same language: locale is the language already shown (e.g. "en") → relabel/reword in place, e.g. "Report data" → "Submit report".
-
-### Actions
-- \`get\` — read the controller registry (omit app/locale) or one translation map (pass app+locale). Use this FIRST to see what exists.
-- \`set\` — create/update translations for app+locale; it writes the key AND registers the pair in the controller in one call. Merges by default; pass replace:true to overwrite the whole map.
-- \`remove\` — delete an app+locale map (or pass keys:[...] to drop specific source strings).
-- \`list\` — show the whole namespace.
-
-### Critical
-- Match each source string EXACTLY as shown on screen (capitalisation, punctuation, whitespace) — read the real UI text first; an inexact key is silently ignored.
-- The app slug is lowercase (capture, dashboard, data-visualizer, maps). The user must reload the app with that locale active to see changes.
-- Requires DHIS2 2.43+; the tool refuses on older servers (the apps don't read the namespace there).
-- DataStore keys are NOT covered by manage_backups. set/remove return previous_value / previous_controller for manual rollback — surface the key name to the user.
-
-### Recipes
-- "Translate Capture to Arabic": manage_custom_translations(action="set", app="capture", locale="ar", translations={"Get started with Capture app":"...","Report data":"..."})
-- "Rename a button in English": manage_custom_translations(action="set", app="capture", locale="en", translations={"Report data":"Submit report"})
-- "What translations exist?": manage_custom_translations(action="list")
-- "Undo the Arabic translation": manage_custom_translations(action="remove", app="capture", locale="ar")
+EXPERIMENTAL DHIS2 2.43+ feature: translate or re-label an app's UI strings via the "custom-translations" dataStore — no source-code changes. "Translate this app", "rename a button/label", "reword the UI" → **manage_custom_translations** (list/get/set/remove) — NEVER hand-write those dataStore keys via dhis2_query (the controller registry must stay in sync; the tool does that). Source strings must match the on-screen text EXACTLY.
 `;
   }
 
@@ -6836,152 +7195,34 @@ EXPERIMENTAL DHIS2 2.43+ feature. It translates or re-labels an app's UI strings
   if (wantsGrowthChartPrompt) {
     p += `
 ## WHO Capture Growth Chart plugin — use the **manage_growth_chart_plugin** tool
-Sets up the "Capture Growth Chart" plugin (App Hub, key capture-growth-chart) so WHO growth charts render on a tracker program's enrollment dashboard in Capture. NEVER hand-assemble its dataStore via dhis2_query — use this tool.
-
-### Actions (typical order)
-- \`status\` — is the app installed? what is configured? Run this first.
-- \`install\` — install the plugin from the App Hub (idempotent).
-- \`scaffold_program\` — create a ready-to-use growth-monitoring tracker program (needs org_unit_id) when the user has no suitable program.
-- \`configure\` — the core step: pass program_id; the tool auto-detects the date-of-birth + gender attributes, the female/male option codes, and the weight/height/head-circumference data elements, then writes/merges dataStore captureGrowthChart/config. Pass attribute_ids / data_element_ids to override detection, settings to set usePercentiles/weightInGrams/defaultIndicator (wfa|hcfa|lhfa|wflh).
-- \`remove\` — drop a program from the config (program_id) or delete it all (confirm_delete_all:true).
-
-### Hard requirements (the tool validates and refuses with a list if unmet)
-The program MUST have a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If any of the three DEs is missing the chart will not display. If configure reports missing metadata, offer scaffold_program or ask the user for the exact attribute/DE ids.
-
-### Making it visible
-configure makes the plugin FUNCTION but does not place the widget. Relay the tool's \`dashboard_attach\` block: the plugin must be added to the enrollment dashboard via the Tracker Plugin Configurator app (or Capture's "Add plugin" with the returned plugin source URL). The tool deliberately does NOT write dataStore/capture (Capture-owned; risk of cache corruption).
-
-### Recipe
-- "Set up the growth chart plugin for <program>": status → install (if needed) → configure(program_id) → relay dashboard_attach steps.
-- "I have no program for it": scaffold_program(org_unit_id) → configure(created program) → install.
+Sets up the "Capture Growth Chart" plugin so WHO growth charts render on a tracker program's enrollment dashboard in Capture. Use **manage_growth_chart_plugin** (status → install → configure(program_id) → relay the returned dashboard_attach steps; scaffold_program creates a ready-made growth-monitoring program). NEVER hand-assemble its dataStore via dhis2_query.
 `;
   }
 
-  // ── Meta-Architect Protocol — only included when user is creating/modifying metadata ──
+  // ── Meta-Architect Protocol (decide-time core) — only when creating/modifying metadata ──
+  // The deep how-to (payload slots, error recovery, value-type mapping, rule
+  // syntax, PI grammar) lives in the tool manuals delivered on first use.
   if (isCreating || wantsProgramRulesPrompt || wantsProgramIndicatorsPrompt) {
     p += `
 ## DHIS2 Meta-Architect Protocol
 
 ### ⚠️ CRITICAL: Creating Programs — ONE-CALL pattern
-When asked to create a program, you MUST use **create_metadata(action=create_program)** with ALL components in a SINGLE call.
-The tool handles the FULL dependency chain atomically and auto-resolves all internal references (option set names → IDs, DE names → IDs, TEA names → IDs).
-It also auto-checks for duplicate option sets, data elements, TEAs, and options by name and reuses existing IDs.
-
-**Mandatory workflow:**
-1. **Outline your plan** in your text response — list all option sets, TEAs, DEs, stages, rules, indicators you will create
-2. **ONE call** to create_metadata(action=create_program) with everything:
-   - \`program_attributes\`: tracked entity attributes (with inline \`option_set\` if needed)
-   - \`org_unit_ids\`: the org units the program should be assigned to for Capture/Tracker use. If the user mentions districts/facilities/org units, resolve them first and pass them here.
-   - \`assign_all_org_units: true\`: use this WHEN THE USER SAYS "all OUs", "all org units", "all levels", "all facilities", "every org unit" — the tool fetches every org unit server-side in ONE call. DO NOT paginate org units yourself.
-   - \`sharing\`: \`{ public_access: "rwrw----", include_current_user: true, user_ids: [...], user_group_ids: [...] }\`. Set \`include_current_user: true\` when the user says "include me", "share with me", "I should have access", etc. Sharing is auto-applied to stages + DEs + option sets + TEAs unless \`apply_to_children: false\`. **DHIS2 only permits data-level sharing (positions 3-4 of the access string) on Program + ProgramStage — DataElement, OptionSet, TrackedEntityAttribute, ProgramIndicator are metadata-only.** The tool strips the data bits automatically for those classes, so a single \`public_access: "rwrw----"\` is safe everywhere.
-   - \`stages\`: data elements (with inline \`option_set\` if needed)
-   - \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`)
-   - \`program_indicators\`: indicators with expressions and filters
-3. **Verify** with architect_metadata(action=verify) after creation
-
-**Internal dependency order** the tool enforces in the atomic payload (you never build this yourself — it's here so you understand recovery):
-Options → OptionSets → TrackedEntityAttributes → DataElements → Program + ProgramStages (stages carry programStageDataElements) → ProgramRuleVariables → ProgramRuleActions → ProgramRules → (follow-up POST) ProgramIndicators. Sharing attaches to Program/Stage in full; DE/OS/TEA/PI get metadata-only. OrgUnit assignment rides inside the Program object.
-
-**If create_program returns \`success: false\`, read \`errors[]\`:**
-- "Data sharing is not enabled for X" → the tool now strips data bits itself; if you still see this, a custom class changed — retry with \`sharing.apply_to_children: false\` and then run \`manage_metadata(action=update_sharing)\` per object.
-- "Property X is required" on a specific klass → add that field to the matching input slot and retry the WHOLE create_program (the rollback is atomic).
-- Validation rejects ONE stage (name clash, bad DE) → keep the other stage in a retry minus the bad one, then use \`add_stage\` / \`add_data_elements_to_stage\` afterwards to fix the rejected piece.
-- Option-set or DE already exists by name → the tool reuses it automatically; no action needed.
-Never retry by looping through children one-at-a-time when the single atomic retry can succeed. Decompose only on targeted rejection.
-
-⛔ **NEVER paginate org units with search_metadata / dhis2_query to gather "all OUs"** — that wastes iterations and blows the context window. For any "all OUs / all levels / all facilities" request, pass \`assign_all_org_units: true\` and let the tool do it in one server-side call.
-
-**Value-type mapping** (use these exact DHIS2 valueTypes):
-- "Yes/No" / "boolean" → \`BOOLEAN\`
-- "Yes only" / "checkbox" → \`TRUE_ONLY\`
-- "date" → \`DATE\`
-- "date and time" → \`DATETIME\`
-- "number" → \`NUMBER\`, integer → \`INTEGER\`, positive integer → \`INTEGER_POSITIVE\`
-- "text" → \`TEXT\`, long text → \`LONG_TEXT\`
-- "option set / dropdown / select from list" (single-select) → \`TEXT\` with an inline \`option_set: { name, options: [...] }\`
-- "multi-select / multiple values / multiple selections / multi-select option set / text with multiple values / select multiple" → \`MULTI_TEXT\` with an inline \`option_set: { name, options: [...] }\`. The tool auto-aligns the option set's own valueType to \`MULTI_TEXT\` so the pair is consistent — never declare a multi-select DE with \`TEXT\`, even though the field stores comma-separated codes at runtime; the New Tracker Capture form only renders the multi-checkbox UI when the DE valueType is \`MULTI_TEXT\`. To **convert** an existing TEXT option set + DE into multi-select, use \`manage_metadata(action=convert_value_type, object_type="dataElements"|"optionSets", object_id=..., value_type="MULTI_TEXT")\` — it cascades the change to every DE/TEA referencing the option set.
-
-**Program Rule syntax:**
-- Condition: \`#{variable_name}\` for DEs (lowercase, underscores), \`A{attr_name}\` for TEAs, \`V{current_date}\` for system vars
-- ⚠ **\`A{attr_name}\` IS the correct, canonical way to reference a tracked-entity-attribute program rule variable** in BOTH conditions and ASSIGN/expression \`data\` — this matches DHIS2's own demo rules, e.g. \`d2:yearsBetween(A{born}, V{current_date})\` and \`A{Sex} == 'MALE'\`. \`#{...}\` is for DATA-ELEMENT-sourced variables only. **Do NOT "fix" a working \`A{tea}\` reference into \`#{tea}\`** — for a TEA variable that is a regression, not a fix, and it is NEVER the cause of a rule "not firing". Auto-calc-from-attribute patterns like \`ASSIGN d2:monthsBetween(A{dob}, V{current_date}) → "Age in months"\` are correct as written.
-- 🔎 **When a user says an auto-assign / calculation rule "isn't working", DIAGNOSE from real metadata — never guess a syntax cause.** First \`manage_program_rules(action=get)\` + \`action=list_variables\` and read the ACTUAL condition, the PRV source types, and the target DE's valueType. If the expression already matches a known-good pattern (A{tea} for attributes, V{current_date}, a valid d2: function, ASSIGN target DE that can hold the result), the rule is correct — say so. The real reasons an ASSIGN value looks "missing" are runtime/UX, not syntax: (a) the assigned value only appears once you open the stage event that contains the target DE and the source attribute already has a value; (b) the target field is read-only/auto-filled by design; (c) the target DE valueType cannot hold the computed value (e.g. a number assigned to a TEXT field). Explain the real cause and verify; do NOT invent "the reference doesn't resolve at runtime" without evidence.
-- HIDEFIELD on TEA: use \`tracked_entity_attribute_name\`; on DE: use \`data_element_name\`
-- Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, WARNINGONCOMPLETE, ERRORONCOMPLETE, SHOWWARNINGINFORMATION
-- Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
-- **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE / SHOWWARNINGINFORMATION** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
-- **DISPLAYTEXT** (instructions banner) takes \`content\` only — keep it static.
-- **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
-- **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
-- **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
-- HIDEPROGRAMSTAGE hides an entire stage tab (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section.
-- BOOLEAN / TRUE_ONLY: compare against unquoted \`true\` / \`false\`. Canonical forms:
-  • is Yes: \`#{flag} == true\`
-  • is empty or No: \`!d2:hasValue(#{flag}) || #{flag} != true\`
-  ⚠ Never write \`#{flag} == false\`, \`== 'true'\`, \`== 'Yes'\`, or \`== 'No'\` — these fail silently on DHIS2.
-- Option-set fields: set the rule variable's \`use_code_for_option_set: true\` and compare to the CODE in quotes, e.g. \`#{status} == 'APPROVED'\`.
-- ⚠ **Every \`#{name}\` MUST resolve to a programRuleVariable for the rule to fire.** For \`manage_program_rules(action=create)\` on an existing program: just use \`#{sanitized_de_display_name}\` (e.g. DE "Is breathing abnormal" → \`#{is_breathing_abnormal}\`) — the tool auto-creates the PRV by matching the sanitized name to the program's DEs and picks the correct sourceType (CURRENT_EVENT when the rule acts on the same stage, NEWEST_EVENT_PROGRAM otherwise) plus valueType + optionSet from the DE. Pass \`variables:[]\` only if you need to override the source_type, reference a DE whose displayName does not match, or wire a TEI_ATTRIBUTE variable. If a \`#{name}\` does not match any existing PRV or program DE, the tool refuses the POST and returns \`unresolved[]\` with suggestions — correct the name or add an explicit \`variables[]\` entry and retry.
-
-⚠️ **NEVER** create option sets, DEs, or TEAs with separate tool calls — the ONE-CALL pattern handles everything.
-⚠️ **NEVER** use dhis2_query PUT/PATCH to modify programIndicators (409/415 errors). Use manage_program_indicators instead.
+When asked to create a program, you MUST use **create_metadata(action=create_program)** with ALL components (program_attributes, org_unit_ids, sharing, stages + data elements with inline option sets, program_rules, program_indicators) in a SINGLE call. The tool handles the full dependency chain atomically, auto-resolves name→ID references, and reuses existing option sets/DEs/TEAs by name.
+**Mandatory workflow:** (1) outline your plan in your text response; (2) ONE create_metadata(action=create_program) call with everything; (3) verify with architect_metadata(action=verify).
+⚠️ **NEVER** create option sets, DEs, or TEAs with separate tool calls when building a program — the ONE-CALL pattern handles everything.
+⛔ **NEVER paginate org units** to gather "all OUs" — for "all OUs / all levels / all facilities" pass \`assign_all_org_units: true\` (one server-side call).
+⚠️ \`org_unit_ids\` (where the program is usable in Capture) and \`sharing\` (who has access) are SEPARATE concepts — set both.
+⚠️ **NEVER** use dhis2_query PUT/PATCH on programRules or programIndicators (409/415) — use manage_program_rules / manage_program_indicators.
 ⚠️ **NEVER** call tools unrelated to metadata creation (e.g., get_visualization_details) when the user asks to create a program.
-⚠️ **IMPORTANT**: \`org_unit_ids\` and sharing are separate. A program can have broad sharing but still not be usable in a facility if that facility is not in \`program.organisationUnits\`.
 
-### Adding DEs to an existing stage
-create_metadata(action=add_data_elements_to_stage, stage_id=<id>, data_element_ids=[<id>])
+### Routing for EXISTING programs
+- Add DEs to an existing stage → create_metadata(action=add_data_elements_to_stage); add a stage → create_metadata(action=add_stage); more rules → create_metadata(action=add_program_rules).
+- Add TEAs to an existing program → manage_metadata(action=add_program_attributes) — NEVER PATCH programs/{id} or POST programTrackedEntityAttributes (415/404/409).
+- Update a program's OU assignment → manage_metadata(action=update_program_org_units, merge_mode=replace|add|remove).
+- "Broken / non-working rules" → manage_program_rules(action=audit) first, then bulk_fix_conditions. "Broken indicators" → manage_program_indicators(action=audit), then bulk_fix / bulk_fix_expressions.
 
-### Adding tracked-entity attributes to an EXISTING program (e.g. "add name and age as searchable attributes")
-\`manage_metadata(action=add_program_attributes, program_id="<id>", program_attributes=[
-  { name: "First name", searchable: true, display_in_list: true },
-  { name: "Age",        searchable: true, display_in_list: true }
-])\`
-- Each entry may supply \`id\` (reuse a known TEA), \`name\` alone (reuses one by that exact display name, or creates new if \`value_type\` is provided), or \`name + value_type [+ option_set]\` (creates fresh).
-- ⛔ **NEVER** try to PATCH \`programs/{id}\`, POST \`programTrackedEntityAttributes\`, or POST \`/metadata\` to attach TEAs — those routes return 415/404/409. Always use this action.
-
-### Updating which OUs a program is assigned to
-\`manage_metadata(action=update_program_org_units, program_id="<id>", org_unit_ids=["<ou1>","<ou2>"], merge_mode="replace")\`
-- \`replace\` = exact OU list
-- \`add\` = append new OUs to existing assignment
-- \`remove\` = remove OUs from existing assignment
-
-### Existing program rules/indicators (manage_program_rules / manage_program_indicators)
-- manage_program_rules: list, create, update, delete, list_variables, audit, bulk_fix_conditions (requires program_id)
-  - audit: scans every rule + variable in a program. Detects broken boolean patterns (\`== false\`, quoted \`'true'\`), unresolved \`#{var}\`/\`A{attr}\` references, actions missing required targets/content/data, orphan refs to deleted DEs/TEAs/stages/sections, variables pointing at deleted objects. Returns \`rule_issues\`, \`variable_issues\`, and \`_condition_fix_hints\` with canonical rewrites.
-  - bulk_fix_conditions: applies \`{ rule_id, condition }\` or \`{ rule_id, find, replace }\` entries in one metadata POST. Lint-checks every new condition; rejected entries are returned in \`lint_errors\` and never committed. Use this after audit instead of calling update N times.
-  - ALWAYS use audit for "broken/non-working rules", then bulk_fix_conditions for any lint-flagged rewrites.
-- manage_program_indicators: list, create, update, delete, audit (catches broken indicators with reliable pagination + structural scan + DHIS2 /expression/description server-side validation), bulk_fix (swap a wrong stage ID across many indicators), bulk_fix_expressions (apply per-indicator expression/filter fixes in one batch — use after audit for anything beyond a stage-id swap; validates each new expression with the server before committing)
-  - ALWAYS use audit for finding broken indicators (handles pagination internally)
-- NEVER use \`dhis2_query\` PUT/PATCH against \`/programRules/{id}\` or \`/programIndicators/{id}\` — DHIS2 returns 409/415. Use the update / bulk_fix_* actions, which POST via the \`/metadata\` endpoint with all required linked objects.
-
-### Program-Indicator EXPRESSION GRAMMAR (DHIS2 2.41) — read this BEFORE writing any PI
-The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:\` syntax but have DIFFERENT function sets and different semantics. The chatbot lints every PI expression+filter both locally and via DHIS2's /expression/description endpoint before saving — broken PIs are rejected at create-time, not silently saved.
-
-**Refs (in expression OR filter):** \`#{stageId.deId}\` (data element in a stage), \`A{teaId}\` (tracked-entity attribute), \`V{var}\` (system variable: \`tei_count\`, \`event_count\`, \`enrollment_count\`, \`event_date\`, \`enrollment_date\`, \`enrollment_status\`, \`current_date\`, etc.), \`C{constantId}\` (constant). **Do NOT** use \`I{}\` (regular indicator), \`OUG{}\`, or \`subExpression(...)\` — those are for regular Indicators, not Program Indicators, and the parser rejects them.
-
-**Operators:** \`== != < > <= >=\` (==/= behave the same way — **exact-string match** for strings, even on MULTI_TEXT), \`&& ||\`, \`+ - * /\`. There is **NO** \`LIKE\`, \`ILIKE\`, \`IN\`, \`position()\`, \`regexp_match()\`, \`coalesce()\`, or \`~\` regex in PI grammar. The parser will say "Invalid string token 'LIKE'" or similar.
-
-**Allowed d2: functions in PI:** \`condition\`, \`count\`, \`countIfValue\`, \`countIfCondition\`, \`hasValue\`, \`daysBetween\`, \`weeksBetween\`, \`monthsBetween\`, \`yearsBetween\`, \`minutesBetween\`, \`oizp\`, \`zing\`, \`zpvc\`, \`relationshipCount\`, \`ceil\`, \`floor\`, \`round\`, \`modulus\`, \`addDays\`, \`left\`, \`right\`, \`substring\`, \`split\`, \`concatenate\`, \`length\`, \`validatePattern\`, \`inOrgUnitGroup\`, \`lastEventDate\`, \`zScoreHFA\`/\`WFA\`/\`WFH\`.
-
-**FORBIDDEN d2: functions in PI** (these exist only in Program Rules — using them in a PI filter creates a PI that **looks** saved but returns HTTP 409 from analytics forever after): \`d2:contains\`, \`d2:containsString\`, \`d2:inOrgUnit\` (use \`d2:inOrgUnitGroup\` instead), \`d2:hasUserRole\`, \`d2:removeMin\`.
-
-**Quoting inside d2:condition:** the first arg is a STRING. To embed a string literal you need different outer-quotes — use **double-quoted outer**: \`d2:condition("#{stage.de} == 'X'", 1, 0) == 1\`. Single-quoted outer with escaped inner does NOT parse.
-
-**MULTI_TEXT (multi-select) — read carefully:**
-- DHIS2 stores MULTI_TEXT as a single comma-separated string per row (e.g. \`Diabetes,HYPERTENSION\`).
-- In PI filters, \`==\` does **exact-string match** even on MULTI_TEXT — verified: a row stored as \`Diabetes,HYPERTENSION\` matches \`#{X.Y} == 'Diabetes,HYPERTENSION'\` but NOT \`#{X.Y} == 'Diabetes'\`. Order is whatever the user clicked first.
-- **There is NO native way to express "MULTI_TEXT contains both X and Y" in a 2.41 PI filter.** \`d2:contains\` is rule-engine-only. \`subExpression\` is not available for PIs in 2.41.
-- When the user asks for "women with both Diabetes and Hypertension" on a MULTI_TEXT field, recommend ONE of these THREE options up front and let the user choose:
-  1. **Restructure (best, durable):** convert the MULTI_TEXT into N separate BOOLEAN data elements (one per option), via \`create_metadata\` for new programs or by adding new BOOLEAN DEs and a program rule that mirrors the multi-select. Filter is then trivial: \`#{stage.de_dm} == true && #{stage.de_htn} == true\`.
-  2. **Line Listing app (no metadata change):** the Line Listing UI supports the IN operator with comma-list values which DOES match comma-separated MULTI_TEXT cells. Use \`line_listing_guide\` to walk the user through it.
-  3. **Brittle exact-match (stopgap):** \`#{stage.de} == 'Diabetes,HYPERTENSION'\` — only matches that exact string, order-dependent, breaks if a third risk factor was also selected. Disclose the limitation.
-- **NEVER** silently emit \`d2:contains(...)\` or \`#{X.Y} == 'A' && #{X.Y} == 'B'\` for the same ref — the lint blocks both.
-
-**aggregationType vs analyticsType:**
-- \`analyticsType\`: \`EVENT\` (one row per event) or \`ENROLLMENT\` (one row per enrollment, latest event values per stage).
-- \`aggregationType\`: \`COUNT\` for count-of-rows, \`SUM\`/\`AVERAGE\`/\`MIN\`/\`MAX\` for numeric aggregations.
-- "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{tei_count}\`. \`V{enrollment_count}\` is also valid; \`V{event_count}\` is for EVENT-type PIs.
-
-**Validation safety net (you don't manage this — it just runs):**
-- Every \`manage_program_indicators(action=create|update)\` call now validates expression+filter via DHIS2's \`/programIndicators/expression/description\` and \`/filter/description\` endpoints BEFORE saving. If either returns \`status: ERROR\`, the create/update is refused and the parser's exact error string is returned to you in \`_error\` along with a hint in \`_hint\`. Read both, fix the expression, and retry — do NOT loop with the same broken filter.
+### Expression grammars — follow the manual, do not guess
+Program-rule conditions and program-indicator expressions use DIFFERENT restricted grammars with silent server-side failure modes (e.g. \`== false\` on booleans, \`d2:contains\` in a PI filter). The exact grammar, canonical patterns and forbidden functions are in the manuals of create_metadata / manage_program_rules / manage_program_indicators, delivered automatically on your first call to each — read them before writing any condition or expression, and never "fix" \`A{tea}\` into \`#{tea}\` (A{} is correct for attribute variables).
 `;
   }
 
@@ -6989,22 +7230,7 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
   if (wantsMetadataMgmt) {
     p += `
 ### Removing/Deleting Metadata — manage_metadata
-
-⚠️ **NEVER** use dhis2_query with DELETE method for metadata objects. Use manage_metadata instead — it checks references and verifies deletion.
-
-**Workflow to remove a data element from a program and delete it:**
-1. \`manage_metadata(action=remove_from_stage, stage_id=<stageId>, data_element_ids=[<deId>])\` — removes DE from the stage (keeps DE in system)
-2. \`manage_metadata(action=delete, object_type=dataElements, object_id=<deId>)\` — deletes the DE after checking references
-
-**If deletion fails (409 / references exist):** the tool returns exactly which references block deletion (program stages, program rules, event data). Remove those references first, then retry.
-
-**Supported object types for delete:** dataElements, optionSets, options, trackedEntityAttributes, programStages, categoryOptions, categories, categoryCombos, indicators, dataElementGroups, indicatorGroups
-
-**Convert a single-select option set to multi-select (or any valueType change):**
-- \`manage_metadata(action=convert_value_type, object_type="dataElements", object_id="<deId>", value_type="MULTI_TEXT")\` — flips the DE valueType AND its attached optionSet AND every other DE/TEA referencing the same optionSet (so the pair is never inconsistent).
-- Works on \`dataElements\`, \`trackedEntityAttributes\`, or \`optionSets\` directly. Idempotent — already-correct objects are skipped.
-- Use this for "change Maternal Risk Factors to text with multiple values", "convert this to multi-select", etc.
-- ⛔ **NEVER** PATCH only the DE's valueType to MULTI_TEXT and leave the optionSet at TEXT — the New Tracker Capture form will silently render single-select. This tool prevents that mistake.
+⚠️ **NEVER** use dhis2_query with DELETE method for metadata objects. Use manage_metadata: remove_from_stage (detach a DE from a stage) → delete (reference-checked). Value-type conversions ("make this multi-select" / "text with multiple values") → manage_metadata(action=convert_value_type) — it cascades the DE + optionSet pair consistently; never PATCH one side only.
 `;
   }
 
@@ -7012,24 +7238,7 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
   if (wantsIconStyle) {
     p += `
 ### Icon / style updates — discover FIRST, then update_style
-
-DHIS2 ships a fixed library of ~900 icons. Many obvious-sounding names DO NOT EXIST: \`tuberculosis_positive\`, \`diabetes_positive\`, \`vaccine_positive\`, \`pregnancy_positive\` are all fabrications. Guessing burns tool round trips and the user has called this out as unacceptable.
-
-**MANDATORY two-step flow — never skip step 1:**
-
-1. **Discover** — \`manage_metadata(action=discover_icons, keywords=["<root1>","<root2>",...])\`
-   - Pass 4-8 SHORT keyword roots, not full domain words. DHIS2 search is prefix-on-keyword: \`preg\` matches but \`pregnancy\` returns 0; \`respir\` matches but \`respiratory\` returns 0; \`tb\` works, \`tuberculosis\` doesn't.
-   - For a TB program: \`["lung","respir","tb","medical","clinic"]\`. For maternity: \`["preg","mater","baby","fem"]\`. For vaccines: \`["vacc","syring","needle","shield"]\`.
-   - The response gives you \`verified_keys[]\` — every real key that matched any of your roots.
-
-2. **Apply** — \`manage_metadata(action=update_style, object_type=..., object_id=..., icon=<exact key from verified_keys[]>, color="#...")\`
-   - Pass the icon key VERBATIM from step 1's response. Don't modify it.
-   - \`update_style\` REFUSES any icon that wasn't verified this turn. A fabricated key returns \`_scope: "icon_not_verified"\` and you must retry via discover_icons.
-   - \`color\` (optional hex) does not require discovery and can be set independently.
-
-**If discover_icons returns no matches**, your roots were too long or too domain-specific. Retry with broader fallbacks: \`["medical","clinic","health","hospital","stethoscope","capsule"]\`. If still nothing, drop the icon entirely and call \`update_style\` with only \`color\`.
-
-**Do NOT:** PATCH \`/programs/{id}\` with \`dhis2_query\` using \`application/json\` — DHIS2 returns 415. \`update_style\` uses the correct \`application/json-patch+json\` content-type, verifies the result, and snapshots a backup before patching.
+DHIS2 has a fixed ~900-icon library; obvious names like \`tuberculosis_positive\` DO NOT EXIST. MANDATORY: manage_metadata(action=discover_icons, keywords=[4-8 SHORT roots like "tb","respir","lung"]) first, then update_style with an EXACT key from the response (update_style refuses unverified keys). Icon search is prefix-on-keyword: \`preg\` matches, \`pregnancy\` returns 0. \`color\` needs no discovery. NEVER PATCH styles via dhis2_query (415).
 `;
   }
 
@@ -7037,26 +7246,7 @@ DHIS2 ships a fixed library of ~900 icons. Many obvious-sounding names DO NOT EX
   if (wantsNotificationsPrompt) {
     p += `
 ### Program Notifications — manage_program_notifications
-
-Use this tool for any "create a webhook", "notify on enrollment/completion", "send to endpoint", "program notification template" request. Do NOT try to POST \`/api/programNotificationTemplates\` via dhis2_query — the payload shape and linking steps are non-obvious and previously caused 400/500 loops.
-
-DHIS2 schema reality (codified in the tool — don't relearn):
-- \`ProgramNotificationTemplate\` has **no** \`url\` / \`webhookUrl\` / \`hookUrl\` field. DHIS2 silently drops these keys on POST, then PATCH with \`url\` returns 400 because the property doesn't exist.
-- For \`notificationRecipient = WEB_HOOK\`, the URL goes in \`messageTemplate\` (server convention) and \`deliveryChannels\` is auto-set to \`[HTTP]\` by DHIS2's object-bundle hook. The tool's \`webhook_url\` arg handles placement.
-- \`subjectTemplate\` max length = 100 chars. Keep variable syntax tight (e.g. \`V{program_name} A{<teaUid>}\`) — the tool rejects overlong values with a hint.
-- Linking a template to a program uses a dedicated endpoint: \`POST /api/programs/{programId}/notificationTemplates/{templateId}\`. It is NOT a field on the program you can PATCH. The Program schema property is \`notificationTemplates\` (not \`programNotificationTemplates\`).
-
-**One-shot pattern** (most common — "create a webhook on enrollment"):
-\`manage_program_notifications(action="create_and_link", program_id="<pid>", name="<title>", trigger="ENROLLMENT", recipient="WEB_HOOK", webhook_url="https://...", message_content="Program: V{program_name} | OU: V{org_unit_name} | A{<teaUid1>} | A{<teaUid2>}")\`
-
-Triggers: ENROLLMENT | COMPLETION | PROGRAM_RULE | SCHEDULED_DAYS_DUE_DATE | SCHEDULED_DAYS_INCIDENT_DATE | SCHEDULED_DAYS_ENROLLMENT_DATE (SCHEDULED_* requires \`relative_scheduled_days\`).
-Recipients: TRACKED_ENTITY_INSTANCE | ORGANISATION_UNIT_CONTACT | USERS_AT_ORGANISATION_UNIT | USER_GROUP (+recipient_user_group_id) | PROGRAM_ATTRIBUTE (+recipient_program_attribute_id) | DATA_ELEMENT (+recipient_data_element_id) | WEB_HOOK (+webhook_url).
-
-Template variables: V{program_name}, V{program_stage_name}, V{org_unit_name}, V{orgunit_id}, V{enrollment_id}, V{event_id}, V{current_date}, A{<teaUid>} for tracked-entity attribute values, #{<deUid>} for program-rule data elements.
-
-**Atomicity** — \`create_and_link\` is all-or-nothing: if the link step fails, the just-created template is auto-deleted so the server stays clean. If the call returns an error, inspect \`rollback.succeeded\` — \`true\` means state is unchanged and you can simply retry. There is also a pre-flight dedup: if a template with the same \`name\` is already attached to the program, the tool returns that existing one rather than creating a duplicate. **Never** call \`create\` and \`link\` as two separate tool calls for this flow — use \`create_and_link\`.
-
-If the user reports leftover/duplicate notification templates from a prior failed run: \`manage_program_notifications(action="orphan_sweep")\` lists unlinked templates; add \`delete=true\` to remove them.
+For any "create a webhook", "notify on enrollment/completion", "program notification template" request use manage_program_notifications — NEVER POST /api/programNotificationTemplates via dhis2_query (the payload shape and linking endpoint are non-obvious; historical 400/500 loops). The one-shot pattern is action="create_and_link" (atomic create + attach, auto-rollback, deduped) — never call create and link separately. Leftover templates → action="orphan_sweep".
 `;
   }
 
@@ -7064,25 +7254,7 @@ If the user reports leftover/duplicate notification templates from a prior faile
   if (wantsSharingAccess) {
     p += `
 ### Sharing & Access — manage_metadata(action=update_sharing)
-
-When a program/object doesn't appear in an app (Capture, Data Entry, etc.) or a user reports "can't see" / "not showing":
-
-**Diagnosis:**
-1. For programs in Capture/Tracker, first check \`program.organisationUnits\` — if the target OU is missing, fix that with \`manage_metadata(action=update_program_org_units, ...)\`
-2. Fetch the object with \`?fields=id,displayName,sharing,access\` — check \`access.data.read\` and \`access.data.write\`
-3. DHIS2 access string format (8 chars): positions 1-2 = metadata access (r/w), positions 3-4 = data access (r/w)
-   - \`"rw------"\` = metadata read+write ONLY — **NO data access** → won't appear in Capture/Data Entry
-   - \`"rwrw----"\` = metadata + data read+write → full access, appears everywhere
-   - \`"r-rw----"\` = metadata read + data read+write → can capture data but can't edit program config
-   - \`"r-r-----"\` = metadata read + data read → view-only
-4. Also check \`sharing.userGroups\` — user groups can grant data access even if publicAccess doesn't
-5. OU assignment and sharing must both be correct for users to actually use a program in Capture.
-
-**Fix:**
-\`manage_metadata(action=update_sharing, object_type="programs", object_id="<id>", public_access="rwrw----")\`
-
-⚠️ **NEVER** use dhis2_query PUT/PATCH to modify sharing — it will fail with 405/500 errors. Always use manage_metadata(action=update_sharing).
-⚠️ The DHIS2 sharing API endpoint is \`PUT /api/sharing?type={singularType}&id={id}\` — manage_metadata handles this correctly.
+For "can't see / not appearing / no access" issues: (1) for programs in Capture/Tracker check \`program.organisationUnits\` FIRST — fix via manage_metadata(action=update_program_org_units); (2) then check the 8-char access string (positions 1-2 = metadata, 3-4 = data): \`"rw------"\` has NO data access (won't appear in Capture/Data Entry), \`"rwrw----"\` is full access. Also check sharing.userGroups. Fix via manage_metadata(action=update_sharing). ⚠️ NEVER PUT/PATCH sharing via dhis2_query (405/500).
 `;
   }
 
@@ -14572,6 +14744,53 @@ function sanitizeVariableName(name) {
     .substring(0, 255);
 }
 
+// Resolve every #{token} / A{token} in a rule's condition AND action `data`
+// expressions to a data element / tracked-entity attribute: exact
+// sanitized-name match first, then a UNIQUE prefix match either way round
+// (e.g. #{muac} → DE "MUAC in cm" whose sanitized name muac_in_cm starts with
+// the token). Tokens already backed by an existing PRV name are skipped.
+// Ambiguous or unmatched tokens land in `unresolved` so the caller can REFUSE
+// the import instead of silently creating rules that never fire (E2E-verified
+// failure mode: condition "#{muac} >= 11.5" with no muac PRV imports fine but
+// the rule engine rejects the expression at runtime).
+function resolveRuleTokenBindings(rule, deNames, teaNames, existingVarNames = new Set()) {
+  const text = `${rule.condition || ''} ${(rule.actions || []).map(a => a.data || '').join(' ')}`;
+  const bindings = [];
+  const unresolved = [];
+  const seen = new Set();
+  const resolve = (token, teaOnly) => {
+    if (!teaOnly) {
+      for (const n of deNames) if (sanitizeVariableName(n) === token) return { kind: 'de', name: n };
+    }
+    for (const n of teaNames) if (sanitizeVariableName(n) === token) return { kind: 'tea', name: n };
+    const cands = [];
+    if (!teaOnly) {
+      for (const n of deNames) {
+        const s = sanitizeVariableName(n);
+        if (s.startsWith(token) || token.startsWith(s)) cands.push({ kind: 'de', name: n });
+      }
+    }
+    for (const n of teaNames) {
+      const s = sanitizeVariableName(n);
+      if (s.startsWith(token) || token.startsWith(s)) cands.push({ kind: 'tea', name: n });
+    }
+    return cands.length === 1 ? cands[0] : null;
+  };
+  for (const [re, teaOnly] of [[/#\{([^}]+)\}/g, false], [/A\{([^}]+)\}/g, true]]) {
+    for (const m of text.matchAll(re)) {
+      const token = m[1].trim();
+      const key = (teaOnly ? 'A:' : '#:') + token;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (existingVarNames.has(token)) continue; // already a PRV on the program
+      const b = resolve(token, teaOnly);
+      if (b) bindings.push({ token, ...b });
+      else unresolved.push(teaOnly ? `A{${token}}` : `#{${token}}`);
+    }
+  }
+  return { bindings, unresolved };
+}
+
 // DHIS2 icon search is prefix-matched against the keyword tree (e.g. the
 // keyword "pregnant" is reachable from search="preg"/"pregnan", but search=
 // "pregnancy" returns 0 hits — the trailing 'y' breaks the prefix). Models
@@ -17169,73 +17388,72 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       };
     }
 
+    // PRV builders keyed by PRV NAME so a token-named variable (e.g. muac →
+    // DE "MUAC in cm") and an exact-sanitized-name variable never collide.
+    const pushDePrv = (prvName, deName) => {
+      if (prvCreated[prvName]) return;
+      const prvUid = generateDhis2Uid();
+      let sourceStageId = null;
+      for (let si = 0; si < stages.length; si++) {
+        if ((stages[si].data_elements || []).some(d => d.name === deName)) {
+          sourceStageId = stageUids[si]; break;
+        }
+      }
+      allProgramRuleVariables.push({
+        id: prvUid,
+        name: prvName,
+        program: { id: programUid },
+        dataElement: { id: deUidMap[deName] },
+        programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+        ...(sourceStageId ? { programStage: { id: sourceStageId } } : {}),
+      });
+      prvCreated[prvName] = prvUid;
+    };
+    const pushTeaPrv = (prvName, teaName) => {
+      if (prvCreated[prvName]) return;
+      const prvUid = generateDhis2Uid();
+      const teaObj = allTrackedEntityAttributes.find(t => t.name === teaName);
+      allProgramRuleVariables.push({
+        id: prvUid,
+        name: prvName,
+        program: { id: programUid },
+        trackedEntityAttribute: { id: teaUidMap[teaName] },
+        programRuleVariableSourceType: 'TEI_ATTRIBUTE',
+        useCodeForOptionSet: !!teaObj?.optionSet,
+      });
+      prvCreated[prvName] = prvUid;
+    };
+
+    const deNamesAll = Object.keys(deUidMap);
+    const teaNamesAll = Object.keys(teaUidMap);
     for (const rule of args.program_rules) {
-      const referencedDEs = new Set();
-      const referencedTEAs = new Set();
-
-      // Extract #{var_name} from condition — matches DEs and TEAs
-      const condMatches = (rule.condition || '').match(/#\{([^}]+)\}/g) || [];
-      for (const m of condMatches) {
-        const varName = m.slice(2, -1);
-        for (const deName of Object.keys(deUidMap)) {
-          if (sanitizeVariableName(deName) === varName) referencedDEs.add(deName);
-        }
-        for (const teaName of Object.keys(teaUidMap)) {
-          if (sanitizeVariableName(teaName) === varName) referencedTEAs.add(teaName);
-        }
+      // Resolve every #{}/A{} token in condition + action data to a DE/TEA
+      // (exact sanitized name, then unique prefix). The PRV is created under
+      // the TOKEN name so the expression resolves exactly as written.
+      const { bindings, unresolved } = resolveRuleTokenBindings(rule, deNamesAll, teaNamesAll);
+      if (unresolved.length) {
+        return {
+          success: false,
+          phase: 'lint',
+          _error: `Program rule "${rule.name}" references unresolved variable(s): ${unresolved.join(', ')} — no data element or attribute in this request matches (exactly or by prefix). Nothing was imported.`,
+          unresolved,
+          available_variables: deNamesAll.map(n => `#{${sanitizeVariableName(n)}}`),
+          available_attributes: teaNamesAll.map(n => `A{${sanitizeVariableName(n)}}`),
+          _hint: 'Use #{sanitized_data_element_name} for DEs and A{sanitized_attribute_name} for TEAs, matching a data element/attribute defined in this same call. Fix the token(s) and retry the whole create_program.',
+        };
+      }
+      for (const b of bindings) {
+        if (b.kind === 'de') pushDePrv(b.token, b.name); else pushTeaPrv(b.token, b.name);
       }
 
-      // Extract A{attr_name} from condition — TEA syntax
-      const attrMatches = (rule.condition || '').match(/A\{([^}]+)\}/g) || [];
-      for (const m of attrMatches) {
-        const attrName = m.slice(2, -1);
-        for (const teaName of Object.keys(teaUidMap)) {
-          if (sanitizeVariableName(teaName) === attrName) referencedTEAs.add(teaName);
-        }
-      }
-
-      // Check actions for DE/TEA references
+      // Action-target DEs/TEAs also get a PRV under their sanitized name
+      // (pre-existing behavior — harmless and occasionally referenced later).
       for (const act of (rule.actions || [])) {
-        if (act.data_element_name && deUidMap[act.data_element_name]) referencedDEs.add(act.data_element_name);
-        if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) referencedTEAs.add(act.tracked_entity_attribute_name);
-      }
-
-      // Create DE-based PRVs
-      for (const deName of referencedDEs) {
-        if (!prvCreated[deName]) {
-          const prvUid = generateDhis2Uid();
-          let sourceStageId = null;
-          for (let si = 0; si < stages.length; si++) {
-            if ((stages[si].data_elements || []).some(d => d.name === deName)) {
-              sourceStageId = stageUids[si]; break;
-            }
-          }
-          allProgramRuleVariables.push({
-            id: prvUid,
-            name: sanitizeVariableName(deName),
-            program: { id: programUid },
-            dataElement: { id: deUidMap[deName] },
-            programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
-            ...(sourceStageId ? { programStage: { id: sourceStageId } } : {}),
-          });
-          prvCreated[deName] = prvUid;
+        if (act.data_element_name && deUidMap[act.data_element_name]) {
+          pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name);
         }
-      }
-
-      // Create TEA-based PRVs
-      for (const teaName of referencedTEAs) {
-        if (!prvCreated[teaName]) {
-          const prvUid = generateDhis2Uid();
-          const teaObj = allTrackedEntityAttributes.find(t => t.name === teaName);
-          allProgramRuleVariables.push({
-            id: prvUid,
-            name: sanitizeVariableName(teaName),
-            program: { id: programUid },
-            trackedEntityAttribute: { id: teaUidMap[teaName] },
-            programRuleVariableSourceType: 'TEI_ATTRIBUTE',
-            useCodeForOptionSet: !!teaObj?.optionSet,
-          });
-          prvCreated[teaName] = prvUid;
+        if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) {
+          pushTeaPrv(sanitizeVariableName(act.tracked_entity_attribute_name), act.tracked_entity_attribute_name);
         }
       }
 
@@ -18638,71 +18856,80 @@ async function addProgramRules(args) {
     teaHasOptionSet[tea.displayName] = !!tea.optionSet;
   }
 
+  // Existing PRVs on the program: tokens naming them resolve as-is (no new
+  // PRV), and new PRVs must not collide with their names.
+  const existingPrvResp = await safeDhis2Fetch(
+    `programRuleVariables?filter=program.id:eq:${args.program_id}&fields=name&paging=false`
+  );
+  const existingVarNames = new Set(
+    (existingPrvResp.programRuleVariables || []).map(v => v.name)
+  );
+
   const allPRVs = [];
   const allPRAs = [];
   const allPRs = [];
   const prvCreated = {};
+  for (const n of existingVarNames) prvCreated[n] = 'existing';
 
+  const pushDePrv = (prvName, deName) => {
+    if (prvCreated[prvName]) return;
+    const prvUid = generateDhis2Uid();
+    allPRVs.push({
+      id: prvUid,
+      name: prvName,
+      program: { id: args.program_id },
+      dataElement: { id: deNameToId[deName] },
+      programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+      ...(deNameToStage[deName] ? { programStage: { id: deNameToStage[deName] } } : {}),
+    });
+    prvCreated[prvName] = prvUid;
+  };
+  const pushTeaPrv = (prvName, teaName) => {
+    if (prvCreated[prvName]) return;
+    const prvUid = generateDhis2Uid();
+    allPRVs.push({
+      id: prvUid,
+      name: prvName,
+      program: { id: args.program_id },
+      trackedEntityAttribute: { id: teaNameToId[teaName] },
+      programRuleVariableSourceType: 'TEI_ATTRIBUTE',
+      useCodeForOptionSet: !!teaHasOptionSet[teaName],
+    });
+    prvCreated[prvName] = prvUid;
+  };
+
+  const deNamesAll = Object.keys(deNameToId);
+  const teaNamesAll = Object.keys(teaNameToId);
   for (const rule of args.program_rules) {
-    const referencedDEs = new Set();
-    const referencedTEAs = new Set();
-
-    // Extract #{var_name} from condition — matches DEs and TEAs
-    const condMatches = (rule.condition || '').match(/#\{([^}]+)\}/g) || [];
-    for (const m of condMatches) {
-      const varName = m.slice(2, -1);
-      for (const deName of Object.keys(deNameToId)) {
-        if (sanitizeVariableName(deName) === varName) referencedDEs.add(deName);
-      }
-      for (const teaName of Object.keys(teaNameToId)) {
-        if (sanitizeVariableName(teaName) === varName) referencedTEAs.add(teaName);
-      }
+    // Resolve #{}/A{} tokens (condition + action data) to program DEs/TEAs —
+    // exact sanitized name, then unique prefix; tokens naming an existing PRV
+    // pass through. Unresolved tokens REFUSE the import (rules with unknown
+    // variables save fine but never fire).
+    const { bindings, unresolved } = resolveRuleTokenBindings(rule, deNamesAll, teaNamesAll, existingVarNames);
+    if (unresolved.length) {
+      return {
+        success: false,
+        phase: 'lint',
+        _error: `Program rule "${rule.name}" references unresolved variable(s): ${unresolved.join(', ')} — no program rule variable, data element or attribute of this program matches (exactly or by prefix). Nothing was imported.`,
+        unresolved,
+        available_variables: [...existingVarNames].map(n => `#{${n}}`),
+        available_data_elements: deNamesAll.map(n => `#{${sanitizeVariableName(n)}}`),
+        available_attributes: teaNamesAll.map(n => `A{${sanitizeVariableName(n)}}`),
+        _hint: 'Reference an existing program rule variable, or #{sanitized_data_element_name} / A{sanitized_attribute_name} of this program. Fix the token(s) and retry.',
+      };
+    }
+    for (const b of bindings) {
+      if (b.kind === 'de') pushDePrv(b.token, b.name); else pushTeaPrv(b.token, b.name);
     }
 
-    // Extract A{attr_name} from condition — TEA syntax
-    const attrMatches = (rule.condition || '').match(/A\{([^}]+)\}/g) || [];
-    for (const m of attrMatches) {
-      const attrName = m.slice(2, -1);
-      for (const teaName of Object.keys(teaNameToId)) {
-        if (sanitizeVariableName(teaName) === attrName) referencedTEAs.add(teaName);
-      }
-    }
-
-    // Check actions for DE/TEA references
+    // Action-target DEs/TEAs also get a PRV under their sanitized name
+    // (pre-existing behavior).
     for (const act of (rule.actions || [])) {
-      if (act.data_element_name && deNameToId[act.data_element_name]) referencedDEs.add(act.data_element_name);
-      if (act.tracked_entity_attribute_name && teaNameToId[act.tracked_entity_attribute_name]) referencedTEAs.add(act.tracked_entity_attribute_name);
-    }
-
-    // Create DE-based PRVs
-    for (const deName of referencedDEs) {
-      if (!prvCreated[deName]) {
-        const prvUid = generateDhis2Uid();
-        allPRVs.push({
-          id: prvUid,
-          name: sanitizeVariableName(deName),
-          program: { id: args.program_id },
-          dataElement: { id: deNameToId[deName] },
-          programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
-          ...(deNameToStage[deName] ? { programStage: { id: deNameToStage[deName] } } : {}),
-        });
-        prvCreated[deName] = prvUid;
+      if (act.data_element_name && deNameToId[act.data_element_name]) {
+        pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name);
       }
-    }
-
-    // Create TEA-based PRVs
-    for (const teaName of referencedTEAs) {
-      if (!prvCreated[teaName]) {
-        const prvUid = generateDhis2Uid();
-        allPRVs.push({
-          id: prvUid,
-          name: sanitizeVariableName(teaName),
-          program: { id: args.program_id },
-          trackedEntityAttribute: { id: teaNameToId[teaName] },
-          programRuleVariableSourceType: 'TEI_ATTRIBUTE',
-          useCodeForOptionSet: !!teaHasOptionSet[teaName],
-        });
-        prvCreated[teaName] = prvUid;
+      if (act.tracked_entity_attribute_name && teaNameToId[act.tracked_entity_attribute_name]) {
+        pushTeaPrv(sanitizeVariableName(act.tracked_entity_attribute_name), act.tracked_entity_attribute_name);
       }
     }
 
@@ -22713,6 +22940,13 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   console.log(`[AgenticLoop] Using ${contextualTools.length}/${TOOLS.length} tools:`,
     [...contextualToolNames].join(', '));
 
+  // ── Two-tier tool docs ──
+  // The provider receives SLIM definitions for MANUAL_TOOLS (routing info
+  // only); each such tool's full manual is delivered by the gate below on its
+  // first call this turn, BEFORE anything executes.
+  const wireTools = toWireTools(contextualTools);
+  const deliveredManuals = new Set();
+
   const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb, inspectSnapshot);
 
   // If image is attached, analyze with a vision model first, then include description
@@ -23062,7 +23296,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         chunkBuffer += chunk;
         if (!flushTimer) flushTimer = setTimeout(flushChunks, FLUSH_MS);
       }
-    }, contextualTools, i);
+    }, wireTools, i);
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (chunkBuffer) {
       broadcast({ type: 'AI_STREAM_CHUNK', text: chunkBuffer });
@@ -23108,32 +23342,45 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           broadcast({ type: 'AI_CHART', spec: args });
         }
 
-        if (tc.function.name !== 'render_chart') {
-          apiCallsLog.push({ tool: tc.function.name, args: JSON.parse(JSON.stringify(args)) });
-        }
-
         let toolResult;
-        // ── Pre-flight: refuse calls that reference unverified UIDs or that
-        //    exceed the per-turn HTTP-error limit. Prevents 404/409 churn. ──
-        const preflightStop = preflightCheckCall(tc.function.name, args);
-        if (preflightStop) {
-          toolResult = preflightStop;
+        // ── Manual gate (two-tier tool docs): the FIRST call to a
+        //    MANUAL_TOOLS member this turn returns its full usage manual
+        //    instead of executing, so the model always reads the complete
+        //    instructions before the first real (write-capable) execution.
+        //    No API call is made and no preflight/error counters are touched.
+        if (MANUAL_TOOLS.has(tc.function.name) && !deliveredManuals.has(tc.function.name)) {
+          deliveredManuals.add(tc.function.name);
+          console.log(`[AgenticLoop] Manual gate: delivering ${tc.function.name} manual (call not executed)`);
+          toolResult = buildManualGateResult(tc.function.name);
         } else {
-          try {
-            toolResult = await executeTool(tc.function.name, args);
-          } catch (toolErr) {
-            toolResult = { _error: `Tool failed: ${toolErr.message}` };
+          if (tc.function.name !== 'render_chart') {
+            apiCallsLog.push({ tool: tc.function.name, args: JSON.parse(JSON.stringify(args)) });
           }
-          // ── Post-flight: harvest UIDs from the result so subsequent calls
-          //    can reference them, and bump the HTTP-error counter on 4xx/5xx. ──
-          recordKnownIdsFromResult(toolResult);
-          noteHttpErrorFromResult(tc.function.name, toolResult);
+
+          // ── Pre-flight: refuse calls that reference unverified UIDs or that
+          //    exceed the per-turn HTTP-error limit. Prevents 404/409 churn. ──
+          const preflightStop = preflightCheckCall(tc.function.name, args);
+          if (preflightStop) {
+            toolResult = preflightStop;
+          } else {
+            try {
+              toolResult = await executeTool(tc.function.name, args);
+            } catch (toolErr) {
+              toolResult = { _error: `Tool failed: ${toolErr.message}` };
+            }
+            // ── Post-flight: harvest UIDs from the result so subsequent calls
+            //    can reference them, and bump the HTTP-error counter on 4xx/5xx. ──
+            recordKnownIdsFromResult(toolResult);
+            noteHttpErrorFromResult(tc.function.name, toolResult);
+          }
         }
 
         // Compute summary for panel display
         let summary = '?';
         let apiPath = toolResult._apiPath || null;
-        if (toolResult._error) {
+        if (toolResult._tool_manual) {
+          summary = 'Loaded usage manual — validating the call against it';
+        } else if (toolResult._error) {
           // Show the full error sentence in the inline summary (was 80 chars,
           // which truncated mid-message). The expandable details panel below
           // carries the structured _hint / _scope / _origin_server / _refused.
