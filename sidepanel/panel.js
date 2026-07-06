@@ -1585,6 +1585,13 @@ ${turnXml}
       manage_custom_forms: { cls: 'tool-icon-create', icon: '\u{1F4DD}' },
       manage_custom_translations: { cls: 'tool-icon-create', icon: '\u{1F310}' },
       manage_growth_chart_plugin: { cls: 'tool-icon-create', icon: '\u{1F4C8}' },
+      manage_validation_rules: { cls: 'tool-icon-info', icon: '\u{2705}' },
+      manage_org_units: { cls: 'tool-icon-create', icon: '\u{1F3E2}' },
+      manage_indicators: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
+      manage_option_sets: { cls: 'tool-icon-create', icon: '\u{1F5C2}' },
+      manage_legend_sets: { cls: 'tool-icon-create', icon: '\u{1F3A8}' },
+      manage_dashboards: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
+      manage_maps: { cls: 'tool-icon-create', icon: '\u{1F5FA}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
@@ -1615,6 +1622,13 @@ ${turnXml}
       manage_custom_forms: 'Designing custom form',
       manage_custom_translations: 'Managing custom translations',
       manage_growth_chart_plugin: 'Setting up growth chart plugin',
+      manage_validation_rules: 'Managing validation rules',
+      manage_org_units: 'Managing org units',
+      manage_indicators: 'Managing indicators',
+      manage_option_sets: 'Managing option sets',
+      manage_legend_sets: 'Managing legend sets',
+      manage_dashboards: 'Building dashboards',
+      manage_maps: 'Building maps',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
@@ -1765,6 +1779,99 @@ ${turnXml}
       if (args.program_id) parts.push(`program: ${String(args.program_id).slice(0, 11)}`);
       if (args.program_stage_id) parts.push(`stage: ${String(args.program_stage_id).slice(0, 11)}`);
       if (args.org_unit_id) parts.push(`ou: ${String(args.org_unit_id).slice(0, 11)}`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_validation_rules') {
+      const parts = [args.action || 'unknown'];
+      if (args.rule_id) parts.push(`id: ${String(args.rule_id).slice(0, 11)}`);
+      if (args.rule && typeof args.rule === 'object') {
+        if (args.rule.name) parts.push(`"${String(args.rule.name).slice(0, 30)}"`);
+        if (args.rule.operator) parts.push(`op: ${args.rule.operator}`);
+        if (args.rule.importance) parts.push(args.rule.importance);
+      }
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.importance && !(args.rule && args.rule.importance)) parts.push(args.importance);
+      if (args.period_type) parts.push(`pe: ${args.period_type}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_org_units') {
+      const parts = [args.action || 'unknown'];
+      if (args.org_unit_id) parts.push(`id: ${String(args.org_unit_id).slice(0, 11)}`);
+      if (args.org_unit && typeof args.org_unit === 'object') {
+        if (args.org_unit.name) parts.push(`"${String(args.org_unit.name).slice(0, 30)}"`);
+        if (args.org_unit.parent_id) parts.push(`parent: ${String(args.org_unit.parent_id).slice(0, 11)}`);
+      }
+      if (args.parent_id && !(args.org_unit && args.org_unit.parent_id)) parts.push(`parent: ${String(args.parent_id).slice(0, 11)}`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.level != null) parts.push(`level: ${args.level}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_indicators') {
+      const parts = [args.action || 'unknown'];
+      if (args.indicator_id) parts.push(`id: ${String(args.indicator_id).slice(0, 11)}`);
+      if (args.indicator && typeof args.indicator === 'object') {
+        if (args.indicator.name) parts.push(`"${String(args.indicator.name).slice(0, 30)}"`);
+        if (args.indicator.indicator_type) parts.push(`type: ${String(args.indicator.indicator_type).slice(0, 20)}`);
+      }
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.indicator_type && !(args.indicator && args.indicator.indicator_type)) parts.push(`type: ${String(args.indicator_type).slice(0, 20)}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_option_sets') {
+      const parts = [args.action || 'unknown'];
+      if (args.option_set_id) parts.push(`id: ${String(args.option_set_id).slice(0, 11)}`);
+      if (args.option_set && typeof args.option_set === 'object') {
+        if (args.option_set.name) parts.push(`"${String(args.option_set.name).slice(0, 30)}"`);
+        if (Array.isArray(args.option_set.options)) parts.push(`${args.option_set.options.length} option(s)`);
+        if (args.option_set.value_type) parts.push(`type: ${String(args.option_set.value_type).slice(0, 16)}`);
+      }
+      if (Array.isArray(args.options)) parts.push(`+${args.options.length} option(s)`);
+      if (Array.isArray(args.option_codes)) parts.push(`-${args.option_codes.length} code(s)`);
+      if (Array.isArray(args.order)) parts.push(`reorder ${args.order.length}`);
+      else if (Array.isArray(args.option_ids)) parts.push(`${args.option_ids.length} id(s)`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_legend_sets') {
+      const parts = [args.action || 'unknown'];
+      if (args.legend_set_id) parts.push(`id: ${String(args.legend_set_id).slice(0, 11)}`);
+      if (args.legend_set && typeof args.legend_set === 'object') {
+        if (args.legend_set.name) parts.push(`"${String(args.legend_set.name).slice(0, 30)}"`);
+        if (Array.isArray(args.legend_set.legends)) parts.push(`${args.legend_set.legends.length} band(s)`);
+      }
+      if (args.auto_bands && typeof args.auto_bands === 'object') {
+        const a = args.auto_bands;
+        if (a.count != null) parts.push(`${a.count} band(s)`);
+        if (a.start != null && a.end != null) parts.push(`${a.start}–${a.end}`);
+      }
+      if (Array.isArray(args.legends)) parts.push(`+${args.legends.length} band(s)`);
+      if (Array.isArray(args.legend_names)) parts.push(`-${args.legend_names.length} name(s)`);
+      else if (Array.isArray(args.legend_ids)) parts.push(`-${args.legend_ids.length} id(s)`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_dashboards') {
+      const parts = [args.action || 'unknown'];
+      if (args.dashboard_id) parts.push(`id: ${String(args.dashboard_id).slice(0, 11)}`);
+      if (args.visualization && typeof args.visualization === 'object') {
+        if (args.visualization.vis_type) parts.push(String(args.visualization.vis_type));
+        if (args.visualization.name) parts.push(`"${String(args.visualization.name).slice(0, 30)}"`);
+      }
+      if (args.dashboard && typeof args.dashboard === 'object' && args.dashboard.name) {
+        parts.push(`"${String(args.dashboard.name).slice(0, 30)}"`);
+      }
+      if (Array.isArray(args.items)) parts.push(`${args.items.length} item(s)`);
+      if (args.item_id) parts.push(`item: ${String(args.item_id).slice(0, 11)}`);
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      if (args.dry_run_only) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_maps') {
+      const parts = [args.action || 'unknown'];
+      if (args.name) parts.push(`"${String(args.name).slice(0, 30)}"`);
+      if (args.map_id) parts.push(`id: ${String(args.map_id).slice(0, 11)}`);
+      if (args.data_item) parts.push(`dx: ${String(args.data_item).slice(0, 11)}`);
+      if (args.org_unit_level != null) parts.push(`level ${args.org_unit_level}`);
+      if (args.thematic_map_type) parts.push(String(args.thematic_map_type));
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {
       const parts = [args.action || 'list'];

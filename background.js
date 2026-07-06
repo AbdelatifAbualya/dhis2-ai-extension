@@ -157,6 +157,25 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   + 'fix|fixes?|repair|patch|correct|update|modify|change|edit|rewrite|overwrite'
   + '|delete|remove|drop|destroy|wipe|prune|sweep|purge|cleanup|clean ?up'
   + '|create|build|make|set ?up|setup|add|insert'
+  // Write verbs that used to be missing: "Set a custom form on the Quick Check
+  // stage" was classified read_only (worse: the stage NAME "Quick Check"
+  // matched the diagnostic regex) and the write was refused. Verified live
+  // 2026-07-01. Ambiguous verbs (set/apply) only count in imperative form
+  // (followed by an article/pronoun) so problem reports like "the value isn't
+  // set" or "the rule doesn't apply" stay read_only. Deliberately NOT added:
+  // save/write/import/register — they dominate problem reports ("the save
+  // failed") and would weaken the gate.
+  + '|set\\s+(?:a|an|the|this|that|it|up|new|custom|public|sharing)\\b|configure|apply\\s+(?:a|an|the|this|that|it)\\b'
+  + '|install|uninstall|author|generate|translate|relabel'
+  // Form/layout authoring verbs. "Design a custom form for this stage" is the
+  // tool's OWN documented trigger phrase, yet was classified read_only and the
+  // write refused (verified live 2026-07-03). Constrain the ambiguous ones
+  // (design/customize/style/lay out) to imperative form — followed by an
+  // article/pronoun — so a problem report like "the form design is broken" or
+  // "the style is off" stays read_only. redesign is unambiguous → unconstrained.
+  + '|design\\s+(?:a|an|the|this|that|it|new|custom)\\b|redesign|customi[sz]e\\s+(?:a|an|the|this|that|it|new)\\b'
+  + '|style\\s+(?:a|an|the|this|that|it)\\b|lay\\s?out\\s+(?:a|an|the|this)\\b'
+  + '|restore|revert|roll ?back|undo|link|unlink'
   + '|enable|disable|turn (?:on|off)|share|grant|revoke|merge|split|rename|migrate|swap|convert|attach|assign|unassign|detach'
   + '|approve|confirm|proceed|do it|do this|go ahead|just do it'
   + '|yes(?:,?\\s*(?:please|do it|go ahead|fix(?: it)?|update|delete|remove))?'
@@ -1135,6 +1154,16 @@ const SNAPSHOT_FIELDS = {
   indicators:
     'id,name,shortName,code,description,indicatorType[id],numerator,numeratorDescription,' +
     'denominator,denominatorDescription,decimals,annualized,url',
+  // Dashboards are the highest-risk restore target: their whole value lives in
+  // the dashboardItems collection, and a careless full-object PUT that omits an
+  // item permanently drops it. Spell the items out in full (every content-type
+  // reference + grid geometry) so a restore re-creates the dashboard exactly.
+  dashboards:
+    'id,name,description,favorite,restrictFilters,allowedFilters,layout,itemConfig,' +
+    'dashboardItems[id,type,x,y,width,height,shape,appKey,text,messages,' +
+    'visualization[id],eventVisualization[id],eventChart[id],eventReport[id],map[id],' +
+    'chart[id],reportTable[id],reports[id],resources[id],users[id]],' +
+    'sharing',
 };
 
 function getSnapshotFields(objectType) {
@@ -4069,15 +4098,18 @@ If user enabled web browsing from UI, this tool should usually be called before 
                 use_default_combo: { type: 'boolean', description: 'Force this DE onto the system default categoryCombo (no disaggregation), even when the batch has an inline combo. Use for "no disaggregation" rows in a mixed dataset.' },
                 option_set: {
                   type: 'object',
+                  description: 'Inline option set to CREATE and attach to this DE. Use ONLY when the option set does not exist yet. To attach an EXISTING option set (e.g. one just created via manage_option_sets), use option_set_id instead — do NOT re-inline it (that makes a duplicate set).',
                   properties: {
                     name: { type: 'string' },
                     options: { type: 'array', items: { type: 'string' } }
                   }
-                }
+                },
+                option_set_id: { type: 'string', description: 'Attach an EXISTING option set to this DE by UID. Chain the option_set_id returned by manage_option_sets(action="create"). The DE valueType is auto-aligned to the referenced set (TEXT/MULTI_TEXT). Mutually exclusive with the inline option_set.' },
+                option_set_name: { type: 'string', description: 'Attach an EXISTING option set to this DE by exact name (resolved to its UID). Use option_set_id when you already have the UID. Mutually exclusive with the inline option_set.' }
               },
               required: ['name', 'value_type']
             },
-            description: 'Standalone data elements (for create_data_elements). Each DE can opt into the inline category_combo via use_category_combo:true, or stay on the default combo. Mix freely in one call.'
+            description: 'Standalone data elements (for create_data_elements). Each DE can opt into the inline category_combo via use_category_combo:true, or stay on the default combo. Attach an option set either inline (option_set — creates a new set) or by reference (option_set_id / option_set_name — reuses an existing set). Mix freely in one call.'
           },
           category_combo: {
             type: 'object',
@@ -4885,6 +4917,370 @@ Returns { success, ... , dashboard_attach } on success; { _error, _hint } on fai
   {
     type: 'function',
     function: {
+      name: 'manage_validation_rules',
+      description: `CRUD for DHIS2 Validation Rules — the aggregate-data quality checks that compare two expressions (leftSide vs rightSide) with an operator over a period, flagging data that violates the rule (e.g. "inpatient days ≤ available bed-days", "sum of sub-totals == grand total", "ANC 1st visits ≥ ANC 4th visits"). Use this tool for ALL validation-rule operations — NEVER assemble raw /metadata POST/PUT bodies via dhis2_query.
+Actions: list / get / create / update / delete.
+Both sides are DHIS2 expressions over data elements: #{dataElementUid} (all category-option-combos summed) or #{dataElementUid.cocUid} (one disaggregation); constants use C{constantUid}; numbers/operators (+ - * /) are allowed. The chatbot server-validates BOTH expressions via DHIS2's /expressions/description endpoint BEFORE saving — a malformed or unresolved expression is rejected at create/update time, never silently saved.
+operator: equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, compulsory_pair (both sides must have a value or neither), exclusive_pair (at most one side may have a value).
+importance: HIGH | MEDIUM | LOW. missingValueStrategy per side: NEVER_SKIP (default — missing treated as 0), SKIP_IF_ANY_VALUE_MISSING, SKIP_IF_ALL_VALUES_MISSING.
+NEVER invent dataElement/constant UIDs — reuse UIDs from search_metadata / manage_datasets / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete'],
+            description: 'list=paginated validation-rule list (optional name/importance/period filters); get=one rule with both sides; create=new rule; update=patch an existing rule; delete=remove a rule.'
+          },
+          rule_id: { type: 'string', description: 'Existing validation rule UID (required for get, update, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on rule name.' },
+          importance: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'], description: 'For list: filter by importance. (For create/update set it inside the rule object.)' },
+          period_type: { type: 'string', description: 'For list: filter by period type (Monthly, Quarterly, Yearly, … exact-case).' },
+          limit: { type: 'integer', description: 'For list: max rules to return (1–200, default 50).' },
+          rule: {
+            type: 'object',
+            description: 'Validation-rule definition (required for create; pass only the changed fields for update).',
+            properties: {
+              name: { type: 'string', description: 'Unique rule name.' },
+              description: { type: 'string' },
+              instruction: { type: 'string', description: 'Message shown when the rule is violated (what the user should do about it).' },
+              importance: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'], description: 'Default MEDIUM.' },
+              operator: { type: 'string', enum: ['equal_to', 'not_equal_to', 'greater_than', 'greater_than_or_equal_to', 'less_than', 'less_than_or_equal_to', 'compulsory_pair', 'exclusive_pair'], description: 'How leftSide is compared to rightSide.' },
+              period_type: { type: 'string', description: 'Evaluation period type (Monthly, Quarterly, …, same 20 exact-case values as datasets). Default Monthly.' },
+              left_expression: { type: 'string', description: 'leftSide expression, e.g. "#{deUid}" or "#{deUid.cocUid} + #{deUid2}".' },
+              left_description: { type: 'string', description: 'Human label for the left side (auto-derived from DHIS2 if omitted).' },
+              left_missing_strategy: { type: 'string', enum: ['NEVER_SKIP', 'SKIP_IF_ANY_VALUE_MISSING', 'SKIP_IF_ALL_VALUES_MISSING'], description: 'Default NEVER_SKIP.' },
+              right_expression: { type: 'string', description: 'rightSide expression.' },
+              right_description: { type: 'string', description: 'Human label for the right side (auto-derived from DHIS2 if omitted).' },
+              right_missing_strategy: { type: 'string', enum: ['NEVER_SKIP', 'SKIP_IF_ANY_VALUE_MISSING', 'SKIP_IF_ALL_VALUES_MISSING'], description: 'Default NEVER_SKIP.' }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create: validate expressions + metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_org_units',
+      description: `CRUD for DHIS2 Organisation Units — the facilities/chiefdoms/districts that make up the org-unit HIERARCHY (the tree every program, dataset, data value and enrollment is attached to). Use this tool for ALL org-unit structure work — creating a new facility under a parent, renaming/closing one, MOVING (re-parenting) a unit or subtree, or deleting a leaf — NEVER hand-assemble raw /metadata POST/PUT bodies via dhis2_query.
+Actions: list / get / create / update / delete.
+Hierarchy rules the tool enforces for you: every unit except the single root has exactly one parent; \`level\` and \`path\` are DERIVED by DHIS2 from the parent (you never set them) — a child of a level-3 chiefdom becomes level 4 automatically, and moving a unit re-computes level/path for it AND every descendant. create verifies the parent exists first; update validates a re-parent target (rejecting a move under the unit's own descendant, which would create a cycle) and auto-snapshots a backup before writing; delete refuses any unit that still has CHILDREN (re-parent or remove them first) and lets DHIS2's atomic delete block units that still hold data values / program assignments, surfacing the exact reason.
+Dates: openingDate is required on create; openingDate/closedDate accept YYYY-MM-DD. NEVER invent parent UIDs — resolve them with manage_org_units(action=list) or search_metadata.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete'],
+            description: 'list=paginated org-unit list (optional name/level/parent filters); get=one unit with parent, child count, dates and contact info; create=new child unit under a parent; update=patch fields and/or move (re-parent); delete=remove a childless leaf unit.'
+          },
+          org_unit_id: { type: 'string', description: 'Existing org-unit UID (required for get, update, delete).' },
+          parent_id: { type: 'string', description: 'For list: only return direct children of this parent UID. For create: the parent the new unit is placed under (can also be set inside org_unit).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on org-unit name.' },
+          level: { type: 'integer', description: 'For list: filter to a single hierarchy level (1=root/national, 2=district, …).' },
+          limit: { type: 'integer', description: 'For list: max units to return (1–200, default 50).' },
+          org_unit: {
+            type: 'object',
+            description: 'Org-unit definition (required for create; pass only the changed fields for update).',
+            properties: {
+              name: { type: 'string', description: 'Unit name (unique within DHIS2).' },
+              short_name: { type: 'string', description: 'Short name (≤50 chars, unique). Defaults to name on create if omitted.' },
+              parent_id: { type: 'string', description: 'Parent org-unit UID. REQUIRED on create. On update, supplying it MOVES (re-parents) the unit and all its descendants.' },
+              opening_date: { type: 'string', description: 'Date the unit opened, YYYY-MM-DD. REQUIRED on create.' },
+              closed_date: { type: 'string', description: 'Date the unit closed, YYYY-MM-DD. On update, pass an empty string to clear it.' },
+              code: { type: 'string', description: 'Optional unique code.' },
+              description: { type: 'string' },
+              comment: { type: 'string' },
+              address: { type: 'string' },
+              email: { type: 'string' },
+              phone_number: { type: 'string' },
+              contact_person: { type: 'string' },
+              url: { type: 'string' }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create: validate the metadata import (incl. parent reference) without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_indicators',
+      description: `CRUD for DHIS2 aggregate Indicators — the calculated values shown in dashboards, pivot tables and maps, computed as (numerator / denominator) × the indicatorType factor (1, 100, 1000, …). Examples: "ANC coverage = ANC 1st visits ÷ expected pregnancies × 100", "case fatality rate", "facilities reporting rate". Use this tool for ALL aggregate-indicator work — NEVER assemble raw /metadata POST/PUT bodies via dhis2_query. (This is for AGGREGATE indicators; tracker/event program indicators are handled by manage_program_indicators.)
+Actions: list / get / create / update / delete.
+numerator and denominator are DHIS2 aggregate expressions: #{dataElementUid} (summed across all category-option-combos) or #{dataElementUid.cocUid} (one disaggregation); R{dataSetUid.REPORTING_RATE} for reporting rates; I{programIndicatorUid} to reuse a program indicator; C{constantUid} for constants; numeric literals and + - * / are allowed. For a plain count/sum use denominator "1". The chatbot server-validates BOTH expressions via DHIS2's /expressions/description endpoint BEFORE saving — a malformed or unresolved expression is rejected at create/update time, never silently saved.
+indicator_type selects the scaling factor: "Number (Factor 1)" for a raw ratio/count, "Per cent" (×100) for a percentage, "Per thousand"/"Per ten thousand"/"Per hundred thousand" for rates. Pass its UID or exact name — the tool resolves and verifies it before writing.
+NEVER invent dataElement / dataSet / programIndicator / constant UIDs — reuse UIDs from search_metadata / manage_datasets / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete'],
+            description: 'list=paginated indicator list (optional name / indicator_type filters); get=one indicator with both expressions; create=new indicator; update=patch an existing indicator; delete=remove an indicator.'
+          },
+          indicator_id: { type: 'string', description: 'Existing indicator UID (required for get, update, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on indicator name.' },
+          indicator_type: { type: 'string', description: 'For list: filter by indicatorType (UID or exact name). (For create/update set it inside the indicator object.)' },
+          limit: { type: 'integer', description: 'For list: max indicators to return (1–200, default 50).' },
+          indicator: {
+            type: 'object',
+            description: 'Indicator definition (required for create; pass only the changed fields for update). To render the indicator colour-coded (traffic-light) on dashboards/pivots/maps, chain an existing legend set via legend_set_id (create it first with manage_legend_sets).',
+            properties: {
+              name: { type: 'string', description: 'Unique indicator name.' },
+              short_name: { type: 'string', description: 'Short name (≤50 chars). Defaults to name on create if omitted.' },
+              description: { type: 'string' },
+              indicator_type: { type: 'string', description: 'indicatorType UID or exact name ("Number (Factor 1)", "Per cent", "Per thousand", …). REQUIRED on create.' },
+              numerator: { type: 'string', description: 'Numerator expression, e.g. "#{anc1Uid}" or "#{deA} + #{deB}". REQUIRED on create.' },
+              numerator_description: { type: 'string', description: 'Human label for the numerator (auto-derived from DHIS2 if omitted).' },
+              denominator: { type: 'string', description: 'Denominator expression. Use "1" for a plain count/sum. REQUIRED on create.' },
+              denominator_description: { type: 'string', description: 'Human label for the denominator (auto-derived from DHIS2 if omitted).' },
+              annualized: { type: 'boolean', description: 'Annualize the value (scale to a full year based on the selected period). Default false.' },
+              decimals: { type: 'integer', description: 'Fixed number of output decimals (0–5). Omit/null to inherit the system default.' },
+              legend_set_id: { type: 'string', description: 'Attach an EXISTING legend set (its colour bands) so this indicator renders color-coded / traffic-light in dashboards, pivot tables and maps. Pass the `legend_set_id` returned by manage_legend_sets(action="create") — this is the legend-set → indicator chaining path. The set MUST already exist (verified before write); NEVER invent the UID and NEVER attempt the attach via a raw dhis2_query PATCH or manage_metadata (it has no legend action).' },
+              legend_set_ids: { type: 'array', items: { type: 'string' }, description: 'Attach MULTIPLE existing legend sets (uncommon). Each entry must be an existing legend-set UID. On update, an empty array [] detaches all legend sets.' },
+              legend_set_name: { type: 'string', description: 'Alternative to legend_set_id: attach an existing legend set by its EXACT unique name (resolved to a UID; refuses a 0-match or ambiguous multi-match).' }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create: validate expressions + indicatorType + metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_option_sets',
+      description: `Full lifecycle CRUD for DHIS2 **option sets** — the reusable code/label pick-lists (drop-downs) that data elements and tracked-entity attributes use to constrain input to a fixed set of choices (e.g. "HIV Result: Positive/Negative/Inconclusive", "Sex: Male/Female"). Use this tool for ALL standalone option-set work — NEVER hand-assemble /metadata option bodies via dhis2_query.
+Actions: list / get / create / update / add_options / remove_options / reorder_options / delete.
+An option set has a valueType (the data type of its codes) and an ORDERED list of options; each option is a { code, name } pair — code is the value stored in data, name is the label shown to the user. Codes must be UNIQUE within a set.
+- create: a brand-new standalone option set plus its options, imported atomically (VALIDATE then COMMIT).
+- add_options / remove_options: append new options to, or delete options from, an EXISTING set (remove deletes the option objects, which auto-detaches them; it refuses to remove the last remaining option).
+- reorder_options: set the display order of an existing set's options by listing their codes (or UIDs) in the desired order.
+- update: patch the set's OWN fields (name / code / description / value_type) — does NOT change membership.
+- delete: remove the whole set (and its options); refuses, with the exact blockers, if any data element or tracked-entity attribute still uses it.
+Each update/add/remove/reorder/delete auto-snapshots a backup first (restore via manage_backups).
+(To create an option set INLINE as part of a NEW data element in one shot, use create_metadata's option_set field instead. To CONVERT an existing set to MULTI_TEXT/etc. and cascade the change, use manage_metadata(action=convert_value_type). This tool owns the standalone option-set lifecycle.)
+NEVER invent option-set or option UIDs — reuse UIDs from search_metadata / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'add_options', 'remove_options', 'reorder_options', 'delete'],
+            description: 'list=paginated option-set list (optional name / value_type filters); get=one set with its options in display order; create=new standalone set + options; update=patch the set\'s own fields; add_options=append options; remove_options=delete options; reorder_options=set option display order; delete=remove the whole set + its options.'
+          },
+          option_set_id: { type: 'string', description: 'Existing option set UID (required for get, update, add_options, remove_options, reorder_options, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on option-set name.' },
+          value_type: { type: 'string', description: 'For list: filter by valueType (e.g. TEXT). (For create/update set it inside the option_set object.)' },
+          limit: { type: 'integer', description: 'For list: max option sets to return (1–200, default 50).' },
+          option_set: {
+            type: 'object',
+            description: 'Option-set definition (required for create; for update pass only the changed OWN fields).',
+            properties: {
+              name: { type: 'string', description: 'Unique option-set name.' },
+              code: { type: 'string', description: 'Optional unique option-set code.' },
+              description: { type: 'string' },
+              value_type: { type: 'string', description: 'Data type of the option codes (TEXT, NUMBER, INTEGER, LETTER, BOOLEAN, MULTI_TEXT, …). Defaults to TEXT if omitted on create.' },
+              options: { type: 'array', description: 'For create: the ordered options. Each { code, name }. Codes must be unique within the set.', items: { type: 'object', properties: { code: { type: 'string' }, name: { type: 'string' } } } }
+            }
+          },
+          options: { type: 'array', description: 'For add_options: the new options to append, each { code, name }. New codes must not collide with the set\'s existing codes.', items: { type: 'object', properties: { code: { type: 'string' }, name: { type: 'string' } } } },
+          option_codes: { type: 'array', description: 'For remove_options: the codes of the options to delete from the set. (Use option_ids to target by UID instead.)', items: { type: 'string' } },
+          option_ids: { type: 'array', description: 'For remove_options: option UIDs to delete (alternative to option_codes). For reorder_options: may be used as the ordered list of option UIDs if order is omitted.', items: { type: 'string' } },
+          order: { type: 'array', description: 'For reorder_options: the option codes (or UIDs) in the desired display order. Must cover every option currently in the set, each exactly once.', items: { type: 'string' } },
+          dry_run_only: { type: 'boolean', description: 'For create: validate the metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/add_options/remove_options/reorder_options/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_legend_sets',
+      description: `Full lifecycle CRUD for DHIS2 **legend sets** — the reusable colour-coded value bands that data elements, indicators, visualisations and maps use to render numeric values as a traffic-light / heat-map scale (e.g. ANC coverage shaded red 0–50, amber 50–80, green 80–100). Use this tool for ALL standalone legend-set work — NEVER hand-assemble /metadata legendSets bodies via dhis2_query.
+Actions: list / get / create / add_legends / remove_legends / update / delete.
+A legend set owns an ORDERED-by-value list of **legends**, each a { name, startValue, endValue, color } band. Ranges are half-open [startValue, endValue): a band covers values >= startValue and < endValue, so endValue of one band may equal startValue of the next without overlapping. \`color\` is an optional 6-digit hex (#RRGGBB). DHIS2 does NOT reject overlapping/gapped bands, so this tool WARNS about overlaps but never blocks on them.
+- create: a brand-new legend set + its bands, imported atomically (VALIDATE then COMMIT). Supply explicit \`legend_set.legends\`, OR pass \`auto_bands:{ start, end, count }\` to generate \`count\` equal-width contiguous bands spanning start→end, default-coloured on a red→amber→green ramp (low→high). \`auto_bands.colors\`/\`auto_bands.names\` (length must equal count) override the defaults.
+- add_legends / remove_legends: append bands to, or drop bands (by name or UID) from, an EXISTING set; refuses to remove the last remaining band.
+- update: patch the set's OWN fields (name / code) only — does NOT change the bands.
+- delete: remove the whole set (its legends cascade with it); refuses, with the exact blockers, if any data element, indicator, visualisation or map still uses it.
+Each add_legends/remove_legends/update/delete auto-snapshots a backup first (restore via manage_backups).
+NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get results.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'add_legends', 'remove_legends', 'update', 'delete'],
+            description: 'list=paginated legend-set list (optional name filter); get=one set with its bands in value order; create=new set + bands (explicit or auto_bands); add_legends=append bands; remove_legends=drop bands; update=patch the set\'s own fields; delete=remove the whole set + its bands.'
+          },
+          legend_set_id: { type: 'string', description: 'Existing legend set UID (required for get, add_legends, remove_legends, update, delete).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on legend-set name.' },
+          limit: { type: 'integer', description: 'For list: max legend sets to return (1–200, default 50).' },
+          legend_set: {
+            type: 'object',
+            description: 'Legend-set definition (required for create; for update pass only the changed OWN fields name/code).',
+            properties: {
+              name: { type: 'string', description: 'Unique legend-set name.' },
+              code: { type: 'string', description: 'Optional unique legend-set code.' },
+              legends: { type: 'array', description: 'For create (when auto_bands is not used): the colour bands. Each { name, startValue, endValue, color? }. endValue must be > startValue; band names must be unique within the set; color is an optional 6-digit hex.', items: { type: 'object', properties: { name: { type: 'string' }, startValue: { type: 'number' }, endValue: { type: 'number' }, color: { type: 'string', description: '6-digit hex like #FF0000 (optional).' } } } }
+            }
+          },
+          auto_bands: {
+            type: 'object',
+            description: 'For create: generate count equal-width contiguous bands spanning start→end (an alternative to listing legends explicitly). Default colours follow a red→amber→green ramp from low to high.',
+            properties: {
+              start: { type: 'number', description: 'Low end of the scale (first band startValue).' },
+              end: { type: 'number', description: 'High end of the scale (last band endValue). Must be > start.' },
+              count: { type: 'integer', description: 'Number of equal-width bands (1–50).' },
+              names: { type: 'array', description: 'Optional band names (length must equal count). Defaults to "start–end" range labels.', items: { type: 'string' } },
+              colors: { type: 'array', description: 'Optional 6-digit hex colours (length must equal count). Defaults to a red→amber→green ramp.', items: { type: 'string' } }
+            }
+          },
+          legends: { type: 'array', description: 'For add_legends: the new bands to append, each { name, startValue, endValue, color? }. New band names must not collide with the set\'s existing band names.', items: { type: 'object', properties: { name: { type: 'string' }, startValue: { type: 'number' }, endValue: { type: 'number' }, color: { type: 'string' } } } },
+          legend_names: { type: 'array', description: 'For remove_legends: the names of the bands to drop. (Use legend_ids to target by UID instead.)', items: { type: 'string' } },
+          legend_ids: { type: 'array', description: 'For remove_legends: band UIDs to drop (alternative to legend_names).', items: { type: 'string' } },
+          dry_run_only: { type: 'boolean', description: 'For create: validate the metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before add_legends/remove_legends/update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_dashboards',
+      description: `Build and inspect DHIS2 **analytics dashboards and visualizations** — the charts, pivot tables and single-value tiles shown in the Dashboard app, and the dashboards that arrange them. Use this tool for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata visualizations or dashboards bodies via dhis2_query (a raw POST that only sets columns/rows/filters silently imports an EMPTY, un-renderable chart — DHIS2 stores the layout as columnDimensions/rowDimensions/filterDimensions and the data as dataDimensionItems / relativePeriods / organisationUnits; this tool assembles that exact structure for you).
+Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
+- create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (indicator / dataElement / programIndicator UIDs — their types are auto-resolved AND verified to exist), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed.
+- create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
+- add_items: add chart(s)/map(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
+- remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
+- list / get: list dashboards (optional name filter) / read one dashboard with its items (each item's id, type, and referenced visualization/map).
+Every mutating action is backed up first (undo via manage_backups). For sharing use manage_metadata(action=update_sharing). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create_visualization', 'create_dashboard', 'add_items', 'remove_item', 'update', 'delete'],
+            description: 'list=dashboard list; get=one dashboard with items; create_visualization=one chart/pivot/single-value; create_dashboard=a NEW dashboard with items; add_items=safely APPEND item(s) to an EXISTING dashboard (never wipes existing tiles); remove_item=drop one tile; update=edit dashboard name/description; delete=remove a whole dashboard. All mutating actions snapshot to backups first.'
+          },
+          dashboard_id: { type: 'string', description: 'Existing dashboard UID (required for get, add_items, remove_item, update, delete).' },
+          item_id: { type: 'string', description: 'For remove_item: the dashboardItem UID to drop (see action=get for item ids).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on dashboard name.' },
+          limit: { type: 'integer', description: 'For list: max dashboards to return (1–200, default 50).' },
+          visualization: {
+            type: 'object',
+            description: 'For create_visualization: the visualization spec.',
+            properties: {
+              name: { type: 'string', description: 'Visualization display name (required).' },
+              vis_type: { type: 'string', description: 'Chart type: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, STACKED_AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, YEAR_OVER_YEAR_COLUMN, SCATTER, BUBBLE. Default COLUMN.' },
+              data_items: { type: 'array', items: { type: 'string' }, description: 'Indicator / dataElement / programIndicator UIDs to plot (the dx dimension). Types are auto-resolved and existence-verified.' },
+              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) and/or fixed ISO periods (202401, 2025Q1, 2025).' },
+              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2).' },
+              short_name: { type: 'string', description: 'Optional short name (max 50 chars).' },
+              description: { type: 'string', description: 'Optional description.' },
+              layout: {
+                type: 'object',
+                description: 'Optional layout override — which dimensions sit on each axis. Each is a subset of ["dx","pe","ou"]. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → columns[dx] rows[pe] filters[ou].',
+                properties: {
+                  columns: { type: 'array', items: { type: 'string' } },
+                  rows: { type: 'array', items: { type: 'string' } },
+                  filters: { type: 'array', items: { type: 'string' } }
+                }
+              }
+            }
+          },
+          dashboard: {
+            type: 'object',
+            description: 'For create_dashboard (name required) and update (name and/or description to change).',
+            properties: {
+              name: { type: 'string', description: 'Dashboard display name.' },
+              description: { type: 'string', description: 'Optional description.' }
+            }
+          },
+          items: {
+            type: 'array',
+            description: 'For create_dashboard (items to place on a NEW dashboard) AND add_items (items to APPEND to an existing dashboard). Each entry either references an existing object OR inline-creates a new visualization.',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map.' },
+                visualization_id: { type: 'string', description: 'UID of an EXISTING visualization to embed (type VISUALIZATION).' },
+                map_id: { type: 'string', description: 'UID of an EXISTING map to embed (type MAP).' },
+                text: { type: 'string', description: 'Tile text (type TEXT).' },
+                new_visualization: {
+                  type: 'object',
+                  description: 'Inline-create a NEW visualization for this item (same fields as the create_visualization "visualization" spec): name, vis_type, data_items, periods, org_units, short_name, description, layout.'
+                },
+                x: { type: 'integer', description: 'Optional grid x (0–58). Auto-placed if omitted.' },
+                y: { type: 'integer', description: 'Optional grid y. Auto-placed if omitted.' },
+                width: { type: 'integer', description: 'Optional grid width (default 29 = half row).' },
+                height: { type: 'integer', description: 'Optional grid height (default 20).' }
+              }
+            }
+          },
+          dry_run_only: { type: 'boolean', description: 'For create_visualization / create_dashboard: validate the metadata import without committing. Default false.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the mandatory pre-write snapshot on add_items/remove_item/update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_maps',
+      description: `Create and inspect DHIS2 **thematic maps** (choropleth / bubble layers) — the shaded-by-value maps shown in the Maps app and embedded on dashboards. Use this tool for ALL map CREATION — DHIS2 has NO simple "create map" object, so NEVER hand-assemble a /api/maps body via dhis2_query (the layer's data goes on the mapView's columns[dx]/rows[ou]/filters[pe], with organisationUnitLevels, and a program attached for program-indicator layers — this tool assembles that exact structure, verified on play 2.43.0.1).
+- create: one thematic map layer. Supply name, data_item (ONE indicator / dataElement / programIndicator UID — its type is auto-resolved AND verified, and the owning program is auto-attached for a program indicator), org_unit_level (e.g. 2 to shade every district) and/or org_units (parent UIDs or USER_ORGUNIT as the boundary), period (relative keyword like LAST_12_MONTHS or fixed like 202401), optional legend_set_id (create it first with manage_legend_sets for fixed colour bands — otherwise equal-interval auto colours), optional thematic_map_type (CHOROPLETH default, or BUBBLE), classes, color_scale, basemap. Returns map_id.
+- list / get: list maps (optional name filter) / read one map with its layers, data item, org-unit levels, program and legend set.
+- delete: remove a map (snapshots a backup first; restore via manage_backups).
+To place a new map on a dashboard, pass its map_id to manage_dashboards(action="add_items", items=[{ type:"MAP", map_id }]) or reference it in a create_dashboard item. NEVER invent map, data-item or legend-set UIDs — resolve them via search_metadata / a prior tool result. For non-thematic layers (facilities, boundaries, Earth Engine) use the Maps app UI.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'delete'],
+            description: 'list=recent maps (optional name filter); get=one map with its layers; create=new thematic map; delete=remove a map (auto-backup first).'
+          },
+          map_id: { type: 'string', description: 'Map UID (required for get / delete). A Maps app URL is also accepted.' },
+          name: { type: 'string', description: 'For create: the map display name (required).' },
+          data_item: { type: 'string', description: 'For create: the ONE indicator / data element / program indicator UID to shade the map by (the dx dimension). Type auto-resolved + existence-verified; the program is auto-attached for a program indicator.' },
+          org_unit_level: { type: 'integer', description: 'For create: the org-unit LEVEL to shade (e.g. 2 = districts, 3 = chiefdoms). Every OU at this level under the boundary gets a colour.' },
+          org_units: { type: 'array', items: { type: 'string' }, description: 'For create: boundary/parent org units — UIDs and/or USER_ORGUNIT / LEVEL-<n>. Combine with org_unit_level to shade that level within these parents. Defaults to shading the given level nationwide if omitted.' },
+          period: { type: 'string', description: 'For create: a single period — relative keyword (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) or fixed ISO (202401, 2025Q1, 2025). Default LAST_12_MONTHS.' },
+          legend_set_id: { type: 'string', description: 'For create (optional): a legend set UID for fixed colour bands (make one with manage_legend_sets). Omit for equal-interval auto colours.' },
+          thematic_map_type: { type: 'string', enum: ['CHOROPLETH', 'BUBBLE'], description: 'For create: CHOROPLETH (shaded areas, default) or BUBBLE (proportional circles).' },
+          classes: { type: 'integer', description: 'For create (optional): number of colour classes for auto (equal-interval) legends. Default 5.' },
+          color_scale: { type: 'string', description: 'For create (optional): DHIS2 colour scale id (e.g. YlOrRd, Blues, Reds). Default YlOrRd.' },
+          basemap: { type: 'string', description: 'For create (optional): basemap id (osmLight default, osmDetailed, …).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on map name.' },
+          limit: { type: 'integer', description: 'For list: max maps to return (1–200, default 50).' },
+          program_id: { type: 'string', description: 'For create (optional): owning program UID for a program-indicator/event layer. Auto-derived from a program indicator when omitted.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -4942,6 +5338,13 @@ const TOOL_ROUTER = Object.freeze({
   manage_custom_forms: true,
   manage_custom_translations: true,
   manage_growth_chart_plugin: true,
+  manage_validation_rules: true,
+  manage_org_units: true,
+  manage_indicators: true,
+  manage_option_sets: true,
+  manage_legend_sets: true,
+  manage_dashboards: true,
+  manage_maps: true,
   manage_backups: true,
 });
 
@@ -4980,7 +5383,12 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     || /\bnew (tracker|program|stage|data element|option set|indicator|rule|category|category combo|category combination|disaggregation|dataset|data set)\b/.test(combinedText);
   const wantsManageIntent =
     /\b(delete|remove|drop|detach|unassign|clean up|update|modify|change|fix|grant|give|enable|set|share|assign)\b.{0,120}\b(program|stage|data ?element|option set|attribute|metadata|sharing|access|permission|org unit|organisation unit|ou|category|category combo|category combination|disaggregation|dataset|data set)\b/.test(combinedText);
-  const wantsSharingIntent = /\b(sharing|access|permission|publicaccess|public access|user group access|share with|include me|include my user)\b/.test(combinedText);
+  const wantsSharingIntent =
+    /\b(sharing|shared|access|permission|publicaccess|public access|user group access|share with|include me|include my user)\b/.test(combinedText)
+    || /\b(make|set|mark|publish|share)\b.{0,30}\bpublic(ly)?\b/.test(combinedText)
+    || /\bpublic(ly)?\b.{0,25}\b(access|sharing|visible|to\s+everyone|to\s+all)\b/.test(combinedText)
+    || /\bshare[ds]?\b.{0,40}\bwith\b.{0,40}\b(everyone|all\s+users|the\s+public|public|user\s*group|colleagues?|team)\b/.test(combinedText)
+    || /\b(give|grant)\b.{0,30}\b(everyone|all\s+users)\b.{0,20}\baccess\b/.test(combinedText);
   const wantsIconStyleIntent = /\b(icon|color|colour|style)\b/.test(combinedText)
     && /\b(program|stage|data ?element|option set|attribute|tea|indicator|option)\b/.test(combinedText);
   const wantsNotificationsIntent =
@@ -5027,6 +5435,107 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const wantsGrowthChartIntent =
     /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/.test(combinedText)
     || (/\bgrowth\b/.test(combinedText) && /\b(plugin|chart|standard|percentile|z-?score)\b/.test(combinedText));
+  // ── Validation-rule intent ──
+  // "validation rule(s)", or a data-quality/consistency/plausibility check that
+  // co-occurs with rule/check/dataset/data-element terms. Conservative: the bare
+  // word "validate" only triggers alongside an aggregate-data noun, so unrelated
+  // "validate this expression / form" turns don't surface the tool.
+  const wantsValidationRuleIntent =
+    /\bvalidation\s*rules?\b/.test(combinedText)
+    || (/\b(data\s*quality|consistency|cross[-\s]?check|plausibility|sanity\s*check)\b/.test(combinedText)
+        && /\b(rule|check|validat|dataset|data\s*set|data\s*element|aggregate|expression)\b/.test(combinedText))
+    || (/\bvalidat(e|ion)\b/.test(combinedText)
+        && /\b(left\s*side|right\s*side|leftside|rightside|compulsory\s*pair|exclusive\s*pair|greater\s*than|less\s*than|data\s*set|dataset|aggregate\s*data)\b/.test(combinedText));
+  // ── Org-unit (hierarchy) intent ──
+  // Explicit "org/organisation unit(s)" or "OU/org hierarchy/tree" terms, OR a
+  // management verb on a facility/chiefdom noun, optionally preceded by
+  // determiners/quantifiers (a/the/new/several/"three"/"5", singular OR plural
+  // facility|clinic|hospital|…), with at most ONE free intervening word — so
+  // "register three new health facilities" and "close 2 clinics" DO match while
+  // "create a chart for the facility" does NOT — OR a facility noun coupled with a
+  // hierarchy/parent/re-parent term. Conservative on purpose: bare "facility"/
+  // "district" in an analytics question never surfaces the tool.
+  const wantsOrgUnitIntent =
+    /\b(organi[sz]ation\s*units?|org\s*units?|orgunits?|sub-?units?)\b/.test(combinedText)
+    || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/.test(combinedText)
+    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+|some\s+|several\s+|multiple\s+|\d+\s+|(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinics?|hospitals?|chiefdoms?|catchment\s*areas?|sub[-\s]?districts?)\b/.test(combinedText)
+    || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/.test(combinedText);
+  // ── Aggregate-indicator intent ──
+  // Aggregate indicators = (numerator / denominator) × factor, surfaced in
+  // dashboards/pivots/maps. Conservative AND disjoint from program (tracker)
+  // indicators: a turn that mentions "program indicator(s)" never matches here,
+  // so manage_indicators can never steal a manage_program_indicators turn.
+  // Fires on an explicit aggregate signal (aggregate indicator / indicator
+  // type / numerator / denominator) OR "indicator" coupled with an authoring /
+  // aggregate-analytics term.
+  const mentionsProgramIndicator = /\bprogram\s+indicators?\b/.test(combinedText);
+  const wantsIndicatorIntent =
+    !mentionsProgramIndicator && (
+      /\baggregate\s+indicators?\b/.test(combinedText)
+      || /\bindicator\s*types?\b/.test(combinedText)
+      || /\b(numerator|denominator)\b/.test(combinedText)
+      || (/\bindicators?\b/.test(combinedText)
+          && /\b(create|add|build|make|define|set\s*up|edit|update|modify|rename|delete|remove|coverage|per\s*cent|percentage|reporting\s*rate|rate|ratio|formula|factor)\b/.test(combinedText)));
+  // ── Option-set intent ──
+  // Reusable code/label pick-lists. Conservative: fires on an explicit
+  // "option set(s)" / "optionset(s)" mention, OR a membership-mutation verb on
+  // "option(s)" coupled with a drop-down / code-list / "to the set" container
+  // term — so a bare "what options do I have" never surfaces the tool.
+  const wantsOptionSetIntent =
+    /\boption\s*sets?\b/.test(combinedText)
+    || /\boptionsets?\b/.test(combinedText)
+    || (/\b(add|append|remove|delete|drop|reorder|re-?order)\b/.test(combinedText)
+        && /\boptions?\b/.test(combinedText)
+        && (/\b(drop[\s-]?down|pick[\s-]?list|picklist|code\s*list|choices?\s+list)\b/.test(combinedText)
+            || /\b(?:the|this|that)\s+(?:[\w-]+\s+){0,2}set\b/.test(combinedText)));
+  // ── Legend-set intent ──
+  // Reusable colour-coded value bands for analytics styling. Conservative:
+  // fires on an explicit "legend set(s)" mention, OR a colour-coding / threshold
+  // term coupled with an authoring or visual-styling noun — so a bare "the chart
+  // legend" or "the legend of the map" never surfaces the tool on its own.
+  const wantsLegendSetIntent =
+    /\blegend\s*sets?\b/.test(combinedText)
+    || /\blegendsets?\b/.test(combinedText)
+    || ((/\bcolou?r[-\s]?cod/.test(combinedText)
+          || /\bcolou?r\s+(?:band|scale|ramp|range|gradient)s?\b/.test(combinedText)
+          || /\b(?:value\s+)?thresholds?\b/.test(combinedText))
+        && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/.test(combinedText))
+    // The word "legend" coupled with an explicit colour-scale signal — so
+    // "give it a traffic-light legend", "a red/amber/green legend", "a
+    // colour-coded legend", "a heat-map legend" all surface the tool, while a
+    // bare "the chart/map legend" (no colour-scale intent) stays FALSE.
+    || (/\blegends?\b/.test(combinedText)
+        && (/\btraffic[-\s]?light/.test(combinedText)
+            || /\bheat[-\s]?map/.test(combinedText)
+            || /\bcolou?r[-\s]?cod/.test(combinedText)
+            || /\b(?:value\s+)?thresholds?\b/.test(combinedText)
+            || /\bred\b[-\s\/,]*(?:to\s+)?(?:amber|orange|yellow)\b[-\s\/,]*(?:to\s+)?\bgreen\b/.test(combinedText)
+            || /\bgreen\b[-\s\/,]*(?:to\s+)?(?:amber|orange|yellow)\b[-\s\/,]*(?:to\s+)?\bred\b/.test(combinedText)));
+  // ── Dashboard / visualization authoring intent ──
+  // Reusable analytics dashboards and the charts/pivots/single-value tiles on
+  // them. Conservative AND disjoint from render_chart (the inline preview tool):
+  // fires on an explicit "dashboard" mention, OR a PERSISTENCE verb (create /
+  // build / make / save / design / set up) coupled with a saved-visualization
+  // noun (visualization / pivot table / single value / gauge / saved chart) —
+  // so "show me a chart" / "plot this" stays with render_chart and never
+  // surfaces this tool. Being on the Dashboard app also surfaces it.
+  const wantsDashboardIntent =
+    /\bdashboards?\b/.test(combinedText)
+    || (/\b(create|build|make|save|design|set\s*up|setup|add|new|assemble|put\s*together)\b/.test(combinedText)
+        && (/\bvisuali[sz]ations?\b/.test(combinedText)
+            || /\bpivot\s*tables?\b/.test(combinedText)
+            || /\bsingle[-\s]?value\b/.test(combinedText)
+            || /\bgauge\s*(chart|visuali[sz]ation)?\b/.test(combinedText)
+            || /\b(saved|reusable|favou?rite)\s+(chart|graph|visuali[sz]ation|pivot)\b/.test(combinedText)));
+  // Map AUTHORING intent — creating a thematic (choropleth/bubble) map, or a map
+  // to place on a dashboard. Constrained to an authoring verb / thematic keyword
+  // (or the Maps app) so plain words like "roadmap"/"heat map"/"map out" don't
+  // trip it. Reads ("explain this map") stay with get_map_details.
+  const wantsMapIntent =
+    (/\bmaps?\b/.test(combinedText)
+      && (/\b(create|build|make|save|design|set\s*up|setup|add|new|choropleth|bubble|thematic|shade[ds]?|colou?r[- ]?cod)\b/.test(combinedText)))
+    || /\bchoropleth\b/.test(combinedText)
+    || /\bthematic\s+maps?\b/.test(combinedText);
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -5184,6 +5693,83 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('search_metadata');
   }
 
+  // ── Validation-rule authoring — surfaced only on explicit validation-rule
+  //    intent so it never crowds unrelated dataset/tracker flows. search_metadata
+  //    is the companion for resolving the data-element UIDs the expressions need. ──
+  if (wantsValidationRuleIntent) {
+    selected.add('manage_validation_rules');
+    selected.add('search_metadata');
+  }
+
+  // ── Org-unit hierarchy authoring — surfaced only on explicit org-unit intent
+  //    so it never crowds unrelated analytics/dataset/tracker flows. search_metadata
+  //    is the companion for resolving parent / target OU UIDs. ──
+  if (wantsOrgUnitIntent) {
+    selected.add('manage_org_units');
+    selected.add('search_metadata');
+  }
+
+  // ── Aggregate-indicator authoring — surfaced only on explicit, program-
+  //    indicator-disjoint aggregate-indicator intent so it never crowds
+  //    unrelated analytics/tracker flows. search_metadata is the companion for
+  //    resolving the dataElement / dataSet / programIndicator UIDs the
+  //    numerator/denominator expressions need. ──
+  if (wantsIndicatorIntent) {
+    selected.add('manage_indicators');
+    selected.add('search_metadata');
+  }
+
+  // ── Option-set authoring — surfaced only on explicit option-set intent so it
+  //    never crowds unrelated flows. search_metadata is the companion for
+  //    resolving the set / option UIDs the membership ops need. Purely additive:
+  //    create_metadata's inline option_set path is unaffected. ──
+  if (wantsOptionSetIntent) {
+    selected.add('manage_option_sets');
+    selected.add('search_metadata');
+  }
+
+  // ── Legend-set authoring — surfaced only on explicit legend-set intent so it
+  //    never crowds unrelated analytics/styling flows. search_metadata is the
+  //    companion for resolving the dataElement / indicator UIDs a legend set is
+  //    later attached to. Purely additive. ──
+  if (wantsLegendSetIntent) {
+    selected.add('manage_legend_sets');
+    selected.add('search_metadata');
+  }
+
+  // ── Thematic map authoring — surfaced on explicit map-creation intent or when
+  //    the user is in the Maps app. search_metadata resolves the data item /
+  //    OU UIDs; legend sets pair naturally with choropleth colour bands. ──
+  if (wantsMapIntent || isMaps) {
+    selected.add('manage_maps');
+    selected.add('search_metadata');
+    selected.add('manage_legend_sets');
+  }
+
+  // ── Dashboard / visualization authoring — surfaced on explicit dashboard /
+  //    saved-visualization intent, OR whenever the user is on the Dashboard or
+  //    Data Visualizer app (where building/saving a chart or dashboard is the
+  //    obvious next step). search_metadata is the companion for resolving the
+  //    indicator / dataElement / programIndicator / OU UIDs the charts plot.
+  //    render_chart stays in the set, so inline-preview turns are unaffected. ──
+  if (wantsDashboardIntent || isDashboard || isDataViz) {
+    selected.add('manage_dashboards');
+    selected.add('search_metadata');
+    // Maps commonly ride onto dashboards ("…and a map of X by district"), so the
+    // map authoring tool travels with dashboard intent too.
+    selected.add('manage_maps');
+    // Dashboard/visualization SHARING and DELETION live in manage_metadata
+    // (manage_dashboards only CREATES and READS). The canonical multi-step
+    // dashboard goal ends in a "share it" / "make it public" step, so the
+    // sharing tool must travel with explicit dashboard/visualization authoring
+    // intent — otherwise that final step has no tool and the model falls back
+    // to a raw dhis2_query PUT that DHIS2 rejects. Gated on the explicit text
+    // intent (NOT bare isDataViz/isDashboard) so pure analytics turns add no
+    // destructive tool; on the Dashboard app manage_metadata is already
+    // surfaced by the non-tracker authoring block above.
+    if (wantsDashboardIntent) selected.add('manage_metadata');
+  }
+
   // ── Intent-driven override: if the user explicitly asks to create or manage
   //    metadata, the full authoring kit must be available regardless of page.
   //    This fixes the failure mode where a user on Data Visualizer / Maps / a
@@ -5228,7 +5814,9 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   const writeCapableNames = new Set([
     'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
-    'manage_custom_forms',
+    'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
+    'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
+    'manage_dashboards', 'manage_maps',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -5263,6 +5851,13 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('create_metadata');
     selected.delete('manage_datasets');
     selected.delete('manage_custom_forms');
+    selected.delete('manage_validation_rules');
+    selected.delete('manage_org_units');
+    selected.delete('manage_indicators');
+    selected.delete('manage_option_sets');
+    selected.delete('manage_legend_sets');
+    selected.delete('manage_dashboards');
+    selected.delete('manage_maps');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }
@@ -5307,7 +5902,9 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
   const wantsSharingAccess = /\b(sharing|access|permission|can'?t see|not visible|not showing|doesn'?t appear|doesn'?t show|don'?t see|missing from|hidden|no access|data access|publicAccess|public access|user group access)\b/i.test(text)
     || /\b(capture|data entry|tracker).{0,60}\b(not|doesn'?t|can'?t|missing|hidden|don'?t)\b/i.test(text)
     || /\b(not|doesn'?t|can'?t|missing|hidden|don'?t).{0,60}\b(capture|data entry|tracker|drop.?down|dropdown|list)\b/i.test(text)
-    || /\b(fix|update|change|set|grant|give|enable)\b.{0,40}\b(sharing|access|permission|visibility)\b/i.test(text);
+    || /\b(fix|update|change|set|grant|give|enable)\b.{0,40}\b(sharing|access|permission|visibility)\b/i.test(text)
+    || /\b(make|set|mark|publish|share)\b.{0,30}\bpublic(ly)?\b/i.test(text)
+    || /\bshare[ds]?\b.{0,40}\bwith\b.{0,40}\b(everyone|all\s+users|the\s+public|user\s*group|team|colleagues?)\b/i.test(text);
   const wantsIconStyle = /\b(icon|style)\b/i.test(text) && /\b(program|stage|data ?element|option set|attribute|tea|indicator)\b/i.test(text)
     || /\b(give|set|assign|change|update|pick|choose|add)\b.{0,25}\b(icon|style|color|colour)\b/i.test(text)
     || /\b(icon|style|color|colour)\b.{0,40}\b(for|to|on)\b.{0,40}\b(program|stage|data ?element|option set|attribute|indicator)\b/i.test(text);
@@ -5339,6 +5936,71 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
   const wantsGrowthChartPrompt =
     /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/i.test(text)
     || (/\bgrowth\b/i.test(text) && /\b(plugin|chart|standard|percentile|z-?score)\b/i.test(text));
+  const wantsValidationRulePrompt =
+    /\bvalidation\s*rules?\b/i.test(text)
+    || (/\b(data\s*quality|consistency|cross[-\s]?check|plausibility|sanity\s*check)\b/i.test(text)
+        && /\b(rule|check|validat|dataset|data\s*set|data\s*element|aggregate|expression)\b/i.test(text))
+    || (/\bvalidat(e|ion)\b/i.test(text)
+        && /\b(left\s*side|right\s*side|leftside|rightside|compulsory\s*pair|exclusive\s*pair|greater\s*than|less\s*than|data\s*set|dataset|aggregate\s*data)\b/i.test(text));
+  const wantsOrgUnitPrompt =
+    /\b(organi[sz]ation\s*units?|org\s*units?|orgunits?|sub-?units?)\b/i.test(text)
+    || /\b(ou|org|organi[sz]ation)\s*(?:hierarch|tree)/i.test(text)
+    || /\b(create|add|register|build|set\s*up|rename|re-?name|move|relocate|re-?parent|delete|remove|deactivate|close|reopen)\s+(?:a\s+|an\s+|the\s+|new\s+|this\s+|that\s+|some\s+|several\s+|multiple\s+|\d+\s+|(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+)*(?:\w+\s+){0,1}(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|clinics?|hospitals?|chiefdoms?|catchment\s*areas?|sub[-\s]?districts?)\b/i.test(text)
+    || /\b(facilit(?:y|ies)|health\s*facilit(?:y|ies)?|chiefdom|catchment\s*area)\b[^.?!]{0,30}\b(hierarch|parent\s*org|sub[-\s]?unit|org\s*unit|move.{0,12}under|re-?parent)\b/i.test(text);
+  const wantsIndicatorPrompt =
+    !/\bprogram\s+indicators?\b/i.test(text) && (
+      /\baggregate\s+indicators?\b/i.test(text)
+      || /\bindicator\s*types?\b/i.test(text)
+      || /\b(numerator|denominator)\b/i.test(text)
+      || (/\bindicators?\b/i.test(text)
+          && /\b(create|add|build|make|define|set\s*up|edit|update|modify|rename|delete|remove|coverage|per\s*cent|percentage|reporting\s*rate|rate|ratio|formula|factor)\b/i.test(text)));
+  const wantsOptionSetPrompt =
+    /\boption\s*sets?\b/i.test(text)
+    || /\boptionsets?\b/i.test(text)
+    || (/\b(add|append|remove|delete|drop|reorder|re-?order)\b/i.test(text)
+        && /\boptions?\b/i.test(text)
+        && (/\b(drop[\s-]?down|pick[\s-]?list|picklist|code\s*list|choices?\s+list)\b/i.test(text)
+            || /\b(?:the|this|that)\s+(?:[\w-]+\s+){0,2}set\b/i.test(text)));
+  const wantsLegendSetPrompt =
+    /\blegend\s*sets?\b/i.test(text)
+    || /\blegendsets?\b/i.test(text)
+    || ((/\bcolou?r[-\s]?cod/i.test(text)
+          || /\bcolou?r\s+(?:band|scale|ramp|range|gradient)s?\b/i.test(text)
+          || /\b(?:value\s+)?thresholds?\b/i.test(text))
+        && /\b(create|add|build|make|define|set\s*up|configure|legend|map|visuali[sz]ation|indicator|data\s*element)\b/i.test(text));
+
+  // Dashboard / visualization authoring KB — surfaced on explicit dashboard /
+  // saved-visualization intent, or whenever the user is on the Dashboard or
+  // Data Visualizer app.
+  const wantsDashboardPrompt =
+    /\bdashboards?\b/i.test(text)
+    || ctx.appType === 'Dashboard'
+    || ctx.appType === 'Data Visualizer'
+    || (/\b(create|build|make|save|design|set\s*up|assemble)\b/i.test(text)
+        && (/\bvisuali[sz]ations?\b/i.test(text) || /\bpivot\s*tables?\b/i.test(text)
+            || /\bsingle[-\s]?value\b/i.test(text) || /\b(saved|reusable|favou?rite)\s+(chart|graph|visuali[sz]ation|pivot)\b/i.test(text)));
+
+  // Compound / multi-step authoring goal — the request needs several DEPENDENT
+  // steps to finish (e.g. a dashboard whose indicators/visualizations do not
+  // exist yet, or "set up a program AND its indicators AND a dashboard AND
+  // sharing"). Detected when dashboard authoring co-occurs with create /
+  // indicator / visualization intent, OR when an assembling verb co-occurs with
+  // a chaining word and two-or-more distinct buildable nouns. Used only to add
+  // the orchestration playbook below — never to remove or gate any tool.
+  const _buildNouns = (text.match(/\b(programmes?|programs?|datasets?|data\s*sets?|data\s*elements?|program\s*indicators?|indicators?|visuali[sz]ations?|charts?|pivots?|dashboards?|option\s*sets?|legend\s*sets?|validation\s*rules?|org(?:anisation)?\s*units?|sharing)\b/gi) || []);
+  const _distinctBuildNouns = new Set(_buildNouns.map(s => s.toLowerCase().replace(/\s+/g, ' ').replace(/s$/, '')));
+  const wantsMultiStepGoal =
+    // Dashboard CREATION (isCreating) that ALSO names a second buildable piece —
+    // an indicator/visualization/data-element, or explicit "don't have it yet"
+    // language. Both guards are required: bare "build a dashboard of X" (one
+    // step, no second piece) and bare "make this visualization public" (a pure
+    // sharing step, no creation) must each stay false.
+    (wantsDashboardPrompt && isCreating && (wantsIndicatorPrompt
+        || /\b(indicators?|visuali[sz]ations?|program\s*indicators?|data\s*elements?)\b/i.test(text)
+        || /\b(don'?t|do\s*not|doesn'?t|does\s*not|not\s*yet|missing|need(s)?\s+(new|to\s+create)|that\s+don'?t\s+exist)\b/i.test(text)))
+    || (/\b(build|create|make|set\s*up|setup|assemble|design)\b/i.test(text)
+        && /\b(and|then|plus|including|along\s+with|as\s+well\s+as|so\s+that)\b/i.test(text)
+        && _distinctBuildNouns.size >= 2);
 
   let p = `You are a DHIS2 Health Data AI Assistant. You answer questions about health data by querying the DHIS2 API using the tools provided.
 
@@ -5367,7 +6029,9 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 10.9. For cross-program questions about INDICATOR CONTENT ("complex / heavy / biggest / top / most complicated program indicators", "indicators with lots of data", "find intricate expressions", "which indicators have the most events"), ALWAYS call manage_program_indicators(action="discover"). It needs NO program_id and returns ranked results in one shot. NEVER guess a program ID and NEVER call analytics/events/aggregate/{pid} with a made-up ID — if you don't already have a program UID in context or from a prior tool result, use action="discover" or search_metadata(object_type="programs") first.
 10.9.1. For "which OUs / districts / regions / facilities have the most data (or events, or values) for these indicators / programs" questions, ALWAYS call manage_program_indicators(action="rank_ou", indicator_ids=[...]) — pass the indicator_ids returned by the prior discover call. Do NOT hand-build analytics/events/query or analytics/events/aggregate URLs for this. The tool handles the OU dimension and LEVEL correctly (default level=2; pass level=3 for districts, 4 for facilities).
 10.9.2. HARD RULE — UIDs are NEVER invented. Any 11-char UID you put into a tool argument MUST come from either (a) the "Current Context" section below, or (b) a prior tool result in this conversation (discover, list, search_metadata, get_program_info, etc.). If you do not have a UID, use a tool that does not need one (discover, rank_ou, search_metadata). An analytics call with a guessed UID will be refused before it hits the server.
-11. Patient/TEI data lookup is DISABLED. There is no get_tracked_entity tool, and you must NOT fetch tracker/trackedEntities/{id} (or its attributes/enrollments/events sub-resources) via dhis2_query, even when a TEI ID is in the page URL. If the user asks about "this person", "this patient", their attributes, enrollments, or visits, tell them patient-level data retrieval is disabled by the extension owner and offer program-level alternatives (count_records, get_event_analytics, get_program_info).
+11. ${isLocalProvider(getProviderConfig())
+  ? 'Patient-level tracker data IS available because you are running on a LOCAL model (Ollama/localhost). When the user asks about a specific person/patient, their attributes, enrollments, or visits, you MAY use detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), and read tracker/events|enrollments|trackedEntities via dhis2_query. Handle this sensitive data responsibly and never expose more than asked.'
+  : 'Patient/TEI data lookup is HARD-BLOCKED on this (remote/cloud) model — the extension refuses every patient-level tracker read IN CODE, so do NOT attempt detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), or tracker/trackedEntities|events|enrollments reads via dhis2_query (even when a TEI ID is in the page URL); they are refused regardless of what you do. If the user asks about "this person/patient", their attributes, enrollments, or visits, explain that patient-level retrieval is permitted ONLY when the assistant runs on a local (Ollama) model, and offer program-level alternatives (count_records, get_event_analytics aggregate, get_program_info).'}
 12. NEVER show option codes like "M-360-8010" or data element IDs to the user. Always show resolved display names.
 13. When presenting aggregate / event analytics data, resolve any raw IDs (data element, org unit, program stage) via resolve_option_codes before showing them to the user.
 14. For any data element value that looks like a code (hyphens, letters+numbers) — resolve it using resolve_option_codes before displaying.
@@ -5596,6 +6260,53 @@ When a call returns 404 or 409:
 - **404**: the path / UID / resource does not exist. STOP. Do not retry the same path. Do not try a similar verb. Do not invent "stale cache" explanations. Either ask the user, or call a discovery endpoint.
 - **409**: the request body or constraints are wrong. Read the error code (E1xxx for tracker, importSummary for metadata). STOP. Do not retry without first correcting the request based on the error.
 `;
+
+  // ── Multi-step orchestration playbook — only for compound goals ──
+  // Teaches decomposition, dependency ordering, and ID-chaining across tools so
+  // the model finishes a goal whose pieces don't exist yet (the canonical
+  // "build a dashboard that needs new indicators, then share it" chain) entirely
+  // on its own. Gated on wantsMultiStepGoal so it never bloats single-step turns.
+  if (wantsMultiStepGoal) {
+    p += `
+## Multi-step goals — decompose, order by dependency, chain IDs
+This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose indicators/visualizations don't exist yet, or "set up a program AND its indicators AND a dashboard AND sharing"). Do NOT stop after the first tool and do NOT hand the remaining steps back to the user. Plan the WHOLE chain, then execute every step yourself, in dependency order, feeding each tool's returned UID into the next tool's inputs.
+
+### Procedure
+1. UNDERSTAND the end state: list every object that must EXIST when you are done.
+2. Walk the dependencies BACKWARDS: a dashboard needs visualizations; a visualization needs data items (indicators / data elements / program indicators); an aggregate indicator needs the data elements in its numerator/denominator. For each piece, check whether it already exists (search_metadata or a list action) or must be CREATED first.
+3. ORDER the steps so every input exists before it is referenced — create the missing LEAF metadata FIRST, then the objects that reference it, and do SHARING/access LAST.
+4. EXECUTE each step and READ ITS RESULT. Capture the new UID the tool returns:
+   - manage_indicators(action="create") → \`indicator_id\` (AGGREGATE indicator)
+   - manage_program_indicators(action="create") → \`program_indicator_id\` (TRACKER/event indicator)
+   - manage_dashboards(action="create_visualization") → \`visualization_id\`
+   - manage_dashboards(action="create_dashboard") → \`dashboard_id\` (+ \`new_visualizations[]\`)
+   - manage_option_sets(action="create") → \`option_set_id\`
+   - manage_legend_sets(action="create") → \`legend_set_id\` (a reusable colour band scale)
+   - create_metadata(action="create_data_elements") → each new DE's id in \`summary.dataElements[].id\`
+   - create_metadata / manage_datasets / manage_org_units / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
+5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. A new option set's \`option_set_id\` goes into a data element via create_metadata(action="create_data_elements", data_elements:[{ name, value_type, option_set_id:<option_set_id> }]) — pass \`option_set_id\` to REFERENCE the existing set (the DE valueType auto-aligns); NEVER re-inline the same options with \`option_set:{...}\` (that creates a DUPLICATE set). A new DE id then goes into manage_datasets(action="add_data_elements", dataset_id, data_element_ids:[<id>]). A new legend set's \`legend_set_id\` goes into an aggregate indicator via manage_indicators(action="create", indicator:{ …, legend_set_id:<legend_set_id> }) — so the indicator renders colour-coded (traffic-light) on the dashboard; NEVER attach a legend with a raw dhis2_query PATCH and NEVER via manage_metadata (it has no legend action). (This is exactly the verified provenance the Verify-before-call rule demands.)
+6. SHARE last: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). NEVER set sharing with a raw dhis2_query PUT — it fails.
+
+### Worked chain — "build a malaria dashboard that needs new indicators, then make it public"
+1. search_metadata(object_type="dataElements", query=…) → the data-element UIDs the indicator formulas need (e.g. malaria deaths, malaria cases).
+2. manage_indicators(action="create", indicator:{ name, numerator:"#{deathsUID}", denominator:"#{casesUID}", indicator_type:"Per cent" }) for EACH missing indicator → keep each returned \`indicator_id\`.
+3. manage_dashboards(action="create_dashboard", dashboard:{ name:"Malaria Surveillance" }, items:[ { new_visualization:{ name:"CFR by month", vis_type:"COLUMN", data_items:[<indicator_id #1>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } }, { new_visualization:{ name:"ACT coverage", vis_type:"SINGLE_VALUE", data_items:[<indicator_id #2>], periods:["THIS_YEAR"], org_units:["<ou>"] } } ]) — the inline visualizations and the dashboard import atomically; keep the returned \`dashboard_id\`.
+4. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------") so everyone can view it.
+
+### Worked chain — "build a colour-coded ANC coverage indicator with a traffic-light legend and put it on a public dashboard"
+1. search_metadata(object_type="dataElements", query=…) → the numerator/denominator DE UIDs (e.g. ANC 1st visit, expected pregnancies).
+2. manage_legend_sets(action="create", legend_set:{ name:"Coverage 0–100 (RAG)" }, auto_bands:{ start:0, end:100, count:3 }) → keep the returned \`legend_set_id\` (red→amber→green low→high).
+3. manage_indicators(action="create", indicator:{ name:"ANC 1st visit coverage", numerator:"#{anc1Uid}", denominator:"#{expectedUid}", indicator_type:"Per cent", legend_set_id:<legend_set_id> }) → the indicator is created AND the legend attached in ONE call; keep \`indicator_id\`.
+4. manage_dashboards(action="create_dashboard", dashboard:{ name:"ANC Coverage" }, items:[ { new_visualization:{ name:"ANC coverage by month", vis_type:"COLUMN", data_items:[<indicator_id>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } } ]) → keep \`dashboard_id\`.
+5. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------").
+
+### Worked chain — "create an option set for RDT results, a data element that uses it, and add it to the monthly malaria dataset"
+1. manage_option_sets(action="create", option_set:{ name:"Malaria RDT Result", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INV",name:"Invalid"}] }) → keep the returned \`option_set_id\`.
+2. create_metadata(action="create_data_elements", data_elements:[{ name:"Malaria RDT outcome", value_type:"TEXT", domain_type:"AGGREGATE", option_set_id:<option_set_id> }]) → the DE REFERENCES the set just created (do NOT re-inline the options); keep the new DE id from \`summary.dataElements[0].id\`.
+3. manage_datasets(action="add_data_elements", dataset_id:<the dataset UID>, data_element_ids:[<DE id>]) — resolve the dataset UID first via search_metadata(object_type="dataSets") if you don't have it in context.
+Run all steps without pausing. Only ask the user when a step is genuinely ambiguous (e.g. which data element represents "malaria cases").
+`;
+  }
 
   if (hasMapCtx) {
     p += `
@@ -5864,6 +6575,193 @@ A dataset only appears in a user's Data Entry app for the OUs assigned to it. Us
 - DataSet \`version\` auto-increments on save — never set it manually.
 - \`expiryDays = 0\` and \`openFuturePeriods = 0\` mean "never expires" and "no future periods open", NOT "expires immediately".
 - A dataset's "indicators" field is for DISPLAY indicators on the form (read-only sums). DON'T confuse with program indicators.
+`;
+  }
+
+  // ── Validation Rules KB — aggregate data-quality checks (manage_validation_rules) ──
+  if (wantsValidationRulePrompt) {
+    p += `
+## DHIS2 Validation Rules (manage_validation_rules)
+A **validationRule** is an aggregate data-quality check: it compares a **leftSide** expression to a **rightSide** expression with an **operator**, evaluated per period. When data violates it, DHIS2 surfaces it in the Data Quality / Validation Analysis app and in the Data Entry "Run validation" panel. Use **manage_validation_rules** for ALL validation-rule work — never hand-write /metadata bodies via dhis2_query.
+
+### Actions
+list (filter by name/importance/period_type), get, create, update, delete. Update auto-snapshots a backup first (restore via manage_backups); delete checks references first.
+
+### Expressions (both sides)
+- \`#{dataElementUid}\` = the data element summed across all its category-option-combos.
+- \`#{dataElementUid.categoryOptionComboUid}\` = one specific disaggregation cell.
+- \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed (e.g. \`#{de1} + #{de2}\`).
+- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving. A bad UID or malformed syntax is rejected at create/update time with the parser's exact error — fix the expression and retry, don't loop.
+- Look up data-element UIDs with search_metadata(object_type="dataElements") or manage_datasets(action=get) — NEVER invent UIDs.
+
+### operator (leftSide <op> rightSide)
+equal_to, not_equal_to, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, compulsory_pair (both sides must have a value or neither), exclusive_pair (at most one side may have a value).
+
+### Other fields
+- importance: HIGH | MEDIUM | LOW (default MEDIUM).
+- period_type: same 20 exact-case values as datasets (Monthly, Quarterly, Yearly, …); default Monthly. Pick the period at which the compared totals are meaningful.
+- left_missing_strategy / right_missing_strategy: NEVER_SKIP (default — a missing value counts as 0), SKIP_IF_ANY_VALUE_MISSING, SKIP_IF_ALL_VALUES_MISSING. Use a SKIP_* strategy when a missing value should suppress the check instead of being treated as 0.
+- instruction: the message shown to the data-entry user when the rule fails — phrase it as what to check/fix.
+
+### Examples
+- "Inpatient days must not exceed available bed-days (monthly)": create rule { name, operator:"less_than_or_equal_to", period_type:"Monthly", left_expression:"#{inpatientDaysUid}", right_expression:"#{bedDaysUid}", importance:"MEDIUM" }.
+- "ANC 4th visits should never exceed ANC 1st visits": operator "less_than_or_equal_to", left=#{anc4}, right=#{anc1}.
+- "Sex sub-totals must equal the grand total": operator "equal_to", left="#{deMale} + #{deFemale}", right="#{deTotal}".
+`;
+  }
+
+  // ── Org-Unit hierarchy KB — organisationUnits (manage_org_units) ──
+  if (wantsOrgUnitPrompt) {
+    p += `
+## DHIS2 Organisation Units (manage_org_units)
+The org-unit hierarchy is the tree of facilities/chiefdoms/districts/countries that EVERY program, dataset, data value and enrollment is attached to. Use **manage_org_units** for ALL org-unit STRUCTURE work (create a facility under a parent, rename/close one, MOVE/re-parent a unit or subtree, delete a leaf) — never hand-write /metadata bodies via dhis2_query.
+
+### Actions
+list (filter by name/level/parent_id), get, create, update, delete.
+
+### The one rule that trips people up: level & path are DERIVED, never set
+- A unit's \`level\` and \`path\` come from its parent — DHIS2 computes them. You pass only \`parent_id\`; a child of a level-3 chiefdom automatically becomes level 4 with path = parentPath + "/" + newId.
+- NEVER put level or path in the org_unit object, and never "fix" them by hand — that is not how the hierarchy works.
+
+### create
+- Required: org_unit.name, org_unit.parent_id, org_unit.opening_date (YYYY-MM-DD). short_name defaults to name (≤50 chars).
+- The tool verifies the parent exists first and reports the derived level. Resolve the parent UID with manage_org_units(action=list) or search_metadata — NEVER invent it. Creating a new ROOT is intentionally unsupported (it would split the hierarchy).
+- Use dry_run_only:true to validate (incl. the parent reference) without committing.
+
+### update / move (re-parent)
+- Patch any field (name, short_name, opening_date, closed_date — pass "" to clear closed_date — code, description, comment, contact fields).
+- Supplying org_unit.parent_id MOVES the unit; DHIS2 re-computes level/path for it AND all descendants. The tool rejects a move under the unit's own descendant (cycle) and under itself.
+- update auto-snapshots a backup first (restore via manage_backups).
+
+### delete
+- Only LEAF units delete. The tool refuses a unit that still has children (re-parent or delete them bottom-up first) and lets DHIS2 block any unit still holding data values / program-dataset assignments / user scope, surfacing the exact reason. Auto-backup is taken first.
+
+### Examples
+- "Add a new facility 'Bo CHC' under Badjia chiefdom (opened 2015-01-01)": create with org_unit:{ name:"Bo CHC", parent_id:"<BadjiaUID>", opening_date:"2015-01-01" }.
+- "Move the Ngelehun clinic under Kakua chiefdom instead": update org_unit_id=<clinic> org_unit:{ parent_id:"<KakuaUID>" }.
+- "Close facility X as of 2024-12-31": update org_unit:{ closed_date:"2024-12-31" }.
+`;
+  }
+
+  // ── Aggregate Indicators KB — numerator/denominator formulas (manage_indicators) ──
+  if (wantsIndicatorPrompt) {
+    p += `
+## DHIS2 Aggregate Indicators (manage_indicators)
+An aggregate **indicator** is a calculated value: **(numerator / denominator) × the indicatorType factor**. It is what dashboards, pivot tables and maps usually display (e.g. ANC coverage, case fatality rate, reporting rate). Use **manage_indicators** for ALL aggregate-indicator work — never hand-write /metadata bodies via dhis2_query.
+IMPORTANT: this tool is for **aggregate** indicators only. **Tracker / event program indicators** are a DIFFERENT object — use **manage_program_indicators** for those.
+
+### Actions
+list (filter by name / indicator_type), get, create, update, delete. Update auto-snapshots a backup first (restore via manage_backups); delete checks references then surfaces DHIS2's exact blocker (dataSet / visualization / indicatorGroup / predictor) if the indicator is still in use.
+
+### Expressions (numerator & denominator)
+- \`#{dataElementUid}\` = data element summed across all its category-option-combos; \`#{dataElementUid.cocUid}\` = one disaggregation cell.
+- \`R{dataSetUid.REPORTING_RATE}\` (also ACTUAL_REPORTS, EXPECTED_REPORTS, …) for reporting rates; \`I{programIndicatorUid}\` to reuse a program indicator; \`C{constantUid}\` for constants; numeric literals and \`+ - * /\` are allowed.
+- For a plain count/sum, set denominator to \`"1"\`.
+- The tool server-validates BOTH expressions via DHIS2's \`/expressions/description\` endpoint BEFORE saving — a bad UID or malformed syntax is rejected at create/update time with the parser's exact error. Fix the expression and retry, don't loop.
+- Look up UIDs with search_metadata / manage_datasets(action=get) — NEVER invent them.
+
+### indicator_type (the scaling factor)
+Pass a UID or the exact name. Common types: **"Number (Factor 1)"** (×1 — raw ratio/count), **"Per cent"** (×100 — a percentage), **"Per thousand"**, **"Per ten thousand"**, **"Per hundred thousand"**. The tool resolves and verifies the type before writing.
+
+### Other fields
+- short_name: ≤50 chars (defaults to name). annualized: scale to a full year for the chosen period (default false). decimals: 0–5 fixed output decimals (omit to inherit the default). numerator_description / denominator_description: auto-derived from DHIS2 if omitted.
+
+### Examples
+- "ANC 1 coverage as a percentage of expected pregnancies": create indicator:{ name:"ANC 1 Coverage", indicator_type:"Per cent", numerator:"#{anc1Uid}", denominator:"#{expectedPregnanciesUid}" }.
+- "Maternal deaths per 100,000 live births": indicator_type:"Per hundred thousand", numerator:"#{maternalDeaths}", denominator:"#{liveBirths}".
+- "Total malaria cases (a plain sum)": indicator_type:"Number (Factor 1)", numerator:"#{malariaConfirmed} + #{malariaClinical}", denominator:"1".
+`;
+  }
+
+  // ── Option Sets KB — reusable code/label pick-lists (manage_option_sets) ──
+  if (wantsOptionSetPrompt) {
+    p += `
+## DHIS2 Option Sets (manage_option_sets)
+An **option set** is a reusable, ordered pick-list (drop-down) of \`{ code, name }\` pairs that constrains a data element or tracked-entity attribute to a fixed set of choices (e.g. HIV Result = Positive/Negative/Inconclusive). \`code\` is the value stored in data; \`name\` is the label shown to users. **Codes must be unique within a set.** Use **manage_option_sets** for ALL standalone option-set work — never hand-write /metadata option bodies via dhis2_query.
+
+### Actions
+- **list** (name / value_type filters) and **get** (returns options in display order) are read-only.
+- **create** — a new standalone set + its options, imported atomically (VALIDATE then COMMIT). Pass \`option_set:{ name, value_type, options:[{code,name},…] }\`. value_type defaults to TEXT if omitted.
+- **add_options** — append new options to an existing set: \`option_set_id\` + \`options:[{code,name},…]\`. New codes must not collide with existing ones.
+- **remove_options** — delete options from a set by \`option_codes:[…]\` or \`option_ids:[…]\`. Deletes the option objects (which auto-detaches them); refuses to remove the last remaining option.
+- **reorder_options** — set display order via \`order:[…]\` listing every current option's code (or UID) in the desired sequence.
+- **update** — patch the set's OWN fields (name / code / description / value_type) only — never membership.
+- **delete** — remove the whole set (and its options); refuses with the exact blockers if any data element or tracked-entity attribute still uses it.
+
+### Rules
+- update / add_options / remove_options / reorder_options / delete each auto-snapshot a backup first (restore via manage_backups).
+- NEVER invent option-set or option UIDs — get them from search_metadata / action=get.
+- To create an option set as part of a NEW data element in one shot, use create_metadata's inline \`option_set\` instead. To CONVERT a set to MULTI_TEXT (multi-select) and cascade the change to every DE/TEA using it, use manage_metadata(action=convert_value_type). This tool owns standalone option-set CRUD.
+
+### Examples
+- "Create an HIV Result option set with Positive/Negative/Inconclusive": create option_set:{ name:"HIV Result", value_type:"TEXT", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INC",name:"Inconclusive"}] }.
+- "Add a 'Refused' choice to that set": add_options option_set_id:"<id>", options:[{code:"REF",name:"Refused"}].
+- "Put Negative before Positive": reorder_options option_set_id:"<id>", order:["NEG","POS","INC"].
+`;
+  }
+
+  // ── Legend Sets KB — reusable colour-coded value bands (manage_legend_sets) ──
+  if (wantsLegendSetPrompt) {
+    p += `
+## DHIS2 Legend Sets (manage_legend_sets)
+A **legend set** is a reusable, ordered list of colour **bands** that renders numeric values as a traffic-light / heat-map scale on data elements, indicators, visualisations and maps (e.g. ANC coverage shaded red 0–50, amber 50–80, green 80–100). Each band is \`{ name, startValue, endValue, color }\`. Use **manage_legend_sets** for ALL standalone legend-set work — never hand-write /metadata legendSets bodies via dhis2_query.
+
+### Ranges
+- Bands are **half-open [startValue, endValue)**: a band matches values >= startValue and < endValue, so a band's endValue may equal the next band's startValue without overlapping. endValue must be > startValue.
+- DHIS2 does NOT reject overlapping or gapped bands. This tool returns an overlap **warning** (it never blocks) — relay any warning to the user.
+- \`color\` is an optional 6-digit hex (#RRGGBB); the tool canonicalises "#rrggbb"/"rrggbb".
+
+### Actions
+- **list** (name filter) and **get** (bands in value order) are read-only.
+- **create** — a new set + its bands, imported atomically (VALIDATE then COMMIT). EITHER pass explicit \`legend_set:{ name, legends:[{name,startValue,endValue,color?},…] }\`, OR pass \`legend_set:{ name }\` + \`auto_bands:{ start, end, count }\` to auto-generate \`count\` equal-width contiguous bands on a red→amber→green (low→high) ramp. \`auto_bands.colors\` / \`auto_bands.names\` (length == count) override the defaults.
+- **add_legends** — append bands to an existing set: \`legend_set_id\` + \`legends:[…]\`. New band names must not collide with existing ones.
+- **remove_legends** — drop bands by \`legend_names:[…]\` or \`legend_ids:[…]\`; refuses to remove the last remaining band.
+- **update** — patch the set's OWN fields (name / code) only — never the bands.
+- **delete** — remove the whole set (its bands cascade); refuses with the exact blockers if any data element, indicator, visualisation or map still uses it.
+
+### Rules
+- add_legends / remove_legends / update / delete each auto-snapshot a backup first (restore via manage_backups).
+- NEVER invent legend-set or band UIDs — get them from search_metadata / action=get.
+- A legend set only defines the colour scale; ATTACHING it is a SEPARATE step. To an aggregate **indicator** (so it renders colour-coded in every dashboard/pivot/map): pass the set's UID as \`legend_set_id\` to manage_indicators(action="create" — or "update" to add it later). This is the legend-set → indicator chain. For a data element, visualisation or map layer, set the legend in the relevant app — the extension does not (yet) automate those attach points. NEVER attempt any legend attach via a raw dhis2_query PATCH or manage_metadata (it has NO legend action). This tool owns standalone legend-set CRUD.
+
+### Examples
+- "Make a coverage legend, red→green, 0 to 100 in 5 bands": create legend_set:{ name:"Coverage 0–100" }, auto_bands:{ start:0, end:100, count:5 }.
+- "Create a stockout legend: 0 red, 1–10 amber, 11+ green": create legend_set:{ name:"Stock status", legends:[{name:"Out",startValue:0,endValue:1,color:"#D32F2F"},{name:"Low",startValue:1,endValue:11,color:"#FBC02D"},{name:"OK",startValue:11,endValue:1000000,color:"#388E3C"}] }.
+- "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].
+`;
+  }
+
+  // ── Dashboards & Visualizations KB — analytics dashboard builder (manage_dashboards) ──
+  if (wantsDashboardPrompt) {
+    p += `
+## DHIS2 Dashboards & Visualizations (manage_dashboards)
+A **visualization** is a saved chart, pivot table or single-value tile (the analytics output shown in the Dashboard app and Data Visualizer). A **dashboard** arranges several visualizations (and maps / text tiles) on a grid. Use **manage_dashboards** for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata \`visualizations\` or \`dashboards\` bodies via dhis2_query.
+
+### Why a raw POST silently fails (and this tool does not)
+DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/\`filterDimensions\` (lists of dimension ids) and its DATA as \`dataDimensionItems\` (typed dx items) + \`relativePeriods\`/\`periods\` (pe) + \`organisationUnits\`/\`organisationUnitLevels\`/\`userOrganisationUnit\` (ou). The \`columns\`/\`rows\`/\`filters\` arrays are DERIVED read-only views — a raw POST that only sets them imports an EMPTY, un-renderable chart. This tool assembles the correct structure (verified VALIDATE+COMMIT on the live server).
+
+### Actions
+- **list** (optional name_filter) and **get** (dashboard_id → its items + each item's visualization) are read-only.
+- **create_visualization** — one chart/pivot/single-value: \`visualization:{ name, vis_type, data_items:[…UIDs], periods:[…], org_units:[…] }\`. data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped.
+- **create_dashboard** — a whole NEW dashboard atomically: \`dashboard:{ name }\` + \`items:[…]\`. Each item EITHER references an existing object (\`{ visualization_id }\` or \`{ type:"MAP", map_id }\` or \`{ type:"TEXT", text }\`) OR inline-creates a new chart (\`{ new_visualization:{ name, vis_type, data_items, periods, org_units } }\`). New visualizations + the dashboard import together, so one bad UID rolls the whole thing back. Items are auto-arranged on the 58-column grid (override per item with x/y/width/height).
+- **add_items** — add tile(s) to an EXISTING dashboard: \`dashboard_id\` + \`items:[…]\` (same item shapes as create_dashboard). THIS IS THE ONLY SAFE WAY to add to a dashboard that already exists. It reads the full dashboard, appends below the current tiles, and writes the COMPLETE item set back, snapshotting to backups first. NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} or a /metadata dashboards[] body — a dashboard PUT is a whole-object REPLACE and permanently wipes every existing tile (this is what made dashboards "go missing"; it's now blocked in code).
+- **remove_item** (\`dashboard_id\` + \`item_id\`), **update** (\`dashboard_id\` + \`dashboard:{ name?, description? }\`), **delete** (\`dashboard_id\`) — each snapshots first; undo any of them via manage_backups.
+
+### Fields
+- **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
+- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025).
+- **org_units**: UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2 = all level-2 OUs).
+- **layout** (optional): which of dx/pe/ou sit on columns/rows/filters. Sensible per-type defaults apply (pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → cols[dx]/rows[pe]).
+
+### Rules
+- NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / list / get first.
+- To delete a whole dashboard use manage_dashboards(action="delete") (it snapshots first, so it's restorable). To delete a standalone visualization/map, or to change sharing on either, use **manage_metadata** (object_type "dashboards" / "visualizations" / "maps").
+- Use **render_chart** for a quick inline chart preview in chat; use **manage_dashboards** to SAVE a reusable visualization/dashboard in DHIS2. They are different jobs.
+
+### Examples
+- "Build an ANC dashboard with a coverage chart, a pivot and a single value": create_dashboard dashboard:{ name:"ANC Programme" }, items:[ {new_visualization:{name:"ANC Coverage by Month",vis_type:"COLUMN",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC Coverage Pivot",vis_type:"PIVOT_TABLE",data_items:["<anc1>","<anc2>","<anc3>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC 1 This Year",vis_type:"SINGLE_VALUE",data_items:["<anc1>"],periods:["THIS_YEAR"],org_units:["<ou>"]}} ].
+- "Make me a column chart of malaria cases by district last year": create_visualization visualization:{ name:"Malaria cases by district", vis_type:"COLUMN", data_items:["<de>"], periods:["LAST_YEAR"], org_units:["LEVEL-2"] }.
+- "Add a coverage chart for this new indicator to my National Overview dashboard": add_items dashboard_id:"<dashId>", items:[ { new_visualization:{ name:"ANC coverage", vis_type:"COLUMN", data_items:["<indicatorId>"], periods:["LAST_12_MONTHS"], org_units:["USER_ORGUNIT"] } } ] — this APPENDS; the dashboard's existing tiles are preserved and snapshotted.
 `;
   }
 
@@ -8149,12 +9047,89 @@ async function detectEnrollmentAbnormalities(args, programId, orgUnitId) {
   };
 }
 
+// ── HARD privacy safeguard: patient-level tracker data ↔ LOCAL model only ────
+// Reading patient/tracker INDIVIDUAL records (events, enrollments, tracked
+// entities, relationships, row-level event queries, the enrollment-abnormality
+// scanner) is permitted ONLY when the LLM backend is LOCAL (Ollama / localhost).
+// With ANY remote/cloud provider these reads are refused unconditionally so that
+// patient identities never leave the device to a third-party model.
+//
+// This is enforced in CODE at the single tool-execution choke point — it is NOT
+// a system-prompt instruction and CANNOT be enabled, overridden, or jailbroken
+// by anything the model is told or asked. Adding a new patient-data tool in the
+// future? Put its name in PATIENT_DATA_TOOL_NAMES (or extend toolReadsPatientData)
+// and it is automatically gated. De-identified AGGREGATE analytics and metadata
+// are unaffected.
+const PATIENT_DATA_TOOL_NAMES = new Set([
+  'detect_enrollment_abnormalities',
+]);
+// True when a raw dhis2_query path targets individual patient records.
+function pathReadsPatientData(rawPath) {
+  if (typeof rawPath !== 'string') return false;
+  const base = rawPath.split('?')[0].replace(/^\//, '').replace(/^api\/\d+\//i, '').toLowerCase();
+  // Boundary `(\/|\.|$)` = the resource name is followed by a sub-path (`/`), a
+  // format/extension suffix (`.json`, `.csv`, `.xml`, `.geojson`, `.csv.gz`, …),
+  // or end-of-path. The extension form MUST be gated too: `tracker/events.csv`,
+  // `tracker/trackedEntities.json`, `analytics/events/query.csv` etc. return the
+  // exact same patient-level rows as the extension-less endpoint, so anchoring on
+  // `/` or `$` alone (the old patterns) let a `.csv`/`.json` suffix slip the gate.
+  // None of the de-identified/metadata endpoints (eventReports, eventCharts,
+  // analytics/events/aggregate, dataValueSets, …) begin with these exact resource
+  // names followed by `/`, `.`, or end, so the `.` boundary never over-gates them.
+  // New Tracker API individual-record endpoints
+  if (/^tracker\/(events|enrollments|trackedentities|relationships)(\/|\.|$)/.test(base)) return true;
+  // Legacy tracker endpoints
+  if (/^(events|enrollments|trackedentityinstances)(\/|\.|$)/.test(base)) return true;
+  // Row-level (individual) event/enrollment analytics — aggregate is de-identified and allowed
+  if (/^analytics\/(events|enrollments)\/query(\/|\.|$)/.test(base)) return true;
+  // SQL view EXECUTION (…/data, …/execute). A saved SQL view can SELECT arbitrary
+  // columns — including patient identifiers — from any table (trackedentityinstance,
+  // event/programstageinstance, enrollment, trackedentityattributevalue, …), so
+  // executing one on a remote model could exfiltrate row-level tracker data past
+  // the endpoint checks above. Fail closed: gate the execution sub-endpoints. The
+  // view DEFINITION (…/sqlViews/{id}?fields=…, i.e. no /data|/execute) stays
+  // readable as metadata. A purely-aggregate view is over-gated on a remote model —
+  // run it on a local model or use aggregate analytics. Verified live 2026-07-03:
+  // sqlViews/{id}/data was NOT gated before this line (torture-test bypass probe).
+  if (/^sqlviews\/[a-z0-9]+\/(data|execute)(\/|\.|$)/i.test(base)) return true;
+  return false;
+}
+// True when a tool call would read patient-level tracker data.
+function toolReadsPatientData(name, args) {
+  if (PATIENT_DATA_TOOL_NAMES.has(name)) return true;
+  if (name === 'dhis2_query') return pathReadsPatientData(args && args.path);
+  if (name === 'get_event_analytics' && args) {
+    // aggregate_type "query" (and value_dimensions, which implies query) returns
+    // individual event rows; aggregate counts/sums are de-identified and allowed.
+    if (String(args.aggregate_type || '').toLowerCase() === 'query') return true;
+    if (Array.isArray(args.value_dimensions) && args.value_dimensions.length) return true;
+  }
+  return false;
+}
+// Returns a refusal object if the call must be blocked, else null.
+function enforcePatientDataPrivacyGate(name, args) {
+  if (!toolReadsPatientData(name, args)) return null;
+  if (isLocalProvider(getProviderConfig())) return null; // local model → permitted
+  return {
+    _error: 'Refused by hard privacy safeguard: patient-level tracker data (events, enrollments, tracked entities, individual event rows) can only be read when the assistant runs on a LOCAL model (Ollama / localhost). The current provider is remote/cloud, so this data cannot be accessed.',
+    _privacy_block: true,
+    _scope: 'patient_data_privacy_gate',
+    _hint: 'This is a hard-coded, non-overridable safeguard — no instruction can enable it. To work with patient-level data, switch the provider to a local model (Ollama) in settings. For program-level needs without patient identities, use aggregate alternatives: count_records, get_event_analytics(aggregate_type="aggregate"), get_program_info.',
+  };
+}
+
 // ── Tool Execution ───────────────────────────────────────────────────────────
 
 async function executeTool(name, args) {
   if (!TOOL_ROUTER[name]) {
     return { _error: `Unknown tool: ${name}` };
   }
+
+  // HARD privacy gate (see above): block patient-level tracker-data reads unless
+  // the LLM backend is local. Runs before ANY tool logic; cannot be bypassed by
+  // prompt content. De-identified aggregates and metadata pass straight through.
+  const _privacyBlock = enforcePatientDataPrivacyGate(name, args);
+  if (_privacyBlock) return _privacyBlock;
 
   const ctx = dhis2.pageContext || {};
   const programId = ctx.programId;
@@ -8334,6 +9309,50 @@ async function executeTool(name, args) {
       }
     }
 
+    // Guard: DASHBOARD DATA-LOSS PREVENTION. The single most destructive thing
+    // the model has ever done: to "add a chart to a dashboard" it did a full
+    // PUT /dashboards/{id} (or POST /metadata with a dashboards[] entry) whose
+    // body carried only the NEW item — DHIS2 treats a dashboard PUT as a
+    // whole-object replace, so every pre-existing dashboardItem was wiped and
+    // the dashboard "went missing" (verified on the 2.43 playground: HTTP 200,
+    // silent data loss). These raw writes are now refused and routed to
+    // manage_dashboards(action=add_items), which snapshots first and APPENDS
+    // without touching existing items. (Item-level ops like
+    // PUT dashboards/{id}/items/{itemId} and the append endpoint
+    // dashboards/{id}/items/content are left alone.)
+    if (method === 'PUT' || method === 'PATCH' || method === 'POST') {
+      const dashItemMatch = safePath.match(/^dashboards\/([A-Za-z][A-Za-z0-9]{10})(\b|\/|\?|$)/);
+      const isContentAppend = /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/content(\b|\?|$)/.test(safePath);
+      const isItemLevel = /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/[A-Za-z][A-Za-z0-9]{10}/.test(safePath);
+      if ((method === 'PUT' || method === 'PATCH') && dashItemMatch && !isContentAppend && !isItemLevel) {
+        return {
+          _error: `Blocked: ${method} dashboards/${dashItemMatch[1]} via dhis2_query REPLACES the entire dashboard object. If the body does not carry every existing dashboardItem, the whole dashboard's contents are permanently destroyed — this is exactly how dashboards "went missing" before. Never hand-write a dashboard PUT.`,
+          _hint: `Use manage_dashboards — it snapshots the dashboard first, then APPENDS without touching existing items:\n• Add existing/new charts to a dashboard: manage_dashboards(action="add_items", dashboard_id="${dashItemMatch[1]}", items=[{ visualization_id:"<vizId>" }])\n• Remove one tile: manage_dashboards(action="remove_item", dashboard_id="${dashItemMatch[1]}", item_id="<itemId>").\n• Rename: manage_dashboards(action="update"). To restore a wiped one: manage_backups(action="list") then restore.`,
+          _redirect: 'manage_dashboards',
+        };
+      }
+      if (method === 'POST' && /^metadata(\?|$)/.test(safePath)) {
+        try {
+          const parsedMeta = typeof args.body === 'string' ? JSON.parse(args.body) : args.body;
+          const dashArr = parsedMeta && Array.isArray(parsedMeta.dashboards) ? parsedMeta.dashboards : null;
+          if (dashArr && dashArr.some(d => d && d.id && Array.isArray(d.dashboardItems))) {
+            return {
+              _error: `Blocked: POST /metadata with a dashboards[] entry that has an existing id and a dashboardItems array replaces that dashboard's items wholesale — the classic "dashboard vanished" data-loss path.`,
+              _hint: `Use manage_dashboards(action="add_items", dashboard_id="<id>", items=[…]) to append safely (it snapshots first), or action="create_dashboard" for a brand-new dashboard.`,
+              _redirect: 'manage_dashboards',
+            };
+          }
+        } catch { /* non-JSON body — fall through */ }
+      }
+      if (method === 'POST' && dashItemMatch && /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/?(\?|$)/.test(safePath)) {
+        return {
+          _error: `Blocked: POST dashboards/${dashItemMatch[1]}/items is not the correct way to add a dashboard item and can fail silently.`,
+          _hint: `Use manage_dashboards(action="add_items", dashboard_id="${dashItemMatch[1]}", items=[{ visualization_id:"<vizId>" }]).`,
+          _redirect: 'manage_dashboards',
+        };
+      }
+    }
+
     // Guard: redirect raw programNotificationTemplates writes to manage_program_notifications.
     // DHIS2 2.36+ reality: no `url` / `webhookUrl` field on the schema → silently dropped on POST,
     // PATCH returns 400. Linking needs POST /api/programs/{id}/notificationTemplates/{templateId},
@@ -8467,6 +9486,12 @@ async function executeTool(name, args) {
         'optionSets', 'options', 'trackedEntityTypes',
         'categoryCombos', 'categories', 'categoryOptions',
         'userGroups', 'dataSets', 'sections', 'indicators',
+        // Analytics-app objects. Dashboards especially: a raw PUT replaces the
+        // whole object, so a pre-write snapshot is the only safety net if the
+        // model slips past the redirect guard with skip_backup off.
+        'dashboards', 'visualizations', 'maps',
+        'eventCharts', 'eventReports', 'eventVisualizations',
+        'charts', 'reportTables', // legacy (pre-2.34) analytics favorites
       ]);
       if (itemMatch && backupableTypes.has(itemMatch[1])) {
         const itemBackup = await ensureBackupOrBail(
@@ -9007,12 +10032,32 @@ async function executeTool(name, args) {
       return await safeDhis2Fetch(`${type}/${args.id}?fields=${fields}`);
     }
 
+    // Accept the aliases models actually use. `query` was previously IGNORED,
+    // so search_metadata(query="X") returned the ENTIRE collection and the
+    // model could act on an arbitrary first row — observed live steering a
+    // delete toward the wrong program (2026-07-01).
+    const nameFilter = args.name_filter || args.query || args.name || args.search || null;
+
     let path = `${type}?fields=${fields}&pageSize=${args.page_size || 50}`;
-    if (args.name_filter) path += `&filter=displayName:ilike:${encodeURIComponent(args.name_filter)}`;
+    if (nameFilter) path += `&filter=displayName:ilike:${encodeURIComponent(nameFilter)}`;
     if (args.filters?.length) {
       for (const f of args.filters) path += `&filter=${f}`;
     }
-    return await safeDhis2Fetch(path);
+    const resp = await safeDhis2Fetch(path);
+    // Rank exact displayName matches first, then prefix matches, so "the
+    // first result" is the least-surprising object when the model follows up
+    // with a destructive action on it.
+    if (resp && !resp._error && nameFilter && Array.isArray(resp[type])) {
+      const q = String(nameFilter).toLowerCase();
+      const rank = (o) => {
+        const n = String(o.displayName || '').toLowerCase();
+        if (n === q) return 0;
+        if (n.startsWith(q)) return 1;
+        return 2;
+      };
+      resp[type] = resp[type].slice().sort((a, b) => rank(a) - rank(b));
+    }
+    return resp;
   }
 
   // ── resolve_option_codes ──
@@ -9990,12 +11035,2653 @@ async function executeTool(name, args) {
     return await executeManageGrowthChartPlugin(args);
   }
 
+  // ── manage_validation_rules ──
+  if (name === 'manage_validation_rules') {
+    return await executeManageValidationRules(args);
+  }
+
+  // ── manage_org_units ──
+  if (name === 'manage_org_units') {
+    return await executeManageOrgUnits(args);
+  }
+
+  // ── manage_indicators ──
+  if (name === 'manage_indicators') {
+    return await executeManageIndicators(args);
+  }
+
+  // ── manage_option_sets ──
+  if (name === 'manage_option_sets') {
+    return await executeManageOptionSets(args);
+  }
+
+  // ── manage_legend_sets ──
+  if (name === 'manage_legend_sets') {
+    return await executeManageLegendSets(args);
+  }
+
+  // ── manage_dashboards ──
+  if (name === 'manage_dashboards') {
+    return await executeManageDashboards(args);
+  }
+
+  // ── manage_maps ──
+  if (name === 'manage_maps') {
+    return await executeManageMaps(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
   }
 
   return { _error: `Unhandled tool route: ${name}` };
+}
+
+// ── manage_validation_rules: CRUD for DHIS2 validationRules (aggregate data-quality checks) ──
+
+const VALIDATION_OPERATORS = new Set([
+  'equal_to', 'not_equal_to', 'greater_than', 'greater_than_or_equal_to',
+  'less_than', 'less_than_or_equal_to', 'compulsory_pair', 'exclusive_pair',
+]);
+const VALIDATION_IMPORTANCE = new Set(['HIGH', 'MEDIUM', 'LOW']);
+const VALIDATION_MISSING_STRATEGY = new Set([
+  'NEVER_SKIP', 'SKIP_IF_ANY_VALUE_MISSING', 'SKIP_IF_ALL_VALUES_MISSING',
+]);
+
+// Server-side validate a validation-rule side expression via DHIS2's
+// /api/expressions/description endpoint (GET). This is the authoritative
+// validator for validationRule left/right expressions — it confirms the
+// #{...} references resolve and the syntax is well-formed.
+// Returns { ok: true, description } or { ok: false, error }.
+async function describeValidationExpression(expression) {
+  const resp = await safeDhis2Fetch(
+    `expressions/description?expression=${encodeURIComponent(expression)}`
+  );
+  if (resp?._error) {
+    return { ok: false, error: `Could not reach the expression validator for "${expression}": ${resp._error}` };
+  }
+  const status = resp?.status;
+  if (status && status !== 'OK') {
+    return { ok: false, error: resp?.message || 'Expression is not well-formed' };
+  }
+  return { ok: true, description: resp?.description || '' };
+}
+
+async function executeManageValidationRules(args) {
+  const action = args?.action;
+  if (!action) {
+    return {
+      _error: 'Missing required parameter: action',
+      _hint: 'One of: list, get, create, update, delete.',
+    };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.importance && VALIDATION_IMPORTANCE.has(args.importance)) filters.push(`importance:eq:${args.importance}`);
+    if (args.period_type) filters.push(`periodType:eq:${encodeURIComponent(args.period_type)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `validationRules?fields=id,displayName,importance,operator,periodType,leftSide[expression],rightSide[expression]&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `validationRules list failed: ${resp._error}` };
+    const rules = (resp.validationRules || []).map(r => ({
+      id: r.id,
+      name: r.displayName,
+      importance: r.importance,
+      operator: r.operator,
+      periodType: r.periodType,
+      leftSide: r.leftSide?.expression,
+      rightSide: r.rightSide?.expression,
+    }));
+    return {
+      success: true,
+      total: rules.length,
+      pager_total: resp.pager?.total ?? null,
+      validation_rules: rules,
+    };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const id = args.rule_id || args.object_id;
+    if (!id) return { _error: 'rule_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `validationRules/${id}?fields=id,displayName,description,instruction,importance,operator,periodType,` +
+      `leftSide[expression,description,missingValueStrategy],rightSide[expression,description,missingValueStrategy],sharing,access`
+    );
+    if (resp?._status === 404) return { _error: `validationRules with id "${id}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load validation rule ${id}: ${resp._error}` };
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      description: resp.description,
+      instruction: resp.instruction,
+      importance: resp.importance,
+      operator: resp.operator,
+      periodType: resp.periodType,
+      leftSide: resp.leftSide,
+      rightSide: resp.rightSide,
+      access: resp.access,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_validation_rules', 'create');
+    if (_gate) return _gate;
+    return await createValidationRule(args);
+  }
+
+  // ── update ────────────────────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_validation_rules', 'update', { rule_id: args.rule_id });
+    if (_gate) return _gate;
+    const id = args.rule_id || args.object_id;
+    if (!id) return { _error: 'rule_id required for update' };
+    if (!args.rule || typeof args.rule !== 'object') {
+      return {
+        _error: 'rule object required for update',
+        _hint: 'Pass rule:{ name?, description?, instruction?, importance?, operator?, period_type?, left_expression?, left_description?, left_missing_strategy?, right_expression?, right_description?, right_missing_strategy? }',
+      };
+    }
+    const exists = await verifyTargetExists('validationRules', id, 'manage_validation_rules', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+
+    const vrResp = await safeDhis2Fetch(`validationRules/${id}?fields=:owner`);
+    if (vrResp?._error) return { _error: `Could not load validation rule ${id}: ${vrResp._error}` };
+    const objName = vrResp.name || vrResp.displayName || id;
+
+    // Validate field values + any new expressions BEFORE snapshotting/mutating,
+    // so an invalid patch never triggers a backup or a half-applied write.
+    const r = args.rule;
+    if (r.importance !== undefined && !VALIDATION_IMPORTANCE.has(r.importance)) {
+      return { _error: `Invalid importance "${r.importance}". One of: HIGH, MEDIUM, LOW.` };
+    }
+    if (r.operator !== undefined && !VALIDATION_OPERATORS.has(r.operator)) {
+      return { _error: `Invalid operator "${r.operator}". One of: ${[...VALIDATION_OPERATORS].join(', ')}.` };
+    }
+    if (r.period_type !== undefined && !VALID_PERIOD_TYPES.has(r.period_type)) {
+      return { _error: `Invalid period_type "${r.period_type}".`, _hint: `One of: ${[...VALID_PERIOD_TYPES].join(', ')}` };
+    }
+    for (const [side, strat] of [['left', r.left_missing_strategy], ['right', r.right_missing_strategy]]) {
+      if (strat !== undefined && !VALIDATION_MISSING_STRATEGY.has(strat)) {
+        return { _error: `Invalid ${side}_missing_strategy "${strat}". One of: ${[...VALIDATION_MISSING_STRATEGY].join(', ')}.` };
+      }
+    }
+    for (const [side, expr] of [['left', r.left_expression], ['right', r.right_expression]]) {
+      if (expr !== undefined) {
+        if (typeof expr !== 'string' || !expr.trim()) return { _error: `${side}_expression must be a non-empty string.` };
+        const chk = await describeValidationExpression(expr);
+        if (!chk.ok) return { _error: `${side}_expression rejected by DHIS2: ${chk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} exists (use search_metadata) and the syntax is well-formed, then retry.' };
+      }
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_validation_rule', tool: 'manage_validation_rules', action: 'update', reason: `Update validation rule ${objName}` },
+      [{ object_type: 'validationRules', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (r.name !== undefined) { vrResp.name = r.name; applied.name = r.name; }
+    if (r.description !== undefined) { vrResp.description = r.description; applied.description = r.description; }
+    if (r.instruction !== undefined) { vrResp.instruction = r.instruction; applied.instruction = r.instruction; }
+    if (r.importance !== undefined) { vrResp.importance = r.importance; applied.importance = r.importance; }
+    if (r.operator !== undefined) { vrResp.operator = r.operator; applied.operator = r.operator; }
+    if (r.period_type !== undefined) { vrResp.periodType = r.period_type; applied.periodType = r.period_type; }
+    vrResp.leftSide = vrResp.leftSide || {};
+    vrResp.rightSide = vrResp.rightSide || {};
+    if (r.left_expression !== undefined) { vrResp.leftSide.expression = r.left_expression; applied.leftSide_expression = r.left_expression; }
+    if (r.left_description !== undefined) { vrResp.leftSide.description = r.left_description; applied.leftSide_description = r.left_description; }
+    if (r.left_missing_strategy !== undefined) { vrResp.leftSide.missingValueStrategy = r.left_missing_strategy; applied.leftSide_missingValueStrategy = r.left_missing_strategy; }
+    if (r.right_expression !== undefined) { vrResp.rightSide.expression = r.right_expression; applied.rightSide_expression = r.right_expression; }
+    if (r.right_description !== undefined) { vrResp.rightSide.description = r.right_description; applied.rightSide_description = r.right_description; }
+    if (r.right_missing_strategy !== undefined) { vrResp.rightSide.missingValueStrategy = r.right_missing_strategy; applied.rightSide_missingValueStrategy = r.right_missing_strategy; }
+
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'rule supplied no recognized fields to update.', backup: backup.block };
+    }
+
+    const putResp = await safeDhis2Fetch(`validationRules/${id}`, { method: 'PUT', body: vrResp });
+    if (putResp?._error) return { _error: `Failed to update validation rule: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', rule_id: id, rule_name: objName, applied, backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_validation_rules', 'delete', { rule_id: args.rule_id });
+    if (_gate) return _gate;
+    const id = args.rule_id || args.object_id;
+    if (!id) return { _error: 'rule_id required for delete' };
+    const exists = await verifyTargetExists('validationRules', id, 'manage_validation_rules', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || id;
+
+    const refsResult = await checkMetadataReferences('validationRules', id);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete validation rule "${objName}" — it has active references.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('validationRules', id, refsResult.references),
+      };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_validation_rule', tool: 'manage_validation_rules', action: 'delete', reason: `Deleting validation rule ${objName} (${id})` },
+      [{ object_type: 'validationRules', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { validationRules: [{ id }] },
+    });
+    if (delResp?._error) return { _error: `Validation rule deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'validationRules', id, name: objName },
+        message: `Successfully deleted validation rule "${objName}".`,
+        backup: backup.block,
+      };
+    }
+    return { _error: 'Deletion did not remove the validation rule (deleted count 0). It may already be gone or still have references.', backup: backup.block };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_validation_rules.`,
+    _hint: 'One of: list, get, create, update, delete.',
+  };
+}
+
+async function createValidationRule(args) {
+  const r = args.rule;
+  if (!r || typeof r !== 'object') {
+    return {
+      _error: 'rule object required for create',
+      _hint: 'Pass rule:{ name, operator, left_expression, right_expression, importance?, period_type?, instruction?, ... }',
+    };
+  }
+  if (!r.name || !String(r.name).trim()) return { _error: 'rule.name is required.' };
+  if (!r.operator || !VALIDATION_OPERATORS.has(r.operator)) {
+    return { _error: `rule.operator is required and must be one of: ${[...VALIDATION_OPERATORS].join(', ')}.` };
+  }
+  if (!r.left_expression || !String(r.left_expression).trim()) return { _error: 'rule.left_expression is required.' };
+  if (!r.right_expression || !String(r.right_expression).trim()) return { _error: 'rule.right_expression is required.' };
+
+  const importance = r.importance || 'MEDIUM';
+  if (!VALIDATION_IMPORTANCE.has(importance)) return { _error: `Invalid importance "${importance}". One of: HIGH, MEDIUM, LOW.` };
+  const periodType = r.period_type || 'Monthly';
+  if (!VALID_PERIOD_TYPES.has(periodType)) return { _error: `Invalid period_type "${periodType}".`, _hint: `One of: ${[...VALID_PERIOD_TYPES].join(', ')}` };
+  const leftStrategy = r.left_missing_strategy || 'NEVER_SKIP';
+  const rightStrategy = r.right_missing_strategy || 'NEVER_SKIP';
+  for (const [side, strat] of [['left', leftStrategy], ['right', rightStrategy]]) {
+    if (!VALIDATION_MISSING_STRATEGY.has(strat)) {
+      return { _error: `Invalid ${side}_missing_strategy "${strat}". One of: ${[...VALIDATION_MISSING_STRATEGY].join(', ')}.` };
+    }
+  }
+
+  // Server-validate BOTH expressions before building the payload — a broken
+  // reference is caught here with the parser's exact error, not silently saved.
+  const leftChk = await describeValidationExpression(r.left_expression);
+  if (!leftChk.ok) return { _error: `left_expression rejected by DHIS2: ${leftChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+  const rightChk = await describeValidationExpression(r.right_expression);
+  if (!rightChk.ok) return { _error: `right_expression rejected by DHIS2: ${rightChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+
+  const id = generateDhis2Uid();
+  const leftSide = {
+    expression: r.left_expression,
+    description: r.left_description || leftChk.description || 'Left side',
+    missingValueStrategy: leftStrategy,
+  };
+  const rightSide = {
+    expression: r.right_expression,
+    description: r.right_description || rightChk.description || 'Right side',
+    missingValueStrategy: rightStrategy,
+  };
+  const ruleObj = {
+    id,
+    name: String(r.name).trim(),
+    importance,
+    operator: r.operator,
+    periodType,
+    leftSide,
+    rightSide,
+  };
+  if (r.description) ruleObj.description = r.description;
+  if (r.instruction) ruleObj.instruction = r.instruction;
+
+  const result = await postMetadataPayload({ validationRules: [ruleObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return {
+      _error: result._error || 'Validation rule create failed.',
+      phase: result.phase,
+      errors: result.errors,
+      _validated_expressions: { left: leftChk.description, right: rightChk.description },
+    };
+  }
+  if (args.dry_run_only) {
+    return {
+      success: true,
+      dry_run: true,
+      message: `Validation passed for "${r.name}". No rule created (dry_run_only=true).`,
+      would_create: { id, name: ruleObj.name, importance, operator: r.operator, periodType },
+      left_meaning: leftChk.description,
+      right_meaning: rightChk.description,
+    };
+  }
+  return {
+    success: true,
+    action: 'create',
+    rule_id: id,
+    rule: { id, name: ruleObj.name, importance, operator: r.operator, periodType, leftSide, rightSide },
+    left_meaning: leftChk.description,
+    right_meaning: rightChk.description,
+    message: `Created validation rule "${ruleObj.name}" (${id}).`,
+  };
+}
+
+// ── manage_org_units: CRUD for DHIS2 organisationUnits (the OU hierarchy) ──
+//
+// level + path are DERIVED by DHIS2 from the parent — this tool never sets
+// them. create verifies the parent first; update validates a re-parent target
+// (and rejects cycles) and auto-snapshots before writing; delete refuses any
+// unit that still has children and surfaces DHIS2's exact blocking reason for
+// units that still hold data/assignments. All shared helpers are reused with
+// their existing signatures — no shared code is modified.
+
+const OU_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+function normalizeOuDate(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  return OU_DATE_ONLY_RE.test(s) ? `${s}T00:00:00.000` : s;
+}
+function isValidOuDate(value) {
+  const s = String(value ?? '').trim();
+  return OU_DATE_ONLY_RE.test(s) || /^\d{4}-\d{2}-\d{2}T/.test(s);
+}
+
+async function executeManageOrgUnits(args) {
+  const action = args?.action;
+  if (!action) {
+    return {
+      _error: 'Missing required parameter: action',
+      _hint: 'One of: list, get, create, update, delete.',
+    };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.level != null && Number.isFinite(Number(args.level))) filters.push(`level:eq:${Number(args.level)}`);
+    if (args.parent_id) filters.push(`parent.id:eq:${encodeURIComponent(args.parent_id)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `organisationUnits?fields=id,displayName,level,path,parent[id,displayName],children~size,openingDate,closedDate&pageSize=${pageSize}${fp}&order=path:asc`
+    );
+    if (resp?._error) return { _error: `organisationUnits list failed: ${resp._error}` };
+    const ous = (resp.organisationUnits || []).map(o => ({
+      id: o.id,
+      name: o.displayName,
+      level: o.level,
+      path: o.path,
+      parent: o.parent ? { id: o.parent.id, name: o.parent.displayName } : null,
+      children: o.children ?? 0,
+      openingDate: o.openingDate,
+      closedDate: o.closedDate || null,
+    }));
+    return {
+      success: true,
+      total: ous.length,
+      pager_total: resp.pager?.total ?? null,
+      org_units: ous,
+    };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const id = args.org_unit_id || args.object_id;
+    if (!id) return { _error: 'org_unit_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `organisationUnits/${id}?fields=id,displayName,shortName,code,level,path,parent[id,displayName,level],` +
+      `children~size,openingDate,closedDate,description,comment,address,email,phoneNumber,url,contactPerson,featureType,access`
+    );
+    if (resp?._status === 404) return { _error: `organisationUnits with id "${id}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load org unit ${id}: ${resp._error}` };
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      shortName: resp.shortName,
+      code: resp.code || null,
+      level: resp.level,
+      path: resp.path,
+      parent: resp.parent ? { id: resp.parent.id, name: resp.parent.displayName, level: resp.parent.level } : null,
+      childCount: resp.children ?? 0,
+      openingDate: resp.openingDate,
+      closedDate: resp.closedDate || null,
+      description: resp.description || null,
+      comment: resp.comment || null,
+      contact: {
+        address: resp.address || null,
+        email: resp.email || null,
+        phoneNumber: resp.phoneNumber || null,
+        contactPerson: resp.contactPerson || null,
+        url: resp.url || null,
+      },
+      featureType: resp.featureType || null,
+      access: resp.access,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_org_units', 'create');
+    if (_gate) return _gate;
+    return await createOrgUnit(args);
+  }
+
+  // ── update ────────────────────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_org_units', 'update', { org_unit_id: args.org_unit_id });
+    if (_gate) return _gate;
+    const id = args.org_unit_id || args.object_id;
+    if (!id) return { _error: 'org_unit_id required for update' };
+    if (!args.org_unit || typeof args.org_unit !== 'object') {
+      return {
+        _error: 'org_unit object required for update',
+        _hint: 'Pass org_unit:{ name?, short_name?, parent_id?, opening_date?, closed_date?, code?, description?, comment?, address?, email?, phone_number?, contact_person?, url? }',
+      };
+    }
+    const exists = await verifyTargetExists('organisationUnits', id, 'manage_org_units', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+
+    const o = args.org_unit;
+    // Validate field values + any re-parent target BEFORE snapshotting/mutating,
+    // so an invalid patch never triggers a backup or a half-applied write.
+    if (o.opening_date !== undefined && !isValidOuDate(o.opening_date)) {
+      return { _error: `Invalid opening_date "${o.opening_date}". Use YYYY-MM-DD.` };
+    }
+    if (o.closed_date !== undefined && o.closed_date !== null && String(o.closed_date).trim() !== '' && !isValidOuDate(o.closed_date)) {
+      return { _error: `Invalid closed_date "${o.closed_date}". Use YYYY-MM-DD (or "" to clear).` };
+    }
+
+    let newParent = null;
+    if (o.parent_id !== undefined && o.parent_id !== null && String(o.parent_id).trim() !== '') {
+      const newParentId = String(o.parent_id).trim();
+      if (newParentId === id) return { _error: 'Cannot set an org unit as its own parent.' };
+      const pResp = await safeDhis2Fetch(`organisationUnits/${newParentId}?fields=id,displayName,level,path`);
+      if (pResp?._status === 404) return { _error: `New parent org unit "${newParentId}" does not exist (404).`, _hint: 'Confirm the parent UID via manage_org_units(action=list) or search_metadata.' };
+      if (pResp?._error) return { _error: `Could not load new parent ${newParentId}: ${pResp._error}` };
+      // Cycle guard: the new parent must NOT be this unit's own descendant.
+      if (pResp.path && pResp.path.split('/').includes(id)) {
+        return { _error: `Cannot move org unit ${id} under "${pResp.displayName}" — that target is a descendant of this org unit (would create a cycle).` };
+      }
+      newParent = pResp;
+    }
+
+    const objResp = await safeDhis2Fetch(`organisationUnits/${id}?fields=:owner`);
+    if (objResp?._error) return { _error: `Could not load org unit ${id}: ${objResp._error}` };
+    const objName = objResp.name || objResp.displayName || id;
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_org_unit', tool: 'manage_org_units', action: 'update', reason: `Update org unit ${objName}` },
+      [{ object_type: 'organisationUnits', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (o.name !== undefined) { objResp.name = String(o.name).trim(); applied.name = objResp.name; }
+    if (o.short_name !== undefined || o.shortName !== undefined) {
+      objResp.shortName = String(o.short_name ?? o.shortName).trim().slice(0, 50);
+      applied.shortName = objResp.shortName;
+    }
+    if (o.opening_date !== undefined) { objResp.openingDate = normalizeOuDate(o.opening_date); applied.openingDate = objResp.openingDate; }
+    if (o.closed_date !== undefined) {
+      if (o.closed_date === null || String(o.closed_date).trim() === '') { delete objResp.closedDate; applied.closedDate = null; }
+      else { objResp.closedDate = normalizeOuDate(o.closed_date); applied.closedDate = objResp.closedDate; }
+    }
+    if (o.code !== undefined) { if (o.code) { objResp.code = String(o.code).trim(); } else { delete objResp.code; } applied.code = objResp.code || null; }
+    if (o.description !== undefined) { objResp.description = o.description; applied.description = o.description; }
+    if (o.comment !== undefined) { objResp.comment = o.comment; applied.comment = o.comment; }
+    for (const [field, src] of [['address', 'address'], ['email', 'email'], ['phoneNumber', 'phone_number'], ['url', 'url'], ['contactPerson', 'contact_person']]) {
+      if (o[src] !== undefined) { objResp[field] = o[src]; applied[field] = o[src]; }
+    }
+    if (newParent) { objResp.parent = { id: newParent.id }; applied.parent = { id: newParent.id, name: newParent.displayName }; }
+
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'org_unit supplied no recognized fields to update.', backup: backup.block };
+    }
+
+    const putResp = await safeDhis2Fetch(`organisationUnits/${id}`, { method: 'PUT', body: objResp });
+    if (putResp?._error) return { _error: `Failed to update org unit: ${putResp._error}`, backup: backup.block };
+    const result = { success: true, action: 'update', org_unit_id: id, org_unit_name: objName, applied, backup: backup.block };
+    if (newParent) result.note = `Moved under "${newParent.displayName}". DHIS2 recomputes level/path for this org unit and all its descendants automatically.`;
+    return result;
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_org_units', 'delete', { org_unit_id: args.org_unit_id });
+    if (_gate) return _gate;
+    const id = args.org_unit_id || args.object_id;
+    if (!id) return { _error: 'org_unit_id required for delete' };
+    const exists = await verifyTargetExists('organisationUnits', id, 'manage_org_units', 'delete', 'id,displayName,children~size,path');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || id;
+    const childCount = exists.data?.children ?? 0;
+
+    // Hard guard: never delete a non-leaf unit. DHIS2 blocks it (E4030) anyway,
+    // but refusing up-front gives a precise, actionable message and avoids
+    // snapshotting a node that cannot be removed.
+    if (childCount > 0) {
+      return {
+        _error: `Cannot delete org unit "${objName}" — it has ${childCount} child org unit(s).`,
+        _hint: `Re-parent or delete its children first: manage_org_units(action=list, parent_id="${id}") to see them, then either move each (action=update, org_unit:{parent_id:"<other OU>"}) or delete the leaves bottom-up.`,
+        child_count: childCount,
+      };
+    }
+
+    // organisationUnits is an unmapped type in checkMetadataReferences → returns
+    // has_references:false; DHIS2's atomic DELETE is the authoritative net for any
+    // remaining association (assigned programs/datasets, captured data values,
+    // users' org-unit scope) and is surfaced explicitly below.
+    const refsResult = await checkMetadataReferences('organisationUnits', id);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete org unit "${objName}" — it has active references.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('organisationUnits', id, refsResult.references),
+      };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_org_unit', tool: 'manage_org_units', action: 'delete', reason: `Deleting org unit ${objName} (${id})` },
+      [{ object_type: 'organisationUnits', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { organisationUnits: [{ id }] },
+    });
+    if (delResp?._error) return { _error: `Org unit deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'organisationUnits', id, name: objName },
+        message: `Successfully deleted org unit "${objName}".`,
+        backup: backup.block,
+      };
+    }
+    // Surface DHIS2's exact blocking reason (E4030 "associated with another
+    // object", data values, program assignment) instead of a generic message.
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Org unit "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'The unit is still associated with other objects (assigned programs/datasets, captured data values, or users’ org-unit scope). Remove those associations, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_org_units.`,
+    _hint: 'One of: list, get, create, update, delete.',
+  };
+}
+
+async function createOrgUnit(args) {
+  const o = args.org_unit;
+  if (!o || typeof o !== 'object') {
+    return {
+      _error: 'org_unit object required for create',
+      _hint: 'Pass org_unit:{ name, parent_id, opening_date, short_name?, code?, description?, ... }',
+    };
+  }
+  if (!o.name || !String(o.name).trim()) return { _error: 'org_unit.name is required.' };
+
+  const parentId = (o.parent_id || args.parent_id) ? String(o.parent_id || args.parent_id).trim() : '';
+  if (!parentId) {
+    return {
+      _error: 'org_unit.parent_id is required.',
+      _hint: 'Every org unit except the single root has a parent. Pass the parent OU UID (find it with manage_org_units(action=list) or search_metadata). Creating a NEW root is intentionally not supported by this tool to avoid splitting the hierarchy.',
+    };
+  }
+
+  const openingRaw = o.opening_date ?? o.openingDate;
+  if (!openingRaw) return { _error: 'org_unit.opening_date is required (YYYY-MM-DD).' };
+  if (!isValidOuDate(openingRaw)) return { _error: `Invalid opening_date "${openingRaw}". Use YYYY-MM-DD.` };
+  const closedRaw = o.closed_date ?? o.closedDate;
+  if (closedRaw && !isValidOuDate(closedRaw)) return { _error: `Invalid closed_date "${closedRaw}". Use YYYY-MM-DD.` };
+
+  // Verify the parent exists up-front: gives a clear error + lets us report the
+  // derived level. postMetadataPayload's VALIDATE pass is the backstop for a
+  // reference that vanishes between this check and the import (E5002).
+  const parentResp = await safeDhis2Fetch(`organisationUnits/${parentId}?fields=id,displayName,level,path`);
+  if (parentResp?._status === 404) {
+    return { _error: `Parent org unit "${parentId}" does not exist (404).`, _hint: 'Confirm the parent UID via manage_org_units(action=list) or search_metadata before creating a child.' };
+  }
+  if (parentResp?._error) return { _error: `Could not load parent org unit ${parentId}: ${parentResp._error}` };
+
+  const id = generateDhis2Uid();
+  const name = String(o.name).trim();
+  const shortName = String(o.short_name || o.shortName || name).trim().slice(0, 50);
+  const ouObj = {
+    id,
+    name,
+    shortName,
+    openingDate: normalizeOuDate(openingRaw),
+    parent: { id: parentId },
+  };
+  if (closedRaw) ouObj.closedDate = normalizeOuDate(closedRaw);
+  if (o.code) ouObj.code = String(o.code).trim();
+  if (o.description) ouObj.description = String(o.description);
+  if (o.comment) ouObj.comment = String(o.comment);
+  for (const [field, src] of [['address', 'address'], ['email', 'email'], ['phoneNumber', 'phone_number'], ['url', 'url'], ['contactPerson', 'contact_person']]) {
+    const v = o[src] ?? o[field];
+    if (v) ouObj[field] = String(v);
+  }
+
+  const result = await postMetadataPayload({ organisationUnits: [ouObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return { _error: result._error || 'Org unit create failed.', phase: result.phase, errors: result.errors };
+  }
+
+  const expectedLevel = (parentResp.level || 0) + 1;
+  if (args.dry_run_only) {
+    return {
+      success: true,
+      dry_run: true,
+      message: `Validation passed for "${name}". No org unit created (dry_run_only=true).`,
+      would_create: { id, name, shortName, parent: { id: parentId, name: parentResp.displayName }, expected_level: expectedLevel },
+    };
+  }
+  return {
+    success: true,
+    action: 'create',
+    org_unit_id: id,
+    org_unit: {
+      id, name, shortName, level: expectedLevel,
+      parent: { id: parentId, name: parentResp.displayName },
+      openingDate: ouObj.openingDate, closedDate: ouObj.closedDate || null,
+    },
+    message: `Created org unit "${name}" (${id}) under "${parentResp.displayName}" at level ${expectedLevel}.`,
+  };
+}
+
+// ── manage_indicators: CRUD for DHIS2 aggregate indicators (numerator/denominator formulas) ──
+//
+// An aggregate INDICATOR is a calculated value: (numerator / denominator) ×
+// the indicatorType factor (1, 100, 1000, …). numerator and denominator are
+// DHIS2 aggregate expressions over data-element operands #{de} / #{de.coc},
+// reporting rates R{ds.REPORTING_RATE}, program indicators I{pi}, constants
+// C{const} and numeric literals. This tool reuses the SAME server-side
+// validator already used for validation-rule sides (describeValidationExpression
+// → GET /api/expressions/description), which the 2.43 playground confirmed
+// accepts the full indicator grammar (#{}, R{}, I{}, numbers/operators). The
+// indicatorType is resolved + verified (by UID or exact name) before any write.
+// All shared helpers are reused with their existing signatures — no shared code
+// is modified.
+
+// Resolve an indicatorType by UID or exact name → { id, name, factor } or { _error }.
+async function resolveIndicatorType(idOrName) {
+  const v = String(idOrName ?? '').trim();
+  if (!v) return { _error: 'indicator_type is required (an indicatorType UID or exact name, e.g. "Number (Factor 1)" or "Per cent").' };
+  if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(v)) {
+    const resp = await safeDhis2Fetch(`indicatorTypes/${v}?fields=id,name,factor`);
+    if (resp?._status === 404) return { _error: `indicatorType "${v}" does not exist (404).`, _hint: 'List the available types with dhis2_query GET indicatorTypes, or pass the type name instead.' };
+    if (resp?._error) return { _error: `Could not load indicatorType ${v}: ${resp._error}` };
+    return { id: resp.id, name: resp.name, factor: resp.factor };
+  }
+  const resp = await safeDhis2Fetch(`indicatorTypes?filter=name:eq:${encodeURIComponent(v)}&fields=id,name,factor&paging=false`);
+  if (resp?._error) return { _error: `Could not look up indicatorType "${v}": ${resp._error}` };
+  const types = resp.indicatorTypes || [];
+  if (types.length === 0) return { _error: `No indicatorType named "${v}".`, _hint: 'Common types: "Number (Factor 1)", "Per cent", "Per thousand", "Per ten thousand", "Per hundred thousand". List all with dhis2_query GET indicatorTypes.' };
+  return { id: types[0].id, name: types[0].name, factor: types[0].factor };
+}
+
+async function executeManageIndicators(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create, update, delete.' };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.indicator_type) {
+      const it = await resolveIndicatorType(args.indicator_type);
+      if (it._error) return it;
+      filters.push(`indicatorType.id:eq:${it.id}`);
+    }
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `indicators?fields=id,displayName,indicatorType[id,name,factor],annualized,numerator,denominator&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `indicators list failed: ${resp._error}` };
+    const indicators = (resp.indicators || []).map(i => ({
+      id: i.id,
+      name: i.displayName,
+      indicatorType: i.indicatorType?.name,
+      factor: i.indicatorType?.factor,
+      annualized: i.annualized,
+      numerator: i.numerator,
+      denominator: i.denominator,
+    }));
+    return {
+      success: true,
+      total: indicators.length,
+      pager_total: resp.pager?.total ?? null,
+      indicators,
+    };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const id = args.indicator_id || args.object_id;
+    if (!id) return { _error: 'indicator_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `indicators/${id}?fields=id,displayName,description,shortName,indicatorType[id,name,factor],annualized,decimals,` +
+      `numerator,numeratorDescription,denominator,denominatorDescription,legendSets[id,displayName],sharing,access`
+    );
+    if (resp?._status === 404) return { _error: `indicators with id "${id}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load indicator ${id}: ${resp._error}` };
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      shortName: resp.shortName,
+      description: resp.description,
+      indicatorType: resp.indicatorType,
+      annualized: resp.annualized,
+      decimals: resp.decimals,
+      numerator: resp.numerator,
+      numeratorDescription: resp.numeratorDescription,
+      denominator: resp.denominator,
+      denominatorDescription: resp.denominatorDescription,
+      legendSets: (resp.legendSets || []).map(ls => ({ id: ls.id, name: ls.displayName })),
+      access: resp.access,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_indicators', 'create');
+    if (_gate) return _gate;
+    return await createIndicator(args);
+  }
+
+  // ── update ────────────────────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_indicators', 'update', { indicator_id: args.indicator_id });
+    if (_gate) return _gate;
+    const id = args.indicator_id || args.object_id;
+    if (!id) return { _error: 'indicator_id required for update' };
+    if (!args.indicator || typeof args.indicator !== 'object') {
+      return {
+        _error: 'indicator object required for update',
+        _hint: 'Pass indicator:{ name?, short_name?, description?, indicator_type?, annualized?, decimals?, numerator?, numerator_description?, denominator?, denominator_description?, legend_set_id? (attach a colour legend), legend_set_ids? ([] detaches) }',
+      };
+    }
+    const exists = await verifyTargetExists('indicators', id, 'manage_indicators', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+
+    const ownerResp = await safeDhis2Fetch(`indicators/${id}?fields=:owner`);
+    if (ownerResp?._error) return { _error: `Could not load indicator ${id}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || id;
+
+    // Validate field values + any new expressions/type BEFORE snapshotting/mutating,
+    // so an invalid patch never triggers a backup or a half-applied write.
+    const ind = args.indicator;
+    let resolvedType = null;
+    if (ind.indicator_type !== undefined) {
+      resolvedType = await resolveIndicatorType(ind.indicator_type);
+      if (resolvedType._error) return resolvedType;
+    }
+    if (ind.decimals !== undefined && ind.decimals !== null) {
+      const d = Number(ind.decimals);
+      if (!Number.isInteger(d) || d < 0 || d > 5) return { _error: 'decimals must be an integer 0–5 (or null to inherit the system default).' };
+    }
+    for (const [field, expr] of [['numerator', ind.numerator], ['denominator', ind.denominator]]) {
+      if (expr !== undefined) {
+        if (typeof expr !== 'string' || !expr.trim()) return { _error: `${field} must be a non-empty string.` };
+        const chk = await describeValidationExpression(expr);
+        if (!chk.ok) return { _error: `${field} rejected by DHIS2: ${chk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} / R{dsUid.REPORTING_RATE} / I{programIndicatorUid} exists (use search_metadata) and the syntax is well-formed, then retry.' };
+      }
+    }
+    // Legend-set attach/detach: resolve+verify BEFORE snapshotting/mutating, so an
+    // invalid reference never triggers a backup or a half-applied write. A supplied
+    // legend_set_id/legend_set_name attaches an existing set; an explicit
+    // legend_set_ids:[] detaches all. Left untouched when no legend field is given.
+    let resolvedLegendSets; // undefined = field not supplied → leave legendSets as-is
+    const _touchesLegend = (ind.legend_set_id && String(ind.legend_set_id).trim())
+      || Array.isArray(ind.legend_set_ids)
+      || (ind.legend_set_name && String(ind.legend_set_name).trim());
+    if (_touchesLegend) {
+      const legendRefs = await resolveLegendSetRefs(ind.legend_set_id, ind.legend_set_ids, ind.legend_set_name);
+      if (legendRefs._error) return legendRefs;
+      resolvedLegendSets = legendRefs;
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_indicator', tool: 'manage_indicators', action: 'update', reason: `Update indicator ${objName}` },
+      [{ object_type: 'indicators', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (ind.name !== undefined) { ownerResp.name = ind.name; applied.name = ind.name; }
+    if (ind.short_name !== undefined) { ownerResp.shortName = String(ind.short_name).slice(0, 50); applied.shortName = ownerResp.shortName; }
+    if (ind.description !== undefined) { ownerResp.description = ind.description; applied.description = ind.description; }
+    if (resolvedType) { ownerResp.indicatorType = { id: resolvedType.id }; applied.indicatorType = resolvedType.name; }
+    if (ind.annualized !== undefined) { ownerResp.annualized = !!ind.annualized; applied.annualized = !!ind.annualized; }
+    if (ind.decimals !== undefined) { ownerResp.decimals = ind.decimals == null ? null : Number(ind.decimals); applied.decimals = ownerResp.decimals; }
+    if (ind.numerator !== undefined) { ownerResp.numerator = ind.numerator; applied.numerator = ind.numerator; }
+    if (ind.numerator_description !== undefined) { ownerResp.numeratorDescription = ind.numerator_description; applied.numeratorDescription = ind.numerator_description; }
+    if (ind.denominator !== undefined) { ownerResp.denominator = ind.denominator; applied.denominator = ind.denominator; }
+    if (ind.denominator_description !== undefined) { ownerResp.denominatorDescription = ind.denominator_description; applied.denominatorDescription = ind.denominator_description; }
+    if (resolvedLegendSets) {
+      ownerResp.legendSets = resolvedLegendSets.ids.map(lid => ({ id: lid }));
+      applied.legendSets = resolvedLegendSets.ids.length ? resolvedLegendSets.names : '(detached all)';
+    }
+
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'indicator supplied no recognized fields to update.', backup: backup.block };
+    }
+
+    const putResp = await safeDhis2Fetch(`indicators/${id}`, { method: 'PUT', body: ownerResp });
+    if (putResp?._error) return { _error: `Failed to update indicator: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', indicator_id: id, indicator_name: objName, applied, backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_indicators', 'delete', { indicator_id: args.indicator_id });
+    if (_gate) return _gate;
+    const id = args.indicator_id || args.object_id;
+    if (!id) return { _error: 'indicator_id required for delete' };
+    const exists = await verifyTargetExists('indicators', id, 'manage_indicators', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || id;
+
+    // indicators is an unmapped type in checkMetadataReferences → returns
+    // has_references:false; DHIS2's atomic DELETE is the authoritative net for
+    // any remaining association (dataSets, visualizations, indicatorGroups,
+    // predictors) and its exact reason is surfaced below.
+    const refsResult = await checkMetadataReferences('indicators', id);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete indicator "${objName}" — it has active references.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('indicators', id, refsResult.references),
+      };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_indicator', tool: 'manage_indicators', action: 'delete', reason: `Deleting indicator ${objName} (${id})` },
+      [{ object_type: 'indicators', object_id: id, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { indicators: [{ id }] },
+    });
+    if (delResp?._error) return { _error: `Indicator deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'indicators', id, name: objName },
+        message: `Successfully deleted indicator "${objName}".`,
+        backup: backup.block,
+      };
+    }
+    // Surface DHIS2's exact blocking reason (referenced by a dataSet /
+    // visualization / indicatorGroup / predictor) instead of a generic message.
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Indicator "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'The indicator is still referenced by another object (a dataSet, visualization, indicatorGroup, or predictor). Remove those references first, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_indicators.`,
+    _hint: 'One of: list, get, create, update, delete.',
+  };
+}
+
+// Resolve + verify EXISTING legend-set reference(s) for attaching to an
+// indicator (its `legendSets` array). Mirrors resolveExistingOptionSetRef: a
+// reference must point at a set that ALREADY exists — by UID (single/array) or
+// by exact unique name — so an indicator never silently points at a
+// non-existent legend set. Returns { ids:[...], names:[...] } (de-duplicated,
+// order-preserving) or { _error, _hint }. An empty result means "no legend
+// reference supplied" (caller decides whether that clears or leaves as-is).
+async function resolveLegendSetRefs(legendSetId, legendSetIds, legendSetName) {
+  const refs = [];
+  if (Array.isArray(legendSetIds)) {
+    for (const x of legendSetIds) { const v = String(x || '').trim(); if (v) refs.push({ id: v }); }
+  }
+  if (legendSetId && String(legendSetId).trim()) refs.push({ id: String(legendSetId).trim() });
+  if (legendSetName && String(legendSetName).trim()) refs.push({ name: String(legendSetName).trim() });
+
+  const ids = [];
+  const names = [];
+  const seen = new Set();
+  for (const r of refs) {
+    if (r.id) {
+      const resp = await safeDhis2Fetch(`legendSets/${r.id}?fields=id,name`);
+      if (resp?._error || resp?._status === 404 || !resp?.id) {
+        return {
+          _error: `legend_set_id "${r.id}" does not exist on this server.`,
+          _hint: 'Chain the legend_set_id returned by manage_legend_sets(action="create"), or omit the legend reference.',
+        };
+      }
+      if (!seen.has(resp.id)) { seen.add(resp.id); ids.push(resp.id); names.push(resp.name || resp.id); }
+    } else if (r.name) {
+      const probe = await safeDhis2Fetch(`legendSets?filter=name:eq:${encodeURIComponent(r.name)}&fields=id,name&pageSize=2`);
+      const hits = probe?.legendSets || [];
+      if (!hits.length) return {
+        _error: `legend_set_name "${r.name}" not found on this server.`,
+        _hint: 'Create it first with manage_legend_sets(action="create") and chain the returned legend_set_id.',
+      };
+      if (hits.length > 1) return { _error: `legend_set_name "${r.name}" is ambiguous (${hits.length} matches). Pass legend_set_id instead.` };
+      if (!seen.has(hits[0].id)) { seen.add(hits[0].id); ids.push(hits[0].id); names.push(hits[0].name || r.name); }
+    }
+  }
+  return { ids, names };
+}
+
+async function createIndicator(args) {
+  const ind = args.indicator;
+  if (!ind || typeof ind !== 'object') {
+    return {
+      _error: 'indicator object required for create',
+      _hint: 'Pass indicator:{ name, indicator_type, numerator, denominator, short_name?, annualized?, decimals?, ... }',
+    };
+  }
+  if (!ind.name || !String(ind.name).trim()) return { _error: 'indicator.name is required.' };
+  if (!ind.numerator || !String(ind.numerator).trim()) return { _error: 'indicator.numerator is required (a DHIS2 expression, e.g. "#{deUid}" or "#{deA} + #{deB}").' };
+  if (!ind.denominator || !String(ind.denominator).trim()) return { _error: 'indicator.denominator is required (use "1" for a plain count/sum).' };
+  if (ind.indicator_type === undefined || ind.indicator_type === null || !String(ind.indicator_type).trim()) {
+    return { _error: 'indicator.indicator_type is required (a UID or exact name such as "Number (Factor 1)" for a raw ratio, or "Per cent" for a percentage).' };
+  }
+  if (ind.decimals !== undefined && ind.decimals !== null) {
+    const d = Number(ind.decimals);
+    if (!Number.isInteger(d) || d < 0 || d > 5) return { _error: 'decimals must be an integer 0–5 (or omit to inherit the system default).' };
+  }
+
+  // Resolve + verify the indicatorType BEFORE any expression work, so a bad
+  // type gives a clean error rather than a deep import-report failure.
+  const itype = await resolveIndicatorType(ind.indicator_type);
+  if (itype._error) return itype;
+
+  // Server-validate BOTH expressions before building the payload — a broken
+  // reference is caught here with the parser's exact error, not silently saved.
+  const numChk = await describeValidationExpression(ind.numerator);
+  if (!numChk.ok) return { _error: `numerator rejected by DHIS2: ${numChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} / R{dsUid.REPORTING_RATE} / I{programIndicatorUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+  const denChk = await describeValidationExpression(ind.denominator);
+  if (!denChk.ok) return { _error: `denominator rejected by DHIS2: ${denChk.error}`, _hint: 'Confirm each reference exists (use search_metadata) and the syntax is well-formed. For a plain count/sum use denominator "1".' };
+
+  const id = generateDhis2Uid();
+  const name = String(ind.name).trim();
+  const shortName = String(ind.short_name || name).slice(0, 50);
+  const indObj = {
+    id,
+    name,
+    shortName,
+    numerator: ind.numerator,
+    numeratorDescription: ind.numerator_description || numChk.description || 'Numerator',
+    denominator: ind.denominator,
+    denominatorDescription: ind.denominator_description || denChk.description || 'Denominator',
+    indicatorType: { id: itype.id },
+    annualized: !!ind.annualized,
+  };
+  if (ind.description) indObj.description = ind.description;
+  if (ind.decimals !== undefined && ind.decimals !== null) indObj.decimals = Number(ind.decimals);
+
+  // Optional: attach EXISTING legend set(s) so the indicator renders color-coded
+  // (traffic-light) everywhere it appears — the legend-set → indicator chaining
+  // path. Resolve+verify each set EXISTS before writing (never invent a UID).
+  // Purely additive: skipped entirely when no legend reference is supplied.
+  const legendRefs = await resolveLegendSetRefs(ind.legend_set_id, ind.legend_set_ids, ind.legend_set_name);
+  if (legendRefs._error) return legendRefs;
+  if (legendRefs.ids.length) indObj.legendSets = legendRefs.ids.map(id => ({ id }));
+
+  const result = await postMetadataPayload({ indicators: [indObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return {
+      _error: result._error || 'Indicator create failed.',
+      phase: result.phase,
+      errors: result.errors,
+      _validated_expressions: { numerator: numChk.description, denominator: denChk.description },
+    };
+  }
+  if (args.dry_run_only) {
+    return {
+      success: true,
+      dry_run: true,
+      message: `Validation passed for "${name}". No indicator created (dry_run_only=true).`,
+      would_create: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, annualized: indObj.annualized, legendSetIds: legendRefs.ids.length ? legendRefs.ids : undefined },
+      numerator_meaning: numChk.description,
+      denominator_meaning: denChk.description,
+    };
+  }
+  return {
+    success: true,
+    action: 'create',
+    indicator_id: id,
+    indicator: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, numerator: indObj.numerator, denominator: indObj.denominator, annualized: indObj.annualized, legendSetIds: legendRefs.ids.length ? legendRefs.ids : undefined },
+    // Confirm the attached legend set(s) so a multi-step caller can report the
+    // color-coding link (and never needs a second attach round).
+    legend_sets: legendRefs.ids.length ? legendRefs.ids.map((lid, i) => ({ id: lid, name: legendRefs.names[i] })) : undefined,
+    numerator_meaning: numChk.description,
+    denominator_meaning: denChk.description,
+    message: `Created indicator "${name}" (${id}) of type "${itype.name}" (factor ${itype.factor})${legendRefs.ids.length ? ` with legend set "${legendRefs.names[0]}"${legendRefs.ids.length > 1 ? ` (+${legendRefs.ids.length - 1} more)` : ''}` : ''}.`,
+  };
+}
+
+// ── manage_option_sets: full lifecycle CRUD for DHIS2 option sets ──
+//
+// An option set is a reusable, ordered pick-list of { code, name } options that
+// data elements / tracked-entity attributes reference to constrain input.
+// Proven on the 2.43 playground BEFORE writing: the optionSet (owning side via
+// its options[] list) and the standalone Option objects are imported together
+// in one atomic /metadata payload; an option is removed by deleting the Option
+// object (which auto-detaches it from the set); ordering is driven by each
+// option's sortOrder. All shared helpers are reused with their existing
+// signatures — no shared code is modified.
+
+const OPTION_SET_VALUE_TYPES = new Set([
+  'TEXT', 'LONG_TEXT', 'MULTI_TEXT', 'LETTER', 'PHONE_NUMBER', 'EMAIL', 'BOOLEAN',
+  'TRUE_ONLY', 'DATE', 'DATETIME', 'TIME', 'NUMBER', 'UNIT_INTERVAL', 'PERCENTAGE',
+  'INTEGER', 'INTEGER_POSITIVE', 'INTEGER_NEGATIVE', 'INTEGER_ZERO_OR_POSITIVE',
+  'USERNAME', 'COORDINATE', 'ORGANISATION_UNIT', 'REFERENCE', 'AGE', 'URL',
+  'FILE_RESOURCE', 'IMAGE', 'GEOJSON',
+]);
+
+// Validate + normalize an array of { code, name } option inputs.
+// Returns { ok:true, options:[{code,name}] } or { _error }.
+function normalizeOptionInputs(rawList, label = 'options') {
+  if (!Array.isArray(rawList) || rawList.length === 0) {
+    return { _error: `${label} must be a non-empty array of { code, name } objects.` };
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length; i++) {
+    const o = rawList[i] || {};
+    const code = String(o.code ?? '').trim();
+    const name = String(o.name ?? '').trim();
+    if (!code) return { _error: `${label}[${i}] is missing a code.` };
+    if (!name) return { _error: `${label}[${i}] (code "${code}") is missing a name.` };
+    if (seen.has(code)) return { _error: `${label} contains duplicate code "${code}". Codes must be unique within an option set.` };
+    seen.add(code);
+    out.push({ code, name });
+  }
+  return { ok: true, options: out };
+}
+
+async function executeManageOptionSets(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create, update, add_options, remove_options, reorder_options, delete.' };
+  }
+  const osId = args.option_set_id || args.object_id;
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    if (args.value_type) filters.push(`valueType:eq:${encodeURIComponent(String(args.value_type).toUpperCase())}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `optionSets?fields=id,displayName,code,valueType,options~size&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `optionSets list failed: ${resp._error}` };
+    const optionSets = (resp.optionSets || []).map(o => ({
+      id: o.id,
+      name: o.displayName,
+      code: o.code || null,
+      valueType: o.valueType,
+      options: o.options ?? 0,
+    }));
+    return { success: true, total: optionSets.length, pager_total: resp.pager?.total ?? null, optionSets };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    if (!osId) return { _error: 'option_set_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `optionSets/${osId}?fields=id,displayName,code,description,valueType,options[id,displayName,code,sortOrder]`
+    );
+    if (resp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load option set ${osId}: ${resp._error}` };
+    const options = (resp.options || [])
+      .slice()
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
+      .map(o => ({ id: o.id, name: o.displayName, code: o.code, sortOrder: o.sortOrder }));
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      code: resp.code,
+      description: resp.description,
+      valueType: resp.valueType,
+      option_count: options.length,
+      options,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_option_sets', 'create');
+    if (_gate) return _gate;
+    return await createOptionSet(args);
+  }
+
+  // ── update (own fields only) ────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_option_sets', 'update', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for update' };
+    const os = args.option_set;
+    if (!os || typeof os !== 'object') {
+      return { _error: 'option_set object required for update', _hint: 'Pass option_set:{ name?, code?, description?, value_type? }. To change membership use add_options / remove_options / reorder_options.' };
+    }
+    if (os.value_type !== undefined && os.value_type !== null) {
+      const vt = String(os.value_type).toUpperCase();
+      if (!OPTION_SET_VALUE_TYPES.has(vt)) return { _error: `Invalid value_type "${os.value_type}".`, _hint: `One of: ${[...OPTION_SET_VALUE_TYPES].join(', ')}.` };
+    }
+    const exists = await verifyTargetExists('optionSets', osId, 'manage_option_sets', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=:owner`);
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || osId;
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_option_set', tool: 'manage_option_sets', action: 'update', reason: `Update option set ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (os.name !== undefined) { ownerResp.name = os.name; applied.name = os.name; }
+    if (os.code !== undefined) { ownerResp.code = os.code; applied.code = os.code; }
+    if (os.description !== undefined) { ownerResp.description = os.description; applied.description = os.description; }
+    if (os.value_type !== undefined && os.value_type !== null) { ownerResp.valueType = String(os.value_type).toUpperCase(); applied.valueType = ownerResp.valueType; }
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'option_set supplied no recognized own-fields to update.', _hint: 'Recognized: name, code, description, value_type. For options use add_options / remove_options / reorder_options.', backup: backup.block };
+    }
+    const putResp = await safeDhis2Fetch(`optionSets/${osId}`, { method: 'PUT', body: ownerResp });
+    if (putResp?._error) return { _error: `Failed to update option set: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', option_set_id: osId, option_set_name: objName, applied, backup: backup.block };
+  }
+
+  // ── add_options ─────────────────────────────────────────────────────────
+  if (action === 'add_options') {
+    const _gate = requireWriteAuth('manage_option_sets', 'add_options', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for add_options' };
+    const norm = normalizeOptionInputs(args.options, 'options');
+    if (norm._error) return norm;
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || osId;
+
+    // Reject codes that already exist in the set — option codes must be unique.
+    const existing = await safeDhis2Fetch(`options?filter=optionSet.id:eq:${osId}&fields=code&paging=false`);
+    if (existing?._error) return { _error: `Could not read existing options of ${osId}: ${existing._error}` };
+    const existingCodes = new Set((existing.options || []).map(o => o.code));
+    const collide = norm.options.filter(o => existingCodes.has(o.code)).map(o => o.code);
+    if (collide.length) return { _error: `These codes already exist in "${objName}": ${collide.join(', ')}.`, _hint: 'Option codes must be unique within a set. Choose different codes, or remove the existing options first.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'add_options', tool: 'manage_option_sets', action: 'add_options', reason: `Add ${norm.options.length} option(s) to ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const baseOrder = Array.isArray(ownerResp.options) ? ownerResp.options.length : 0;
+    const newOptionObjs = norm.options.map((o, i) => ({ id: generateDhis2Uid(), name: o.name, code: o.code, sortOrder: baseOrder + i, optionSet: { id: osId } }));
+    ownerResp.options = [...(ownerResp.options || []), ...newOptionObjs.map(o => ({ id: o.id }))];
+
+    const result = await postMetadataPayload({ optionSets: [ownerResp], options: newOptionObjs }, false);
+    if (!result.success) return { _error: result._error || 'add_options failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return {
+      success: true,
+      action: 'add_options',
+      option_set_id: osId,
+      option_set_name: objName,
+      added: newOptionObjs.map(o => ({ id: o.id, code: o.code, name: o.name })),
+      backup: backup.block,
+    };
+  }
+
+  // ── remove_options ───────────────────────────────────────────────────────
+  if (action === 'remove_options') {
+    const _gate = requireWriteAuth('manage_option_sets', 'remove_options', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for remove_options' };
+    const byId = Array.isArray(args.option_ids) && args.option_ids.length > 0;
+    const byCode = Array.isArray(args.option_codes) && args.option_codes.length > 0;
+    if (!byId && !byCode) return { _error: 'Provide option_codes[] or option_ids[] for remove_options.' };
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=id,displayName,options[id,code]`);
+    if (ownerResp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.displayName || osId;
+    const setOptions = ownerResp.options || [];
+    const targetIds = [];
+    const notFound = [];
+    if (byId) {
+      for (const id of args.option_ids) { (setOptions.some(o => o.id === id) ? targetIds : notFound).push(id); }
+    } else {
+      const codeToId = new Map(setOptions.map(o => [o.code, o.id]));
+      for (const c of args.option_codes) { const id = codeToId.get(c); if (id) targetIds.push(id); else notFound.push(c); }
+    }
+    if (notFound.length) return { _error: `These ${byId ? 'option ids' : 'codes'} are not in "${objName}": ${notFound.join(', ')}.`, _hint: 'Use action=get to list the set\'s current options.' };
+    if (targetIds.length >= setOptions.length) return { _error: `Refusing to remove ALL ${setOptions.length} option(s) from "${objName}" — that would leave an empty option set.`, _hint: 'Keep at least one option, or delete the whole set with action=delete.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'remove_options', tool: 'manage_option_sets', action: 'remove_options', reason: `Remove ${targetIds.length} option(s) from ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }, ...targetIds.map(id => ({ object_type: 'options', object_id: id, role: 'cascade' }))],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const removed = [];
+    const failed = [];
+    for (const id of targetIds) {
+      const del = await safeDhis2Fetch(`options/${id}`, { method: 'DELETE' });
+      if (del?._error) failed.push({ id, error: del._error }); else removed.push(id);
+    }
+    if (failed.length) return { _error: `Removed ${removed.length}/${targetIds.length}; ${failed.length} failed.`, removed, failed, backup: backup.block, _hint: 'An option may be referenced by saved data values; DHIS2 blocks those deletions.' };
+    return { success: true, action: 'remove_options', option_set_id: osId, option_set_name: objName, removed_count: removed.length, removed_ids: removed, backup: backup.block };
+  }
+
+  // ── reorder_options ───────────────────────────────────────────────────────
+  if (action === 'reorder_options') {
+    const _gate = requireWriteAuth('manage_option_sets', 'reorder_options', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for reorder_options' };
+    const order = (Array.isArray(args.order) && args.order.length) ? args.order
+      : (Array.isArray(args.option_ids) && args.option_ids.length ? args.option_ids : null);
+    if (!order) return { _error: 'Provide order[] (option codes or UIDs in the desired display order) for reorder_options.' };
+    const ownerResp = await safeDhis2Fetch(`optionSets/${osId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `optionSet with id "${osId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load option set ${osId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || osId;
+    const optsResp = await safeDhis2Fetch(`options?filter=optionSet.id:eq:${osId}&fields=:owner&paging=false`);
+    if (optsResp?._error) return { _error: `Could not load options of ${osId}: ${optsResp._error}` };
+    const opts = optsResp.options || [];
+    if (opts.length === 0) return { _error: `Option set "${objName}" has no options to reorder.` };
+    const byOptId = new Map(opts.map(o => [o.id, o]));
+    const byOptCode = new Map(opts.map(o => [o.code, o]));
+    const resolved = [];
+    const unknown = [];
+    const seen = new Set();
+    for (const tok of order) {
+      const o = byOptId.get(tok) || byOptCode.get(tok);
+      if (!o) { unknown.push(tok); continue; }
+      if (seen.has(o.id)) continue;
+      seen.add(o.id);
+      resolved.push(o);
+    }
+    if (unknown.length) return { _error: `These tokens don't match any option in "${objName}": ${unknown.join(', ')}.`, _hint: 'order[] must use this set\'s option codes or UIDs (action=get lists them).' };
+    if (resolved.length !== opts.length) {
+      const missing = opts.filter(o => !seen.has(o.id)).map(o => o.code);
+      return { _error: `order[] must cover every option exactly once. Missing: ${missing.join(', ')}.`, _hint: 'Include all current option codes/UIDs.' };
+    }
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'reorder_options', tool: 'manage_option_sets', action: 'reorder_options', reason: `Reorder options of ${objName}` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    resolved.forEach((o, i) => { o.sortOrder = i; });
+    ownerResp.options = resolved.map(o => ({ id: o.id }));
+    const result = await postMetadataPayload({ optionSets: [ownerResp], options: resolved }, false);
+    if (!result.success) return { _error: result._error || 'reorder_options failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'reorder_options', option_set_id: osId, option_set_name: objName, order: resolved.map(o => o.code), backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_option_sets', 'delete', { option_set_id: osId });
+    if (_gate) return _gate;
+    if (!osId) return { _error: 'option_set_id required for delete' };
+    const exists = await verifyTargetExists('optionSets', osId, 'manage_option_sets', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || osId;
+
+    // optionSets IS mapped in checkMetadataReferences (data elements + TEAs that
+    // use it). If anything references it, refuse with the exact blockers — the
+    // option set must be detached before it can be deleted.
+    const refsResult = await checkMetadataReferences('optionSets', osId);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete option set "${objName}" — it is still in use.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('optionSets', osId, refsResult.references),
+      };
+    }
+
+    // Child options must be deleted first; deleting the set alone can leave
+    // orphaned Option objects. Snapshot the set AND its options for restore.
+    const optsResp = await safeDhis2Fetch(`options?filter=optionSet.id:eq:${osId}&fields=id&paging=false`);
+    const childIds = (optsResp?.options || []).map(o => o.id);
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_option_set', tool: 'manage_option_sets', action: 'delete', reason: `Deleting option set ${objName} (${osId})` },
+      [{ object_type: 'optionSets', object_id: osId, role: 'primary' }, ...childIds.map(id => ({ object_type: 'options', object_id: id, role: 'cascade' }))],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    for (const id of childIds) { await safeDhis2Fetch(`options/${id}`, { method: 'DELETE' }); }
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { optionSets: [{ id: osId }] },
+    });
+    if (delResp?._error) return { _error: `Option set deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'optionSets', id: osId, name: objName, options_deleted: childIds.length },
+        message: `Successfully deleted option set "${objName}" and its ${childIds.length} option(s).`,
+        backup: backup.block,
+      };
+    }
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Option set "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'It may still be referenced by a data element or tracked-entity attribute. Detach those first, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_option_sets.`,
+    _hint: 'One of: list, get, create, update, add_options, remove_options, reorder_options, delete.',
+  };
+}
+
+async function createOptionSet(args) {
+  const os = args.option_set;
+  if (!os || typeof os !== 'object') {
+    return { _error: 'option_set object required for create', _hint: 'Pass option_set:{ name, value_type, options:[{code,name},…] }.' };
+  }
+  if (!os.name || !String(os.name).trim()) return { _error: 'option_set.name is required.' };
+  const vt = (os.value_type === undefined || os.value_type === null || !String(os.value_type).trim())
+    ? 'TEXT'
+    : String(os.value_type).toUpperCase();
+  if (!OPTION_SET_VALUE_TYPES.has(vt)) return { _error: `Invalid value_type "${os.value_type}".`, _hint: `One of: ${[...OPTION_SET_VALUE_TYPES].join(', ')}.` };
+  const norm = normalizeOptionInputs(os.options, 'option_set.options');
+  if (norm._error) return norm;
+
+  const setId = generateDhis2Uid();
+  const name = String(os.name).trim();
+  const optionObjs = norm.options.map((o, i) => ({ id: generateDhis2Uid(), name: o.name, code: o.code, sortOrder: i, optionSet: { id: setId } }));
+  const setObj = { id: setId, name, valueType: vt, options: optionObjs.map(o => ({ id: o.id })) };
+  if (os.code) setObj.code = String(os.code).trim();
+  if (os.description) setObj.description = os.description;
+
+  const result = await postMetadataPayload({ optionSets: [setObj], options: optionObjs }, !!args.dry_run_only);
+  if (!result.success) {
+    return { _error: result._error || 'Option set create failed.', phase: result.phase, errors: result.errors };
+  }
+  if (args.dry_run_only) {
+    return { success: true, dry_run: true, message: `Validation passed for "${name}". No option set created (dry_run_only=true).`, would_create: { id: setId, name, valueType: vt, option_count: optionObjs.length } };
+  }
+  return {
+    success: true,
+    action: 'create',
+    option_set_id: setId,
+    option_set: { id: setId, name, valueType: vt, code: setObj.code, options: optionObjs.map(o => ({ id: o.id, code: o.code, name: o.name, sortOrder: o.sortOrder })) },
+    message: `Created option set "${name}" (${setId}, ${vt}) with ${optionObjs.length} option(s).`,
+  };
+}
+
+// ── manage_legend_sets: full lifecycle CRUD for DHIS2 legend sets ──
+//
+// A legend set owns an ordered list of colour bands (legends). Each legend is an
+// EMBEDDED child of the set (DHIS2 2.43 has no standalone /api/legends collection
+// — confirmed 404), so unlike option sets there are no separate child objects to
+// DELETE: bands are added/removed by re-importing the set's full legends[] array
+// via its :owner snapshot (mergeMode REPLACE drops any band left out), and a set
+// delete cascades its legends. Proven on the 2.43 playground BEFORE writing:
+// create (legends embedded), shrink-re-import deletes a dropped band, colour is
+// optional, and a set referenced by a dataElement/indicator/visualisation/map is
+// blocked from deletion. All shared helpers are reused with their existing
+// signatures — no shared code's behaviour is changed.
+
+const LEGEND_HEX_COLOR_RE = /^#?[0-9a-fA-F]{6}$/;
+
+// Canonicalize an optional band colour. Returns a "#RRGGBB" string, undefined
+// (no colour), or { _error } for a malformed value.
+function normalizeLegendColor(c) {
+  if (c === undefined || c === null || String(c).trim() === '') return undefined;
+  let s = String(c).trim();
+  if (!s.startsWith('#')) s = '#' + s;
+  if (!LEGEND_HEX_COLOR_RE.test(s)) return { _error: `Invalid color "${c}". Use a 6-digit hex like #FF0000.` };
+  return '#' + s.slice(1).toUpperCase();
+}
+
+// Validate + normalize an array of { name, startValue, endValue, color? } bands.
+// Returns { ok:true, legends:[…] } or { _error }. Band names must be unique so
+// remove_legends-by-name is unambiguous.
+function normalizeLegendInputs(rawList, label = 'legends') {
+  if (!Array.isArray(rawList) || rawList.length === 0) {
+    return { _error: `${label} must be a non-empty array of { name, startValue, endValue, color? } objects.` };
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length; i++) {
+    const l = rawList[i] || {};
+    const name = String(l.name ?? '').trim();
+    if (!name) return { _error: `${label}[${i}] is missing a name.` };
+    if (seen.has(name.toLowerCase())) return { _error: `${label} contains duplicate band name "${name}". Band names must be unique within a legend set.` };
+    seen.add(name.toLowerCase());
+    const sv = Number(l.startValue);
+    const ev = Number(l.endValue);
+    if (!Number.isFinite(sv)) return { _error: `${label}[${i}] ("${name}") has a non-numeric startValue.` };
+    if (!Number.isFinite(ev)) return { _error: `${label}[${i}] ("${name}") has a non-numeric endValue.` };
+    if (ev <= sv) return { _error: `${label}[${i}] ("${name}") must have endValue (${ev}) greater than startValue (${sv}).` };
+    const band = { name, startValue: sv, endValue: ev };
+    const col = normalizeLegendColor(l.color);
+    if (col && col._error) return col;
+    if (col) band.color = col;
+    out.push(band);
+  }
+  return { ok: true, legends: out };
+}
+
+// Non-blocking data-quality check: report any pair of bands whose half-open
+// [start,end) ranges overlap. DHIS2 itself accepts overlaps, so these are
+// surfaced as warnings only.
+function detectLegendOverlaps(legends) {
+  const sorted = legends.slice().sort((a, b) => a.startValue - b.startValue);
+  const warnings = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1], cur = sorted[i];
+    if (cur.startValue < prev.endValue) {
+      warnings.push(`Bands "${prev.name}" (${prev.startValue}–${prev.endValue}) and "${cur.name}" (${cur.startValue}–${cur.endValue}) overlap.`);
+    }
+  }
+  return warnings;
+}
+
+// Interpolate a red→amber→green ramp (low→high) for default auto-band colours.
+function legendRampColor(i, count) {
+  if (count <= 1) return '#FBC02D';
+  const t = i / (count - 1);
+  const stops = [[211, 47, 47], [251, 192, 45], [56, 142, 60]]; // red, amber, green
+  const seg = t * (stops.length - 1);
+  const k = Math.min(Math.floor(seg), stops.length - 2);
+  const f = seg - k;
+  const c = [0, 1, 2].map(j => Math.round(stops[k][j] + (stops[k + 1][j] - stops[k][j]) * f));
+  return '#' + c.map(v => v.toString(16).padStart(2, '0').toUpperCase()).join('');
+}
+
+// Generate count equal-width contiguous bands spanning start→end. Endpoints are
+// pinned exactly (first startValue = start, last endValue = end) so floating
+// point drift never leaves a gap. Returns { ok:true, legends } or { _error }.
+function buildLegendAutoBands(cfg) {
+  const start = Number(cfg.start);
+  const end = Number(cfg.end);
+  const count = Math.floor(Number(cfg.count));
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return { _error: 'auto_bands requires numeric start and end.' };
+  if (end <= start) return { _error: `auto_bands end (${cfg.end}) must be greater than start (${cfg.start}).` };
+  if (!Number.isFinite(count) || count < 1 || count > 50) return { _error: 'auto_bands count must be an integer between 1 and 50.' };
+  const names = Array.isArray(cfg.names) ? cfg.names : null;
+  if (names && names.length !== count) return { _error: `auto_bands.names has ${names.length} entries but count is ${count}.` };
+  const colors = Array.isArray(cfg.colors) ? cfg.colors : null;
+  if (colors && colors.length !== count) return { _error: `auto_bands.colors has ${colors.length} entries but count is ${count}.` };
+  const round = (x) => Math.round(x * 1e6) / 1e6;
+  const width = (end - start) / count;
+  const legends = [];
+  const seenNames = new Set();
+  for (let i = 0; i < count; i++) {
+    const sv = i === 0 ? start : round(start + i * width);
+    const ev = i === count - 1 ? end : round(start + (i + 1) * width);
+    const name = names ? String(names[i] ?? '').trim() : `${sv}–${ev}`;
+    if (!name) return { _error: `auto_bands.names[${i}] is empty.` };
+    if (seenNames.has(name.toLowerCase())) return { _error: `auto_bands.names contains duplicate "${name}". Band names must be unique.` };
+    seenNames.add(name.toLowerCase());
+    const band = { name, startValue: sv, endValue: ev };
+    let color;
+    if (colors) { const c = normalizeLegendColor(colors[i]); if (c && c._error) return c; color = c; }
+    else color = legendRampColor(i, count);
+    if (color) band.color = color;
+    legends.push(band);
+  }
+  return { ok: true, legends };
+}
+
+async function executeManageLegendSets(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create, add_legends, remove_legends, update, delete.' };
+  }
+  const lsId = args.legend_set_id || args.object_id;
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `legendSets?fields=id,displayName,code,legends~size&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `legendSets list failed: ${resp._error}` };
+    const legendSets = (resp.legendSets || []).map(o => ({
+      id: o.id,
+      name: o.displayName,
+      code: o.code || null,
+      legends: o.legends ?? 0,
+    }));
+    return { success: true, total: legendSets.length, pager_total: resp.pager?.total ?? null, legendSets };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    if (!lsId) return { _error: 'legend_set_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `legendSets/${lsId}?fields=id,displayName,code,legends[id,displayName,startValue,endValue,color]`
+    );
+    if (resp?._status === 404) return { _error: `legendSet with id "${lsId}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load legend set ${lsId}: ${resp._error}` };
+    const legends = (resp.legends || [])
+      .slice()
+      .sort((a, b) => (a.startValue ?? 0) - (b.startValue ?? 0))
+      .map(l => ({ id: l.id, name: l.displayName, startValue: l.startValue, endValue: l.endValue, color: l.color || null }));
+    const warnings = detectLegendOverlaps(legends);
+    return {
+      success: true,
+      id: resp.id,
+      name: resp.displayName,
+      code: resp.code,
+      legend_count: legends.length,
+      legends,
+      warnings: warnings.length ? warnings : undefined,
+    };
+  }
+
+  // ── create ────────────────────────────────────────────────────────────
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'create');
+    if (_gate) return _gate;
+    return await createLegendSet(args);
+  }
+
+  // ── add_legends ─────────────────────────────────────────────────────────
+  if (action === 'add_legends') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'add_legends', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for add_legends' };
+    const norm = normalizeLegendInputs(args.legends, 'legends');
+    if (norm._error) return norm;
+    const ownerResp = await safeDhis2Fetch(`legendSets/${lsId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `legendSet with id "${lsId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load legend set ${lsId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || lsId;
+
+    // Band names must be unique within the set.
+    const existingNames = new Set((ownerResp.legends || []).map(l => String(l.name || '').toLowerCase()));
+    const collide = norm.legends.filter(l => existingNames.has(l.name.toLowerCase())).map(l => l.name);
+    if (collide.length) return { _error: `These band names already exist in "${objName}": ${collide.join(', ')}.`, _hint: 'Band names must be unique within a legend set. Choose different names, or remove the existing bands first.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'add_legends', tool: 'manage_legend_sets', action: 'add_legends', reason: `Add ${norm.legends.length} band(s) to ${objName}` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const newBands = norm.legends.map(l => ({ id: generateDhis2Uid(), ...l }));
+    ownerResp.legends = [...(ownerResp.legends || []), ...newBands];
+    const result = await postMetadataPayload({ legendSets: [ownerResp] }, false);
+    if (!result.success) return { _error: result._error || 'add_legends failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    const warnings = detectLegendOverlaps(ownerResp.legends.map(l => ({ name: l.name, startValue: Number(l.startValue), endValue: Number(l.endValue) })));
+    return {
+      success: true,
+      action: 'add_legends',
+      legend_set_id: lsId,
+      legend_set_name: objName,
+      added: newBands.map(l => ({ id: l.id, name: l.name, startValue: l.startValue, endValue: l.endValue, color: l.color || null })),
+      warnings: warnings.length ? warnings : undefined,
+      backup: backup.block,
+    };
+  }
+
+  // ── remove_legends ───────────────────────────────────────────────────────
+  if (action === 'remove_legends') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'remove_legends', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for remove_legends' };
+    const byId = Array.isArray(args.legend_ids) && args.legend_ids.length > 0;
+    const byName = Array.isArray(args.legend_names) && args.legend_names.length > 0;
+    if (!byId && !byName) return { _error: 'Provide legend_names[] or legend_ids[] for remove_legends.' };
+    const ownerResp = await safeDhis2Fetch(`legendSets/${lsId}?fields=:owner`);
+    if (ownerResp?._status === 404) return { _error: `legendSet with id "${lsId}" does not exist (404).` };
+    if (ownerResp?._error) return { _error: `Could not load legend set ${lsId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || lsId;
+    const setLegends = ownerResp.legends || [];
+    const targetIds = new Set();
+    const notFound = [];
+    if (byId) {
+      const idSet = new Set(setLegends.map(l => l.id));
+      for (const id of args.legend_ids) { if (idSet.has(id)) targetIds.add(id); else notFound.push(id); }
+    } else {
+      const nameToId = new Map(setLegends.map(l => [String(l.name || '').toLowerCase(), l.id]));
+      for (const n of args.legend_names) { const id = nameToId.get(String(n).toLowerCase()); if (id) targetIds.add(id); else notFound.push(n); }
+    }
+    if (notFound.length) return { _error: `These ${byId ? 'band ids' : 'band names'} are not in "${objName}": ${notFound.join(', ')}.`, _hint: 'Use action=get to list the set\'s current bands.' };
+    if (targetIds.size >= setLegends.length) return { _error: `Refusing to remove ALL ${setLegends.length} band(s) from "${objName}" — that would leave an empty legend set.`, _hint: 'Keep at least one band, or delete the whole set with action=delete.' };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'remove_legends', tool: 'manage_legend_sets', action: 'remove_legends', reason: `Remove ${targetIds.size} band(s) from ${objName}` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const removed = setLegends.filter(l => targetIds.has(l.id)).map(l => ({ id: l.id, name: l.name }));
+    ownerResp.legends = setLegends.filter(l => !targetIds.has(l.id));
+    const result = await postMetadataPayload({ legendSets: [ownerResp] }, false);
+    if (!result.success) return { _error: result._error || 'remove_legends failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'remove_legends', legend_set_id: lsId, legend_set_name: objName, removed_count: removed.length, removed, backup: backup.block };
+  }
+
+  // ── update (own fields only) ────────────────────────────────────────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'update', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for update' };
+    const ls = args.legend_set;
+    if (!ls || typeof ls !== 'object') {
+      return { _error: 'legend_set object required for update', _hint: 'Pass legend_set:{ name?, code? }. To change the bands use add_legends / remove_legends.' };
+    }
+    const exists = await verifyTargetExists('legendSets', lsId, 'manage_legend_sets', 'update', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const ownerResp = await safeDhis2Fetch(`legendSets/${lsId}?fields=:owner`);
+    if (ownerResp?._error) return { _error: `Could not load legend set ${lsId}: ${ownerResp._error}` };
+    const objName = ownerResp.name || ownerResp.displayName || lsId;
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update_legend_set', tool: 'manage_legend_sets', action: 'update', reason: `Update legend set ${objName}` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const applied = {};
+    if (ls.name !== undefined) { ownerResp.name = ls.name; applied.name = ls.name; }
+    if (ls.code !== undefined) { ownerResp.code = ls.code; applied.code = ls.code; }
+    if (Object.keys(applied).length === 0) {
+      return { _error: 'legend_set supplied no recognized own-fields to update.', _hint: 'Recognized: name, code. For bands use add_legends / remove_legends.', backup: backup.block };
+    }
+    const putResp = await safeDhis2Fetch(`legendSets/${lsId}`, { method: 'PUT', body: ownerResp });
+    if (putResp?._error) return { _error: `Failed to update legend set: ${putResp._error}`, backup: backup.block };
+    return { success: true, action: 'update', legend_set_id: lsId, legend_set_name: objName, applied, backup: backup.block };
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_legend_sets', 'delete', { legend_set_id: lsId });
+    if (_gate) return _gate;
+    if (!lsId) return { _error: 'legend_set_id required for delete' };
+    const exists = await verifyTargetExists('legendSets', lsId, 'manage_legend_sets', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const objName = exists.data?.displayName || lsId;
+
+    // legendSets IS mapped in checkMetadataReferences (data elements / indicators /
+    // visualisations / maps that use it). If anything references it, refuse with
+    // the exact blockers — the legend set must be detached before deletion.
+    const refsResult = await checkMetadataReferences('legendSets', lsId);
+    if (refsResult.has_references) {
+      return {
+        _error: `Cannot delete legend set "${objName}" — it is still in use.`,
+        references: refsResult.references,
+        _hint: buildDeletionHint('legendSets', lsId, refsResult.references),
+      };
+    }
+
+    // Legends are embedded children and cascade with the set, so a single
+    // legendSet snapshot (:owner includes legends) fully restores on undo.
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_legend_set', tool: 'manage_legend_sets', action: 'delete', reason: `Deleting legend set ${objName} (${lsId})` },
+      [{ object_type: 'legendSets', object_id: lsId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+      method: 'POST',
+      body: { legendSets: [{ id: lsId }] },
+    });
+    if (delResp?._error) return { _error: `Legend set deletion failed: ${delResp._error}`, backup: backup.block };
+
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return {
+        success: true,
+        deleted: { type: 'legendSets', id: lsId, name: objName },
+        message: `Successfully deleted legend set "${objName}" and its bands.`,
+        backup: backup.block,
+      };
+    }
+    const blockingMsgs = [];
+    for (const tr of (delResp?.response?.typeReports || delResp?.typeReports || [])) {
+      for (const or of (tr.objectReports || [])) {
+        for (const er of (or.errorReports || [])) { if (er.message) blockingMsgs.push(er.message); }
+      }
+    }
+    return {
+      _error: `Legend set "${objName}" was not deleted${blockingMsgs.length ? ': ' + blockingMsgs.join('; ') : ' (deleted count 0).'}`,
+      _hint: 'It may still be referenced by a data element, indicator, visualisation or map. Detach those first, then retry.',
+      backup: backup.block,
+    };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_legend_sets.`,
+    _hint: 'One of: list, get, create, add_legends, remove_legends, update, delete.',
+  };
+}
+
+async function createLegendSet(args) {
+  const ls = args.legend_set;
+  if (!ls || typeof ls !== 'object') {
+    return { _error: 'legend_set object required for create', _hint: 'Pass legend_set:{ name, legends:[{name,startValue,endValue,color?},…] } OR legend_set:{ name } with auto_bands:{ start, end, count }.' };
+  }
+  if (!ls.name || !String(ls.name).trim()) return { _error: 'legend_set.name is required.' };
+
+  let legends;
+  if (args.auto_bands && typeof args.auto_bands === 'object') {
+    const gen = buildLegendAutoBands(args.auto_bands);
+    if (gen._error) return gen;
+    legends = gen.legends;
+  } else {
+    const norm = normalizeLegendInputs(ls.legends, 'legend_set.legends');
+    if (norm._error) return norm;
+    legends = norm.legends;
+  }
+
+  const setId = generateDhis2Uid();
+  const name = String(ls.name).trim();
+  const legendObjs = legends.map(l => ({ id: generateDhis2Uid(), ...l }));
+  const setObj = { id: setId, name, legends: legendObjs };
+  if (ls.code) setObj.code = String(ls.code).trim();
+  const warnings = detectLegendOverlaps(legends);
+
+  const result = await postMetadataPayload({ legendSets: [setObj] }, !!args.dry_run_only);
+  if (!result.success) {
+    return { _error: result._error || 'Legend set create failed.', phase: result.phase, errors: result.errors };
+  }
+  if (args.dry_run_only) {
+    return { success: true, dry_run: true, message: `Validation passed for "${name}". No legend set created (dry_run_only=true).`, would_create: { id: setId, name, legend_count: legendObjs.length }, warnings: warnings.length ? warnings : undefined };
+  }
+  return {
+    success: true,
+    action: 'create',
+    legend_set_id: setId,
+    legend_set: { id: setId, name, code: setObj.code, legends: legendObjs.map(l => ({ id: l.id, name: l.name, startValue: l.startValue, endValue: l.endValue, color: l.color || null })) },
+    message: `Created legend set "${name}" (${setId}) with ${legendObjs.length} band(s).`,
+    warnings: warnings.length ? warnings : undefined,
+  };
+}
+
+// ── manage_dashboards: build + inspect DHIS2 analytics dashboards & visualizations ──
+//
+// CRITICAL structural facts, proven on the 2.43 playground BEFORE writing this
+// (VALIDATE+COMMIT, read-back, render-check) so the chatbot can never ship a
+// silently-empty chart:
+//  • A visualization's LAYOUT is stored as columnDimensions / rowDimensions /
+//    filterDimensions (lists of dimension ids like "dx"/"pe"/"ou"). The
+//    columns/rows/filters item arrays are DERIVED read-only views — POSTing
+//    them does NOTHING (they import back as []), so a naive raw /metadata POST
+//    that only sets columns/rows/filters yields an empty, un-renderable chart.
+//  • The dx data is carried by dataDimensionItems (typed: INDICATOR /
+//    DATA_ELEMENT / PROGRAM_INDICATOR). pe is carried by relativePeriods
+//    (boolean flags) + periods (fixed ISO). ou is carried by organisationUnits
+//    (UID list) + organisationUnitLevels (PLAIN INTEGER list — [2], not
+//    [{level:2}]) + userOrganisationUnit / userOrganisationUnitChildren flags.
+//  • A dashboard's tiles are dashboardItems[{ type, visualization|map|text,
+//    x,y,width,height }]; the 58-column grid is auto-packed here.
+// All shared helpers (generateDhis2Uid, postMetadataPayload, safeDhis2Fetch,
+// requireWriteAuth) are reused with their existing signatures — no shared
+// code's behaviour changes.
+
+// DHIS2 minor version as a number (e.g. 42), or null if unknown. dhis2.apiVersion
+// is set to info.version.split('.')[1] on connect, so it is already the minor.
+function getDhis2MinorVersion() {
+  const v = parseInt(dhis2.apiVersion, 10);
+  return Number.isFinite(v) ? v : null;
+}
+
+// Locate an existing analytics favorite (chart / pivot) regardless of DHIS2
+// version. 2.34+ unifies them under `visualizations`; older servers split them
+// into `charts` and `reportTables`. Probing modern→legacy means one round-trip
+// on current servers and graceful fall-through on old ones. Returns the
+// dashboardItem type + property to use, or {_notFound}/{_error}.
+async function resolveAnalyticsFavorite(id) {
+  const candidates = [
+    { resource: 'visualizations', itemType: 'VISUALIZATION', prop: 'visualization' },
+    { resource: 'charts', itemType: 'CHART', prop: 'chart' },
+    { resource: 'reportTables', itemType: 'REPORT_TABLE', prop: 'reportTable' },
+  ];
+  for (const c of candidates) {
+    const r = await safeDhis2Fetch(`${c.resource}/${id}?fields=id,displayName`);
+    if (r && !r._error) return { ...c, displayName: r.displayName || null };
+    // A non-404 error (403 sharing, 500) is a real problem — surface it rather
+    // than masking it as "not found". A 404 just means "try the next candidate".
+    if (r && r._status && r._status !== 404) {
+      return { _error: `could not verify analytics favorite ${id}: ${r._error}` };
+    }
+  }
+  return { _notFound: true };
+}
+
+const VIZ_TYPES = new Set([
+  'COLUMN', 'STACKED_COLUMN', 'BAR', 'STACKED_BAR', 'LINE', 'AREA', 'STACKED_AREA',
+  'PIE', 'RADAR', 'GAUGE', 'SINGLE_VALUE', 'PIVOT_TABLE', 'YEAR_OVER_YEAR_LINE',
+  'YEAR_OVER_YEAR_COLUMN', 'SCATTER', 'BUBBLE',
+]);
+
+// Relative-period keyword → relativePeriods flag (DHIS2 camelCase).
+const VIZ_REL_PERIOD_FLAG = Object.freeze({
+  THIS_DAY: 'thisDay', YESTERDAY: 'yesterday', LAST_3_DAYS: 'last3Days', LAST_7_DAYS: 'last7Days',
+  LAST_14_DAYS: 'last14Days', LAST_30_DAYS: 'last30Days', LAST_60_DAYS: 'last60Days',
+  LAST_90_DAYS: 'last90Days', LAST_180_DAYS: 'last180Days',
+  THIS_WEEK: 'thisWeek', LAST_WEEK: 'lastWeek', THIS_BIWEEK: 'thisBiWeek', LAST_BIWEEK: 'lastBiWeek',
+  LAST_4_WEEKS: 'last4Weeks', LAST_4_BIWEEKS: 'last4BiWeeks', LAST_12_WEEKS: 'last12Weeks', LAST_52_WEEKS: 'last52Weeks',
+  WEEKS_THIS_YEAR: 'weeksThisYear',
+  THIS_MONTH: 'thisMonth', LAST_MONTH: 'lastMonth', LAST_3_MONTHS: 'last3Months', LAST_6_MONTHS: 'last6Months',
+  LAST_12_MONTHS: 'last12Months', MONTHS_THIS_YEAR: 'monthsThisYear', MONTHS_LAST_YEAR: 'monthsLastYear',
+  THIS_BIMONTH: 'thisBimonth', LAST_BIMONTH: 'lastBimonth', LAST_6_BIMONTHS: 'last6BiMonths', BIMONTHS_THIS_YEAR: 'biMonthsThisYear',
+  THIS_QUARTER: 'thisQuarter', LAST_QUARTER: 'lastQuarter', LAST_4_QUARTERS: 'last4Quarters',
+  QUARTERS_THIS_YEAR: 'quartersThisYear', QUARTERS_LAST_YEAR: 'quartersLastYear',
+  THIS_SIX_MONTH: 'thisSixMonth', LAST_SIX_MONTH: 'lastSixMonth', LAST_2_SIXMONTHS: 'last2SixMonths',
+  THIS_YEAR: 'thisYear', LAST_YEAR: 'lastYear', LAST_5_YEARS: 'last5Years', LAST_10_YEARS: 'last10Years',
+  THIS_FINANCIAL_YEAR: 'thisFinancialYear', LAST_FINANCIAL_YEAR: 'lastFinancialYear',
+  LAST_5_FINANCIAL_YEARS: 'last5FinancialYears', LAST_10_FINANCIAL_YEARS: 'last10FinancialYears',
+});
+const VIZ_REL_OU = Object.freeze({
+  USER_ORGUNIT: 'userOrganisationUnit',
+  USER_ORGUNIT_CHILDREN: 'userOrganisationUnitChildren',
+  USER_ORGUNIT_GRANDCHILDREN: 'userOrganisationUnitGrandChildren',
+});
+const VIZ_DDI_KEY = Object.freeze({
+  INDICATOR: 'indicator', DATA_ELEMENT: 'dataElement', PROGRAM_INDICATOR: 'programIndicator',
+});
+
+// Default dx/pe/ou placement per visualization type.
+function vizDefaultLayout(type) {
+  switch (type) {
+    case 'PIVOT_TABLE':
+      return { columns: ['pe'], rows: ['dx'], filters: ['ou'] };
+    case 'SINGLE_VALUE':
+    case 'GAUGE':
+    case 'PIE':
+    case 'RADAR':
+      return { columns: ['dx'], rows: [], filters: ['pe', 'ou'] };
+    default: // COLUMN / BAR / LINE / AREA family
+      return { columns: ['dx'], rows: ['pe'], filters: ['ou'] };
+  }
+}
+
+// Resolve each data-item UID to its DHIS2 type AND verify it exists. Looks the
+// UIDs up across indicators / dataElements / programIndicators in parallel.
+// Returns { typeMap, unresolved:[…] }. Any UID found in none is unresolved.
+async function resolveDataItemTypes(uids) {
+  const list = [...new Set((uids || []).map(u => String(u).trim()).filter(Boolean))];
+  const typeMap = {};
+  if (!list.length) return { typeMap, unresolved: [] };
+  const inFilter = `id:in:[${list.join(',')}]`;
+  const [indResp, deResp, piResp] = await Promise.all([
+    safeDhis2Fetch(`indicators.json?filter=${inFilter}&fields=id&paging=false`),
+    safeDhis2Fetch(`dataElements.json?filter=${inFilter}&fields=id&paging=false`),
+    safeDhis2Fetch(`programIndicators.json?filter=${inFilter}&fields=id&paging=false`),
+  ]);
+  for (const o of (indResp?.indicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'INDICATOR';
+  for (const o of (deResp?.dataElements || [])) if (!typeMap[o.id]) typeMap[o.id] = 'DATA_ELEMENT';
+  for (const o of (piResp?.programIndicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'PROGRAM_INDICATOR';
+  const unresolved = list.filter(u => !typeMap[u]);
+  return { typeMap, unresolved };
+}
+
+// Build a complete, render-correct visualization object from a friendly spec.
+// typeMap must already contain a resolved type for every data_items UID.
+// Returns { ok:true, id, viz } or { _error }. Pure/synchronous.
+function buildVisualizationObject(spec, typeMap) {
+  if (!spec || typeof spec !== 'object') return { _error: 'visualization spec object is required.' };
+  const type = String(spec.vis_type || spec.type || 'COLUMN').toUpperCase();
+  if (!VIZ_TYPES.has(type)) return { _error: `Unsupported vis_type "${type}". One of: ${[...VIZ_TYPES].join(', ')}.` };
+  const name = String(spec.name || '').trim();
+  if (!name) return { _error: 'visualization name is required.' };
+
+  const dataItems = (Array.isArray(spec.data_items) ? spec.data_items : []).map(u => String(u).trim()).filter(Boolean);
+  if (!dataItems.length) return { _error: 'data_items must list at least one indicator / data element / program indicator UID.' };
+  const periods = (Array.isArray(spec.periods) ? spec.periods : []).map(p => String(p).trim()).filter(Boolean);
+  if (!periods.length) return { _error: 'periods must list at least one period (relative keyword like LAST_12_MONTHS or fixed like 202401).' };
+  const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : []).map(o => String(o).trim()).filter(Boolean);
+  if (!orgUnits.length) return { _error: 'org_units must list at least one org-unit UID or relative keyword (USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2).' };
+
+  const id = spec.id || generateDhis2Uid();
+
+  // dx — typed dataDimensionItems (+ dimension presence)
+  const dataDimensionItems = [];
+  const seenDx = new Set();
+  for (const u of dataItems) {
+    if (seenDx.has(u)) continue;
+    seenDx.add(u);
+    const t = typeMap[u];
+    if (!t) return { _error: `Could not resolve data item "${u}" to a known type. Verify the UID with search_metadata.` };
+    const key = VIZ_DDI_KEY[t];
+    if (!key) return { _error: `Data item "${u}" has unsupported type ${t} for a visualization.` };
+    dataDimensionItems.push({ dataDimensionItemType: t, [key]: { id: u } });
+  }
+
+  // pe — relative flags + fixed periods
+  const relativePeriods = {};
+  const fixedPeriods = [];
+  let hasPe = false;
+  for (const p of periods) {
+    const flag = VIZ_REL_PERIOD_FLAG[p.toUpperCase()];
+    if (flag) { relativePeriods[flag] = true; hasPe = true; }
+    else { fixedPeriods.push({ id: p }); hasPe = true; } // fixed ISO period (e.g. 202401, 2025Q1, 2025)
+  }
+
+  // ou — fixed UIDs + relative keywords + levels
+  const organisationUnits = [];
+  const organisationUnitLevels = [];
+  let userOrganisationUnit = false, userOrganisationUnitChildren = false, userOrganisationUnitGrandChildren = false;
+  let hasOu = false;
+  for (const o of orgUnits) {
+    const up = o.toUpperCase();
+    if (VIZ_REL_OU[up]) {
+      if (up === 'USER_ORGUNIT') userOrganisationUnit = true;
+      else if (up === 'USER_ORGUNIT_CHILDREN') userOrganisationUnitChildren = true;
+      else userOrganisationUnitGrandChildren = true;
+      hasOu = true;
+    } else {
+      const m = up.match(/^LEVEL-(\d+)$/);
+      if (m) { const lvl = Number(m[1]); if (!organisationUnitLevels.includes(lvl)) organisationUnitLevels.push(lvl); hasOu = true; }
+      else { organisationUnits.push({ id: o }); hasOu = true; }
+    }
+  }
+
+  // Layout — store dimension lists; only include a dimension that has data.
+  const hasData = { dx: dataDimensionItems.length > 0, pe: hasPe, ou: hasOu };
+  const layoutSpec = spec.layout && typeof spec.layout === 'object' ? spec.layout : vizDefaultLayout(type);
+  const ALLOWED_DIMS = new Set(['dx', 'pe', 'ou']);
+  const axisDims = (dims) => (Array.isArray(dims) ? dims : [])
+    .map(d => String(d).toLowerCase())
+    .filter(d => ALLOWED_DIMS.has(d) && hasData[d]);
+  // Guarantee every present dimension is placed exactly once; if a custom
+  // layout omits one, fall back to the type default so no data is orphaned.
+  const placed = new Set([...axisDims(layoutSpec.columns), ...axisDims(layoutSpec.rows), ...axisDims(layoutSpec.filters)]);
+  const def = vizDefaultLayout(type);
+  const fallbackFilters = [];
+  for (const d of ['dx', 'pe', 'ou']) {
+    if (hasData[d] && !placed.has(d)) fallbackFilters.push(d);
+  }
+  const columnDimensions = axisDims(layoutSpec.columns);
+  const rowDimensions = axisDims(layoutSpec.rows);
+  const filterDimensions = [...axisDims(layoutSpec.filters), ...fallbackFilters];
+  // A visualization must have at least one column dimension to render.
+  if (!columnDimensions.length) {
+    const firstPresent = ['dx', 'pe', 'ou'].find(d => hasData[d]);
+    if (firstPresent) {
+      columnDimensions.push(firstPresent);
+      const fi = filterDimensions.indexOf(firstPresent);
+      if (fi >= 0) filterDimensions.splice(fi, 1);
+      const ri = rowDimensions.indexOf(firstPresent);
+      if (ri >= 0) rowDimensions.splice(ri, 1);
+    }
+  }
+
+  const viz = {
+    id, name, type,
+    dataDimensionItems,
+    columnDimensions, rowDimensions, filterDimensions,
+    organisationUnits,
+    organisationUnitLevels: organisationUnitLevels.slice(),
+    userOrganisationUnit, userOrganisationUnitChildren, userOrganisationUnitGrandChildren,
+    relativePeriods,
+    periods: fixedPeriods,
+  };
+  if (spec.short_name) viz.shortName = String(spec.short_name).slice(0, 50);
+  if (spec.description) viz.description = String(spec.description);
+  return { ok: true, id, viz };
+}
+
+// ── Thematic map authoring ──────────────────────────────────────────────────
+// DHIS2 has NO "create map" API object you can POST naively the way you might a
+// visualization; a map is a container with mapViews[] (layers). This builds a
+// single-layer THEMATIC (choropleth/bubble) map from a friendly spec and mirrors
+// the exact structure proven on play 2.43.0.1 (2026-07-03): the data item goes on
+// the mapView's `columns` dx dimension (typed dimensionItemType), the org units on
+// `rows` ou (LEVEL-n markers + parent UIDs) with organisationUnitLevels, and the
+// period on `filters` pe. Program is auto-attached for program-indicator/event
+// layers. Returns { ok, map } or { _error }.
+const MAP_THEMATIC_TYPES = new Set(['CHOROPLETH', 'BUBBLE']);
+function buildMapObject(spec, typeMap) {
+  if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
+  const name = String(spec.name || '').trim();
+  if (!name) return { _error: 'map name is required.' };
+  const item = String(spec.data_item || (Array.isArray(spec.data_items) ? spec.data_items[0] : '') || '').trim();
+  if (!item) return { _error: 'data_item (one indicator / data element / program indicator UID) is required for a thematic map.' };
+  const t = typeMap[item];
+  if (!t) return { _error: `Could not resolve data item "${item}" to a known type. Verify the UID with search_metadata.` };
+  const ddiKey = VIZ_DDI_KEY[t];
+  if (!ddiKey) return { _error: `Data item "${item}" has unsupported type ${t} for a map.` };
+
+  const period = String(spec.period || (Array.isArray(spec.periods) ? spec.periods[0] : '') || 'LAST_12_MONTHS').trim();
+  const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : (spec.org_units ? [spec.org_units] : [])).map(o => String(o).trim()).filter(Boolean);
+  const level = spec.org_unit_level != null ? Number(spec.org_unit_level) : null;
+
+  // ou dimension: LEVEL markers + parent UIDs + user-orgunit flags.
+  const ouItems = [];
+  const organisationUnits = [];
+  const organisationUnitLevels = [];
+  const ouFlags = {};
+  if (Number.isFinite(level) && level > 0) { organisationUnitLevels.push(level); ouItems.push({ id: `LEVEL-${level}` }); }
+  for (const o of orgUnits) {
+    const up = o.toUpperCase();
+    const m = up.match(/^LEVEL-(\d+)$/);
+    if (VIZ_REL_OU[up]) { ouFlags[VIZ_REL_OU[up]] = true; ouItems.push({ id: up }); }
+    else if (m) { const lvl = Number(m[1]); if (!organisationUnitLevels.includes(lvl)) organisationUnitLevels.push(lvl); ouItems.push({ id: up }); }
+    else { organisationUnits.push({ id: o }); ouItems.push({ id: o }); }
+  }
+  if (!ouItems.length) return { _error: 'A thematic map needs org units: pass org_unit_level (e.g. 2 for districts) and/or org_units (parent UIDs or USER_ORGUNIT).', _hint: 'Typical: org_unit_level:2 to shade every district, org_units:["<countryUid>"] as the boundary.' };
+  if (Number.isFinite(level) && level > 0 && !organisationUnits.length && !Object.keys(ouFlags).length) {
+    // A level with no parent boundary shades every OU at that level nationwide — allowed, but note it.
+  }
+
+  const thematicMapType = MAP_THEMATIC_TYPES.has(String(spec.thematic_map_type || '').toUpperCase())
+    ? String(spec.thematic_map_type).toUpperCase() : 'CHOROPLETH';
+  const mapViewId = generateDhis2Uid();
+  const mapView = {
+    id: mapViewId,
+    layer: 'thematic',
+    renderingStrategy: 'SINGLE',
+    thematicMapType,
+    classes: Number.isFinite(Number(spec.classes)) ? Number(spec.classes) : 5,
+    colorScale: spec.color_scale || 'YlOrRd',
+    aggregationType: spec.aggregation_type || 'DEFAULT',
+    opacity: spec.opacity != null ? Number(spec.opacity) : 0.9,
+    hideTitle: false,
+    columns: [{ dimension: 'dx', items: [{ id: item, dimensionItemType: t }] }],
+    rows: [{ dimension: 'ou', items: ouItems }],
+    filters: [{ dimension: 'pe', items: [{ id: period }] }],
+    organisationUnitSelectionMode: 'SELECTED',
+    organisationUnitLevels,
+    organisationUnits,
+    ...ouFlags,
+  };
+  if (spec.program_id) mapView.program = { id: spec.program_id };
+  // method 1 = predefined legend (legendSet); 2 = equal intervals (auto colours).
+  if (spec.legend_set_id) { mapView.legendSet = { id: spec.legend_set_id }; mapView.method = 1; }
+  else { mapView.method = 2; }
+
+  const map = {
+    id: spec.id || generateDhis2Uid(),
+    name,
+    basemap: spec.basemap || 'osmLight',
+    latitude: spec.latitude != null ? Number(spec.latitude) : 0,
+    longitude: spec.longitude != null ? Number(spec.longitude) : 0,
+    zoom: spec.zoom != null ? Number(spec.zoom) : 3,
+    mapViews: [mapView],
+  };
+  return { ok: true, map, needsProgram: t === 'PROGRAM_INDICATOR' && !spec.program_id, dataItemId: item };
+}
+
+// Resolve the owning program for a program-indicator data item (maps need it on
+// the layer). Returns the program UID or null.
+async function resolveProgramForProgramIndicator(piId) {
+  const resp = await safeDhis2Fetch(`programIndicators/${piId}?fields=program[id]`);
+  return resp?.program?.id || null;
+}
+
+async function executeManageMaps(args) {
+  const action = args.action;
+  if (!action) return { _error: 'action required', _hint: 'One of: list, get, create, delete.' };
+
+  if (action === 'list') {
+    const nameFilter = args.name_filter ? `&filter=name:ilike:${encodeURIComponent(args.name_filter)}` : '';
+    const limit = Math.max(1, Math.min(200, Number(args.limit) || 50));
+    const resp = await safeDhis2Fetch(`maps.json?fields=id,name,lastUpdated,mapViews[layer,thematicMapType]&order=lastUpdated:desc&pageSize=${limit}${nameFilter}`);
+    if (resp?._error) return resp;
+    return { maps: (resp.maps || []).map(m => ({ id: m.id, name: m.name, lastUpdated: m.lastUpdated, layers: (m.mapViews || []).length })), total: resp.pager?.total ?? (resp.maps || []).length };
+  }
+
+  if (action === 'get') {
+    const id = extractMapIdFromInput(args.map_id) || args.map_id;
+    if (!id) return { _error: 'map_id required for get.' };
+    const resp = await safeDhis2Fetch(`maps/${id}?fields=id,name,basemap,mapViews[id,layer,thematicMapType,columns[dimension,items[id,dimensionItemType]],organisationUnitLevels,program[id,name],legendSet[id,name]]`);
+    if (resp?._error) return resp;
+    return { map: resp };
+  }
+
+  if (action === 'create') {
+    const _gate = requireWriteAuth('manage_maps', 'create');
+    if (_gate) return _gate;
+    const spec = args.map || args;
+    // Resolve the data item's type (+ existence) exactly like create_visualization.
+    const itemId = String(spec.data_item || (Array.isArray(spec.data_items) ? spec.data_items[0] : '') || '').trim();
+    if (!itemId) return { _error: 'data_item (one indicator / data element / program indicator UID) is required.' };
+    const { typeMap, unresolved } = await resolveDataItemTypes([itemId]);
+    if (unresolved.length) return { _error: `Data item not found: ${unresolved.join(', ')}. Verify the UID with search_metadata / a prior tool result.`, _scope: 'unresolved_data_item' };
+    // Auto-attach program for a program-indicator layer.
+    if (typeMap[itemId] === 'PROGRAM_INDICATOR' && !spec.program_id) {
+      const pid = await resolveProgramForProgramIndicator(itemId);
+      if (pid) spec.program_id = pid;
+    }
+    const built = buildMapObject(spec, typeMap);
+    if (built._error) return built;
+    const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
+    if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
+    const newId = resp?.response?.uid || built.map.id;
+    return {
+      success: true,
+      map_id: newId,
+      name: built.map.name,
+      layer: 'thematic',
+      thematic_map_type: built.map.mapViews[0].thematicMapType,
+      data_item: itemId,
+      org_unit_levels: built.map.mapViews[0].organisationUnitLevels,
+      period: built.map.mapViews[0].filters[0].items[0].id,
+      legend_set: spec.legend_set_id || null,
+      _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]) — or reference it in a new dashboard's items.`,
+    };
+  }
+
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_maps', 'delete', { map_id: args.map_id });
+    if (_gate) return _gate;
+    const id = extractMapIdFromInput(args.map_id) || args.map_id;
+    if (!id) return { _error: 'map_id required for delete.' };
+    const _verify = await verifyTargetExists('maps', id, 'manage_maps', 'delete', 'id,name');
+    if (!_verify.exists) return _verify.refusal;
+    // Snapshot before delete so it can be restored.
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete_map', tool: 'manage_maps', action: 'delete', user_text: lastUserText },
+      [{ object_type: 'maps', object_id: id, role: 'primary' }], args);
+    if (!backup.ok) return backup.error;
+    const resp = await safeDhis2Fetch(`maps/${id}`, { method: 'DELETE' });
+    if (resp?._error) return { _error: `Map delete failed: ${resp._error}`, backup: backup.block };
+    return { success: true, deleted_map_id: id, backup: backup.block };
+  }
+
+  return { _error: `Unknown manage_maps action: ${action}`, _hint: 'One of: list, get, create, delete.' };
+}
+
+async function executeManageDashboards(args) {
+  const action = args?.action;
+  if (!action) {
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, remove_item, update, delete.' };
+  }
+
+  // ── list ──────────────────────────────────────────────────────────────
+  if (action === 'list') {
+    const filters = [];
+    if (args.name_filter) filters.push(`name:ilike:${encodeURIComponent(args.name_filter)}`);
+    const fp = filters.length ? `&${filters.map(f => `filter=${f}`).join('&')}` : '';
+    const pageSize = Math.max(1, Math.min(Number(args.limit) || 50, 200));
+    const resp = await safeDhis2Fetch(
+      `dashboards?fields=id,displayName,dashboardItems~size,access&pageSize=${pageSize}${fp}&order=displayName:iasc`
+    );
+    if (resp?._error) return { _error: `dashboards list failed: ${resp._error}` };
+    const dashboards = (resp.dashboards || []).map(d => ({
+      id: d.id,
+      name: d.displayName,
+      items: d.dashboardItems ?? 0,
+      canEdit: !!d.access?.update,
+    }));
+    return { success: true, total: dashboards.length, pager_total: resp.pager?.total ?? null, dashboards };
+  }
+
+  // ── get ───────────────────────────────────────────────────────────────
+  if (action === 'get') {
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for get' };
+    const resp = await safeDhis2Fetch(
+      `dashboards/${dId}?fields=id,displayName,description,` +
+      `dashboardItems[id,type,x,y,width,height,text,visualization[id,displayName,type],map[id,displayName]]`
+    );
+    if (resp?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (resp?._error) return { _error: `Could not load dashboard ${dId}: ${resp._error}` };
+    const items = (resp.dashboardItems || []).map(it => ({
+      id: it.id,
+      type: it.type,
+      visualization: it.visualization ? { id: it.visualization.id, name: it.visualization.displayName, type: it.visualization.type } : undefined,
+      map: it.map ? { id: it.map.id, name: it.map.displayName } : undefined,
+      text: it.text || undefined,
+      layout: { x: it.x, y: it.y, width: it.width, height: it.height },
+    }));
+    return { success: true, id: resp.id, name: resp.displayName, description: resp.description || null, item_count: items.length, items };
+  }
+
+  // ── create_visualization ────────────────────────────────────────────────
+  if (action === 'create_visualization') {
+    const _gate = requireWriteAuth('manage_dashboards', 'create_visualization');
+    if (_gate) return _gate;
+    const spec = args.visualization;
+    if (!spec || typeof spec !== 'object') {
+      return { _error: 'visualization object required for create_visualization', _hint: 'Pass visualization:{ name, vis_type, data_items:[…], periods:[…], org_units:[…] }.' };
+    }
+    const { typeMap, unresolved } = await resolveDataItemTypes(spec.data_items);
+    if (unresolved.length) {
+      return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${unresolved.join(', ')}.`, _hint: 'Resolve the correct UIDs with search_metadata first; never invent UIDs.' };
+    }
+    const built = buildVisualizationObject(spec, typeMap);
+    if (built._error) return built;
+    const result = await postMetadataPayload({ visualizations: [built.viz] }, !!args.dry_run_only);
+    if (!result.success) return { _error: result._error || 'Visualization create failed.', phase: result.phase, errors: result.errors };
+    if (args.dry_run_only) {
+      return { success: true, dry_run: true, message: `Validation passed for "${built.viz.name}". No visualization created (dry_run_only=true).`, would_create: { id: built.id, name: built.viz.name, type: built.viz.type } };
+    }
+    return {
+      success: true,
+      action: 'create_visualization',
+      // Top-level *_id mirrors manage_indicators' `indicator_id` convention so a
+      // multi-step caller can chain this UID into the next tool without digging
+      // into the nested object. The nested `visualization` object is preserved.
+      visualization_id: built.id,
+      visualization: { id: built.id, name: built.viz.name, type: built.viz.type, data_items: built.viz.dataDimensionItems.length },
+      message: `Created ${built.viz.type} visualization "${built.viz.name}" (${built.id}).`,
+    };
+  }
+
+  // ── create_dashboard ──────────────────────────────────────────────────
+  if (action === 'create_dashboard') {
+    const _gate = requireWriteAuth('manage_dashboards', 'create_dashboard');
+    if (_gate) return _gate;
+    const dash = args.dashboard;
+    if (!dash || typeof dash !== 'object' || !String(dash.name || '').trim()) {
+      return { _error: 'dashboard:{ name } is required for create_dashboard.' };
+    }
+    const items = Array.isArray(args.items) ? args.items : [];
+    if (!items.length) {
+      return { _error: 'items must list at least one dashboard item (existing visualization/map UID, inline new_visualization, or text).' };
+    }
+
+    // First pass: collect every data_items UID across all inline visualizations
+    // so we resolve their types in ONE batched lookup.
+    const inlineSpecs = [];
+    const allDataItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      if (it.new_visualization && typeof it.new_visualization === 'object') {
+        inlineSpecs.push({ index: i, spec: it.new_visualization });
+        for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
+      }
+    }
+    let typeMap = {};
+    if (allDataItems.length) {
+      const res = await resolveDataItemTypes(allDataItems);
+      if (res.unresolved.length) {
+        return { _error: `These data_items UIDs (across the dashboard's new visualizations) do not exist: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
+      }
+      typeMap = res.typeMap;
+    }
+
+    // Build inline visualizations.
+    const newVisualizations = [];
+    const inlineVizIdByIndex = {};
+    for (const { index, spec } of inlineSpecs) {
+      const built = buildVisualizationObject(spec, typeMap);
+      if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
+      newVisualizations.push(built.viz);
+      inlineVizIdByIndex[index] = built.id;
+    }
+
+    // Assemble dashboardItems with auto grid-packing (58-col grid, default
+    // 29×20 tiles, 2 per row) unless explicit x/y/width/height are given.
+    const GRID_W = 58, DEF_W = 29, DEF_H = 20;
+    let cursorX = 0, cursorY = 0, rowH = 0;
+    const dashboardItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
+      const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
+      let x, y;
+      if (Number.isFinite(Number(it.x)) && Number.isFinite(Number(it.y))) {
+        x = Number(it.x); y = Number(it.y);
+      } else {
+        if (cursorX + w > GRID_W) { cursorX = 0; cursorY += rowH; rowH = 0; }
+        x = cursorX; y = cursorY;
+        cursorX += w; rowH = Math.max(rowH, h);
+      }
+      const di = { id: generateDhis2Uid(), type: itType, x, y, width: w, height: h };
+      if (itType === 'VISUALIZATION') {
+        const vizId = inlineVizIdByIndex[i] || it.visualization_id;
+        if (!vizId) return { _error: `Item ${i + 1} is a VISUALIZATION but has neither new_visualization nor visualization_id.` };
+        di.visualization = { id: vizId };
+      } else if (itType === 'MAP') {
+        if (!it.map_id) return { _error: `Item ${i + 1} is a MAP but has no map_id.` };
+        di.map = { id: it.map_id };
+      } else if (itType === 'TEXT') {
+        di.text = String(it.text || '');
+      } else {
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT.` };
+      }
+      dashboardItems.push(di);
+    }
+
+    // Verify referenced (existing) visualizations and maps exist, so a bad UID
+    // fails clearly instead of importing a dashboard with a dangling tile.
+    const refVizIds = [...new Set(items
+      .map((it, i) => (String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase() === 'VISUALIZATION' && !inlineVizIdByIndex[i]) ? it.visualization_id : null)
+      .filter(Boolean))];
+    if (refVizIds.length) {
+      const vr = await safeDhis2Fetch(`visualizations.json?filter=id:in:[${refVizIds.join(',')}]&fields=id&paging=false`);
+      const found = new Set((vr?.visualizations || []).map(o => o.id));
+      const missing = refVizIds.filter(id => !found.has(id));
+      if (missing.length) return { _error: `These referenced visualization UIDs do not exist: ${missing.join(', ')}.`, _hint: 'Create them first (new_visualization) or fix the UIDs via search_metadata / list.' };
+    }
+    const refMapIds = [...new Set(items.filter(it => String(it.type || '').toUpperCase() === 'MAP').map(it => it.map_id).filter(Boolean))];
+    if (refMapIds.length) {
+      const mr = await safeDhis2Fetch(`maps.json?filter=id:in:[${refMapIds.join(',')}]&fields=id&paging=false`);
+      const foundM = new Set((mr?.maps || []).map(o => o.id));
+      const missingM = refMapIds.filter(id => !foundM.has(id));
+      if (missingM.length) return { _error: `These referenced map UIDs do not exist: ${missingM.join(', ')}.` };
+    }
+
+    const dashId = generateDhis2Uid();
+    const dashObj = { id: dashId, name: String(dash.name).trim(), dashboardItems };
+    if (dash.description) dashObj.description = String(dash.description);
+
+    const payload = {};
+    if (newVisualizations.length) payload.visualizations = newVisualizations;
+    payload.dashboards = [dashObj];
+
+    const result = await postMetadataPayload(payload, !!args.dry_run_only);
+    if (!result.success) return { _error: result._error || 'Dashboard create failed.', phase: result.phase, errors: result.errors };
+    if (args.dry_run_only) {
+      return {
+        success: true, dry_run: true,
+        message: `Validation passed for dashboard "${dashObj.name}" (${dashboardItems.length} item(s), ${newVisualizations.length} new visualization(s)). Nothing created (dry_run_only=true).`,
+        would_create: { dashboard_id: dashId, name: dashObj.name, items: dashboardItems.length, new_visualizations: newVisualizations.length },
+      };
+    }
+    return {
+      success: true,
+      action: 'create_dashboard',
+      // Top-level dashboard_id mirrors the *_id convention so the final sharing
+      // step (manage_metadata update_sharing) can chain it directly. The nested
+      // `dashboard` object is preserved for any existing reader.
+      dashboard_id: dashId,
+      dashboard: { id: dashId, name: dashObj.name },
+      items: dashboardItems.length,
+      new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
+      message: `Created dashboard "${dashObj.name}" (${dashId}) with ${dashboardItems.length} item(s)${newVisualizations.length ? `, including ${newVisualizations.length} new visualization(s)` : ''}.`,
+    };
+  }
+
+  // ── add_items (SAFE, NON-DESTRUCTIVE append to an EXISTING dashboard) ──────
+  // This is the fix for "each time it added a chart, the whole dashboard went
+  // missing": we read the FULL current dashboard, append, and write the
+  // COMPLETE item set back (never a partial replace), snapshotting first so any
+  // slip is one manage_backups(restore) away.
+  if (action === 'add_items') {
+    const _gate = requireWriteAuth('manage_dashboards', 'add_items', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for add_items' };
+    const items = Array.isArray(args.items) ? args.items : [];
+    if (!items.length) {
+      return { _error: 'items[] required for add_items', _hint: 'Each item: { visualization_id } | { type:"MAP", map_id } | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.' };
+    }
+    // Read the FULL current object so every existing item is preserved on write.
+    const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
+    if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
+    const dashName = owner.name || owner.displayName || dId;
+    const existingItems = Array.isArray(owner.dashboardItems) ? owner.dashboardItems : [];
+
+    // Resolve inline new_visualizations (reuse the create builder + batched type lookup).
+    const inlineSpecs = [];
+    const allDataItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      if (it.new_visualization && typeof it.new_visualization === 'object') {
+        inlineSpecs.push({ index: i, spec: it.new_visualization });
+        for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
+      }
+    }
+    let typeMap = {};
+    if (allDataItems.length) {
+      const res = await resolveDataItemTypes(allDataItems);
+      if (res.unresolved.length) return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
+      typeMap = res.typeMap;
+    }
+    const newVisualizations = [];
+    const inlineVizIdByIndex = {};
+    for (const { index, spec } of inlineSpecs) {
+      const built = buildVisualizationObject(spec, typeMap);
+      if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
+      newVisualizations.push(built.viz);
+      inlineVizIdByIndex[index] = built.id;
+    }
+
+    // Build the NEW dashboardItems, grid-packed BELOW existing tiles (same
+    // 58-col / 29×20 convention as create_dashboard) so nothing overlaps.
+    const GRID_W = 58, DEF_W = 29, DEF_H = 20;
+    let startY = 0;
+    for (const it of existingItems) { const y = Number(it.y) || 0, h = Number(it.height) || 0; if (y + h > startY) startY = y + h; }
+    let cursorX = 0, cursorY = startY, rowH = 0;
+    const newItems = [];
+    const summary = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
+      const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
+      let x, y;
+      if (Number.isFinite(Number(it.x)) && Number.isFinite(Number(it.y))) { x = Number(it.x); y = Number(it.y); }
+      else { if (cursorX + w > GRID_W) { cursorX = 0; cursorY += rowH; rowH = 0; } x = cursorX; y = cursorY; cursorX += w; rowH = Math.max(rowH, h); }
+      const di = { id: generateDhis2Uid(), type: itType, x, y, width: w, height: h };
+      if (itType === 'VISUALIZATION' || itType === 'CHART' || itType === 'REPORT_TABLE') {
+        if (inlineVizIdByIndex[i] !== undefined) {
+          di.type = 'VISUALIZATION';
+          di.visualization = { id: inlineVizIdByIndex[i] };
+          summary.push({ item_id: di.id, type: 'VISUALIZATION', object_id: di.visualization.id, inline: true });
+        } else {
+          const vizId = it.visualization_id || it.id;
+          if (!vizId) return { _error: `Item ${i + 1} is a visualization but has neither new_visualization nor visualization_id.` };
+          // Cross-version: resolve the ACTUAL type (visualization on 2.34+,
+          // chart/reportTable on older) so we never add a dead tile.
+          const fav = await resolveAnalyticsFavorite(vizId);
+          if (fav._error) return { _error: `Item ${i + 1}: ${fav._error}` };
+          if (fav._notFound) return { _error: `Item ${i + 1}: visualization/chart/report-table "${vizId}" does not exist (404). Not adding it — that would create a broken dashboard tile.`, _hint: 'Confirm the UID (search_metadata / action=list) or inline-create it with new_visualization.' };
+          di.type = fav.itemType;
+          di[fav.prop] = { id: vizId };
+          summary.push({ item_id: di.id, type: fav.itemType, object_id: vizId, object_name: fav.displayName || null });
+        }
+      } else if (itType === 'MAP') {
+        const mapId = it.map_id || it.id;
+        if (!mapId) return { _error: `Item ${i + 1} is a MAP but has no map_id.` };
+        const mr = await safeDhis2Fetch(`maps/${mapId}?fields=id,displayName`);
+        if (mr?._status === 404) return { _error: `Item ${i + 1}: map "${mapId}" does not exist (404). Not adding a broken tile.` };
+        if (mr?._error) return { _error: `Item ${i + 1}: could not verify map ${mapId}: ${mr._error}` };
+        di.map = { id: mapId };
+        summary.push({ item_id: di.id, type: 'MAP', object_id: mapId, object_name: mr.displayName || null });
+      } else if (itType === 'TEXT') {
+        di.text = String(it.text || '');
+        summary.push({ item_id: di.id, type: 'TEXT' });
+      } else {
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT (or new_visualization).` };
+      }
+      newItems.push(di);
+    }
+
+    // Snapshot BEFORE the write (mandatory unless the user waived it).
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'manage_dashboards', action: 'add_items', reason: `Append ${newItems.length} item(s) to dashboard ${dashName}` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+
+    owner.dashboardItems = [...existingItems, ...newItems];
+    const payload = {};
+    if (newVisualizations.length) payload.visualizations = newVisualizations;
+    payload.dashboards = [owner];
+    const result = await postMetadataPayload(payload, false);
+    if (!result.success) return { _error: result._error || 'add_items failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+
+    const verify = await safeDhis2Fetch(`dashboards/${dId}?fields=dashboardItems~size`);
+    const after = verify && !verify._error ? (verify.dashboardItems ?? null) : null;
+    return {
+      success: true,
+      action: 'add_items',
+      dashboard_id: dId,
+      dashboard_name: dashName,
+      items_before: existingItems.length,
+      items_added: newItems.length,
+      items_after: after,
+      new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
+      added: summary,
+      backup: backup.block,
+      _note: (after !== null && after !== existingItems.length + newItems.length)
+        ? `Warning: expected ${existingItems.length + newItems.length} items but server reports ${after}. Verify with action=get.`
+        : undefined,
+    };
+  }
+
+  // ── remove_item (drop one tile; preserves the rest; snapshots first) ──────
+  if (action === 'remove_item') {
+    const _gate = requireWriteAuth('manage_dashboards', 'remove_item', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for remove_item' };
+    if (!args.item_id) return { _error: 'item_id required for remove_item', _hint: 'Call action=get first to see each item id.' };
+    const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
+    if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
+    const dashName = owner.name || owner.displayName || dId;
+    const existingItems = Array.isArray(owner.dashboardItems) ? owner.dashboardItems : [];
+    if (!existingItems.some(it => it.id === args.item_id)) {
+      return { _error: `Dashboard "${dashName}" has no item with id "${args.item_id}".`, _hint: 'Use action=get to list current item ids.' };
+    }
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'manage_dashboards', action: 'remove_item', reason: `Remove item ${args.item_id} from dashboard ${dashName}` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    owner.dashboardItems = existingItems.filter(it => it.id !== args.item_id);
+    const result = await postMetadataPayload({ dashboards: [owner] }, false);
+    if (!result.success) return { _error: result._error || 'remove_item failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'remove_item', dashboard_id: dId, dashboard_name: dashName, removed_item_id: args.item_id, items_after: owner.dashboardItems.length, backup: backup.block };
+  }
+
+  // ── update (own fields only: name / description; snapshots first) ──────────
+  if (action === 'update') {
+    const _gate = requireWriteAuth('manage_dashboards', 'update', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for update' };
+    const d = args.dashboard;
+    if (!d || typeof d !== 'object') return { _error: 'dashboard object required for update', _hint: 'Pass dashboard:{ name?, description? }. To add/remove tiles use add_items / remove_item.' };
+    const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
+    if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
+    const dashName = owner.name || owner.displayName || dId;
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'manage_dashboards', action: 'update', reason: `Update dashboard ${dashName}` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    const applied = {};
+    if (d.name !== undefined) { owner.name = String(d.name); applied.name = owner.name; }
+    if (d.description !== undefined) { owner.description = String(d.description); applied.description = owner.description; }
+    if (Object.keys(applied).length === 0) return { _error: 'dashboard supplied no recognized own-fields to update.', _hint: 'Recognized: name, description. For tiles use add_items / remove_item.', backup: backup.block };
+    const result = await postMetadataPayload({ dashboards: [owner] }, false);
+    if (!result.success) return { _error: result._error || 'update failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    return { success: true, action: 'update', dashboard_id: dId, dashboard_name: dashName, applied, backup: backup.block };
+  }
+
+  // ── delete (whole dashboard; snapshots first — fully restorable) ───────────
+  if (action === 'delete') {
+    const _gate = requireWriteAuth('manage_dashboards', 'delete', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for delete' };
+    const exists = await verifyTargetExists('dashboards', dId, 'manage_dashboards', 'delete', 'id,displayName');
+    if (!exists.exists) return exists.refusal;
+    const dashName = exists.data?.displayName || dId;
+    const backup = await ensureBackupOrBail(
+      { operation: 'delete', tool: 'manage_dashboards', action: 'delete', reason: `Deleting dashboard ${dashName} (${dId})` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', { method: 'POST', body: { dashboards: [{ id: dId }] } });
+    if (delResp?._error) return { _error: `Dashboard deletion failed: ${delResp._error}`, backup: backup.block };
+    const stats = delResp?.response?.stats || delResp?.stats || {};
+    if ((stats.deleted || 0) >= 1) {
+      return { success: true, deleted: { type: 'dashboards', id: dId, name: dashName }, message: `Deleted dashboard "${dashName}". Restore with manage_backups(action="restore", backup_key="${backup.block?.key}").`, backup: backup.block };
+    }
+    return { _error: `Dashboard "${dashName}" was not deleted (deleted count 0).`, backup: backup.block };
+  }
+
+  return {
+    _error: `Unknown action "${action}" for manage_dashboards.`,
+    _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, remove_item, update, delete.',
+  };
 }
 
 // ── manage_datasets: full CRUD for DHIS2 dataSets (aggregate "programs") ──
@@ -11255,13 +14941,20 @@ function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames
     domainType,
     // Explicit value_type always wins. When absent, infer from the name so
     // numeric fields are not silently created as TEXT — but never infer when an
-    // option set is attached (those are code-valued, keep TEXT default).
-    valueType: de.value_type || (de.option_set ? 'TEXT' : inferValueType(de.name, 'TEXT')),
+    // option set is attached (those are code-valued, keep TEXT default). When an
+    // EXISTING option set is referenced, the DE valueType is AUTHORITATIVELY the
+    // set's own valueType (TEXT/MULTI_TEXT) — a mismatch would make the DE
+    // unusable, so the referenced set wins over any inferred/passed value_type.
+    valueType: de._optionSetRef
+      ? (de._optionSetRef.valueType || 'TEXT')
+      : (de.value_type || (de.option_set ? 'TEXT' : inferValueType(de.name, 'TEXT'))),
     aggregationType,
     categoryCombo: { id: ccId },
   };
   if (de.option_set && optionSetUidMap[de.option_set.name]) {
     elem.optionSet = { id: optionSetUidMap[de.option_set.name] };
+  } else if (de._optionSetRef && de._optionSetRef.id) {
+    elem.optionSet = { id: de._optionSetRef.id };
   }
   if (de.code && typeof de.code === 'string' && de.code.trim()) {
     elem.code = de.code.trim();
@@ -11590,24 +15283,58 @@ function escapeCustomFormHtml(value) {
 
 // A single data-entry cell DHIS2 binds to. The id is the only thing that matters for
 // binding; title/value mirror what the Maintenance custom-form designer emits.
+// width:100% + max-width keeps the rendered control sized by its table cell —
+// Capture swaps the <input> for its own component but honors the cell's box.
 function customFormInputCell(inputId) {
-  return `<input id="${escapeCustomFormHtml(inputId)}" title="" value="">`;
+  return `<input id="${escapeCustomFormHtml(inputId)}" title="" value="" style="width:100%;max-width:430px;box-sizing:border-box">`;
 }
 
-// Build a clean, readable two-column custom-form htmlCode from grouped field rows.
-// groups: [{ heading?, rows: [{ inputId, label }] }]
+// Build a clean, responsive two-column custom-form htmlCode from grouped field rows.
+// groups: [{ heading?, rows: [{ inputId, label, hint? }] }]
+//
+// Layout rules (all verified by rendering in Capture 2.42 event view/edit AND the
+// aggregate Data Entry app, 2026-07-01):
+// - EVERYTHING is inline styles. <style> blocks are unreliable: the aggregate Data
+//   Entry app injects htmlCode into an existing DOM (a stylesheet leaks globally),
+//   and sanitizers may strip them.
+// - The old generator emitted a bare <table border="1"> with no width control: the
+//   table shrank to hug its content (too narrow in Capture's wide card) or, when a
+//   long label/validation message appeared, stretched unpredictably (too wide /
+//   layout jumping). Fix: a max-width wrapper + width:100% fixed-layout table with
+//   an explicit 40/60 colgroup — fills narrow containers, caps on wide ones, and
+//   never reflows on content changes.
+// - Inputs get width:100%;max-width:430px;box-sizing:border-box so Capture's
+//   replaced components line up regardless of value type.
 function buildCustomFormHtml(title, groups) {
+  const esc = escapeCustomFormHtml;
   const parts = [];
-  if (title) parts.push(`<h3>${escapeCustomFormHtml(title)}</h3>`);
+  parts.push('<div style="width:100%;max-width:920px;margin:0 auto;font-family:inherit">');
+  if (title) parts.push(`<h3 style="margin:0 0 12px;font-size:20px;color:#212934">${esc(title)}</h3>`);
   for (const group of groups) {
-    if (group.heading) parts.push(`<h4>${escapeCustomFormHtml(group.heading)}</h4>`);
-    parts.push('<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">');
-    parts.push('<tr><th align="left">Field</th><th align="left">Value</th></tr>');
-    for (const row of group.rows) {
-      parts.push(`<tr><td>${escapeCustomFormHtml(row.label)}</td><td>${customFormInputCell(row.inputId)}</td></tr>`);
+    parts.push('<div style="border:1px solid #d5dde5;border-radius:8px;margin-bottom:16px;overflow:hidden;background:#fff">');
+    if (group.heading) {
+      parts.push(`<h4 style="margin:0;padding:10px 14px;font-size:14px;background:#f3f5f7;border-bottom:1px solid #d5dde5;border-left:4px solid #1976d2;color:#212934">${esc(group.heading)}</h4>`);
     }
+    parts.push('<table style="width:100%;border-collapse:collapse;table-layout:fixed">');
+    parts.push('<colgroup><col style="width:40%"><col style="width:60%"></colgroup>');
+    parts.push('<tbody>');
+    let i = 0;
+    for (const row of group.rows) {
+      const shade = i % 2 === 1 ? 'background:#fafbfc;' : '';
+      const hint = row.hint
+        ? `<div style="font-size:12px;color:#8a93a0;margin-top:2px">${esc(row.hint)}</div>`
+        : '';
+      parts.push(
+        `<tr><td style="padding:10px 14px;border-bottom:1px solid #eef1f4;vertical-align:middle;font-size:14px;color:#40464e;word-wrap:break-word;${shade}">${esc(row.label)}${hint}</td>`
+        + `<td style="padding:10px 14px;border-bottom:1px solid #eef1f4;${shade}">${customFormInputCell(row.inputId)}</td></tr>`
+      );
+      i++;
+    }
+    parts.push('</tbody>');
     parts.push('</table>');
+    parts.push('</div>');
   }
+  parts.push('</div>');
   return parts.join('\n');
 }
 
@@ -11918,7 +15645,8 @@ async function setStageCustomForm(args) {
 
   const hints = [];
   if (unknownDes.length) hints.push(`htmlCode references ${unknownDes.length} input(s) whose DE is not on this stage (${unknownDes.slice(0, 5).join(', ')}); those cells will not save.`);
-  hints.push('Custom program-stage forms render in the new Capture app; verify in Capture > new event/enrollment for this program.');
+  hints.push('Custom program-stage forms render in the new Capture app when VIEWING or EDITING an existing event — the "New event" flow renders the DEFAULT layout in current Capture versions (verified on 2.42). Verify by opening an existing event of this stage.');
+  hints.push('⚠️ Capture caches program metadata in IndexedDB. A form saved AFTER the user opened Capture will NOT appear until they hard-refresh the Capture tab (Ctrl+Shift+R / Cmd+Shift+R; if it still shows the old layout, DevTools > Application > Clear storage). TELL THE USER THIS — "the form does not show" is almost always this cache, not a save failure.');
 
   return {
     success: true,
@@ -13073,9 +16801,18 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // Resolve sharing — build the sharing block that will be attached to the program
   // (and optionally to stages / DEs / option sets). Shape matches the new sharing
   // format DHIS2 expects on metadata POST: { public, external, users, userGroups }.
-  const sharingInput = args.sharing || null;
+  // Sharing ALWAYS gets built — even when the model passes no sharing argument.
+  // DHIS2's server default for new programs is metadata-only ("rw------"),
+  // which means NOBODY (not even the creating admin) has data write access:
+  // every enrollment/event import bounces with E1091/E1095/E1096 and Capture's
+  // Save silently fails. Verified live on play 2.42.5.1 (2026-07-01): a program
+  // created without a sharing block was born unusable for data entry. Default
+  // to public "rwrw----" on the program + stages (the two data-shareable
+  // classes) so tracker data entry works out of the box — same convention
+  // manage_datasets has always used.
+  const sharingInput = args.sharing || {};
   let sharingBlock = null;
-  if (sharingInput) {
+  {
     // Normalize: any model-supplied access string is coerced to a canonical
     // 8-char [rw-] form here. Without this, "r--------" (9 chars) leaks into
     // program.publicAccess and DHIS2 rejects the entire atomic import.
@@ -13225,13 +16962,19 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   }
   let finalOptions = allOptions.filter(opt => !skippedOptionIds.has(opt.id));
 
-  // 3 + 4 + 5. Run options / DE / TEA name probes in parallel — they have no
-  // ordering dependency on each other, only on Step 1 above.
-  const optionBatches = [];
-  if (finalOptions.length > 0) {
-    const optNameList = finalOptions.map(o => o.name);
-    for (let i = 0; i < optNameList.length; i += 50) optionBatches.push(optNameList.slice(i, i + 50));
-  }
+  // 3 + 4. Run DE / TEA name probes in parallel — they have no ordering
+  // dependency on each other, only on Step 1 above.
+  //
+  // ⚠️ Options are deliberately NOT deduplicated against the server by name.
+  // A DHIS2 Option belongs to exactly ONE optionSet (options.optionsetid FK).
+  // The old "reuse an existing option with the same name" logic rewired a NEW
+  // option set to reference options owned by OTHER option sets ("None",
+  // "Negative", "Live birth", …) and the metadata import silently RE-PARENTED
+  // them — ripping the option out of its original set and corrupting unrelated
+  // metadata with no backup. Verified live on play 2.42.5.1 (2026-07-01): a new
+  // set referencing an existing "None"/"Mild" stole both options from the set
+  // that owned them. Same-name options across different sets are normal and
+  // correct in DHIS2 — every new set must get ITS OWN option rows.
   const deBatches = [];
   if (allDataElements.length > 0) {
     const deNames = allDataElements.map(d => d.name);
@@ -13243,11 +16986,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     for (let i = 0; i < teaNames.length; i += 50) teaBatches.push(teaNames.slice(i, i + 50));
   }
 
-  const [optResponses, deResponses, teaResponses] = await Promise.all([
-    Promise.all(optionBatches.map(batch => {
-      const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
-      return safeDhis2Fetch(`options?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
-    })),
+  const [deResponses, teaResponses] = await Promise.all([
     Promise.all(deBatches.map(batch => {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
       return safeDhis2Fetch(`dataElements?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
@@ -13257,23 +16996,6 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       return safeDhis2Fetch(`trackedEntityAttributes?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
     })),
   ]);
-
-  // Apply options dedup
-  for (const resp of optResponses) {
-    for (const ex of (resp?.options || [])) {
-      const newOpt = finalOptions.find(o => o.name === ex.name && !o._skip);
-      if (newOpt) {
-        const oldOptId = newOpt.id;
-        newOpt.id = ex.id;
-        newOpt._skip = true;
-        for (const os of filteredOptionSets) {
-          const ref = os.options?.find(r => r.id === oldOptId);
-          if (ref) ref.id = ex.id;
-        }
-      }
-    }
-  }
-  finalOptions = finalOptions.filter(o => !o._skip);
 
   // Apply DE dedup
   for (const resp of deResponses) {
@@ -13653,7 +17375,24 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     recordRecentCreation('program', args.program_name, programUid, summary);
   }
 
-  return { ...result, summary };
+  // Top-level ID handles for multi-step orchestration. The full detail stays in
+  // `summary`, but the very next step of a "create program → add rules/indicators
+  // → build a dashboard/map" chain needs the program + stage + DE UIDs without
+  // digging into nested summary shapes. Mirror the top-level id exposure that
+  // manage_program_indicators / manage_dashboards / manage_maps already provide,
+  // so the model reliably reuses REAL UIDs (never invents them). name→id maps let
+  // it target a stage/DE/attribute by the name it just asked for.
+  const stage_ids = {};
+  summary.stages.forEach((s) => { stage_ids[s.name] = s.id; });
+  return {
+    ...result,
+    program_id: programUid,
+    stage_ids,
+    data_element_ids: { ...deUidMap },
+    tracked_entity_attribute_ids: { ...teaUidMap },
+    option_set_ids: { ...optionSetUidMap },
+    summary,
+  };
 }
 
 async function addStageToProgram(args, defaultCatComboId) {
@@ -14753,6 +18492,27 @@ async function checkMetadataReferences(objectType, objectId) {
     }
   }
 
+  if (objectType === 'legendSets') {
+    // Distinct ref keys (…_using_legendset) so buildDeletionHint can give
+    // legend-set-specific guidance without colliding with the option-set keys.
+    const deResp = await safeDhis2Fetch(`dataElements?filter=legendSets.id:eq:${id}&fields=id,name&paging=false`);
+    if (!deResp._error && deResp.dataElements?.length) {
+      refs.data_elements_using_legendset = deResp.dataElements.map(de => ({ id: de.id, name: de.name }));
+    }
+    const indResp = await safeDhis2Fetch(`indicators?filter=legendSets.id:eq:${id}&fields=id,name&paging=false`);
+    if (!indResp._error && indResp.indicators?.length) {
+      refs.indicators_using_legendset = indResp.indicators.map(x => ({ id: x.id, name: x.name }));
+    }
+    const visResp = await safeDhis2Fetch(`visualizations?filter=legendSet.id:eq:${id}&fields=id,name&paging=false`);
+    if (!visResp._error && visResp.visualizations?.length) {
+      refs.visualizations_using_legendset = visResp.visualizations.map(x => ({ id: x.id, name: x.name }));
+    }
+    const mapResp = await safeDhis2Fetch(`maps?filter=mapViews.legendSet.id:eq:${id}&fields=id,name&paging=false`);
+    if (!mapResp._error && mapResp.maps?.length) {
+      refs.maps_using_legendset = mapResp.maps.map(x => ({ id: x.id, name: x.name }));
+    }
+  }
+
   if (objectType === 'trackedEntityAttributes') {
     const ptaResp = await safeDhis2Fetch(
       `programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:eq:${id}&fields=id,name&paging=false`
@@ -14807,6 +18567,18 @@ function buildDeletionHint(objectType, objectId, refs) {
   }
   if (refs.programs_using_this?.length) {
     hints.push(`Remove this attribute from ${refs.programs_using_this.length} program(s): ${refs.programs_using_this.map(p => p.name).join(', ')}`);
+  }
+  if (refs.data_elements_using_legendset?.length) {
+    hints.push(`${refs.data_elements_using_legendset.length} data element(s) use this legend set — detach it from them first (manage_metadata): ${refs.data_elements_using_legendset.map(d => d.name).join(', ')}`);
+  }
+  if (refs.indicators_using_legendset?.length) {
+    hints.push(`${refs.indicators_using_legendset.length} indicator(s) use this legend set — detach it from them first: ${refs.indicators_using_legendset.map(d => d.name).join(', ')}`);
+  }
+  if (refs.visualizations_using_legendset?.length) {
+    hints.push(`${refs.visualizations_using_legendset.length} visualization(s) use this legend set — change their legend in Data Visualizer first: ${refs.visualizations_using_legendset.map(d => d.name).join(', ')}`);
+  }
+  if (refs.maps_using_legendset?.length) {
+    hints.push(`${refs.maps_using_legendset.length} map(s) use this legend set — change the layer legend in Maps first: ${refs.maps_using_legendset.map(d => d.name).join(', ')}`);
   }
   if (refs.parent_program) {
     hints.push(`This stage belongs to program "${refs.parent_program.name}" — removing it will affect all enrollments`);
@@ -15615,6 +19387,19 @@ async function executeManageProgramRules(args, ctxProgramId) {
       allPRVs.push(prv);
     }
 
+    // Resolve any action target display names → UIDs (same as the create path).
+    // Without this a name-targeted ASSIGN/SETMANDATORYFIELD/HIDEFIELD would save
+    // target-less and DHIS2 would reject the whole update.
+    if (merged.actions) {
+      const _res = await resolveRuleActionTargetNames(pid, merged.actions);
+      if (_res.unresolved && _res.unresolved.length) {
+        return {
+          _error: `Rule action target name(s) could not be resolved on this program: ${_res.unresolved.map(u => `${u.kind} "${u.name}"`).join(', ')}.`,
+          _hint: 'Pass the exact data element / attribute display name as it appears on this program, or pass the UID directly (data_element_id / tei_attribute_id).',
+        };
+      }
+    }
+
     // Decide which actions to use
     const actionsToPost = merged.actions
       ? merged.actions  // new set provided — will replace old ones
@@ -16275,22 +20060,28 @@ function lintProgramIndicatorExpression(text, kind) {
   if (/\bI\{[^}]+\}/.test(t)) return { error: 'I{} (indicator) references are not valid in program indicators.', hint: 'Compose the calculation directly in this PI using #{stage.de} / A{tea}.' };
   if (/\bOUG\{[^}]+\}/.test(t)) return { error: 'OUG{} (org unit group) references are not valid in program indicators.', hint: 'Use d2:inOrgUnitGroup(\'<ougId>\') instead.' };
 
-  // MULTI_TEXT exact-match smell — multiple `==` against the SAME #{stage.de}
-  // is logically impossible (a column can only equal one literal string at a
-  // time). This is what the user's failed PI looked like after the model
-  // dropped d2:contains: `#{X.Y} == 'Diabetes' && #{X.Y} == 'HYPERTENSION'`.
-  // We can't tell from the text alone if the DE is MULTI_TEXT, but the
-  // pattern itself is wrong on any value type. Soft-warn with a hint.
+  // Same-field equality against two DIFFERENT literals is impossible ONLY when the
+  // comparisons are AND-ed: `#{X} == 'A' && #{X} == 'B'`. The OR form
+  // `#{X} == 'A' || #{X} == 'B'` is the NORMAL, correct way to match one of several
+  // option codes (RR/MDR profile, treatment-outcome cohorts, …) and must NOT be
+  // blocked. So evaluate the check PER OR-TERM (split on ||): within a single
+  // conjunction a field can equal only one literal; across OR-terms it can equal
+  // any of them. (The old check counted same-ref equalities across the whole
+  // filter and wrongly rejected valid `||` "field in set" filters.)
   if (kind === 'filter') {
-    const refEqRefEq = [...t.matchAll(/(#\{[^}]+\}|A\{[^}]+\})\s*==\s*'[^']+'/g)];
-    if (refEqRefEq.length >= 2) {
-      const refs = refEqRefEq.map(m => m[1]);
-      const sameRefTwice = refs.length !== new Set(refs).size;
-      if (sameRefTwice) {
-        return {
-          error: 'Filter compares the same field equal to two different literals (`#{X} == \'A\' && #{X} == \'B\'`) — logically impossible: a column can only equal one literal at a time.',
-          hint: 'If the field is MULTI_TEXT and you want "contains both A and B": this is NOT expressible in DHIS2 2.41 PI grammar. Either (a) restructure into separate BOOLEAN data elements and filter `#{stage.dm} == true && #{stage.htn} == true`, or (b) use the Line Listing app at query time. If the field is single-value, the user picked exactly one — pick which value to filter on.',
-        };
+    for (const term of t.split('||')) {
+      const byRef = new Map(); // ref → Set(distinct literals compared with ==)
+      for (const m of term.matchAll(/(#\{[^}]+\}|A\{[^}]+\})\s*==\s*'([^']*)'/g)) {
+        if (!byRef.has(m[1])) byRef.set(m[1], new Set());
+        byRef.get(m[1]).add(m[2]);
+      }
+      for (const [ref, lits] of byRef) {
+        if (lits.size >= 2) {
+          return {
+            error: `Filter requires the same field ${ref} to equal ${[...lits].map(l => `'${l}'`).join(' AND ')} simultaneously — logically impossible (within an AND a field can equal only one literal).`,
+            hint: 'To match ANY of several values use OR: `#{X} == \'A\' || #{X} == \'B\'`. For a MULTI_TEXT "contains both A and B" (not expressible in PI grammar): split into BOOLEAN data elements and filter `#{stage.a} == true && #{stage.b} == true`, or use the Line Listing app at query time.',
+          };
+        }
       }
     }
   }
@@ -16537,6 +20328,45 @@ async function applyRuleActionSugarSideEffects(plan, rules) {
 //      displayName — auto-creating a PRV when a DE match is found
 //   3. rewrites A{name} (non-UID) into A{UID} using the program's TEAs
 //   4. refuses the POST with a structured _hint when a reference cannot be resolved
+// Resolve rule-action target display names (data_element_name /
+// tracked_entity_attribute_name) to UIDs against a program's DEs + TEAs. Mutates
+// each action in place, filling data_element_id / tei_attribute_id when only a
+// name was supplied. Returns { unresolved:[{name,kind}] } for names that matched
+// nothing. Lets the manage_program_rules UPDATE path bind name-targeted actions
+// the same way the create path (_buildAndPostProgramRules) already does — without
+// it, an ASSIGN/SETMANDATORYFIELD/HIDEFIELD passed by name saved target-less and
+// DHIS2 rejected the bundle ("DataElement ... cannot be null").
+async function resolveRuleActionTargetNames(pid, actions) {
+  const needs = (actions || []).some(a => a && (
+    (a.data_element_name && !a.data_element_id) ||
+    (a.tracked_entity_attribute_name && !a.tei_attribute_id)));
+  if (!needs) return { unresolved: [] };
+  const prog = await safeDhis2Fetch(`programs/${pid}?fields=programStages[programStageDataElements[dataElement[id,displayName]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName]]`);
+  if (!prog || prog._error) return { unresolved: [], _fetchError: prog && prog._error };
+  const deByName = new Map(), deBySan = new Map();
+  for (const ps of (prog.programStages || [])) for (const psde of (ps.programStageDataElements || [])) {
+    const de = psde.dataElement; if (!de?.id) continue;
+    deByName.set(de.displayName, de.id); deBySan.set(sanitizeVariableName(de.displayName), de.id);
+  }
+  const teaByName = new Map(), teaBySan = new Map();
+  for (const pta of (prog.programTrackedEntityAttributes || [])) {
+    const tea = pta.trackedEntityAttribute; if (!tea?.id) continue;
+    teaByName.set(tea.displayName, tea.id); teaBySan.set(sanitizeVariableName(tea.displayName), tea.id);
+  }
+  const unresolved = [];
+  for (const a of (actions || [])) {
+    if (a.data_element_name && !a.data_element_id) {
+      const id = deByName.get(a.data_element_name) || deBySan.get(sanitizeVariableName(a.data_element_name));
+      if (id) a.data_element_id = id; else unresolved.push({ name: a.data_element_name, kind: 'dataElement' });
+    }
+    if (a.tracked_entity_attribute_name && !a.tei_attribute_id) {
+      const id = teaByName.get(a.tracked_entity_attribute_name) || teaBySan.get(sanitizeVariableName(a.tracked_entity_attribute_name));
+      if (id) a.tei_attribute_id = id; else unresolved.push({ name: a.tracked_entity_attribute_name, kind: 'trackedEntityAttribute' });
+    }
+  }
+  return { unresolved };
+}
+
 async function _buildAndPostProgramRules(programId, rules, dryRun) {
   // 1. Lint conditions for known-broken boolean patterns.
   const lintErrors = [];
@@ -16582,6 +20412,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   // Index program DEs by sanitized display name AND by which stage(s) they live in.
   const deBySanitized = new Map();  // sanitized(displayName) → { id, displayName, valueType, optionSet, stageIds:[] }
   const deByDisplayName = new Map(); // raw displayName → same
+  const deById = new Map();          // deId → same entry (for ASSIGN option-code checks)
   for (const ps of (progResp.programStages || [])) {
     for (const psde of (ps.programStageDataElements || [])) {
       const de = psde.dataElement;
@@ -16593,22 +20424,53 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
         deBySanitized.set(sKey, entry);
         deByDisplayName.set(de.displayName, entry);
       }
+      deById.set(de.id, entry);
       if (!entry.stageIds.includes(ps.id)) entry.stageIds.push(ps.id);
     }
   }
 
   // Index TEAs by sanitized display name and by UID for A{} rewriting.
   const teaBySanitized = new Map();
+  const teaByDisplayName = new Map(); // raw displayName → entry (for action target resolution)
   const teaById = new Map();
   for (const ptea of (progResp.programTrackedEntityAttributes || [])) {
     const tea = ptea.trackedEntityAttribute;
     if (!tea?.id) continue;
     const entry = { id: tea.id, displayName: tea.displayName, valueType: tea.valueType, optionSet: tea.optionSet };
     teaBySanitized.set(sanitizeVariableName(tea.displayName), entry);
+    teaByDisplayName.set(tea.displayName, entry);
     teaById.set(tea.id, entry);
   }
 
   const isDhis2Uid = (s) => /^[a-zA-Z][a-zA-Z0-9]{10}$/.test(s);
+
+  // Resolve a rule action's TARGET (the DE/TEA the action acts on) from either an
+  // explicit UID (data_element_id / tei_attribute_id) OR a display name
+  // (data_element_name / tracked_entity_attribute_name). The schema advertises the
+  // *_name fields as "resolved to ID automatically" and the create_metadata rule
+  // path already resolves them (via deUidMap) — this makes manage_program_rules
+  // behave identically, so ASSIGN / SETMANDATORYFIELD / HIDEFIELD written by name
+  // actually bind instead of bouncing with "DataElement ... cannot be null".
+  const resolveActionDeEntry = (act) => {
+    if (!act) return null;
+    if (act.data_element_id) return deById.get(act.data_element_id) || { id: act.data_element_id };
+    const nm = act.data_element_name;
+    if (!nm) return null;
+    return deByDisplayName.get(nm)
+      || deBySanitized.get(String(nm).toLowerCase())
+      || deBySanitized.get(sanitizeVariableName(nm))
+      || null;
+  };
+  const resolveActionTeaEntry = (act) => {
+    if (!act) return null;
+    if (act.tei_attribute_id) return teaById.get(act.tei_attribute_id) || { id: act.tei_attribute_id };
+    const nm = act.tracked_entity_attribute_name;
+    if (!nm) return null;
+    return teaByDisplayName.get(nm)
+      || teaBySanitized.get(String(nm).toLowerCase())
+      || teaBySanitized.get(sanitizeVariableName(nm))
+      || null;
+  };
 
   // 3. Build payload while resolving references per-rule.
   const allPRVs = [];
@@ -16624,13 +20486,11 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   const pickSourceType = (deEntry, rule) => {
     const actionStageIds = new Set();
     for (const act of (rule.actions || [])) {
-      if (act.data_element_id) {
-        // Find which stage this action DE is in.
-        for (const [_, e] of deBySanitized) {
-          if (e.id === act.data_element_id) {
-            for (const sid of e.stageIds) actionStageIds.add(sid);
-          }
-        }
+      // Resolve the action target by id OR name so name-targeted actions still
+      // steer the PRV toward CURRENT_EVENT when they act on the trigger's stage.
+      const tgt = resolveActionDeEntry(act);
+      if (tgt && Array.isArray(tgt.stageIds)) {
+        for (const sid of tgt.stageIds) actionStageIds.add(sid);
       }
       if (act.program_stage_id) actionStageIds.add(act.program_stage_id);
     }
@@ -16752,11 +20612,26 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       if (!ok) unresolved.push({ rule: rule.name, reference: `#{${name}}`, suggestions: collectSuggestions(name) });
     }
 
-    // A{ref}: if ref is a UID, pass through unchanged. Otherwise try to rewrite to A{uid}
-    // using TEA displayName match; if no match, flag as unresolved.
+    // A{ref}: DHIS2's grammar accepts BOTH a TEA UID and the NAME of a
+    // TEI_ATTRIBUTE-sourced programRuleVariable (the demo DB's own rules use
+    // e.g. d2:yearsBetween(A{born}, V{current_date}) where "born" is a PRV).
+    // Resolution order:
+    //   1. UID → pass through.
+    //   2. Existing PRV with that name, or a variables:[] entry the model
+    //      supplied in THIS rule (source_type TEI_ATTRIBUTE) → keep A{name},
+    //      creating the PRV if it came from variables:[]. (Previously this
+    //      path was missing: the tool's own error hint told the model to pass
+    //      variables:[], then ignored them for A{} refs and refused the POST.)
+    //   3. TEA displayName match → rewrite to A{uid}.
+    //   4. Otherwise unresolved.
     for (const ref of attrRefs) {
       if (isDhis2Uid(ref) && teaById.has(ref)) continue;
       if (isDhis2Uid(ref)) continue;  // Leave unknown UIDs alone — DHIS2 will resolve at runtime.
+      if (existingPRVs.has(ref.toLowerCase()) || newPRVsByName.has(ref.toLowerCase())) continue;
+      const suppliedVar = (rule.variables || []).find(v =>
+        String(v.name || '').toLowerCase() === ref.toLowerCase()
+        && (v.source_type === 'TEI_ATTRIBUTE' || v.tei_attribute_id));
+      if (suppliedVar && ensureVarForRule(ref, rule)) continue;
       const teaEntry = teaBySanitized.get(ref.toLowerCase()) || teaBySanitized.get(sanitizeVariableName(ref));
       if (teaEntry) {
         const before = `A{${ref}}`;
@@ -16783,8 +20658,22 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       };
       if (act.content) pra.content = act.content;
       if (act.data) pra.data = act.data;
-      if (act.data_element_id) pra.dataElement = { id: act.data_element_id };
-      if (act.tei_attribute_id) pra.trackedEntityAttribute = { id: act.tei_attribute_id };
+      // Resolve the action's target DE/TEA by id OR by display name. Previously
+      // only *_id was honored, so a name-targeted ASSIGN/SETMANDATORYFIELD/HIDEFIELD
+      // saved with no target and DHIS2 rejected the whole bundle at validation.
+      const deTgt = resolveActionDeEntry(act);
+      const teaTgt = deTgt ? null : resolveActionTeaEntry(act);
+      if (deTgt && deTgt.id) pra.dataElement = { id: deTgt.id };
+      else if (teaTgt && teaTgt.id) pra.trackedEntityAttribute = { id: teaTgt.id };
+      // A name was supplied but did not resolve → surface it (fail loudly with
+      // suggestions) rather than posting a target-less action that bounces server-side.
+      if (!pra.dataElement && !pra.trackedEntityAttribute) {
+        if (act.data_element_name) {
+          unresolved.push({ rule: rule.name, reference: `action target data_element_name="${act.data_element_name}"`, suggestions: collectSuggestions(act.data_element_name) });
+        } else if (act.tracked_entity_attribute_name) {
+          unresolved.push({ rule: rule.name, reference: `action target tracked_entity_attribute_name="${act.tracked_entity_attribute_name}"`, suggestions: collectSuggestions(act.tracked_entity_attribute_name) });
+        }
+      }
       if (act.program_stage_id) pra.programStage = { id: act.program_stage_id };
       if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
       allPRAs.push(pra);
@@ -16814,6 +20703,133 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     };
   }
 
+  // ── ASSIGN → option-set DE: the assigned literal MUST be an option CODE ──
+  // The server-side rule engine (2.42+ runs ASSIGN on tracker import) and the
+  // tracker importer validate assigned values against the option set's CODES,
+  // not names. A rule assigning 'Moderate' to a DE whose option codes are
+  // MILD/MODERATE/SEVERE bounces every event save with E1125. Verified live on
+  // play 2.42.5.1 (2026-07-01). Auto-map a name → its code; reject unknowns
+  // with the valid code list so the model can self-correct in one iteration.
+  {
+    const assignsByOptionSet = new Map(); // optionSetId → [pra]
+    for (const pra of allPRAs) {
+      if (pra.programRuleActionType !== 'ASSIGN' || !pra.dataElement?.id) continue;
+      const deEntry = deById.get(pra.dataElement.id);
+      const osId = deEntry?.optionSet?.id;
+      if (!osId) continue;
+      const literal = typeof pra.data === 'string' && pra.data.trim().match(/^'([^']*)'$|^"([^"]*)"$/);
+      if (!literal) continue; // dynamic expression — can't statically check
+      if (!assignsByOptionSet.has(osId)) assignsByOptionSet.set(osId, []);
+      assignsByOptionSet.get(osId).push(pra);
+    }
+    if (assignsByOptionSet.size) {
+      const optionSetIds = [...assignsByOptionSet.keys()];
+      const optResps = await Promise.all(optionSetIds.map(id =>
+        safeDhis2Fetch(`optionSets/${id}?fields=id,name,options[name,code]`)));
+      const codeErrors = [];
+      for (let i = 0; i < optionSetIds.length; i++) {
+        const os = optResps[i];
+        if (!os || os._error) continue; // can't verify — let the server decide
+        const byCode = new Map((os.options || []).map(o => [String(o.code), o]));
+        const byName = new Map((os.options || []).map(o => [String(o.name).toLowerCase(), o]));
+        for (const pra of assignsByOptionSet.get(optionSetIds[i])) {
+          const raw = pra.data.trim();
+          const value = raw.slice(1, -1);
+          if (byCode.has(value)) continue;
+          const named = byName.get(value.toLowerCase());
+          if (named) {
+            pra.data = `'${named.code}'`; // auto-map display name → code
+          } else {
+            codeErrors.push(`ASSIGN to "${deById.get(pra.dataElement.id)?.displayName}" uses '${value}', which is neither an option code nor an option name of option set "${os.name}". Valid codes: ${(os.options || []).map(o => o.code).join(', ')}`);
+          }
+        }
+      }
+      if (codeErrors.length) {
+        return {
+          success: false,
+          _error: `ASSIGN value(s) do not match the target data element's option set: ${codeErrors.join(' | ')}`,
+          phase: 'assign_option_code_check',
+          _hint: 'ASSIGN writes the raw value into the field; for an option-set data element the value must be an option CODE (names are auto-mapped when they match). Fix the data expression to one of the listed codes and retry.',
+        };
+      }
+    }
+  }
+
+  // ── Option-set CONDITION literals: rewrite option NAMES → CODES ──
+  // Auto-created option-set PRVs use useCodeForOptionSet=true, so the value the
+  // rule engine compares is the option CODE (this matches the DHIS2 demo DB
+  // convention, e.g. #{CaseClassifiedAs} != 'IMPORTED'). A condition that compares
+  // such a variable to an option NAME (…== 'Positive') lints clean, SAVES, and then
+  // NEVER FIRES — a silent failure. We already map ASSIGN data names→codes; do the
+  // same for conditions. This only ever rewrites a NAME literal to its CODE — it
+  // never touches '' (empty checks) or literals that are already valid codes, so it
+  // cannot break a condition that was already correct (it can only fix a broken one).
+  let conditionOptionAdvisories = [];
+  {
+    // varName(lower) → { optionSetId, useCode } for every option-set-backed PRV
+    // in scope (freshly built for this batch + already existing on the program).
+    const varOptionInfo = new Map();
+    const noteVar = (name, useCode, deId, teaId) => {
+      if (!name) return;
+      let osId = null;
+      if (deId) osId = deById.get(deId)?.optionSet?.id || null;
+      else if (teaId) osId = teaById.get(teaId)?.optionSet?.id || null;
+      if (osId) varOptionInfo.set(String(name).toLowerCase(), { optionSetId: osId, useCode: useCode !== false });
+    };
+    for (const prv of allPRVs) noteVar(prv.name, prv.useCodeForOptionSet, prv.dataElement?.id, prv.trackedEntityAttribute?.id);
+    for (const [, prv] of existingPRVs) noteVar(prv.name, prv.useCodeForOptionSet, prv.dataElement?.id, prv.trackedEntityAttribute?.id);
+
+    // Which option sets do the conditions actually reference (option vars w/ useCode)?
+    const neededOsIds = new Set();
+    for (const pr of allPRs) {
+      for (const m of (pr.condition.match(/#\{([^}]+)\}/g) || [])) {
+        const info = varOptionInfo.get(m.slice(2, -1).toLowerCase());
+        if (info && info.useCode) neededOsIds.add(info.optionSetId);
+      }
+    }
+    if (neededOsIds.size) {
+      const osIds = [...neededOsIds];
+      const resps = await Promise.all(osIds.map(id => safeDhis2Fetch(`optionSets/${id}?fields=id,name,options[name,code]`)));
+      const osMap = new Map(); // osId → { byCode:Set, byName:Map(lower→code), name, options }
+      for (let i = 0; i < osIds.length; i++) {
+        const o = resps[i];
+        if (!o || o._error) continue;
+        osMap.set(osIds[i], {
+          byCode: new Set((o.options || []).map(x => String(x.code))),
+          byName: new Map((o.options || []).map(x => [String(x.name).toLowerCase(), String(x.code)])),
+          name: o.name,
+          options: o.options || [],
+        });
+      }
+      for (const pr of allPRs) {
+        let cond = pr.condition;
+        const usedVars = new Set((cond.match(/#\{([^}]+)\}/g) || []).map(m => m.slice(2, -1)));
+        for (const vRaw of usedVars) {
+          const info = varOptionInfo.get(vRaw.toLowerCase());
+          if (!info || !info.useCode) continue;
+          const os = osMap.get(info.optionSetId);
+          if (!os) continue;
+          const varToken = `#{${vRaw}}`;
+          const esc = vRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          // `#{var} ==|!= 'literal'` in either order.
+          const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*#\\{${esc}\\}`, 'g');
+          cond = cond.replace(re, (full, op1, lit1, lit2, op2) => {
+            const lit = (lit1 !== undefined ? lit1 : lit2);
+            const op = op1 || op2;
+            if (lit === '') return full;         // empty-value check — leave alone
+            if (os.byCode.has(lit)) return full; // already a code — leave alone
+            const code = os.byName.get(lit.toLowerCase());
+            if (code) return op1 ? `${varToken} ${op} '${code}'` : `'${code}' ${op} ${varToken}`;
+            // Neither a code nor a name of this option set → advise (don't rewrite).
+            conditionOptionAdvisories.push(`Rule "${pr.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of option set "${os.name}" (codes: ${os.options.map(x => x.code).join(', ')}). This comparison will never match — verify the value.`);
+            return full;
+          });
+        }
+        pr.condition = cond;
+      }
+    }
+  }
+
   const payload = {};
   if (allPRVs.length) payload.programRuleVariables = allPRVs;
   if (allPRAs.length) payload.programRuleActions = allPRAs;
@@ -16831,6 +20847,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       ...(sugarSideEffects.stageUpdates.length ? { compulsory_flags_cleared: sugarSideEffects.stageUpdates } : {}),
       ...(sugarSideEffects.errors.length ? { compulsory_flag_errors: sugarSideEffects.errors } : {}),
       ...(sugarPlan.siblingMandateRules.length ? { auto_paired_mandate_rules: sugarPlan.siblingMandateRules.map(r => r.name) } : {}),
+      ...(conditionOptionAdvisories.length ? { condition_option_advisories: conditionOptionAdvisories } : {}),
     },
   };
 }
@@ -17895,7 +21912,18 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   }
 
   const result = await postMetadataPayload({ programIndicators: [pi] }, false);
-  return { ...result, summary: { indicator: { id: uid, name: indicator.name } } };
+  const out = { ...result, summary: { indicator: { id: uid, name: indicator.name } } };
+  // Mirror the top-level *_id convention every other write tool already exposes
+  // (manage_indicators → indicator_id, manage_dashboards → visualization_id /
+  // dashboard_id, manage_org_units → org_unit_id, manage_datasets → dataset_id)
+  // so a multi-step caller can chain this program indicator's UID STRAIGHT into
+  // the next tool — e.g. a dashboard visualization's data_items, where it is
+  // auto-resolved as PROGRAM_INDICATOR — without having to dig into the nested
+  // summary object. Purely additive: summary.indicator.id is preserved for any
+  // existing reader. Only surfaced on a successful import so a failed create can
+  // never yield a chainable-but-nonexistent UID.
+  if (result && result.success) out.program_indicator_id = uid;
+  return out;
 }
 
 async function createStandaloneOptionSet(args) {
@@ -17917,6 +21945,38 @@ async function createStandaloneOptionSet(args) {
       options: options.map(o => ({ id: o.id, name: o.name, code: o.code })),
     },
   };
+}
+
+// Resolve an EXISTING option set for a data element that references one by UID
+// or exact name (as opposed to bundling a brand-new inline option_set). Returns
+// { id, valueType, name } on success or { _error } if it cannot be resolved — so
+// a DE never silently points at a non-existent set (which would fail the import
+// with an opaque message). Purely additive: DEs that pass only an inline
+// option_set (or none) never reach this path. This is what lets the
+// manage_option_sets(create) → create_data_elements chain compose — the DE step
+// can attach the just-created set by option_set_id instead of duplicating it.
+async function resolveExistingOptionSetRef(optionSetId, optionSetName) {
+  if (optionSetId) {
+    const id = String(optionSetId).trim();
+    const resp = await safeDhis2Fetch(`optionSets/${id}?fields=id,name,valueType`);
+    if (resp?._error || resp?._status === 404 || !resp?.id) {
+      return {
+        _error: `option_set_id "${id}" does not exist on this server.`,
+        _hint: 'Chain the option_set_id returned by manage_option_sets(action="create"), or pass an inline option_set:{name,options:[...]} to create a new one.',
+      };
+    }
+    return { id: resp.id, valueType: resp.valueType || 'TEXT', name: resp.name || id };
+  }
+  const nm = String(optionSetName || '').trim();
+  if (!nm) return { _error: 'option_set reference is empty (no option_set_id or option_set_name).' };
+  const probe = await safeDhis2Fetch(`optionSets?filter=name:eq:${encodeURIComponent(nm)}&fields=id,name,valueType&pageSize=2`);
+  const hits = probe?.optionSets || [];
+  if (!hits.length) return {
+    _error: `option_set_name "${nm}" not found on this server.`,
+    _hint: 'Create it first with manage_option_sets(action="create") and chain the returned option_set_id, or pass an inline option_set:{name,options:[...]}.',
+  };
+  if (hits.length > 1) return { _error: `option_set_name "${nm}" is ambiguous (${hits.length} matches). Pass option_set_id instead.` };
+  return { id: hits[0].id, valueType: hits[0].valueType || 'TEXT', name: hits[0].name || nm };
 }
 
 async function createStandaloneDataElements(args, defaultCatComboId) {
@@ -17969,8 +22029,24 @@ async function createStandaloneDataElements(args, defaultCatComboId) {
   const batchComboId = inlineComboUid || existingComboId || null;
 
   for (const de of args.data_elements) {
+    const hasInlineOptionSet = !!(de.option_set && de.option_set.name && de.option_set.options?.length);
+    const refIdRaw = de.option_set_id || de.optionSetId || null;
+    const refNameRaw = de.option_set_name || de.optionSetName || null;
+    // Reference an EXISTING option set by UID/name (the chaining path). Mutually
+    // exclusive with an inline option_set so intent is never ambiguous.
+    if ((refIdRaw || refNameRaw) && hasInlineOptionSet) {
+      return {
+        _error: `Data element "${de.name || '(unnamed)'}" specifies BOTH an inline option_set and an existing option_set_id/option_set_name.`,
+        _hint: 'Use inline option_set:{name,options} to CREATE a new set, OR option_set_id/option_set_name to REFERENCE an existing one — not both.',
+      };
+    }
+    if (refIdRaw || refNameRaw) {
+      const ref = await resolveExistingOptionSetRef(refIdRaw, refNameRaw);
+      if (ref._error) return ref;
+      de._optionSetRef = { id: ref.id, valueType: ref.valueType };
+    }
     // Inline option set bundling (existing behavior — preserved verbatim).
-    if (de.option_set && de.option_set.name && de.option_set.options?.length) {
+    if (hasInlineOptionSet) {
       if (!optionSetUidMap[de.option_set.name]) {
         const { optionSet, options, osUid } = buildOptionSetAndOptions(de.option_set, de.value_type);
         allOptions.push(...options);
@@ -18041,6 +22117,7 @@ async function createStandaloneDataElements(args, defaultCatComboId) {
         domainType: de.domainType,
         aggregationType: de.aggregationType,
         categoryComboId: de.categoryCombo?.id,
+        optionSetId: de.optionSet?.id || null,
       })),
       optionSets: Object.entries(optionSetUidMap).map(([name, id]) => ({ name, id })),
       categoryCombo: inlineComboUid

@@ -20,7 +20,7 @@
 
 ---
 
-## The 25 tools
+## The 32 tools
 
 Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → panel.js iconMap + toolLabels → CSS`. The model is given only the subset relevant to the current page and request — usually 6–12 of them.
 
@@ -51,6 +51,13 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 | 23 | `manage_custom_forms` | Author **CUSTOM (HTML) data-entry forms** for BOTH dataSets (render in Aggregate Data Entry) and tracker/event **program stages** (render in Capture). Actions: `get`, `preview_html` (auto-generate a table form skeleton from the target's DEs without saving), `set_dataset_form`, `set_stage_form`, `remove_form`. Encodes the verified-on-2.43 quirks: a `dataEntryForm` must be created standalone via `POST /api/dataEntryForms` first (it can never be embedded inline — E5002), the input-id binding differs per target (`<de>-<coc>-val` for datasets, `<stage>-<de>-val` for stages), and linking to a program stage re-attaches `program:{id}` on a full PUT (PATCH/naive PUT drops it). Auto-backup before every write. |
 | 24 | `manage_custom_translations` | Translate or re-label **any app's UI strings** via the experimental **DHIS2 2.43+** `custom-translations` dataStore namespace — no source-code changes. Actions: `list`, `get`, `set`, `remove`. Keeps the `controller` registry (`{ "<slug>": ["<locale>"] }`) and the per-app key (`<slug>__<locale>`, a `{ "<source string>": "<replacement>" }` map) in sync automatically. Supports both true translation (different locale, e.g. `capture`→`ar`) and same-language rewriting (locale `en`, e.g. "Report data"→"Submit report"). Version-gated to 2.43+; merges by default (`replace:true` to overwrite); returns `previous_value`/`previous_controller` for manual rollback since dataStore keys aren't covered by `manage_backups`. Verified on play 2.43.0.1 — the Capture app fetches both `controller` and `capture__ar` (200) at startup. |
 | 25 | `manage_growth_chart_plugin` | End-to-end setup of the **WHO Capture Growth Chart** plugin ([dev-otta/dhis2-who-growth-chart](https://github.com/dev-otta/dhis2-who-growth-chart), App Hub key `capture-growth-chart`). Actions: `status`, `install` (from the App Hub, idempotent), `scaffold_program` (create a ready-to-use growth tracker program), `configure` (auto-detect DOB/gender attributes + female/male option codes + weight/height/head-circumference data elements for a program and write/merge the `captureGrowthChart/config` dataStore key), `remove`. Validates the plugin's hard requirements (DOB + gender attribute, all three measurement DEs) and refuses with a precise missing-items list. Infers `weightInGrams` from the weight DE name. Surfaces a `dashboard_attach` block (plugin source URL + steps) rather than auto-writing the Capture-owned `dataStore/capture` dashboard layout. Verified on play 2.43.0.1: app installed via `POST /api/appHub/{versionId}`, a full program + 3 measurement DEs + enrolled child created, and `captureGrowthChart/config` written and read back. |
+| 26 | `manage_validation_rules` | Aggregate data-quality validation rules — CRUD + server-side expression validation before save. |
+| 27 | `manage_org_units` | Organisation-unit hierarchy CRUD with cascade/reference checks. |
+| 28 | `manage_indicators` | Aggregate indicators (numerator/denominator) — CRUD, expressions server-validated, legend-set attach. |
+| 29 | `manage_option_sets` | Option-set lifecycle: create/update/add/remove/reorder/delete with per-set unique codes. |
+| 30 | `manage_legend_sets` | Colour-coded legend sets; `auto_bands` generates equal-width red→green ramps. |
+| 31 | `manage_dashboards` | Dashboards + visualizations: list/get/create, safe `add_items`/`remove_item`/`update`/`delete` with pre-write snapshots. |
+| 32 | `manage_maps` | **Thematic map authoring** (choropleth / bubble): `list`/`get`/`create`/`delete`. Assembles a thematic mapView from a friendly spec — data item on `columns[dx]` (type auto-resolved, program auto-attached for a program indicator), org units on `rows[ou]` with `organisationUnitLevels`, period on `filters[pe]`, optional legend set — the exact `/api/maps` structure DHIS2 needs (there is no simple "create map" object). Returns `map_id` to embed on a dashboard via `manage_dashboards(add_items, { type:"MAP", map_id })`. Auto-backup on delete. |
 
 ### Page-context auto-detection
 
@@ -77,7 +84,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 │ • URL change monitor  │   │ • DHIS2 detection & session │   │ • Chat interface      │
 │ • hashchange/popstate │   │ • Page-context extraction   │   │ • Streaming display   │
 │ • 2s polling fallback │   │ • Universal LLM streaming   │   │ • Tool progress UI    │
-│ • Sends ctx updates   │   │ • 23-tool agentic loop      │   │ • Chart rendering     │
+│ • Sends ctx updates   │   │ • 31-tool agentic loop      │   │ • Chart rendering     │
 │ • Self-heal on        │   │ • Tracker write pipeline    │   │ • Image attachments   │
 │   "context invalid"   │   │ • Atomic metadata bundles   │   │ • Settings modal      │
 │   after extension     │   │ • Auto-backup + restore     │   │ • Theme switching     │
@@ -91,7 +98,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 1. **Context extraction** — read URL of active DHIS2 tab → app type, program, stage, dataset, OU, TEI, viz, map.
 2. **System prompt assembly** — base rules + only the conditional blocks the request needs.
 3. **Reliability prefetch** — TEI details / visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
-4. **Tool selection** — `getContextualTools()` filters the 25 tools down to the 6–12 relevant for the request.
+4. **Tool selection** — `getContextualTools()` filters the 32 tools down to the 6–12 relevant for the request.
 5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 50 iterations per turn, 3 consecutive empty responses trigger bailout.
 6. **Persistence** — per-turn state (`knownIds`, `knownIcons`, `recentCreations`, `writeAuth`, …) survives service-worker restarts via stripped JSON snapshots.
 
@@ -199,7 +206,7 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
 ```
 dhis2-AI/
-├── manifest.json              MV3 config (v2.2.0)
+├── manifest.json              MV3 config (v2.7.0)
 ├── background.js              Service worker — all AI + API logic (~18.2k LOC)
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
