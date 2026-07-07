@@ -397,16 +397,44 @@ function lookupRecentCreation(kind, name) {
   return dhis2.recentCreations.get(`${kind}:${String(name).toLowerCase()}`) || null;
 }
 
+// DHIS2 field / query-parameter names that share the 11-char UID shape (a
+// letter followed by 10 alphanumerics) but are NEVER object UIDs. Without this
+// denylist the pre-flight guard mistakes a `fields=id,displayName` entry for a
+// hallucinated UID and REFUSES legitimate discovery calls — fatal on a fresh,
+// empty instance where the model must call discovery/create endpoints to build
+// anything (observed live: `dhis2_query trackedEntityTypes?fields=id,displayName`
+// refused with "unknown UID: displayName"). DHIS_UID_RE only matches exactly-11-
+// char tokens, so this list only needs 11-char words.
+const RESERVED_UID_SHAPED_WORDS = new Set([
+  'displayName', 'lastUpdated', 'description', 'dataElement', 'accessLevel',
+  'coordinates', 'phoneNumber', 'optionGroup', 'programRule', 'inheritable',
+  'aggregation', 'completedBy', 'programName', 'trackedName',
+]);
+
 // Pulls UIDs out of every arg position that is operationally a target
-// (path, rule_id, indicator_id, object_id, stage_id, program_id, template_id,
-// trackedEntity, enrollment, event, plus any string/array passed under those
-// names). Returns the unique UIDs that appear.
+// (path SEGMENTS, rule_id, indicator_id, object_id, stage_id, program_id,
+// template_id, trackedEntity, enrollment, event, plus any string/array passed
+// under those names). Returns the unique UIDs that appear.
+//
+// IMPORTANT: for `path` we scan ONLY the portion before `?` (the resource path
+// segments), never the query string. Query strings carry field lists
+// (fields=id,displayName), ordering, and paging whose tokens are field NAMES,
+// not target UIDs — scanning them produced false "unknown UID" refusals that
+// blocked every discovery call. A hallucinated UID that matters operationally
+// appears as a path segment (/programs/<uid>) or an explicit *_id argument,
+// both still scanned. A bad UID inside a filter self-corrects (empty result),
+// so not scanning it is a safe trade for eliminating the false positives.
 function extractUidsFromCallArgs(toolName, args) {
   const set = new Set();
   if (!args) return [...set];
-  // Always include path UIDs
+  const addUids = (str) => {
+    for (const m of String(str).match(DHIS_UID_RE) || []) {
+      if (!RESERVED_UID_SHAPED_WORDS.has(m)) set.add(m);
+    }
+  };
+  // Path UIDs: resource-path segments only (drop the query string).
   if (typeof args.path === 'string') {
-    for (const m of args.path.match(DHIS_UID_RE) || []) set.add(m);
+    addUids(args.path.split('?')[0]);
   }
   const idKeys = [
     'rule_id', 'indicator_id', 'template_id', 'object_id', 'stage_id',
@@ -417,16 +445,16 @@ function extractUidsFromCallArgs(toolName, args) {
   for (const k of idKeys) {
     const v = args[k];
     if (typeof v === 'string') {
-      for (const m of v.match(DHIS_UID_RE) || []) set.add(m);
+      addUids(v);
     } else if (Array.isArray(v)) {
-      for (const x of v) if (typeof x === 'string') for (const m of x.match(DHIS_UID_RE) || []) set.add(m);
+      for (const x of v) if (typeof x === 'string') addUids(x);
     }
   }
   // Array fields that carry UIDs by name
   const arrayKeys = ['indicator_ids', 'rule_ids', 'object_ids', 'data_element_ids', 'org_unit_ids'];
   for (const k of arrayKeys) {
     const v = args[k];
-    if (Array.isArray(v)) for (const x of v) if (typeof x === 'string') for (const m of x.match(DHIS_UID_RE) || []) set.add(m);
+    if (Array.isArray(v)) for (const x of v) if (typeof x === 'string') addUids(x);
   }
   return [...set];
 }
@@ -5179,7 +5207,8 @@ NEVER invent dataElement/constant UIDs — reuse UIDs from search_metadata / man
       description: `CRUD for DHIS2 Organisation Units — the facilities/chiefdoms/districts that make up the org-unit HIERARCHY (the tree every program, dataset, data value and enrollment is attached to). Use this tool for ALL org-unit structure work — creating a new facility under a parent, renaming/closing one, MOVING (re-parenting) a unit or subtree, or deleting a leaf — NEVER hand-assemble raw /metadata POST/PUT bodies via dhis2_query.
 Actions: list / get / create / update / delete.
 Hierarchy rules the tool enforces for you: every unit except the single root has exactly one parent; \`level\` and \`path\` are DERIVED by DHIS2 from the parent (you never set them) — a child of a level-3 chiefdom becomes level 4 automatically, and moving a unit re-computes level/path for it AND every descendant. create verifies the parent exists first; update validates a re-parent target (rejecting a move under the unit's own descendant, which would create a cycle) and auto-snapshots a backup before writing; delete refuses any unit that still has CHILDREN (re-parent or remove them first) and lets DHIS2's atomic delete block units that still hold data values / program assignments, surfacing the exact reason.
-Dates: openingDate is required on create; openingDate/closedDate accept YYYY-MM-DD. NEVER invent parent UIDs — resolve them with manage_org_units(action=list) or search_metadata.`,
+Dates: openingDate is required on create; openingDate/closedDate accept YYYY-MM-DD. NEVER invent parent UIDs — resolve them with manage_org_units(action=list) or search_metadata.
+Fresh/empty instance: to create the FIRST org unit (the root, e.g. a country) call create with NO parent_id — allowed only while the instance has zero org units. Then build downward, passing each create's returned org_unit_id as the next child's parent_id.`,
       parameters: {
         type: 'object',
         properties: {
@@ -5624,7 +5653,7 @@ const TOOL_SUMMARIES = {
   manage_custom_translations: 'Translate or re-label the UI strings of any DHIS2 app (2.43+ "custom-translations" datastore): list, get, set, remove. Keeps the controller registry in sync automatically — NEVER write those datastore keys via dhis2_query. Source strings must match the on-screen text exactly.',
   manage_growth_chart_plugin: 'Set up the WHO Capture Growth Chart plugin end-to-end: status (run first), install (from App Hub), scaffold_program (ready-made growth-monitoring tracker program), configure (auto-detects DOB/gender attributes + weight/height/head-circumference DEs and writes the plugin config), remove. NEVER hand-write its dataStore via dhis2_query.',
   manage_validation_rules: 'CRUD for DHIS2 validation rules — aggregate data-quality checks comparing a leftSide vs rightSide expression per period (e.g. "ANC 4 ≤ ANC 1"): list, get, create, update, delete. Both expressions are server-validated before saving. NEVER assemble validationRule /metadata bodies via dhis2_query.',
-  manage_org_units: 'CRUD for organisation units (the facility/chiefdom/district hierarchy): list, get, create (needs name, parent_id, opening_date), update (incl. MOVE/re-parent — level/path are DERIVED from the parent, never set them), delete (leaf-only, reference-safe). NEVER hand-write org-unit /metadata bodies via dhis2_query.',
+  manage_org_units: 'CRUD for organisation units (the facility/chiefdom/district hierarchy): list, get, create (needs name + opening_date, plus parent_id for every non-root; on a FRESH/EMPTY instance create the first root with NO parent_id), update (incl. MOVE/re-parent — level/path are DERIVED from the parent, never set them), delete (leaf-only, reference-safe). NEVER hand-write org-unit /metadata bodies via dhis2_query.',
   manage_indicators: 'CRUD for AGGREGATE indicators — (numerator ÷ denominator) × factor values shown on dashboards/pivots/maps: list, get, create, update, delete. Tracker/event PROGRAM indicators are a DIFFERENT object → manage_program_indicators. Expressions are server-validated before save; chain legend_set_id to render colour-coded. NEVER write indicator bodies via dhis2_query.',
   manage_option_sets: 'Standalone option-set lifecycle (reusable ordered code/label drop-downs): list, get, create, update (own fields), add_options, remove_options, reorder_options, delete. For an option set inline on a NEW data element use create_metadata instead; to convert a set to MULTI_TEXT use manage_metadata(action=convert_value_type). NEVER hand-write option bodies via dhis2_query.',
   manage_legend_sets: 'Standalone legend-set lifecycle (reusable colour bands for traffic-light / heat-map rendering): list, get, create (explicit legends or auto_bands red→amber→green), add_legends, remove_legends, update (own fields), delete. Attach to an aggregate indicator via manage_indicators(legend_set_id) — never via raw PATCH. NEVER hand-write legendSets bodies via dhis2_query.',
@@ -5920,8 +5949,9 @@ const KB_ORG_UNITS_DETAILS = `### The one rule that trips people up: level & pat
 - A unit's \`level\` and \`path\` come from its parent — DHIS2 computes them. You pass only \`parent_id\`; a child of a level-3 chiefdom automatically becomes level 4 with path = parentPath + "/" + newId. NEVER put level or path in the org_unit object.
 
 ### create
-- Required: org_unit.name, org_unit.parent_id, org_unit.opening_date (YYYY-MM-DD). short_name defaults to name (≤50 chars).
-- The tool verifies the parent exists first and reports the derived level. Resolve the parent UID with manage_org_units(action=list) or search_metadata — NEVER invent it. Creating a new ROOT is intentionally unsupported.
+- Required: org_unit.name, org_unit.opening_date (YYYY-MM-DD), and org_unit.parent_id for every non-root unit. short_name defaults to name (≤50 chars).
+- The tool verifies the parent exists first and reports the derived level. Resolve the parent UID with manage_org_units(action=list) or search_metadata — NEVER invent it.
+- FRESH / EMPTY instance: to create the FIRST org unit (the root, e.g. a country), call create with NO parent_id. The tool allows this ONLY when the instance has zero org units; once a root exists, every further unit needs a parent_id (a second root is refused). Build a hierarchy top-down: create the root, then create each child passing the parent_id returned by the previous create.
 - Use dry_run_only:true to validate (incl. the parent reference) without committing.
 
 ### update / move (re-parent)
@@ -12105,11 +12135,27 @@ async function createOrgUnit(args) {
   if (!o.name || !String(o.name).trim()) return { _error: 'org_unit.name is required.' };
 
   const parentId = (o.parent_id || args.parent_id) ? String(o.parent_id || args.parent_id).trim() : '';
+  let isRoot = false;
   if (!parentId) {
-    return {
-      _error: 'org_unit.parent_id is required.',
-      _hint: 'Every org unit except the single root has a parent. Pass the parent OU UID (find it with manage_org_units(action=list) or search_metadata). Creating a NEW root is intentionally not supported by this tool to avoid splitting the hierarchy.',
-    };
+    // No parent given. A second root splits the hierarchy, so that stays
+    // refused — BUT on a genuinely EMPTY instance the first org unit MUST be a
+    // root. Without this, a fresh instance can never get its first OU through
+    // this tool, forcing the model into raw metadata calls (where it hit the
+    // parent-by-name E5002 wall). Check the live count and allow ONLY the first.
+    const existing = await safeDhis2Fetch('organisationUnits?fields=id&pageSize=1');
+    if (existing?._error) {
+      return { _error: `Could not check existing org units before creating a root: ${existing._error}` };
+    }
+    const existingTotal = existing?.pager?.total
+      ?? (Array.isArray(existing?.organisationUnits) ? existing.organisationUnits.length : null);
+    if (existingTotal === 0) {
+      isRoot = true; // fresh instance → the first (root) org unit is allowed
+    } else {
+      return {
+        _error: 'org_unit.parent_id is required.',
+        _hint: `This instance already has ${existingTotal ?? 'existing'} org unit(s), so a new org unit needs a parent. Pass the parent OU UID (find it with manage_org_units(action=list) or search_metadata). Creating a SECOND root is not supported — it would split the hierarchy.`,
+      };
+    }
   }
 
   const openingRaw = o.opening_date ?? o.openingDate;
@@ -12120,12 +12166,16 @@ async function createOrgUnit(args) {
 
   // Verify the parent exists up-front: gives a clear error + lets us report the
   // derived level. postMetadataPayload's VALIDATE pass is the backstop for a
-  // reference that vanishes between this check and the import (E5002).
-  const parentResp = await safeDhis2Fetch(`organisationUnits/${parentId}?fields=id,displayName,level,path`);
-  if (parentResp?._status === 404) {
-    return { _error: `Parent org unit "${parentId}" does not exist (404).`, _hint: 'Confirm the parent UID via manage_org_units(action=list) or search_metadata before creating a child.' };
+  // reference that vanishes between this check and the import (E5002). Skipped
+  // for a root OU (there is no parent to verify).
+  let parentResp = null;
+  if (!isRoot) {
+    parentResp = await safeDhis2Fetch(`organisationUnits/${parentId}?fields=id,displayName,level,path`);
+    if (parentResp?._status === 404) {
+      return { _error: `Parent org unit "${parentId}" does not exist (404).`, _hint: 'Confirm the parent UID via manage_org_units(action=list) or search_metadata before creating a child.' };
+    }
+    if (parentResp?._error) return { _error: `Could not load parent org unit ${parentId}: ${parentResp._error}` };
   }
-  if (parentResp?._error) return { _error: `Could not load parent org unit ${parentId}: ${parentResp._error}` };
 
   const id = generateDhis2Uid();
   const name = String(o.name).trim();
@@ -12135,8 +12185,8 @@ async function createOrgUnit(args) {
     name,
     shortName,
     openingDate: normalizeOuDate(openingRaw),
-    parent: { id: parentId },
   };
+  if (!isRoot) ouObj.parent = { id: parentId };
   if (closedRaw) ouObj.closedDate = normalizeOuDate(closedRaw);
   if (o.code) ouObj.code = String(o.code).trim();
   if (o.description) ouObj.description = String(o.description);
@@ -12151,13 +12201,14 @@ async function createOrgUnit(args) {
     return { _error: result._error || 'Org unit create failed.', phase: result.phase, errors: result.errors };
   }
 
-  const expectedLevel = (parentResp.level || 0) + 1;
+  const expectedLevel = isRoot ? 1 : (parentResp.level || 0) + 1;
+  const parentInfo = isRoot ? null : { id: parentId, name: parentResp.displayName };
   if (args.dry_run_only) {
     return {
       success: true,
       dry_run: true,
       message: `Validation passed for "${name}". No org unit created (dry_run_only=true).`,
-      would_create: { id, name, shortName, parent: { id: parentId, name: parentResp.displayName }, expected_level: expectedLevel },
+      would_create: { id, name, shortName, parent: parentInfo, expected_level: expectedLevel, root: isRoot },
     };
   }
   return {
@@ -12166,10 +12217,12 @@ async function createOrgUnit(args) {
     org_unit_id: id,
     org_unit: {
       id, name, shortName, level: expectedLevel,
-      parent: { id: parentId, name: parentResp.displayName },
+      parent: parentInfo,
       openingDate: ouObj.openingDate, closedDate: ouObj.closedDate || null,
     },
-    message: `Created org unit "${name}" (${id}) under "${parentResp.displayName}" at level ${expectedLevel}.`,
+    message: isRoot
+      ? `Created ROOT org unit "${name}" (${id}) at level 1 (first org unit on this instance).`
+      : `Created org unit "${name}" (${id}) under "${parentResp.displayName}" at level ${expectedLevel}.`,
   };
 }
 
@@ -24200,6 +24253,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
               // Success — unlocks ONE identical retry for previously failed
               // calls (a prerequisite may have just been fixed).
               dhis2.toolSuccessCount = (dhis2.toolSuccessCount || 0) + 1;
+              // Reset the cumulative HTTP-error counter so it measures
+              // CONSECUTIVE failures (its documented intent), not lifetime
+              // ones. A long legitimate build — e.g. creating an OU hierarchy
+              // then an option set on a fresh instance — interleaves recoverable
+              // 4xx/409s (wrong order, name-collision probes) with real
+              // successes; the old cumulative count hit the hard-stop mid-build
+              // even though progress was being made. The identical-call and
+              // same-error-family guards still bound genuine retry loops.
+              dhis2.httpErrorCount = 0;
+              dhis2.httpErrorHistory = [];
             }
           }
         }

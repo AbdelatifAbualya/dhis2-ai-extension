@@ -1707,3 +1707,64 @@ legitimate-restore and normal-turn paths — all assertions pass: old
 conversation/context not resurrected after a racing reset; legitimate restore
 still works when no reset raced; stale turn dropped and new thread stays empty;
 normal turn still persists.
+
+---
+
+## 30. Fresh-instance creation no longer hits the guard walls — field names ≠ UIDs, consecutive HTTP-error stop, root OU on empty instance (v2.8.4)
+
+**Files:** `background.js`, `manifest.json`
+**Detailed write-up:** `CHANGES_fresh_instance_create.md`
+
+**Type of change:** Bug fix (3 root causes) + small capability addition
+
+**The report:** On a brand-new instance with zero metadata, asking the assistant to
+create an OU hierarchy + tracked entity type + attributes "hit the wall" and it gave
+up half-done. The anti-hallucination rule (no API calls for UIDs never seen in a
+verified source) must stay, but a fresh instance where the user explicitly wants to
+CREATE must not be blocked.
+
+**Root causes (each verified live against the user's instance, 2.42.5.1):**
+
+1. **Field names mistaken for hallucinated UIDs.** `DHIS_UID_RE` matches any 11-char
+   alphanumeric token, and `extractUidsFromCallArgs` scanned the whole `path` including
+   the `fields=id,displayName` query list. `displayName`/`lastUpdated` are 11-char
+   camelCase, so every discovery call requesting them was refused with
+   `unknown_uid_in_args` — fatal, since a fresh instance must run discovery.
+   → `extractUidsFromCallArgs` now scans only the path **before `?`** and filters
+   candidates through a new `RESERVED_UID_SHAPED_WORDS` denylist. Path-segment UIDs
+   (`/programs/<uid>`) and explicit `*_id` args are still validated — guard intact.
+
+2. **HTTP-error stop was cumulative, not consecutive.** The comment says "3 consecutive
+   4xx," but the counter only reset at turn start. A legitimate build interleaves
+   recoverable 409s with successful creates; the cumulative count hit 3 mid-build (after
+   4 OUs + the TET were already created) and hard-stopped.
+   → On every successful tool call the loop now resets `httpErrorCount`/`httpErrorHistory`.
+   The identical-call and same-error-family guards still bound genuine retry loops.
+
+3. **`manage_org_units` refused to create a root.** `createOrgUnit` hard-required
+   `parent_id`, so on an empty instance the proper tool was unusable and the model fell
+   back to raw metadata POSTs (into the E5002 parent-by-name wall).
+   → When no `parent_id` is given, `createOrgUnit` checks the live OU count: if **zero**,
+   it creates the first (root) OU (level 1, no parent); if any OU exists the old refusal
+   stands (a 2nd root splits the hierarchy) with a clearer hint. Tool description + KB +
+   TOOL_SUMMARIES updated to teach the fresh-instance top-down flow.
+
+**DHIS2 quirks confirmed live and documented (code comments + write-up):** the metadata
+importer resolves `parent` by **UID/code, never by name** (parent-by-name → E5002), so a
+hierarchy must use pre-generated UIDs + `parent:{id}` in ONE payload; an option set imports
+with its options in ONE payload when both carry UIDs and cross-reference; `trackedEntityType`
+requires `shortName` on 2.42 (E4000).
+
+**Scope of impact:** `extractUidsFromCallArgs` (pre-flight UID guard — now fewer false
+refusals for ALL tools), the dispatch-loop HTTP-error counter (all multi-step flows benefit),
+and `createOrgUnit` (adds root-on-empty; existing child creation unchanged). No tool
+regressed; cross-tool effects are strictly improvements (the guard is more accurate).
+
+**Verification:** `node --check` passes. UID-extraction unit cases: `?fields=id,displayName`
+→ no UIDs, `programs/<uid>` → the real UID. Counter simulation of the exact transcript
+sequence: old logic blocks `options create` (as it did live), new logic reaches it. Full
+scenario committed end-to-end on the live instance (root country with NO parent + 3
+descendants in one payload, Person TET, Sex option set + Male/Female, Full Name/DOB/Sex
+attributes) with `ignored:0`, then every object deleted — instance returned to completely
+empty. The stale objects the earlier failed run left behind (4 "Test" OUs + "Person" TET)
+were also removed.
