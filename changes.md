@@ -1651,3 +1651,59 @@ the custom form and *Stillbirth* re-hides them. All test metadata deleted from t
 create, manage_program_indicators create, architect verify, KB text. No wire-schema removals —
 only additive params and result fields; existing correct calls behave identically (name→code
 rewrite only ever converts a NAME literal to its CODE; guards skip negated/guarded conditions).
+
+---
+
+## 29. New-thread history & context reset — starting a new thread no longer continues the old task (v2.8.3)
+
+**Files:** `background.js`, `sidepanel/panel.js`, `manifest.json`
+**Detailed write-up:** `CHANGES_new_thread_reset.md`
+
+**Type of change:** Bug fix (behavior) — critical
+
+**The bug:** Opening a new thread (fresh side panel, possibly on a different DHIS2
+server) did not erase the previous conversation. The model silently continued the
+old task. Reproduction: create a tracker program on server A → open a completely
+new panel/thread → ask to "complete a task" → the model resumes the old
+tracker-program task from server A.
+
+**Root cause:** The model's memory (`conversationHistory`) is persisted to
+`chrome.storage.session` (`chatHistory`), which is scoped to the browser profile
+and survives panel close/reopen, other windows, and service-worker restarts. But
+the side panel never renders prior messages on load — a fresh panel always shows
+the empty welcome screen, so it *looked* like a new thread while the background
+still held the full old conversation. History was only cleared when the user
+clicked "+", and even that left task-specific cached context
+(`programMetadata`, `ouContext`, `visualizationContext`, `mapContext`,
+`pageContext`, `lastFacilityOu`, `datasetContext`) intact.
+
+**The fix (4 parts):**
+1. `CLEAR_HISTORY` is now a full new-thread reset via `clearConversationState()`:
+   wipes `conversationHistory`, `prefetchedIds`, `lastUserText`, and the
+   task-specific `dhis2.*` caches (keeping the connection identity so reconnect is
+   instant; the caches are re-fetched fresh by `initializeFromUrl` on the next
+   init — "context fetched again").
+2. `sidepanel/panel.js` `init()` sends `CLEAR_HISTORY` (awaited) **before**
+   connecting, so every fresh panel = a new thread, and the fresh `INITIALIZE`
+   re-fetches context cleanly.
+3. Restoration race guard: a module-level `historyExplicitlyCleared` flag makes
+   the cold-start restoration IIFE bail entirely if a reset raced it, so the old
+   thread can't be resurrected on top of the cleared one. (Flag resets each cold
+   start, so a genuine SW-restart mid-task still restores the *current* thread.)
+4. Epoch guard: `conversationEpoch` is bumped on each reset; the agentic loop
+   snapshots it at turn start and drops the turn at all four persistence sites if
+   the epoch changed — so a straggling turn from the old thread (panel reopened /
+   "+" clicked mid-generation) can't re-seed the new thread.
+
+**Scope of impact:** New-thread lifecycle only. Normal in-thread multi-turn
+conversation is unchanged (same-epoch turns persist as before); SW-restart
+mid-task still restores the active thread. The connection to DHIS2 is preserved
+across a reset — only conversational memory + task-specific context caches are
+cleared.
+
+**Verification:** `node --check` passes on both files. Standalone logic
+simulation of both guards (restoration race + epoch drop) plus the
+legitimate-restore and normal-turn paths — all assertions pass: old
+conversation/context not resurrected after a racing reset; legitimate restore
+still works when no reset raced; stale turn dropped and new thread stays empty;
+normal turn still persists.

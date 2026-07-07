@@ -130,7 +130,25 @@
     await loadUiPreferences();
     setStatus('connecting', 'Connecting to DHIS2...');
 
-    // Try to load existing state
+    // New thread on every fresh panel. The panel never renders prior messages
+    // on load — it always opens on the empty welcome screen — yet the background
+    // keeps the previous conversation in memory (and in session storage, which
+    // survives panel close/reopen and service-worker restarts within the same
+    // browser profile). Without this, a "new" panel silently inherits the old
+    // task and the model continues it. Clear the background's conversation and
+    // task-specific context BEFORE connecting, so the fresh INITIALIZE below
+    // re-fetches context cleanly. Awaited so the reset can't race the connect.
+    await new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'CLEAR_HISTORY' }, () => {
+          void chrome.runtime.lastError; // ignore "no receiver" on cold start
+          resolve();
+        });
+      } catch { resolve(); }
+    });
+
+    // Try to load existing state (connection status pill only — the reset above
+    // already wiped conversational memory).
     const stored = await chrome.storage.session.get(['dhis2State']);
     if (stored.dhis2State?.connected) {
       updateState(stored.dhis2State);

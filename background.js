@@ -133,6 +133,19 @@ let dhis2 = {
 let conversationHistory = [];
 let prefetchedIds = { viz: null, map: null };
 let lastUserText = '';
+// Set true once a NEW_THREAD/CLEAR_HISTORY reset has run in this service-worker
+// lifetime. The async state-restoration IIFE (which rehydrates chatHistory from
+// session storage on a cold start) checks this so a reset that races the
+// restore can never resurrect the previous thread's conversation. See the
+// restoration block and the CLEAR_HISTORY handler.
+let historyExplicitlyCleared = false;
+// Bumped on every new-thread reset. The agentic loop captures the epoch when a
+// turn starts and refuses to write that turn back into conversationHistory if
+// the epoch changed meanwhile — i.e. the thread was reset (panel reopened / "+"
+// clicked) while a generation from the OLD thread was still finishing. Without
+// this, a straggling turn would re-seed the freshly-cleared history with the
+// old task.
+let conversationEpoch = 0;
 let lineListingAssets = {
   loaded: false,
   systemPromptMd: '',
@@ -1032,6 +1045,13 @@ function userExplicitlyWantsDescendants(userText) {
 (async () => {
   try {
     const stored = await chrome.storage.session.get(['dhis2Full', 'chatHistory']);
+    // Do NOT resurrect the previous thread if a new-thread reset (CLEAR_HISTORY)
+    // fired while this async get() was in flight — otherwise a fresh panel that
+    // clears history the instant it opens could have the prior thread's
+    // conversation AND task context (programMetadata, ouContext, …) restored
+    // right back on top of it, and the model silently continues the old task.
+    // The connect flow re-establishes the connection and re-fetches context.
+    if (historyExplicitlyCleared) return;
     if (stored.dhis2Full) Object.assign(dhis2, stored.dhis2Full);
     if (stored.chatHistory) conversationHistory = stored.chatHistory;
   } catch (e) { console.warn('State restoration failed:', e); }
@@ -1183,6 +1203,46 @@ async function saveState() {
       chatHistory: trimConversationHistory(conversationHistory),
     });
   } catch {}
+}
+
+// ── New-thread reset ────────────────────────────────────────────────────────
+// Wipes ALL conversational memory and task-specific cached context so a new
+// thread starts with a clean slate. Called both when the user clicks "+"
+// (CLEAR_HISTORY) and automatically whenever a fresh side-panel opens, so a new
+// thread NEVER inherits the previous thread's task — even across servers,
+// windows, or service-worker restarts within the same browser profile.
+//
+// Deliberately KEEPS the connection identity (baseUrl/apiVersion/systemInfo/
+// connected/ouMaxLevel/metadataAuditSupport) so reconnecting is fast; the
+// task-specific caches below are re-fetched fresh by initializeFromUrl on the
+// next INITIALIZE/CHAT_MESSAGE, satisfying "context must be fetched again".
+async function clearConversationState() {
+  historyExplicitlyCleared = true;
+  conversationEpoch++;
+  conversationHistory = [];
+  prefetchedIds = { viz: null, map: null };
+  lastUserText = '';
+
+  // Task/page-specific context that could be stale from a prior thread. Nulling
+  // these forces initializeFromUrl to re-derive them from the active tab.
+  dhis2.programMetadata = null;
+  dhis2.programRulesCount = null;
+  dhis2.ouContext = null;
+  dhis2.visualizationContext = null;
+  dhis2.mapContext = null;
+  dhis2.datasetContext = null;
+  dhis2.lastFacilityOu = null;
+  dhis2.pageContext = {};
+
+  // Per-turn action memory (created IDs, error trails). These normally reset
+  // each turn, but drop them here too so no created-metadata memory from the
+  // previous thread can leak into the new one.
+  dhis2.knownIds = null;
+  dhis2.knownIdsSeedSize = 0;
+  dhis2.knownIcons = null;
+  dhis2.recentCreations = null;
+
+  await saveState();
 }
 
 // ── DHIS2 API Helpers ────────────────────────────────────────────────────────
@@ -23998,6 +24058,11 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   // messages.slice(turnStartIdx) so the next turn remembers the actual tool
   // calls + results, not just the final prose.
   const turnStartIdx = 1 + conversationHistory.length;
+  // Snapshot the thread identity. If a new-thread reset happens while this turn
+  // is still running (panel reopened / "+" clicked mid-generation), the epoch
+  // changes and every persistence site below drops this turn instead of
+  // re-seeding the freshly-cleared history with the old task.
+  const turnEpoch = conversationEpoch;
 
   for (let i = 0; i < 50; i++) {
     // Contextual thinking label
@@ -24323,6 +24388,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           const turnHist = buildTurnHistory(messages, turnStartIdx, historyText)
             .filter(m => !(m.role === 'assistant' && !m.tool_calls && !(m.content && String(m.content).trim())));
           turnHist.push({ role: 'assistant', content: fallback });
+          // Drop this turn if the thread was reset while it was running.
+          if (turnEpoch !== conversationEpoch) return { text: '', charts, streamed: false, aborted: true };
           conversationHistory.push(...turnHist);
           conversationHistory = trimConversationHistory(conversationHistory);
           saveState();
@@ -24348,6 +24415,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       // memory of the API calls it made and the IDs it created on later turns,
       // instead of forcing it to re-read its own summary prose.
       const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
+      // Drop this turn if the thread was reset while it was running — pushing it
+      // now would re-seed the new thread with the old task.
+      if (turnEpoch !== conversationEpoch) return { text: '', charts, streamed: false, aborted: true };
       conversationHistory.push(...turnHist);
       conversationHistory = trimConversationHistory(conversationHistory);
 
@@ -24397,6 +24467,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       messages.push({ role: 'assistant', content: finalText });
       if (finalStreamStarted) broadcast({ type: 'AI_STREAM_END', text: finalText });
       const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
+      // Drop this turn if the thread was reset while it was running — pushing it
+      // now would re-seed the new thread with the old task.
+      if (turnEpoch !== conversationEpoch) return { text: '', charts, streamed: false, aborted: true };
       conversationHistory.push(...turnHist);
       conversationHistory = trimConversationHistory(conversationHistory);
       lastInteraction = { question: userText, apiCalls: apiCallsLog, answer: finalText };
@@ -24412,6 +24485,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   try {
     const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);
     if (turnHist.length) {
+      // Drop this turn if the thread was reset while it was running — pushing it
+      // now would re-seed the new thread with the old task.
+      if (turnEpoch !== conversationEpoch) return { text: '', charts, streamed: false, aborted: true };
       conversationHistory.push(...turnHist);
       conversationHistory = trimConversationHistory(conversationHistory);
       saveState();
@@ -24817,10 +24893,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case 'CLEAR_HISTORY': {
-      conversationHistory = [];
-      prefetchedIds = { viz: null, map: null };
-      saveState();
-      sendResponse({ success: true });
+      // Full new-thread reset: conversation memory + prefetch + task-specific
+      // cached context. Sent by the "+" button AND automatically on every fresh
+      // side-panel open, so a new thread never inherits the old task.
+      clearConversationState()
+        .then(() => sendResponse({ success: true }))
+        .catch(e => sendResponse({ error: e.message }));
       return true;
     }
 
