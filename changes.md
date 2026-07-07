@@ -1545,3 +1545,109 @@ probe answers, playground cleaned). `node --check` passes on both files.
 **Scope of impact:** No tool logic changed. Successful calls and legitimate fix-then-retry
 flows are unaffected (proven by the happy-path E2E + success-bypass unit checks). The guard
 only refuses calls that repeat a recorded failure.
+
+## 28. MCH-scenario fixes: stage-by-name rule actions, no phantom IDs after failed create, option-code PRVs + name→code literal mapping, empty-field numeric guards, PI name auto-disambiguation, verify actually reads rules (v2.8.2)
+
+**Files:** `background.js`, `manifest.json`
+**Type of change:** Bug fixes (tool-call reliability + program-rule correctness) + manual/KB updates
+
+**Incident (2026-07-06, user's MCH tracker build on play stable-2-40-12):** two failed tool
+calls during one build, plus three program-rule defects that survived a "verified" program:
+(a) `create_program` bounced with *"ProgramRuleAction: ProgramStage cannot be null"* because
+Rule 4's HIDE-STAGE action had no stage reference — the schema only accepted
+`program_stage_id`, which cannot exist yet during create_program (stage UIDs are generated
+client-side inside the very same call); (b) the failed create's response still exposed
+`program_id`/`stage_ids` handles, so the model called `add_program_rules` against phantom
+program `OuyEAzGOp5i` → 404; (c) Stage 2's infant fields (Infant Birth Weight, APGAR,
+Neonatal Resuscitation) never showed even with outcome = *Live Birth* — the auto-created
+`delivery_outcome` PRV had `useCodeForOptionSet:false` (yields the option **name**) while
+the condition compared the **code** `'LIVE_BIRTH'`, so the hide-condition was always true
+(NOT a custom-form limitation — verified live in Capture 2.40); (d) *Gestational Age* looked
+broken while EDD worked — `V{event_date}` is empty until the user fills the Report date, so
+`d2:weeksBetween(#{lmp}, V{event_date})` correctly fills only after that (EDD depends only on
+LMP); (e) the APGAR `< 7` warning fired on a blank form (empty numeric coerces to 0).
+
+**What changed:**
+
+1. **Stage references by NAME in rule actions** — new `program_stage_name` param (schemas of
+   `create_metadata` rules + `manage_program_rules` actions). `createFullProgram` resolves it
+   against the stage names of the same call (original + collision-suffixed); `addProgramRules`
+   and `_buildAndPostProgramRules` resolve against the program's stage displayNames; a stage
+   name passed in `program_stage_id` also resolves. HIDEPROGRAMSTAGE/CREATEEVENT actions with
+   no resolvable stage now fail at the pre-flight lint (with `valid_stage_names` /
+   `valid_stages`) instead of bouncing the whole atomic import server-side. HIDESECTION inside
+   create_program (no sections exist) is also refused with guidance.
+2. **No phantom IDs after a failed create** — `createFullProgram` returns
+   `program_id`/`stage_ids`/`data_element_ids`/… ONLY on success; failures now carry
+   `nothing_created:true` plus an explicit "atomic import — nothing exists, re-issue
+   create_program, do NOT call add_program_rules" hint. `addProgramRules`' 404 hint explains
+   the failed-create-id case. KB_CREATE_PROGRAM_DETAILS states the same rule.
+3. **Option-set PRVs resolve CODES everywhere** — `createFullProgram.pushDePrv` and
+   `addProgramRules.pushDePrv` now set `useCodeForOptionSet:true` for option-set DEs (the
+   manage_program_rules path already did). New shared `rewriteOptionLiteralsGeneric()` maps
+   option **name** literals in conditions and ASSIGN data to their codes (reported as
+   `condition_option_rewrites`) and flags literals matching neither name nor code
+   (`condition_option_advisories`) in BOTH legacy paths; reused (pre-existing) option sets are
+   fetched from the server so their real codes are used. `addProgramRules` also covers
+   EXISTING option-backed PRVs: code-resolving ones join the rewrite; a name-resolving one
+   compared to a literal is flagged.
+4. **Empty-field numeric guard** — new `autoGuardNumericComparisons()` wraps bare
+   `#{x} < n` / `<= n` atoms as `(d2:hasValue(#{x}) && #{x} < n)` in all three rule-creation
+   paths (compositional under `&&`/`||`; conditions containing negation or an existing
+   d2:hasValue guard for that variable are never touched). Reported as
+   `auto_guarded_conditions`.
+5. **Program-indicator NAME auto-disambiguation** — PI names are globally unique; re-running
+   a scenario whose PI names already exist (even on another program) failed the create. Both
+   `_buildAndPostProgramIndicator` (create) and createFullProgram's PI follow-up now probe
+   name collisions and auto-suffix with the program short name (or UID shard), mirroring the
+   stage-name convention; renames are reported (`name_auto_disambiguated` /
+   `_indicator_renames`).
+6. **`architect_metadata(verify)` actually reads rules** — `programs/{id}?fields=programRules[...]`
+   returns an EMPTY collection on 2.40 even when rules exist (verified live), so verify was
+   silently skipping every rule check ("1/1 verified" on a broken program). Rules + PRVs are
+   now fetched via `programRules?filter=program.id:eq:` / `programRuleVariables?filter=…`.
+   New `rule_advisories` + `integrity_checks.rule_quality_ok`: flags option-set PRVs with
+   `useCodeForOptionSet:false` compared to quoted literals, and notes the HIDEPROGRAMSTAGE
+   Capture-web semantics.
+7. **KB/manual updates** (delivered via the two-tier manual gate):
+   - HIDEPROGRAMSTAGE: use `program_stage_name` in create_program; in the NEW Capture web app
+     it only disables adding events (stage card stays visible, button tooltip "You can't add
+     any more … events") — legacy Tracker Capture/Android hide the stage tab; tell the user.
+   - `V{event_date}` is empty until the Report date is filled — calculated fields appear then;
+     explain instead of "fixing" the rule.
+   - Custom forms × hide/show (KB_CUSTOM_FORMS_DETAILS): rules KEEP WORKING in custom stage
+     forms (inputs unmount/remount dynamically, ASSIGN fills, warnings render inline), but the
+     custom-HTML label row remains visible when its input is hidden (orphan label; default
+     section forms hide the whole row) — proactively explain this trade-off to the user; do
+     NOT claim hide/show is impossible with custom forms and do NOT script hiding in HTML.
+   - Option-set bullet: codes are UPPER_SNAKE of the option name; auto-rewrites/advisories.
+
+**DHIS2 quirks discovered (play stable-2-40-12, verified live in Capture 2.40 via browser):**
+- Custom stage forms render fully in the new Capture app; HIDEFIELD removes/re-adds the input
+  in place (label cell remains — a `<div>` mount point stays in the DOM, too fragile to
+  target with CSS `:empty` tricks, so no auto-collapse is generated).
+- HIDEPROGRAMSTAGE in new Capture = "can't add new events" (disabled + tooltip), card visible.
+- `programs/{id}?fields=programRules[...]` → empty collection even when rules exist;
+  `programRuleVariables[...]` as program fields works. Always use the filtered endpoints.
+- Rule engine coerces empty numeric fields to 0 (`#{empty} < 7` is true); empty option-set
+  values compared with `!=` are true (fields stay hidden until the trigger is chosen).
+- Event status transition ACTIVE→SCHEDULE is refused (E1316).
+
+**Verification:** 25-check harness suite (`executeTool` against play 2.40.12): pure-helper
+units (guards, literal rewrite), original failure shape now a clean lint (no server call, no
+leaked IDs), full MCH create with stage-by-name + name literals + bare `<` (all corrected
+server-side: `useCodeForOptionSet:true`, `!= 'LIVE_BIRTH'`, stage resolved, condition
+guarded), add_program_rules to existing program (existing-PRV literal rewrite), phantom-id
+hint, verify advisories — ALL PASSED. Then a full-loop E2E with a real LLM
+(Fireworks kimi-k2p6) running the user's complete MCH prompt (custom forms + hide/show kept):
+**zero failed tool calls** (vs 2 in the incident + 3 PI name collisions in the first E2E run),
+5 rules + 3 custom forms + 3 PIs created correctly, final answer explains the hide/show
+behaviors to the user. Browser-verified on the user's own program: EDD + GA fill correctly
+once Report date set; with the PRV fixed, selecting *Live Birth* shows the 3 infant inputs in
+the custom form and *Stillbirth* re-hides them. All test metadata deleted from the playground.
+`node --check` passes.
+
+**Scope of impact:** create_program embedded rules, add_program_rules, manage_program_rules
+create, manage_program_indicators create, architect verify, KB text. No wire-schema removals —
+only additive params and result fields; existing correct calls behave identically (name→code
+rewrite only ever converts a NAME literal to its CODE; guards skip negated/guarded conditions).

@@ -4170,7 +4170,8 @@ If user enabled web browsing from UI, this tool should usually be called before 
                       type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages).' },
                       data_element_name: { type: 'string', description: 'Target DE name (resolved to ID automatically)' },
                       tracked_entity_attribute_name: { type: 'string', description: 'Target TEA name for HIDEFIELD on a tracked entity attribute (resolved to ID automatically)' },
-                      program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE)' },
+                      program_stage_name: { type: 'string', description: 'Target stage NAME (for HIDEPROGRAMSTAGE/CREATEEVENT). In create_program ALWAYS use this — stage IDs are generated during the call and cannot be known in advance; the tool resolves the name to the new stage UID.' },
+                      program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE on an EXISTING program, e.g. add_program_rules). During create_program use program_stage_name instead.' },
                       content: { type: 'string', description: 'Static message text for SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/DISPLAYTEXT. Variables in content are shown literally — use the data field for dynamic refs.' },
                       data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: target value. SHOWWARNING/SHOWERROR/etc: dynamic content appended after the static content prefix (e.g. data="#{my_de}" or data="d2:concatenate(\\"X=\\", #{a})").' },
                       exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE).' }
@@ -4445,6 +4446,7 @@ Actions:
                     data_element_id: { type: 'string', description: 'Target data element ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD' },
                     tei_attribute_id: { type: 'string', description: 'Target TEA ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD on attributes' },
                     program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE and stage-scoped actions)' },
+                    program_stage_name: { type: 'string', description: 'Target stage NAME (alternative to program_stage_id — resolved to the stage id automatically)' },
                     program_stage_section_id: { type: 'string', description: 'Target section ID (for HIDESECTION)' },
                     evaluation_time: { type: 'string', enum: ['ON_DATA_ENTRY', 'ON_COMPLETE', 'ALWAYS'], description: 'When action fires. Default: ON_DATA_ENTRY' }
                   },
@@ -5586,12 +5588,16 @@ const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
 - **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
 - **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
 - **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
-- HIDEPROGRAMSTAGE hides an entire stage tab (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section.
+- **HIDEPROGRAMSTAGE** (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section. Two things you MUST know (verified live on Capture 2.40):
+  • **Stage reference:** on create_program pass \`program_stage_name: "<stage name from THIS call>"\` — stage IDs are generated during the call, so an id-less action bounces the whole atomic import with "ProgramStage cannot be null". On an existing program either program_stage_id or program_stage_name works.
+  • **What the user actually sees in the NEW Capture web app:** the stage card stays VISIBLE on the enrollment dashboard — HIDEPROGRAMSTAGE only disables adding new events to it (the "+ New <stage> event" button greys out with "You can't add any more … events"). Only the legacy Tracker Capture app and the Android app hide the stage tab entirely. When you create such a rule, TELL THE USER this so they don't report it as broken.
+- **\`V{event_date}\` is EMPTY until the user fills the event's Report date.** In a fresh Capture form the report-date field starts blank, so an ASSIGN like gestational age \`d2:weeksBetween(#{lmp}, V{event_date})\` shows nothing until the report date is entered — then it fills instantly (verified live: EDD = d2:addDays fills immediately, GA fills on report-date entry). This is normal engine behavior, NOT a broken rule; proactively tell the user "the calculated value appears once the event/report date is set". Use V{current_date} instead ONLY if the value must appear before any date is entered and "as of today" semantics are acceptable.
+- **Numeric \`<\` / \`<=\` comparisons fire on EMPTY fields** — the engine coerces an empty numeric field to 0, so \`#{apgar} < 7\` shows its warning on a blank form. The tool auto-wraps bare \`#{x} < n\` atoms as \`(d2:hasValue(#{x}) && #{x} < n)\` (reported as auto_guarded_conditions); write the d2:hasValue guard yourself in anything more complex (negations are never auto-touched).
 - BOOLEAN / TRUE_ONLY: compare against unquoted \`true\` / \`false\`. Canonical forms:
   • is Yes: \`#{flag} == true\`
   • is empty or No: \`!d2:hasValue(#{flag}) || #{flag} != true\`
   ⚠ Never write \`#{flag} == false\`, \`== 'true'\`, \`== 'Yes'\`, or \`== 'No'\` — these fail silently on DHIS2.
-- Option-set fields: set the rule variable's \`use_code_for_option_set: true\` and compare to the CODE in quotes, e.g. \`#{status} == 'APPROVED'\`.
+- Option-set fields: compare to the option CODE in quotes, e.g. \`#{status} == 'APPROVED'\`. All auto-created PRVs for option-set DEs/TEAs get \`useCodeForOptionSet: true\` (a false value makes #{var} yield the option NAME so \`== 'CODE'\` never matches — a silent, rule-never-fires failure). Auto-generated codes are UPPER_SNAKE of the option name ("Live Birth" → \`LIVE_BIRTH\`). The tool also auto-maps option-NAME literals in conditions/ASSIGN data to their codes (condition_option_rewrites in the result) and flags literals matching neither name nor code (condition_option_advisories) — read those advisories, they mean the rule will never fire as written.
 - ⚠ **Every \`#{name}\` MUST resolve to a programRuleVariable for the rule to fire.** For \`manage_program_rules(action=create)\` on an existing program: just use \`#{sanitized_de_display_name}\` (e.g. DE "Is breathing abnormal" → \`#{is_breathing_abnormal}\`) — the tool auto-creates the PRV by matching the sanitized name to the program's DEs and picks the correct sourceType (CURRENT_EVENT when the rule acts on the same stage, NEWEST_EVENT_PROGRAM otherwise) plus valueType + optionSet from the DE. Pass \`variables:[]\` only if you need to override the source_type, reference a DE whose displayName does not match, or wire a TEI_ATTRIBUTE variable. If a \`#{name}\` does not match any existing PRV or program DE, the tool refuses the POST and returns \`unresolved[]\` with suggestions — correct the name or add an explicit \`variables[]\` entry and retry.`;
 
 const KB_PI_GRAMMAR = `### Program-Indicator EXPRESSION GRAMMAR (DHIS2 2.41) — read this BEFORE writing any PI
@@ -5644,13 +5650,13 @@ The tool handles the FULL dependency chain atomically and auto-resolves all inte
 - \`assign_all_org_units: true\`: use this WHEN THE USER SAYS "all OUs", "all org units", "all levels", "all facilities", "every org unit" — the tool fetches every org unit server-side in ONE call. DO NOT paginate org units yourself.
 - \`sharing\`: \`{ public_access: "rwrw----", include_current_user: true, user_ids: [...], user_group_ids: [...] }\`. Set \`include_current_user: true\` when the user says "include me", "share with me", "I should have access", etc. Sharing is auto-applied to stages + DEs + option sets + TEAs unless \`apply_to_children: false\`. **DHIS2 only permits data-level sharing (positions 3-4 of the access string) on Program + ProgramStage — DataElement, OptionSet, TrackedEntityAttribute, ProgramIndicator are metadata-only.** The tool strips the data bits automatically for those classes, so a single \`public_access: "rwrw----"\` is safe everywhere.
 - \`stages\`: data elements (with inline \`option_set\` if needed)
-- \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`)
+- \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`). Stage-targeting actions (HIDEPROGRAMSTAGE, CREATEEVENT) MUST reference the stage by \`program_stage_name\` (a stage name from this same call) — stage IDs do not exist yet and an unresolvable stage fails the pre-flight lint.
 - \`program_indicators\`: indicators with expressions and filters
 
 **Internal dependency order** the tool enforces in the atomic payload (you never build this yourself — it's here so you understand recovery):
 Options → OptionSets → TrackedEntityAttributes → DataElements → Program + ProgramStages (stages carry programStageDataElements) → ProgramRuleVariables → ProgramRuleActions → ProgramRules → (follow-up POST) ProgramIndicators. Sharing attaches to Program/Stage in full; DE/OS/TEA/PI get metadata-only. OrgUnit assignment rides inside the Program object.
 
-**If create_program returns \`success: false\`, read \`errors[]\`:**
+**If create_program returns \`success: false\`, read \`errors[]\` — and remember the import is ATOMIC: NOTHING was created.** Never call add_program_rules / add_stage / manage_custom_forms with IDs from a failed attempt (they don't exist — you'll get a 404); fix the input and re-issue the whole create_program.
 - "Data sharing is not enabled for X" → the tool now strips data bits itself; if you still see this, a custom class changed — retry with \`sharing.apply_to_children: false\` and then run \`manage_metadata(action=update_sharing)\` per object.
 - "Property X is required" on a specific klass → add that field to the matching input slot and retry the WHOLE create_program (the rollback is atomic).
 - Validation rejects ONE stage (name clash, bad DE) → keep the other stage in a retry minus the bad one, then use \`add_stage\` / \`add_data_elements_to_stage\` afterwards to fix the rejected piece.
@@ -5816,6 +5822,12 @@ Everything else in the HTML (tables, headings, narrative text) renders verbatim.
 - The dataEntryForm is created STANDALONE first (POST /api/dataEntryForms); it can never be embedded inline in a dataSet/programStage (E5002).
 - Linking to a program stage re-attaches the program reference on a full PUT (a PATCH/naive PUT loses it → "must reference a program").
 - A dataset custom form needs sharing rwrw---- + an assigned org unit before users can actually enter data. If the tool's \`_hints\` flag these, fix them with **manage_datasets** (update_sharing / assign_org_units).
+
+### Custom forms × program rules (hide/show) — verified live on Capture 2.40 (2026-07-07)
+Program rules KEEP WORKING inside a custom stage form: HIDEFIELD removes the field's input widget and re-shows it dynamically when the condition flips, ASSIGN fills values, SHOWWARNING renders inline under the input. Do NOT try to re-implement hiding inside the HTML (scripts are not executed by Capture) and do NOT tell users hide/show is impossible with custom forms. But there are TWO user-visible differences you MUST proactively explain whenever a program combines a custom form with hide/show rules:
+1. **Orphan labels:** the custom HTML around the input (the label cell / table row the generator emits) stays visible when the input is hidden — the user sees a label with an empty value cell. In the DEFAULT (section) form the whole row disappears. If pixel-perfect hiding matters more than the custom design, recommend skipping the custom form for that stage.
+2. **HIDEPROGRAMSTAGE** (any form type) in the new Capture web app only disables adding events to the stage — the stage card remains on the enrollment dashboard (see the program-rule KB).
+Also remind users that a rule hiding fields "when X is not Y" hides them while X is still EMPTY — the fields appear only after the trigger value is chosen. That is the rule doing its job, not the form breaking.
 
 ### Recipes
 - "Make a custom form for this dataset": manage_custom_forms(action="set_dataset_form", dataset_id="<id>")  // auto-generates from its DEs
@@ -17269,6 +17281,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const allDataElements = [];
   const allTrackedEntityAttributes = [];
   const optionSetUidMap = {}; // name → uid
+  const optionSetOptionsByName = {}; // option set name → [{name, code}] as BUILT locally
   const deUidMap = {}; // name → uid
   const teaUidMap = {}; // name → uid
   // Per-class shortName dedupe — DHIS2 enforces shortName uniqueness within
@@ -17289,6 +17302,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           allOptions.push(...options);
           allOptionSets.push(optionSet);
           optionSetUidMap[de.option_set.name] = osUid;
+          optionSetOptionsByName[de.option_set.name] = options.map(o => ({ name: o.name, code: o.code }));
         }
       }
       // Build data element (skip duplicates by name)
@@ -17310,6 +17324,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           allOptions.push(...options);
           allOptionSets.push(optionSet);
           optionSetUidMap[attr.option_set.name] = osUid;
+          optionSetOptionsByName[attr.option_set.name] = options.map(o => ({ name: o.name, code: o.code }));
         }
       }
       // Build TEA (skip duplicates by name)
@@ -17347,6 +17362,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // Capability is identical; latency drops from N RTTs to 2.
 
   // 1. Check option sets by name — one batched query, then remap & flag.
+  const reusedOptionSetNames = new Set(); // sets that already exist server-side — their REAL option codes may differ from our locally derived ones
   if (allOptionSets.length > 0) {
     const osNames = allOptionSets.map(o => o.name);
     const osBatches = [];
@@ -17362,6 +17378,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           const oldId = os.id;
           optionSetUidMap[os.name] = ex.id;
           os._skip = true;
+          reusedOptionSetNames.add(os.name);
           for (const de of allDataElements) { if (de.optionSet?.id === oldId) de.optionSet.id = ex.id; }
           for (const tea of allTrackedEntityAttributes) { if (tea.optionSet?.id === oldId) tea.optionSet.id = ex.id; }
         }
@@ -17568,6 +17585,9 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const allProgramRuleActions = [];
   const allProgramRules = [];
   const prvCreated = {}; // track created variables by name
+  let ruleConditionAdvisories = [];
+  let ruleConditionRewrites = [];
+  let ruleAutoGuards = [];
 
   if (args.program_rules?.length) {
     // Pre-flight: lint conditions for known-broken boolean patterns.
@@ -17586,6 +17606,40 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       };
     }
 
+    // deName → its inline option set name (needed so option-set PRVs resolve
+    // option CODES, and so condition/ASSIGN literals can be name→code mapped).
+    const deOptionSetName = {};
+    for (const stage of stages) {
+      for (const de of (stage.data_elements || [])) {
+        if (de.option_set?.name) deOptionSetName[de.name] = de.option_set.name;
+      }
+    }
+    const teaOptionSetName = {};
+    for (const attr of (args.program_attributes || [])) {
+      if (attr.option_set?.name) teaOptionSetName[attr.name] = attr.option_set.name;
+    }
+
+    // Stage references inside rule actions: stage IDs are generated CLIENT-SIDE
+    // in this very call, so the model cannot know them — HIDEPROGRAMSTAGE /
+    // CREATEEVENT actions reference stages by NAME instead (program_stage_name,
+    // or a name passed in program_stage_id). Verified failure mode on play
+    // 2.40.12 (2026-07-06): an id-less HIDEPROGRAMSTAGE bounced the whole atomic
+    // import with "ProgramRuleAction: ProgramStage cannot be null".
+    const stageNameToUid = {};
+    for (let si = 0; si < stages.length; si++) {
+      stageNameToUid[String(stages[si].name || '').trim().toLowerCase()] = stageUids[si];
+      stageNameToUid[String(resolvedStageNames[si] || '').trim().toLowerCase()] = stageUids[si];
+    }
+    const resolveStageRefForAction = (act) => {
+      const ref = act.program_stage_name || act.program_stage_id;
+      if (!ref) return null;
+      const byName = stageNameToUid[String(ref).trim().toLowerCase()];
+      if (byName) return byName;
+      if (stageUids.includes(ref)) return ref;
+      if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(String(ref))) return ref; // plausible pre-existing UID — pass through
+      return undefined; // unresolvable
+    };
+
     // PRV builders keyed by PRV NAME so a token-named variable (e.g. muac →
     // DE "MUAC in cm") and an exact-sanitized-name variable never collide.
     const pushDePrv = (prvName, deName) => {
@@ -17603,6 +17657,12 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         program: { id: programUid },
         dataElement: { id: deUidMap[deName] },
         programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+        // Option-set DEs MUST resolve the option CODE, matching the code
+        // literals the conditions compare against. useCodeForOptionSet=false
+        // makes #{var} yield the option NAME → every `== 'CODE'` comparison
+        // silently never fires (root cause of the MCH "hidden fields never
+        // show" bug, play 2.40.12, 2026-07-07).
+        ...(deOptionSetName[deName] ? { useCodeForOptionSet: true } : {}),
         ...(sourceStageId ? { programStage: { id: sourceStageId } } : {}),
       });
       prvCreated[prvName] = prvUid;
@@ -17624,7 +17684,17 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
 
     const deNamesAll = Object.keys(deUidMap);
     const teaNamesAll = Object.keys(teaUidMap);
+    const autoGuardedConditions = [];
     for (const rule of args.program_rules) {
+      // Bare `#{x} < n` fires on EMPTY fields (empty coerces to 0) — wrap with
+      // d2:hasValue so warnings/hides don't trigger on a blank form.
+      {
+        const g = autoGuardNumericComparisons(rule.condition);
+        if (g.guarded.length) {
+          rule.condition = g.condition;
+          autoGuardedConditions.push({ rule: rule.name, guarded_variables: g.guarded });
+        }
+      }
       // Resolve every #{}/A{} token in condition + action data to a DE/TEA
       // (exact sanitized name, then unique prefix). The PRV is created under
       // the TOKEN name so the expression resolves exactly as written.
@@ -17675,8 +17745,30 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) {
           pra.trackedEntityAttribute = { id: teaUidMap[act.tracked_entity_attribute_name] };
         }
-        if (act.program_stage_id) pra.programStage = { id: act.program_stage_id };
+        const stageId = resolveStageRefForAction(act);
+        if (stageId) pra.programStage = { id: stageId };
         if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
+
+        // Fail FAST (before any server call) on stage-targeting actions that
+        // could not resolve — the server rejects the whole atomic import with
+        // "ProgramRuleAction: ProgramStage cannot be null" otherwise.
+        if ((act.type === 'HIDEPROGRAMSTAGE' || act.type === 'CREATEEVENT') && !pra.programStage) {
+          return {
+            success: false,
+            phase: 'lint',
+            _error: `Program rule "${rule.name}" has a ${act.type} action whose target stage could not be resolved${act.program_stage_name || act.program_stage_id ? ` from "${act.program_stage_name || act.program_stage_id}"` : ' (no stage reference given)'}. Nothing was imported.`,
+            valid_stage_names: stages.map(s => s.name),
+            _hint: 'Stage IDs do not exist yet during create_program — reference the stage by NAME via program_stage_name (one of valid_stage_names) and the tool resolves it to the client-generated stage UID. Fix the action and retry the whole create_program.',
+          };
+        }
+        if (act.type === 'HIDESECTION' && !pra.programStageSection) {
+          return {
+            success: false,
+            phase: 'lint',
+            _error: `Program rule "${rule.name}" has a HIDESECTION action without a program_stage_section_id — create_program does not create sections, so there is no section to hide. Nothing was imported.`,
+            _hint: 'Use HIDEFIELD per data element (or HIDEPROGRAMSTAGE with program_stage_name for a whole stage) instead, or create the sections first and add the rule afterwards via manage_program_rules.',
+          };
+        }
         allProgramRuleActions.push(pra);
       }
 
@@ -17689,6 +17781,59 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         programRuleActions: actionRefs, // ID refs only, not full objects
       });
     }
+
+    // ── Option NAME → CODE mapping in conditions and ASSIGN data ──
+    // PRVs above resolve option CODES (useCodeForOptionSet=true), so literals
+    // must be codes too. Locally built sets carry their derived codes; sets
+    // REUSED from the server may have different codes → fetch those.
+    {
+      const deNameByUid = {};
+      for (const [n, uid] of Object.entries(deUidMap)) deNameByUid[uid] = n;
+      const teaNameByUid = {};
+      for (const [n, uid] of Object.entries(teaUidMap)) teaNameByUid[uid] = n;
+
+      const varToOsKey = new Map();
+      for (const prv of allProgramRuleVariables) {
+        let osName = null;
+        if (prv.dataElement?.id) osName = deOptionSetName[deNameByUid[prv.dataElement.id]] || null;
+        else if (prv.trackedEntityAttribute?.id) osName = teaOptionSetName[teaNameByUid[prv.trackedEntityAttribute.id]] || null;
+        if (osName) varToOsKey.set(String(prv.name).toLowerCase(), osName);
+      }
+      const targetToOsKey = new Map();
+      for (const pra of allProgramRuleActions) {
+        const deId = pra.dataElement?.id;
+        const teaId = pra.trackedEntityAttribute?.id;
+        const osName = (deId && deOptionSetName[deNameByUid[deId]]) || (teaId && teaOptionSetName[teaNameByUid[teaId]]) || null;
+        if (osName) targetToOsKey.set(deId || teaId, osName);
+      }
+
+      const neededOsNames = new Set([...varToOsKey.values(), ...targetToOsKey.values()]);
+      const optionsByOsKey = new Map();
+      const reusedToFetch = [];
+      for (const osName of neededOsNames) {
+        if (reusedOptionSetNames.has(osName)) reusedToFetch.push(osName);
+        else if (optionSetOptionsByName[osName]) optionsByOsKey.set(osName, optionSetOptionsByName[osName]);
+      }
+      if (reusedToFetch.length) {
+        const resps = await Promise.all(reusedToFetch.map(n =>
+          safeDhis2Fetch(`optionSets/${optionSetUidMap[n]}?fields=id,options[name,code]`)));
+        for (let i = 0; i < reusedToFetch.length; i++) {
+          const o = resps[i];
+          if (o && !o._error) optionsByOsKey.set(reusedToFetch[i], (o.options || []).map(x => ({ name: x.name, code: x.code })));
+        }
+      }
+
+      const mapped = rewriteOptionLiteralsGeneric({
+        rules: allProgramRules,
+        actions: allProgramRuleActions,
+        varToOsKey,
+        targetToOsKey,
+        optionsByOsKey,
+      });
+      ruleConditionAdvisories = mapped.advisories;
+      ruleConditionRewrites = mapped.rewrites;
+    }
+    ruleAutoGuards = autoGuardedConditions;
   }
 
   // Build the atomic payload (Batch 1: options + optionSets + TEAs + DEs + program + stages)
@@ -17756,6 +17901,33 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     // ProgramIndicators also have a UNIQUE shortName constraint server-side.
     await disambiguateShortNamesAgainstServer(indicators, 'programIndicators', 'programIndicators');
 
+    // NAME is globally unique too — probe in one batched query and auto-suffix
+    // collisions with the program's short name (or a UID shard), mirroring the
+    // stage-name convention. Without this, re-running a scenario whose PIs
+    // already exist (even on another program) fails the whole follow-up POST.
+    {
+      const piNames = indicators.map(p => p.name);
+      const nameBatches = [];
+      for (let i = 0; i < piNames.length; i += 50) nameBatches.push(piNames.slice(i, i + 50));
+      const probeResps = await Promise.all(nameBatches.map(batch => {
+        const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
+        return safeDhis2Fetch(`programIndicators?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
+      }));
+      const taken = new Set();
+      for (const resp of probeResps) for (const ex of (resp?.programIndicators || [])) taken.add(ex.name);
+      if (taken.size) {
+        const piRenames = [];
+        for (const p of indicators) {
+          if (!taken.has(p.name)) continue;
+          let candidate = programShortForSuffix ? `${p.name} - ${programShortForSuffix}`.substring(0, 230) : '';
+          if (!candidate || taken.has(candidate)) candidate = `${p.name} ${generateDhis2Uid().slice(-4)}`.substring(0, 230);
+          piRenames.push({ original: p.name, final: candidate });
+          p.name = candidate;
+        }
+        if (piRenames.length) result._indicator_renames = piRenames;
+      }
+    }
+
     const piPayload = { programIndicators: indicators };
     const piResult = await postMetadataPayload(piPayload, false);
     indicatorResults = indicators.map(pi => ({ id: pi.id, name: pi.name }));
@@ -17780,6 +17952,9 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     programRules: allProgramRules.map(r => ({ id: r.id, name: r.name })),
     programIndicators: indicatorResults,
     orgUnits: orgUnitIds,
+    ...(ruleAutoGuards.length ? { auto_guarded_conditions: ruleAutoGuards } : {}),
+    ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
+    ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
   };
 
   // Record successful program create in the per-turn registry so a duplicate
@@ -17800,6 +17975,20 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // it target a stage/DE/attribute by the name it just asked for.
   const stage_ids = {};
   summary.stages.forEach((s) => { stage_ids[s.name] = s.id; });
+
+  // On FAILURE, never expose the pre-generated ID handles: the import is atomic,
+  // so NONE of those objects exist. Returning program_id alongside the error
+  // caused the model to call add_program_rules against a phantom program (404
+  // "Program OuyEAzGOp5i could not be found" — observed 2026-07-06 on the MCH
+  // scenario after a validation failure).
+  if (!result || result.success !== true) {
+    return {
+      ...result,
+      nothing_created: true,
+      _hint: `${result?._hint ? result._hint + ' ' : ''}The import is ATOMIC and it failed — NOTHING was created (no program, stages, data elements, or rules exist on the server). Do NOT reuse any IDs from this attempt and do NOT call add_program_rules/add_stage for this program. Fix the reported error and re-issue the ENTIRE create_program call.`,
+    };
+  }
+
   return {
     ...result,
     program_id: programUid,
@@ -19026,9 +19215,14 @@ async function addProgramRules(args) {
   // PSDE id+compulsory included so HIDEALLFIELDS sugar can flip compulsory→false on
   // hidden DEs (DHIS2 New Tracker Capture refuses to visually hide a compulsory DE).
   const progResp = await safeDhis2Fetch(
-    `programs/${args.program_id}?fields=id,programStages[id,sortOrder,programStageDataElements[id,compulsory,dataElement[id,displayName]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,optionSet[id]]]`
+    `programs/${args.program_id}?fields=id,programStages[id,displayName,sortOrder,programStageDataElements[id,compulsory,dataElement[id,displayName,optionSet[id]]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,optionSet[id]]]`
   );
-  if (progResp._error) return { _error: `Could not load program ${args.program_id}: ${progResp._error}` };
+  if (progResp._error) {
+    return {
+      _error: `Could not load program ${args.program_id}: ${progResp._error}`,
+      _hint: 'If this program id came from a FAILED create_program attempt, nothing was created (the import is atomic) — that id does not exist. Either re-issue the full create_program call (rules can be included inline), or find the real program first via search_metadata(object_type="programs", name_filter=...).',
+    };
+  }
 
   // Auto-rewrite SHOWWARNING content + expand HIDEALLFIELDS sugar before processing actions.
   // Side effects: PUT each affected stage with compulsory→false; auto-append a sibling
@@ -19038,30 +19232,49 @@ async function addProgramRules(args) {
 
   const deNameToId = {};
   const deNameToStage = {};
+  const deNameToOptionSetId = {};
+  const stageNameToId = {};
   for (const ps of (progResp.programStages || [])) {
+    if (ps.displayName) stageNameToId[String(ps.displayName).trim().toLowerCase()] = ps.id;
     for (const psde of (ps.programStageDataElements || [])) {
       const de = psde.dataElement;
       deNameToId[de.displayName] = de.id;
       deNameToStage[de.displayName] = ps.id;
+      if (de.optionSet?.id) deNameToOptionSetId[de.displayName] = de.optionSet.id;
     }
   }
+  const validStageIdSet = new Set((progResp.programStages || []).map(ps => ps.id));
+  // Stage references in actions may arrive as a stage NAME (models often can't
+  // know stage UIDs) — resolve name → id; a valid known UID passes through.
+  const resolveStageRefForAction = (act) => {
+    const ref = act.program_stage_name || act.program_stage_id;
+    if (!ref) return null;
+    if (validStageIdSet.has(ref)) return ref;
+    const byName = stageNameToId[String(ref).trim().toLowerCase()];
+    if (byName) return byName;
+    if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(String(ref))) return ref; // plausible UID from elsewhere — let the server validate
+    return undefined;
+  };
 
   const teaNameToId = {};
   const teaHasOptionSet = {};
+  const teaNameToOptionSetId = {};
   for (const ptea of (progResp.programTrackedEntityAttributes || [])) {
     const tea = ptea.trackedEntityAttribute;
     teaNameToId[tea.displayName] = tea.id;
     teaHasOptionSet[tea.displayName] = !!tea.optionSet;
+    if (tea.optionSet?.id) teaNameToOptionSetId[tea.displayName] = tea.optionSet.id;
   }
 
   // Existing PRVs on the program: tokens naming them resolve as-is (no new
-  // PRV), and new PRVs must not collide with their names.
+  // PRV), and new PRVs must not collide with their names. Option-set details
+  // are fetched too so literals compared against EXISTING option-backed
+  // variables get the same name→code mapping as new ones.
   const existingPrvResp = await safeDhis2Fetch(
-    `programRuleVariables?filter=program.id:eq:${args.program_id}&fields=name&paging=false`
+    `programRuleVariables?filter=program.id:eq:${args.program_id}&fields=name,useCodeForOptionSet,dataElement[id,optionSet[id]],trackedEntityAttribute[id,optionSet[id]]&paging=false`
   );
-  const existingVarNames = new Set(
-    (existingPrvResp.programRuleVariables || []).map(v => v.name)
-  );
+  const existingPrvList = existingPrvResp.programRuleVariables || [];
+  const existingVarNames = new Set(existingPrvList.map(v => v.name));
 
   const allPRVs = [];
   const allPRAs = [];
@@ -19078,6 +19291,10 @@ async function addProgramRules(args) {
       program: { id: args.program_id },
       dataElement: { id: deNameToId[deName] },
       programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+      // Option-set DEs must resolve option CODES so `== 'CODE'` conditions
+      // fire (useCodeForOptionSet=false yields the option NAME — silent
+      // never-matching rules; MCH bug, play 2.40.12, 2026-07-07).
+      ...(deNameToOptionSetId[deName] ? { useCodeForOptionSet: true } : {}),
       ...(deNameToStage[deName] ? { programStage: { id: deNameToStage[deName] } } : {}),
     });
     prvCreated[prvName] = prvUid;
@@ -19098,7 +19315,17 @@ async function addProgramRules(args) {
 
   const deNamesAll = Object.keys(deNameToId);
   const teaNamesAll = Object.keys(teaNameToId);
+  const autoGuardedConditions = [];
   for (const rule of args.program_rules) {
+    // Bare `#{x} < n` fires on EMPTY fields (empty coerces to 0) — wrap with
+    // d2:hasValue so warnings/hides don't trigger on a blank form.
+    {
+      const g = autoGuardNumericComparisons(rule.condition);
+      if (g.guarded.length) {
+        rule.condition = g.condition;
+        autoGuardedConditions.push({ rule: rule.name, guarded_variables: g.guarded });
+      }
+    }
     // Resolve #{}/A{} tokens (condition + action data) to program DEs/TEAs —
     // exact sanitized name, then unique prefix; tokens naming an existing PRV
     // pass through. Unresolved tokens REFUSE the import (rules with unknown
@@ -19156,8 +19383,21 @@ async function addProgramRules(args) {
       } else if (act.tracked_entity_attribute_name && teaNameToId[act.tracked_entity_attribute_name]) {
         pra.trackedEntityAttribute = { id: teaNameToId[act.tracked_entity_attribute_name] };
       }
-      if (act.program_stage_id) pra.programStage = { id: act.program_stage_id };
+      const stageId = resolveStageRefForAction(act);
+      if (stageId) pra.programStage = { id: stageId };
       if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
+
+      // Fail fast on stage-targeting actions with no resolvable stage — the
+      // server rejects the whole bundle with "ProgramStage cannot be null".
+      if ((act.type === 'HIDEPROGRAMSTAGE' || act.type === 'CREATEEVENT') && !pra.programStage) {
+        return {
+          success: false,
+          phase: 'lint',
+          _error: `Program rule "${rule.name}" has a ${act.type} action whose target stage could not be resolved${act.program_stage_name || act.program_stage_id ? ` from "${act.program_stage_name || act.program_stage_id}"` : ' (no stage reference given)'}. Nothing was imported.`,
+          valid_stages: (progResp.programStages || []).map(ps => ({ id: ps.id, name: ps.displayName })),
+          _hint: 'Pass program_stage_id with one of the valid stage ids, or program_stage_name with the stage name — the tool resolves names automatically. Fix the action and retry.',
+        };
+      }
       allPRAs.push(pra);
     }
 
@@ -19169,6 +19409,72 @@ async function addProgramRules(args) {
       condition: rule.condition,
       programRuleActions: actionRefs, // ID refs only, not full objects
     });
+  }
+
+  // ── Option NAME → CODE mapping in conditions and ASSIGN data ──
+  // New PRVs above resolve option CODES (useCodeForOptionSet=true); rewrite any
+  // option-NAME literal to its code and flag literals that match neither.
+  let ruleConditionAdvisories = [];
+  let ruleConditionRewrites = [];
+  {
+    const deIdToOsId = new Map();
+    for (const [n, id] of Object.entries(deNameToId)) {
+      if (deNameToOptionSetId[n]) deIdToOsId.set(id, deNameToOptionSetId[n]);
+    }
+    const teaIdToOsId = new Map();
+    for (const [n, id] of Object.entries(teaNameToId)) {
+      if (teaNameToOptionSetId[n]) teaIdToOsId.set(id, teaNameToOptionSetId[n]);
+    }
+    const varToOsKey = new Map();
+    for (const prv of allPRVs) {
+      const osId = (prv.dataElement?.id && deIdToOsId.get(prv.dataElement.id))
+        || (prv.trackedEntityAttribute?.id && teaIdToOsId.get(prv.trackedEntityAttribute.id)) || null;
+      if (osId) varToOsKey.set(String(prv.name).toLowerCase(), osId);
+    }
+    // Existing option-backed PRVs: code-resolving ones join the rewrite; a
+    // NAME-resolving one (useCodeForOptionSet=false) compared to a literal is
+    // flagged — code literals never match it.
+    const nameResolvingOptionVars = [];
+    for (const prv of existingPrvList) {
+      const osId = prv.dataElement?.optionSet?.id || prv.trackedEntityAttribute?.optionSet?.id || null;
+      if (!osId) continue;
+      if (prv.useCodeForOptionSet === false) nameResolvingOptionVars.push(prv.name);
+      else varToOsKey.set(String(prv.name).toLowerCase(), osId);
+    }
+    for (const varName of nameResolvingOptionVars) {
+      const esc = String(varName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'[^']+'`);
+      for (const pr of allPRs) {
+        if (re.test(pr.condition || '')) {
+          ruleConditionAdvisories.push(`Rule "${pr.name}" compares #{${varName}} to a quoted literal, but that EXISTING variable has useCodeForOptionSet=false (it yields the option NAME, not the CODE) — a code literal never matches. Fix the variable via manage_program_rules or compare against the option name.`);
+        }
+      }
+    }
+    const targetToOsKey = new Map();
+    for (const pra of allPRAs) {
+      const osId = (pra.dataElement?.id && deIdToOsId.get(pra.dataElement.id))
+        || (pra.trackedEntityAttribute?.id && teaIdToOsId.get(pra.trackedEntityAttribute.id)) || null;
+      if (osId) targetToOsKey.set(pra.dataElement?.id || pra.trackedEntityAttribute?.id, osId);
+    }
+    const neededOsIds = [...new Set([...varToOsKey.values(), ...targetToOsKey.values()])];
+    if (neededOsIds.length) {
+      const resps = await Promise.all(neededOsIds.map(id =>
+        safeDhis2Fetch(`optionSets/${id}?fields=id,options[name,code]`)));
+      const optionsByOsKey = new Map();
+      for (let i = 0; i < neededOsIds.length; i++) {
+        const o = resps[i];
+        if (o && !o._error) optionsByOsKey.set(neededOsIds[i], (o.options || []).map(x => ({ name: x.name, code: x.code })));
+      }
+      const mapped = rewriteOptionLiteralsGeneric({
+        rules: allPRs,
+        actions: allPRAs,
+        varToOsKey,
+        targetToOsKey,
+        optionsByOsKey,
+      });
+      ruleConditionAdvisories = mapped.advisories;
+      ruleConditionRewrites = mapped.rewrites;
+    }
   }
 
   const payload = {};
@@ -19188,6 +19494,9 @@ async function addProgramRules(args) {
       ...(sugarSideEffects.stageUpdates.length ? { compulsory_flags_cleared: sugarSideEffects.stageUpdates } : {}),
       ...(sugarSideEffects.errors.length ? { compulsory_flag_errors: sugarSideEffects.errors } : {}),
       ...(sugarPlan.siblingMandateRules.length ? { auto_paired_mandate_rules: sugarPlan.siblingMandateRules.map(r => r.name) } : {}),
+      ...(autoGuardedConditions.length ? { auto_guarded_conditions: autoGuardedConditions } : {}),
+      ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
+      ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
     },
   };
 }
@@ -20407,6 +20716,111 @@ function lintProgramRuleCondition(condition, ruleName) {
   return null;
 }
 
+// ── Auto-guard bare `< / <=` numeric comparisons against EMPTY fields ──
+// The Capture rules engine coerces an empty numeric field to 0, so a condition
+// like `#{apgar_score} < 7` is TRUE before the user types anything and its
+// SHOWWARNING/HIDEFIELD fires on a blank form. Verified live on play 2.40.12
+// (2026-07-07): "APGAR < 7" warning rendered under an untouched empty field.
+// Fix: wrap each bare `#{x} < n` / `#{x} <= n` atom in-place as
+// `(d2:hasValue(#{x}) && #{x} < n)` — compositional under && and ||, so
+// compound conditions keep their meaning. Deliberately skipped when the
+// condition contains any negation (`!` other than `!=`) or already guards the
+// same variable with d2:hasValue — rewriting inside a negation would invert
+// the intended empty-field behavior.
+function autoGuardNumericComparisons(condition) {
+  const original = String(condition || '');
+  if (!original.trim()) return { condition: original, guarded: [] };
+  if (/!(?!=)/.test(original)) return { condition: original, guarded: [] }; // negations present — hands off
+  const guarded = [];
+  const re = /([#A]\{[^}]+\})\s*(<=?)\s*(-?\d+(?:\.\d+)?)(?!\d)/g;
+  const rewritten = original.replace(re, (full, token, op, num) => {
+    if (original.includes(`d2:hasValue(${token})`)) return full; // author already guarded it
+    guarded.push(token);
+    return `(d2:hasValue(${token}) && ${token} ${op} ${num})`;
+  });
+  return { condition: rewritten, guarded };
+}
+
+// ── Rewrite option NAMES → CODES in rule conditions and ASSIGN data ──
+// Shared by the create_program embedded-rules path and add_program_rules.
+// (manage_program_rules has its own equivalent, verified earlier — untouched.)
+// Auto-created option-set PRVs use useCodeForOptionSet=true, so the engine
+// compares option CODES. A condition/ASSIGN written with the option NAME
+// ('Live Birth' instead of 'LIVE_BIRTH') lints clean, saves, and then never
+// matches — the exact silent failure seen on the MCH program (play 2.40.12,
+// 2026-07-07: Stage-2 infant fields stayed hidden even with outcome = Live
+// Birth). This only rewrites a NAME literal to its CODE; literals that are
+// already codes, empty-string checks, and unknown literals are left alone
+// (unknowns are surfaced as advisories instead).
+//   rules:   [{ name, condition }]                      — condition mutated in place
+//   actions: [{ programRuleActionType, data, dataElement, trackedEntityAttribute }]
+//   varToOsKey:    Map lowercased #{var} name → option-set key
+//   targetToOsKey: Map DE/TEA id (action targets) → option-set key
+//   optionsByOsKey: Map key → [{ name, code }]
+function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKey, optionsByOsKey }) {
+  const advisories = [];
+  const rewrites = [];
+  const lookup = (osKey) => {
+    const opts = optionsByOsKey.get(osKey);
+    if (!opts || !opts.length) return null;
+    return {
+      byCode: new Set(opts.map(o => String(o.code))),
+      byName: new Map(opts.map(o => [String(o.name).toLowerCase(), String(o.code)])),
+      codes: opts.map(o => o.code).join(', '),
+    };
+  };
+
+  for (const rule of (rules || [])) {
+    let cond = String(rule.condition || '');
+    const usedVars = new Set((cond.match(/#\{([^}]+)\}/g) || []).map(m => m.slice(2, -1)));
+    for (const vRaw of usedVars) {
+      const osKey = varToOsKey.get(vRaw.toLowerCase());
+      if (!osKey) continue;
+      const os = lookup(osKey);
+      if (!os) continue;
+      const varToken = `#{${vRaw}}`;
+      const esc = vRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*#\\{${esc}\\}`, 'g');
+      cond = cond.replace(re, (full, op1, lit1, lit2, op2) => {
+        const lit = (lit1 !== undefined ? lit1 : lit2);
+        const op = op1 || op2;
+        if (lit === '') return full;         // empty-value check — leave alone
+        if (os.byCode.has(lit)) return full; // already a code — leave alone
+        const code = os.byName.get(lit.toLowerCase());
+        if (code) {
+          rewrites.push(`Rule "${rule.name}": '${lit}' → option code '${code}'`);
+          return op1 ? `${varToken} ${op} '${code}'` : `'${code}' ${op} ${varToken}`;
+        }
+        advisories.push(`Rule "${rule.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of its option set (codes: ${os.codes}). This comparison will never match — verify the value.`);
+        return full;
+      });
+    }
+    rule.condition = cond;
+  }
+
+  for (const pra of (actions || [])) {
+    if (pra.programRuleActionType !== 'ASSIGN') continue;
+    const targetId = pra.dataElement?.id || pra.trackedEntityAttribute?.id;
+    const osKey = targetId && targetToOsKey.get(targetId);
+    if (!osKey) continue;
+    const os = lookup(osKey);
+    if (!os) continue;
+    const literal = typeof pra.data === 'string' && pra.data.trim().match(/^'([^']*)'$/);
+    if (!literal) continue; // dynamic expression — can't statically check
+    const value = literal[1];
+    if (value === '' || os.byCode.has(value)) continue;
+    const code = os.byName.get(value.toLowerCase());
+    if (code) {
+      rewrites.push(`ASSIGN '${value}' → option code '${code}'`);
+      pra.data = `'${code}'`;
+    } else {
+      advisories.push(`ASSIGN uses '${value}', which is neither an option code nor an option name of the target's option set (codes: ${os.codes}). The assigned value will bounce on save — fix it.`);
+    }
+  }
+
+  return { advisories, rewrites };
+}
+
 // PI grammar — d2 functions DHIS2 2.41 actually accepts inside a programIndicator
 // expression OR filter. Keep in sync with VALID_D2_FUNCS in audit (line ~12854).
 // d2:contains / d2:containsString / d2:inOrgUnit / d2:hasUserRole / d2:removeMin
@@ -20809,6 +21223,17 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     };
   }
 
+  // 1a. Bare `#{x} < n` fires on EMPTY fields (empty coerces to 0) — wrap with
+  // d2:hasValue so warnings/hides don't trigger on a blank form.
+  const autoGuardedConditions = [];
+  for (const rule of rules) {
+    const g = autoGuardNumericComparisons(rule.condition);
+    if (g.guarded.length) {
+      rule.condition = g.condition;
+      autoGuardedConditions.push({ rule: rule.name, guarded_variables: g.guarded });
+    }
+  }
+
   // 2. Load program so we can resolve variable references and pick smart defaults.
   // PSDE id+compulsory included so HIDEALLFIELDS sugar can flip compulsory→false on
   // hidden DEs (DHIS2 New Tracker Capture refuses to visually hide a compulsory DE).
@@ -20869,6 +21294,23 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
 
   const isDhis2Uid = (s) => /^[a-zA-Z][a-zA-Z0-9]{10}$/.test(s);
 
+  // Stage references in actions may arrive as a stage NAME — resolve name → id.
+  const stageNameToId = new Map();
+  const validStageIdSet = new Set();
+  for (const ps of (progResp.programStages || [])) {
+    validStageIdSet.add(ps.id);
+    if (ps.displayName) stageNameToId.set(String(ps.displayName).trim().toLowerCase(), ps.id);
+  }
+  const resolveStageRefForAction = (act) => {
+    const ref = act.program_stage_name || act.program_stage_id;
+    if (!ref) return null;
+    if (validStageIdSet.has(ref)) return ref;
+    const byName = stageNameToId.get(String(ref).trim().toLowerCase());
+    if (byName) return byName;
+    if (isDhis2Uid(String(ref))) return ref; // plausible UID from elsewhere — let the server validate
+    return undefined;
+  };
+
   // Resolve a rule action's TARGET (the DE/TEA the action acts on) from either an
   // explicit UID (data_element_id / tei_attribute_id) OR a display name
   // (data_element_name / tracked_entity_attribute_name). The schema advertises the
@@ -20917,7 +21359,8 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       if (tgt && Array.isArray(tgt.stageIds)) {
         for (const sid of tgt.stageIds) actionStageIds.add(sid);
       }
-      if (act.program_stage_id) actionStageIds.add(act.program_stage_id);
+      const actStageId = resolveStageRefForAction(act);
+      if (actStageId) actionStageIds.add(actStageId);
     }
     for (const sid of deEntry.stageIds) {
       if (actionStageIds.has(sid)) return { sourceType: 'DATAELEMENT_CURRENT_EVENT', stageId: null };
@@ -21099,8 +21542,18 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
           unresolved.push({ rule: rule.name, reference: `action target tracked_entity_attribute_name="${act.tracked_entity_attribute_name}"`, suggestions: collectSuggestions(act.tracked_entity_attribute_name) });
         }
       }
-      if (act.program_stage_id) pra.programStage = { id: act.program_stage_id };
+      const stageId = resolveStageRefForAction(act);
+      if (stageId) pra.programStage = { id: stageId };
       if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
+      // Stage-targeting actions without a resolvable stage bounce server-side
+      // with "ProgramStage cannot be null" — surface via the unresolved flow.
+      if ((act.type === 'HIDEPROGRAMSTAGE' || act.type === 'CREATEEVENT') && !pra.programStage) {
+        unresolved.push({
+          rule: rule.name,
+          reference: `${act.type} target stage "${act.program_stage_name || act.program_stage_id || '(none given)'}"`,
+          suggestions: (progResp.programStages || []).map(ps => ({ kind: 'programStage', id: ps.id, displayName: ps.displayName })),
+        });
+      }
       allPRAs.push(pra);
     }
 
@@ -21273,6 +21726,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       ...(sugarSideEffects.errors.length ? { compulsory_flag_errors: sugarSideEffects.errors } : {}),
       ...(sugarPlan.siblingMandateRules.length ? { auto_paired_mandate_rules: sugarPlan.siblingMandateRules.map(r => r.name) } : {}),
       ...(conditionOptionAdvisories.length ? { condition_option_advisories: conditionOptionAdvisories } : {}),
+      ...(autoGuardedConditions.length ? { auto_guarded_conditions: autoGuardedConditions } : {}),
     },
   };
 }
@@ -22334,10 +22788,38 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   // its existing shortName (the same row), so skip when indicatorId is set.
   if (!indicatorId) {
     await disambiguateShortNamesAgainstServer([pi], 'programIndicators', 'programIndicators');
+
+    // NAME is also globally unique on programIndicators. A collision (e.g. the
+    // same indicator set created earlier for another program on a shared
+    // server) fails the whole POST with "Property `name` … already exists" —
+    // auto-suffix with the program's short name (then a UID shard), same
+    // convention as stage-name disambiguation. Observed live on play 2.40.12
+    // (2026-07-07) re-running the MCH scenario.
+    const nameProbe = await safeDhis2Fetch(`programIndicators?filter=name:eq:${encodeURIComponent(pi.name)}&fields=id&pageSize=1`);
+    if (nameProbe?.programIndicators?.length) {
+      const progMeta = await safeDhis2Fetch(`programs/${programId}?fields=shortName,name`);
+      const suffix = String(progMeta?.shortName || progMeta?.name || '').trim();
+      let candidate = suffix ? `${indicator.name} - ${suffix}`.substring(0, 230) : '';
+      if (candidate) {
+        const probe2 = await safeDhis2Fetch(`programIndicators?filter=name:eq:${encodeURIComponent(candidate)}&fields=id&pageSize=1`);
+        if (probe2?.programIndicators?.length) candidate = '';
+      }
+      if (!candidate) candidate = `${indicator.name} ${generateDhis2Uid().slice(-4)}`.substring(0, 230);
+      pi._renamedFrom = indicator.name;
+      pi.name = candidate;
+    }
   }
 
+  const renamedFrom = pi._renamedFrom;
+  delete pi._renamedFrom;
   const result = await postMetadataPayload({ programIndicators: [pi] }, false);
-  const out = { ...result, summary: { indicator: { id: uid, name: indicator.name } } };
+  const out = {
+    ...result,
+    summary: {
+      indicator: { id: uid, name: pi.name },
+      ...(renamedFrom ? { name_auto_disambiguated: { from: renamedFrom, to: pi.name, reason: 'a program indicator with the requested name already exists (names are globally unique)' } } : {}),
+    },
+  };
   // Mirror the top-level *_id convention every other write tool already exposes
   // (manage_indicators → indicator_id, manage_dashboards → visualization_id /
   // dashboard_id, manage_org_units → org_unit_id, manage_datasets → dataset_id)
@@ -22706,16 +23188,60 @@ async function executeArchitectMetadata(args) {
         // Deep verify a full program structure
         if (args.verify_program_id) {
           try {
-            const prog = await safeDhis2Fetch(
-              `programs/${args.verify_program_id}?fields=id,name,programType,programStages[id,name,sortOrder,programStageDataElements[dataElement[id,name,valueType,optionSet[id,name]]]],programRuleVariables[id,name,programRuleVariableSourceType],programRules[id,name,condition,programRuleActions[id,programRuleActionType,content,data,dataElement[id,name]]],trackedEntityType[id,name],organisationUnits[id,name]`
-            );
+            // NOTE: rules + rule variables are fetched via the programRules /
+            // programRuleVariables endpoints with a program filter, NOT as
+            // program fields — `programs/{id}?fields=programRules[...]` returns
+            // an EMPTY collection on DHIS2 2.40 even when rules exist (verified
+            // live on play 2.40.12, 2026-07-07), which silently made this
+            // verify skip every rule check.
+            const [prog, rulesResp, prvsResp] = await Promise.all([
+              safeDhis2Fetch(
+                `programs/${args.verify_program_id}?fields=id,name,programType,programStages[id,name,sortOrder,programStageDataElements[dataElement[id,name,valueType,optionSet[id,name]]]],trackedEntityType[id,name],organisationUnits[id,name]`
+              ),
+              safeDhis2Fetch(
+                `programRules?filter=program.id:eq:${args.verify_program_id}&fields=id,name,condition,programRuleActions[id,programRuleActionType,content,data,dataElement[id,name],programStage[id]]&paging=false`
+              ),
+              safeDhis2Fetch(
+                `programRuleVariables?filter=program.id:eq:${args.verify_program_id}&fields=id,name,programRuleVariableSourceType,useCodeForOptionSet,dataElement[id],trackedEntityAttribute[id]&paging=false`
+              ),
+            ]);
             if (!prog || prog._error) {
               results.push({ program_verify: args.verify_program_id, status: '❌ NOT FOUND', error: prog?._error });
             } else {
               const stages = prog.programStages || [];
-              const rules = prog.programRules || [];
-              const prvs = prog.programRuleVariables || [];
+              const rules = rulesResp?.programRules || [];
+              const prvs = prvsResp?.programRuleVariables || [];
               const ous = prog.organisationUnits || [];
+
+              // Rule-quality advisories the pure existence checks can't see.
+              // (a) An option-set-backed PRV with useCodeForOptionSet=false that a
+              //     condition compares to a quoted literal → the variable yields the
+              //     option NAME while conditions conventionally use CODES, so the
+              //     rule silently never fires (exact MCH failure, play 2.40.12).
+              // (b) HIDEPROGRAMSTAGE reminder — in the new Capture web app it only
+              //     blocks adding events; the stage card stays visible.
+              const ruleAdvisories = [];
+              {
+                const optionSetDeIds = new Set();
+                for (const s of stages) {
+                  for (const psde of (s.programStageDataElements || [])) {
+                    if (psde.dataElement?.optionSet) optionSetDeIds.add(psde.dataElement.id);
+                  }
+                }
+                for (const v of prvs) {
+                  const bound = v.dataElement?.id;
+                  if (!bound || !optionSetDeIds.has(bound) || v.useCodeForOptionSet === true) continue;
+                  for (const r of rules) {
+                    const esc = String(v.name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    if (new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'[^']+'`).test(r.condition || '')) {
+                      ruleAdvisories.push(`Rule "${r.name}" compares #{${v.name}} to a quoted literal, but that variable has useCodeForOptionSet=false (it yields the option NAME, not the CODE) — if the literal is an option code the rule NEVER fires. Fix: set useCodeForOptionSet=true on the variable via manage_program_rules, or compare against the option name.`);
+                    }
+                  }
+                }
+                if (rules.some(r => (r.programRuleActions || []).some(a => a.programRuleActionType === 'HIDEPROGRAMSTAGE'))) {
+                  ruleAdvisories.push('This program uses HIDEPROGRAMSTAGE: in the NEW Capture web app that only disables adding events to the stage (the stage card stays visible on the enrollment dashboard); the legacy Tracker Capture / Android apps hide the stage entirely. Expected behavior — mention it to the user.');
+                }
+              }
 
               results.push({
                 program_verify: args.verify_program_id,
@@ -22753,7 +23279,9 @@ async function executeArchitectMetadata(args) {
                   all_stages_have_data_elements: stages.every(s => (s.programStageDataElements || []).length > 0),
                   rule_count: rules.length,
                   prv_count: prvs.length,
+                  rule_quality_ok: ruleAdvisories.length === 0,
                 },
+                ...(ruleAdvisories.length ? { rule_advisories: ruleAdvisories } : {}),
               });
             }
           } catch (e) {
