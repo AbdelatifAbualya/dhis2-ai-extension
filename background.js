@@ -1285,7 +1285,15 @@ async function dhis2Fetch(url) {
 }
 
 function apiUrl(path) {
-  return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${path}`;
+  // Encode the query portion the same way safeDhis2Fetch does, so bracketed
+  // `fields=a[b[c]]` context loads (program metadata, rules, OU context, viz,
+  // maps, datasets) don't 400 on a strict Tomcat-fronted DHIS2. See
+  // encodeStrictQueryChars (hoisted). appendQueryParamsToPath already encodes
+  // via URLSearchParams, so this only matters for raw bracketed path strings.
+  const s = String(path);
+  const qIdx = s.indexOf('?');
+  if (qIdx === -1) return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${s}`;
+  return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${s.substring(0, qIdx)}?${encodeStrictQueryChars(s.substring(qIdx + 1))}`;
 }
 
 function appendQueryParamsToPath(path, queryParams) {
@@ -1806,6 +1814,20 @@ async function fetchViaTab(fullUrl, method, headers, bodyStr) {
   }
 }
 
+// Percent-encode the characters that RFC 7230 / Tomcat reject in a raw request
+// target (`" < > [ \ ] ^ ` { | }` and whitespace). DHIS2's nested-`fields` and
+// `filter=...:in:[..]` syntaxes rely on `[`/`]`, so on a strict Tomcat-fronted
+// instance an un-encoded query 400s ("Invalid character found in the request
+// target"). We deliberately DO NOT touch `%`, so an already-encoded query is
+// never double-encoded, and legal query delimiters (& = , : ;) are preserved —
+// only the forbidden characters are escaped. Safe on relaxed servers too (they
+// decode %5B/%5D back to [/] identically).
+function encodeStrictQueryChars(query) {
+  return String(query).replace(/[\s"<>\[\\\]^`{|}]/g, (c) =>
+    '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')
+  );
+}
+
 async function safeDhis2Fetch(path, options = {}) {
   if (!dhis2.baseUrl || !dhis2.apiVersion) {
     const ok = await ensureConnected();
@@ -1827,7 +1849,13 @@ async function safeDhis2Fetch(path, options = {}) {
   const qIdx = cleanPath.indexOf('?');
   let fullUrl;
   if (qIdx !== -1) {
-    fullUrl = `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${cleanPath.substring(0, qIdx)}?${cleanPath.substring(qIdx + 1)}`;
+    // DHIS2's nested `fields=a[b[c]]` and `filter=x:in:[..]` syntaxes contain
+    // `[` and `]`. A stock Tomcat-fronted DHIS2 (e.g. self-hosted 2.42) enforces
+    // strict RFC 7230 and rejects those raw with 400 "Invalid character found in
+    // the request target"; play.dhis2.org sits behind a relaxed proxy so raw
+    // brackets slip through there (which is why this only bites self-hosted
+    // instances). Percent-encode the forbidden chars in the QUERY portion only.
+    fullUrl = `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${cleanPath.substring(0, qIdx)}?${encodeStrictQueryChars(cleanPath.substring(qIdx + 1))}`;
   } else {
     fullUrl = `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${cleanPath}`;
   }

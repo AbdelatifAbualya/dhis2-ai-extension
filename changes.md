@@ -1887,3 +1887,70 @@ error ✓. No playground writes needed (pure pre-payload resolution).
 **Scope of impact:** supersedes entry 31's name-resolution step only. Real-UID and omitted
 calls are unchanged; the passed-name case is now resilient to case/whitespace/`displayName`
 differences instead of hard-failing. No other tool touches this path.
+
+---
+
+## 33. Percent-encode `[`/`]` in query strings — self-hosted (Tomcat) DHIS2 no longer 400s on bracketed `fields`/`filter` (v2.8.7)
+
+**Files:** `background.js`, `manifest.json`
+**Functions:** new `encodeStrictQueryChars`; applied in `safeDhis2Fetch` (URL build) and `apiUrl`
+**Type of change:** Bug fix (transport-level — fixes an entire class of failures on self-hosted instances)
+
+**Incident (user's local instance `http://localhost:8081`, DHIS2 2.42.5.1 on Tomcat):** the MCH
+build "completed but with many errors." Two distinct root causes were found by connecting to
+that server and reproducing the exact calls:
+
+1. **The custom-form step failed repeatedly** — `manage_custom_forms` (preview_html /
+   set_stage_form) returned *"Could not load program stage eyjD4TwgOIk: DHIS2 API 400"*, even
+   though the SAME stage loaded fine via the model's own `dhis2_query`. Reproduced with curl:
+   ```
+   GET /api/programStages/<id>.json?fields=id,displayName,programStageDataElements[dataElement[id]]
+   → HTTP 400  Tomcat: "Invalid character found in the request target"
+   GET (same, with %5B/%5D instead of [ ])                              → HTTP 200
+   ```
+   **Root cause:** DHIS2's nested-`fields` (`a[b[c]]`) and `filter=…:in:[..]` syntaxes contain
+   `[` and `]`. A stock **Tomcat**-fronted DHIS2 enforces strict RFC 7230 and rejects those raw
+   characters in the request target with 400. `play.dhis2.org` sits behind a relaxed proxy
+   (nginx) that tolerates raw brackets — which is why every playground test passed and this was
+   never caught. The chatbot's internal helpers (`safeDhis2Fetch` AND `apiUrl`/`dhis2Fetch`)
+   built URLs with **raw** brackets; the model's manual `dhis2_query` happened to be
+   URL-encoded, so it worked while the tool's own load didn't. This affected far more than
+   custom forms: the program-context load (`apiUrl` program metadata + rules) was verified to
+   400 on the same server too.
+
+2. **TET "Person" failed to resolve** — this was the v2.8.5 brittle `name:eq:` filter; already
+   fixed in entry 32 (v2.8.6) via the in-memory list match, and re-verified on this exact
+   Tomcat server (its type is lowercase `"person"`, id `sCNHozES5tk`, which the v2.8.6
+   case-insensitive matcher resolves — the v2.8.5 code could not).
+
+**What changed:** new `encodeStrictQueryChars(query)` percent-encodes ONLY the characters Tomcat
+rejects (`" < > [ \ ] ^ \` { | }` and whitespace). It is applied to the **query portion only**
+of the URL in both DHIS2 URL builders — `safeDhis2Fetch` (every tool's internal fetch, incl.
+write-via-tab, which receives the built URL) and `apiUrl` (every `dhis2Fetch` context load). It
+deliberately never touches `%`, so an already-encoded query is not double-encoded, and legal
+delimiters (`& = , : ;`) are preserved. `appendQueryParamsToPath` already encodes via
+`URLSearchParams`, and the LLM-provider / Tavily / `system/info` / `programId=`-only fetches
+carry no brackets, so no other builder needed changing.
+
+**Verification (live, against the user's own Tomcat server + the playground):**
+- Reproduced the 400 on raw brackets and 200 on encoded brackets, for BOTH the
+  `programStages/<id>?fields=…[…]` stage load AND a heavy `apiUrl` program-metadata context
+  load (`programs/<id>?fields=…programStages[…]…programRules[…]`): raw → 400, encoded → 200.
+- Unit-tested `encodeStrictQueryChars`: nested `fields` brackets encoded; `filter=:in:[a b,c]`
+  brackets + spaces encoded; no-bracket query unchanged; already-encoded (`%5B`) NOT
+  double-encoded; `:` preserved.
+- **Completed the user's original request end-to-end on the Tomcat server with ZERO errors**:
+  re-ran the full `set_stage_form` sequence (bracketed meta load → JSON-Patch dataEntryForm
+  update → `:owner` reload → full stage PUT with re-attached `program` + `formType=CUSTOM`) for
+  all 3 MCH stages, applying blue-and-white custom forms. Every step returned HTTP 200; verified
+  `formType=CUSTOM` with 8 / 7 / 5 bound inputs and blue/white styling on ANC / Delivery / PNC.
+- **No regression on relaxed servers:** encoded `fields` brackets and an encoded `in:[..]`
+  filter both return 200 on `play.im.dhis2.org/stable-2-43-0-1` (DHIS2 decodes `%5B`/`%5D`
+  back to `[`/`]` identically).
+- `node --check background.js` passes.
+
+**Scope of impact:** transport-level and universally positive — every DHIS2 GET the extension
+issues now works on strict (Tomcat) AND relaxed (nginx) front-ends. On relaxed servers behavior
+is byte-for-byte identical (server decodes the escapes). No tool logic, schema, or result shape
+changed; this only makes the requests spec-compliant. Fixes the custom-forms failure and the
+broader context-load failures on self-hosted DHIS2 in one place.
