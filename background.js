@@ -4164,7 +4164,7 @@ If user enabled web browsing from UI, this tool should usually be called before 
             enum: ['WITH_REGISTRATION', 'WITHOUT_REGISTRATION'],
             description: 'WITH_REGISTRATION = Tracker, WITHOUT_REGISTRATION = Event'
           },
-          tracked_entity_type_id: { type: 'string', description: 'TET ID (auto-resolved to Person if omitted for tracker)' },
+          tracked_entity_type_id: { type: 'string', description: 'For WITH_REGISTRATION (tracker) programs: the TrackedEntityType to use. Prefer the real UID. If you only know the type\'s NAME (e.g. "Person"), pass the exact name string — the tool resolves it to its UID server-side; NEVER invent/guess a UID. If omitted entirely, auto-resolves to the TrackedEntityType named "Person". For a non-Person type (e.g. "Household", "Livestock"), first confirm it exists via architect_metadata(action="check_existing", object_type="trackedEntityTypes") if unsure of the exact name.' },
           program_attributes: {
             type: 'array',
             items: {
@@ -5734,6 +5734,7 @@ const KB_CREATE_PROGRAM_DETAILS = `### create_program — the ONE-CALL pattern i
 The tool handles the FULL dependency chain atomically and auto-resolves all internal references (option set names → IDs, DE names → IDs, TEA names → IDs). It also auto-checks for duplicate option sets, data elements, TEAs, and options by name and reuses existing IDs.
 
 **Input slots for the single create_program call:**
+- \`tracked_entity_type_id\` (WITH_REGISTRATION programs only): NEVER hardcode/guess a UID here. Either omit it (defaults to the TrackedEntityType named "Person") or pass the exact TrackedEntityType NAME (e.g. "Person", "Household") — the tool resolves the name to its real UID for you. If unsure such a type exists, check first with architect_metadata(action="check_existing", object_type="trackedEntityTypes").
 - \`program_attributes\`: tracked entity attributes (with inline \`option_set\` if needed)
 - \`org_unit_ids\`: the org units the program should be assigned to for Capture/Tracker use. If the user mentions districts/facilities/org units, resolve them first and pass them here.
 - \`assign_all_org_units: true\`: use this WHEN THE USER SAYS "all OUs", "all org units", "all levels", "all facilities", "every org unit" — the tool fetches every org unit server-side in ONE call. DO NOT paginate org units yourself.
@@ -17304,12 +17305,49 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     };
   }
 
-  // Resolve tracked entity type for tracker programs
-  let tetId = args.tracked_entity_type_id;
-  if (isTracker && !tetId) {
-    const tetResp = await safeDhis2Fetch('trackedEntityTypes?filter=name:ilike:Person&fields=id,displayName&pageSize=5');
-    tetId = tetResp?.trackedEntityTypes?.[0]?.id;
-    if (!tetId) return { _error: 'Could not auto-resolve a TrackedEntityType named "Person". Provide tracked_entity_type_id explicitly.' };
+  // Resolve tracked entity type for tracker programs. `tracked_entity_type_id`
+  // is documented as a UID, but the model sometimes passes a NAME instead
+  // (e.g. "Person"), or even a hallucinated UID-shaped token — either one,
+  // written straight into trackedEntityType.id, makes DHIS2 bounce the WHOLE
+  // atomic import with "Invalid reference [Person] (TrackedEntityType)". So we
+  // VERIFY the reference resolves to a real TET on this server (by UID first,
+  // then by exact name) before it ever reaches the payload, and fail fast with
+  // guidance if it does not — never trust the raw value.
+  let tetId = null;
+  if (isTracker) {
+    const rawTet = args.tracked_entity_type_id;
+    if (rawTet) {
+      // UID-shaped → confirm it actually exists (a hallucinated UID 404s here
+      // and falls through to the name lookup / error, instead of reaching the
+      // server as an invalid reference).
+      if (hasUidShape(rawTet)) {
+        const byId = await safeDhis2Fetch(`trackedEntityTypes/${rawTet}?fields=id`);
+        if (byId && byId.id) tetId = byId.id;
+      }
+      // Not a known UID → try to resolve it as an exact type NAME.
+      if (!tetId) {
+        const byName = await safeDhis2Fetch(
+          `trackedEntityTypes?filter=name:eq:${encodeURIComponent(rawTet)}&fields=id&pageSize=1`
+        );
+        tetId = byName?.trackedEntityTypes?.[0]?.id || null;
+      }
+      if (!tetId) {
+        return {
+          _error: `Could not resolve tracked_entity_type_id="${rawTet}" to a TrackedEntityType on this server — it is neither an existing UID nor an existing type name, so it cannot be used as trackedEntityType.id.`,
+          _hint: 'Do NOT guess a UID. List the TrackedEntityTypes that actually exist via architect_metadata(action="check_existing", object_type="trackedEntityTypes"), then pass the real UID (or the exact name) as tracked_entity_type_id — or omit it to default to "Person".',
+        };
+      }
+    } else {
+      // Omitted → default to the type named "Person".
+      const tetResp = await safeDhis2Fetch('trackedEntityTypes?filter=name:ilike:Person&fields=id,displayName&pageSize=5');
+      tetId = tetResp?.trackedEntityTypes?.[0]?.id;
+      if (!tetId) {
+        return {
+          _error: 'Could not auto-resolve a TrackedEntityType named "Person".',
+          _hint: 'Use architect_metadata(action="check_existing", object_type="trackedEntityTypes") to find the real UID, then pass it as tracked_entity_type_id.',
+        };
+      }
+    }
   }
 
   // Resolve org units — order of precedence:

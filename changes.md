@@ -1768,3 +1768,75 @@ descendants in one payload, Person TET, Sex option set + Male/Female, Full Name/
 attributes) with `ignored:0`, then every object deleted — instance returned to completely
 empty. The stale objects the earlier failed run left behind (4 "Test" OUs + "Person" TET)
 were also removed.
+
+---
+
+## 31. `create_program` no longer sends the literal word "Person" as a TrackedEntityType UID (v2.8.5)
+
+**File:** `background.js`
+**Function:** `createFullProgram`, around line 17308 (tracked-entity-type resolution block)
+**Type of change:** Bug fix + schema/manual clarification
+
+**Incident (2026-07-08):** repeated `create_program` failures building "Maternal and Child
+Health (MCH) Program":
+```
+Validation failed with 1 error(s): Program: Invalid reference [Person] (TrackedEntityType)
+on object Maternal and Child Health (MCH) Program [LcJWHOL5XMX] (Program) for association
+`trackedEntityType`
+```
+Root cause: the model was passing the literal string `"Person"` as `tracked_entity_type_id`
+(a NAME, not a UID). The old code trusted `args.tracked_entity_type_id` unconditionally
+(`let tetId = args.tracked_entity_type_id;`) — whenever it was truthy, the auto-resolve-by-name
+branch (`isTracker && !tetId`) was skipped entirely, so the raw word was written straight into
+`program.trackedEntityType = { id: tetId }` and DHIS2 rejected the whole atomic import (per the
+"ATOMIC — nothing created" contract, the model was also told never to retry with the same IDs,
+so it just repeated the identical broken call).
+
+**What changed:**
+1. `createFullProgram` now VERIFIES that `tracked_entity_type_id` resolves to a real TET on
+   the server before it is written into the payload — it never trusts the raw value:
+   - UID-shaped (`hasUidShape`, `background.js:931`) → confirmed to exist via
+     `GET trackedEntityTypes/<id>?fields=id`. A **hallucinated** UID-shaped token (the error the
+     user saw included `LcJWHOL5XMX`) 404s here and falls through — it no longer reaches the
+     server as an invalid reference.
+   - Not a known UID → resolved as an exact type NAME via
+     `trackedEntityTypes?filter=name:eq:<value>` (so the literal word `"Person"`,
+     `"Household"`, etc. becomes its real UID).
+   - Neither resolves → returns a `_error`/`_hint` pointing at
+     `architect_metadata(action="check_existing", object_type="trackedEntityTypes")` and telling
+     the model NOT to guess a UID — instead of letting the raw value bounce the atomic import.
+   - Omitted → unchanged default: auto-resolve to the type named "Person" (`name:ilike:Person`).
+   (`hasUidShape` — pure 11-char structural test — is used for the id-lookup gate rather than
+   `isLikelyDhisUid` so a rare all-lowercase real UID is still probed as an id, not misread as a
+   name.) This mirrors the existing `resolveExistingOptionSetRef` verify-by-id-then-name pattern.
+2. Tool schema description for `tracked_entity_type_id` (`background.js:4167`) rewritten to
+   state explicitly: prefer a real UID; a NAME is now resolved automatically; never invent a
+   UID; check existence first for non-"Person" types via `architect_metadata(check_existing)`.
+3. `KB_CREATE_PROGRAM_DETAILS` manual text (delivered on first `create_metadata` call) gained a
+   bullet under "Input slots" repeating the same rule, so the instruction reaches the model at
+   use-time, not just in the terse wire schema.
+
+**Sibling-path audit (per user request — "even other tools when creating metadata"):** the
+other create/add references were checked for the same "name written into `{id}`" failure mode
+and found guarded: `add_stage`/`add_data_elements_to_stage`/`add_program_rules` load their
+`program_id`/`stage_id` with a GET first (clean early error, not an atomic "Invalid reference"),
+rule actions resolve DE/TEA/stage **names**→IDs, and `create_data_elements` verifies
+`option_set_id`/`option_set_name`/`category_combo_name` against the server before use. Residual
+lower-risk gaps left as noted follow-ups (values documented as UIDs and normally sourced from a
+prior tool result, not a well-known word the model reaches for): `add_data_elements_to_stage`'s
+`data_element_ids[]` and per-DE `category_combo_id` are still passed through unverified.
+
+**Verification:** `node --check background.js` passes. Confirmed live against
+`play.im.dhis2.org/stable-2-43-0-1`: `GET trackedEntityTypes/nEenWmSyUEp?fields=id` → `{"id":
+"nEenWmSyUEp"}` (real UID accepted); `trackedEntityTypes?filter=name:eq:Person` → `nEenWmSyUEp`
+(name resolved); `GET trackedEntityTypes/LcJWHOL5XMX` → HTTP 404 (hallucinated UID rejected,
+falls through to the clean error); a nonexistent name → empty collection. No playground writes
+were needed — this only changes value resolution before the payload is built, not the
+payload/dependency-chain logic itself, which was already proven working in entries 25/28.
+
+**Scope of impact:** Only the tracked-entity-type resolution step of `create_program` changes.
+Calls that already passed a real UID behave identically; calls that omitted the field behave
+identically (still defaults to "Person"). The only behavior change is for calls that passed a
+non-UID string — previously a guaranteed atomic-import failure, now either resolved correctly
+or rejected early with an actionable hint instead of a raw DHIS2 validation error. No other
+tool touches this code path.
