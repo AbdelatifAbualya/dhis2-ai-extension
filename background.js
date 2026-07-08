@@ -17310,43 +17310,53 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // (e.g. "Person"), or even a hallucinated UID-shaped token — either one,
   // written straight into trackedEntityType.id, makes DHIS2 bounce the WHOLE
   // atomic import with "Invalid reference [Person] (TrackedEntityType)". So we
-  // VERIFY the reference resolves to a real TET on this server (by UID first,
-  // then by exact name) before it ever reaches the payload, and fail fast with
-  // guidance if it does not — never trust the raw value.
+  // VERIFY the reference resolves to a real TET on this server before it ever
+  // reaches the payload, and fail fast (listing what IS available) if not.
+  //
+  // We fetch the full TET list once and match in JS rather than using a
+  // server-side `filter=name:eq:` — that filter is case-sensitive, exact, and
+  // only matches the raw `name` (not the translated `displayName`), so it
+  // silently misses "person"/"Person "/instances where the type's name differs
+  // from its displayName. In-memory matching is case-insensitive, checks both
+  // name and displayName, and degrades from exact → contains → Person-fallback.
   let tetId = null;
   if (isTracker) {
     const rawTet = args.tracked_entity_type_id;
-    if (rawTet) {
-      // UID-shaped → confirm it actually exists (a hallucinated UID 404s here
-      // and falls through to the name lookup / error, instead of reaching the
-      // server as an invalid reference).
-      if (hasUidShape(rawTet)) {
-        const byId = await safeDhis2Fetch(`trackedEntityTypes/${rawTet}?fields=id`);
-        if (byId && byId.id) tetId = byId.id;
-      }
-      // Not a known UID → try to resolve it as an exact type NAME.
-      if (!tetId) {
-        const byName = await safeDhis2Fetch(
-          `trackedEntityTypes?filter=name:eq:${encodeURIComponent(rawTet)}&fields=id&pageSize=1`
-        );
-        tetId = byName?.trackedEntityTypes?.[0]?.id || null;
-      }
-      if (!tetId) {
-        return {
-          _error: `Could not resolve tracked_entity_type_id="${rawTet}" to a TrackedEntityType on this server — it is neither an existing UID nor an existing type name, so it cannot be used as trackedEntityType.id.`,
-          _hint: 'Do NOT guess a UID. List the TrackedEntityTypes that actually exist via architect_metadata(action="check_existing", object_type="trackedEntityTypes"), then pass the real UID (or the exact name) as tracked_entity_type_id — or omit it to default to "Person".',
-        };
-      }
-    } else {
-      // Omitted → default to the type named "Person".
-      const tetResp = await safeDhis2Fetch('trackedEntityTypes?filter=name:ilike:Person&fields=id,displayName&pageSize=5');
-      tetId = tetResp?.trackedEntityTypes?.[0]?.id;
-      if (!tetId) {
-        return {
-          _error: 'Could not auto-resolve a TrackedEntityType named "Person".',
-          _hint: 'Use architect_metadata(action="check_existing", object_type="trackedEntityTypes") to find the real UID, then pass it as tracked_entity_type_id.',
-        };
-      }
+    const tetList = await safeDhis2Fetch('trackedEntityTypes?fields=id,name,displayName&paging=false');
+    if (tetList?._error) {
+      return { _error: `Could not load TrackedEntityTypes to resolve trackedEntityType: ${tetList._error}` };
+    }
+    const allTets = tetList?.trackedEntityTypes || [];
+    const norm = (s) => String(s || '').trim().toLowerCase();
+
+    if (rawTet && hasUidShape(rawTet)) {
+      // UID-shaped → accept only if it actually exists (a hallucinated UID
+      // finds no match and falls through, instead of reaching the server as an
+      // invalid reference).
+      const hit = allTets.find(t => t.id === rawTet);
+      if (hit) tetId = hit.id;
+    }
+    if (!tetId && rawTet && !hasUidShape(rawTet)) {
+      // Treat as a NAME — case-insensitive exact match on name/displayName,
+      // then a contains match ("Person (client)" etc.).
+      const want = norm(rawTet);
+      const exact = allTets.find(t => norm(t.name) === want || norm(t.displayName) === want);
+      const partial = exact || allTets.find(t => norm(t.name).includes(want) || norm(t.displayName).includes(want));
+      if (partial) tetId = partial.id;
+    }
+    if (!tetId && (!rawTet || /person/i.test(String(rawTet)))) {
+      // Omitted, or an unresolved "Person"-ish request → default to any Person
+      // type on the instance (matches the historical omitted-default behavior).
+      const person = allTets.find(t => /person/i.test(t.name || '') || /person/i.test(t.displayName || ''));
+      if (person) tetId = person.id;
+    }
+    if (!tetId) {
+      const available = allTets.map(t => `${t.displayName || t.name} (${t.id})`).join(', ') || '(none exist on this server)';
+      return {
+        _error: `Could not resolve a TrackedEntityType${rawTet ? ` for tracked_entity_type_id="${rawTet}"` : ''} on this server.`,
+        _hint: `Do NOT guess a UID. Available TrackedEntityTypes: ${available}. Pass tracked_entity_type_id as one of those UIDs (or its exact name), or omit it to use a Person type. If none exist, create one first.`,
+        _available_tracked_entity_types: allTets.map(t => ({ id: t.id, name: t.displayName || t.name })),
+      };
     }
   }
 

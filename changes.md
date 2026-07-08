@@ -1840,3 +1840,50 @@ identically (still defaults to "Person"). The only behavior change is for calls 
 non-UID string — previously a guaranteed atomic-import failure, now either resolved correctly
 or rejected early with an actionable hint instead of a raw DHIS2 validation error. No other
 tool touches this code path.
+
+---
+
+## 32. Follow-up: TET name resolution must not rely on the brittle `name:eq:` server filter (v2.8.6)
+
+**File:** `background.js`
+**Function:** `createFullProgram` (tracked-entity-type resolution block)
+**Type of change:** Bug fix (the v2.8.5 fix's name path was too strict)
+
+**Incident (immediately after shipping v2.8.5):** the *same* MCH build now failed with the
+NEW error path instead:
+```
+Could not resolve tracked_entity_type_id="Person" to a TrackedEntityType on this server — it
+is neither an existing UID nor an existing type name, so it cannot be used as trackedEntityType.id.
+```
+Root cause: v2.8.5 resolved a passed name with `trackedEntityTypes?filter=name:eq:<value>`.
+That filter is **case-sensitive**, **exact**, and matches only the raw `name` property — NOT
+the translated `displayName`. So on any instance where the Person type's `name` differs from
+`"Person"` (different case, a trailing space, a translated/renamed `name`, or `name` ≠
+`displayName`), the lookup returned empty and the tool hard-failed — even though a perfectly
+usable Person type existed. (The previous *omitted-default* path had used the fuzzy
+`name:ilike:Person`, which is why omitting the field worked but passing `"Person"` did not.)
+
+**What changed:** the resolver no longer uses a server-side name filter at all. It now fetches
+the full TET list once (`trackedEntityTypes?fields=id,name,displayName&paging=false`) and
+matches **in JS**, which removes every server-filter quirk:
+- UID-shaped input → accepted only if its id is present in the list (hallucinated UID → falls
+  through, never reaches the server as an invalid reference).
+- Name input → case-insensitive match on BOTH `name` and `displayName`, exact first, then a
+  `contains` match (e.g. `"Person (client)"`).
+- Unresolved but Person-ish (or omitted) → falls back to any type whose name/displayName
+  matches `/person/i` — restoring the historical omitted-default leniency for the passed-name
+  case too.
+- Still nothing → error that now **lists the actual TrackedEntityTypes on the instance**
+  (`_available_tracked_entity_types`) so the model can pick a real one, instead of a dead-end.
+If the list fetch itself errors, that error is surfaced directly.
+
+**Verification:** `node --check background.js` passes. The exact resolution logic was run in
+Node against the LIVE TET list from `play.im.dhis2.org/stable-2-43-0-1` across 8 inputs:
+`"Person"` → `nEenWmSyUEp` ✓ (the failing case), lowercase `"person"` ✓, `"person "` with a
+trailing space ✓, omitted ✓, real UID `nEenWmSyUEp` ✓, other real type `"Building"` →
+`EawlYwOO61R` ✓, hallucinated UID `LcJWHOL5XMX` → clean error ✓, nonexistent `"Zebra"` → clean
+error ✓. No playground writes needed (pure pre-payload resolution).
+
+**Scope of impact:** supersedes entry 31's name-resolution step only. Real-UID and omitted
+calls are unchanged; the passed-name case is now resilient to case/whitespace/`displayName`
+differences instead of hard-failing. No other tool touches this path.
