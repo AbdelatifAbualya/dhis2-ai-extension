@@ -231,6 +231,11 @@ const SAVE_FAILURE_RE = new RegExp(
 
 function classifyWriteAuthorization(userText) {
   const text = String(userText || '');
+  // Turn bookkeeping lives here because this is the single per-turn entry
+  // point shared by the agentic loop and the test harness. Guarded so the
+  // function still works when `dhis2` isn't defined (unit tests).
+  const D = (typeof dhis2 === 'object' && dhis2) ? dhis2 : {};
+  D.turnCounter = (D.turnCounter || 0) + 1;
   // Negation guard, verb-targeted: a "don't" only neutralizes the verb it
   // directly precedes ("don't recreate them", "do not delete anything") — it
   // must NOT nuke a separate affirmative in the same message. "use these
@@ -248,6 +253,15 @@ function classifyWriteAuthorization(userText) {
   // Hard refusal: an explicit "no, …" decline always wins over any verb match.
   const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text);
   if (isBroad && !isRefusal) {
+    // A BARE affirmation ("yes", "go ahead") directly after a refused write is
+    // an answer to THAT proposal — scope the authorization to the proposed
+    // tool so it cannot be spent on an unrelated write (observed live: "yes"
+    // meant for growth-chart configure spent on deleting a data element).
+    const bareAffirm = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|confirm(?:ed)?|do\s+it|go\s+ahead(?:\s+and\s+(?:do|run)\s+it)?|proceed|go\s+for\s+it|run\s+it|yes,?\s*please)[.!\s]*$/i.test(text);
+    const lrw = D.lastRefusedWrite;
+    if (bareAffirm && lrw && lrw.tool && lrw.turn === D.turnCounter - 1) {
+      return { scope: 'scoped', tool: lrw.tool, action: lrw.action, reason: `bare affirmation — authorization scoped to the write proposed last turn: ${lrw.tool}(${lrw.action})` };
+    }
     return { scope: 'broad', reason: 'user message contains explicit write/fix verb (or affirmative response)' };
   }
   if (isDiag) return { scope: 'read_only', reason: 'user asked to diagnose/check/inspect — no fix authorization' };
@@ -257,12 +271,45 @@ function classifyWriteAuthorization(userText) {
 
 // Returns null if the destructive action is allowed; else a structured refusal
 // that the model can read on the next iteration.
+//
+// Scopes:
+//   'broad'  — any gated write allowed this turn.
+//   'scoped' — the user answered a proposal with a BARE affirmation ("yes",
+//              "go ahead"): ONLY the tool that was refused/proposed last turn
+//              may write. The first matching call widens the scope to broad
+//              for the rest of the turn (legitimate follow-up writes of the
+//              same plan). This exists because a bare "yes" was observed being
+//              spent on manage_metadata(delete <data element>) when the user
+//              had approved manage_growth_chart_plugin(configure) — verified
+//              live 2026-07-10 on the growth-chart transcript.
+//   'read_only' — refuse and RECORD the proposal so next turn's "yes" can be
+//              scoped to it.
 function requireWriteAuth(toolName, action, descriptor) {
-  const scope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
-  if (scope === 'broad') return null;
+  const wa = dhis2.writeAuth || {};
+  const scope = wa.scope || 'read_only';
+  if (scope === 'broad') {
+    if (dhis2.lastRefusedWrite && dhis2.lastRefusedWrite.tool === toolName) dhis2.lastRefusedWrite = null;
+    return null;
+  }
+  if (scope === 'scoped') {
+    if (toolName === wa.tool) {
+      dhis2.writeAuth = { scope: 'broad', reason: `scoped approval fulfilled by ${toolName}(${action}) — follow-up writes this turn allowed` };
+      dhis2.lastRefusedWrite = null;
+      return null;
+    }
+    return {
+      _error: `Refused: the user's bare "yes" authorizes ONLY the write you proposed last turn — ${wa.tool}(${wa.action || 'the proposed action'}) — not ${toolName}(action=${action}).`,
+      _hint: `Call ${wa.tool} NOW to do exactly what the user approved. Do NOT substitute a different tool, do NOT route the write through raw dhis2_query, and NEVER spend this approval on deletes/changes the user did not ask for. After the approved ${wa.tool} call succeeds, further writes this turn are allowed again.`,
+      _refused: { tool: toolName, action, target: descriptor || null, approved_tool: wa.tool, approved_action: wa.action || null },
+      _scope: 'requires_matching_tool',
+    };
+  }
+  // read_only: remember exactly what was proposed-and-refused so a bare "yes"
+  // on the next turn authorizes THIS call and nothing else.
+  dhis2.lastRefusedWrite = { tool: toolName, action, turn: dhis2.turnCounter || 0 };
   return {
-    _error: `Refused: ${toolName}(action=${action}) is a destructive write, but this conversation turn does not authorize it. Reason: ${(dhis2.writeAuth && dhis2.writeAuth.reason) || 'no authorization detected'}.`,
-    _hint: 'Tell the user EXACTLY what change you propose: object name + ID + before → after. Then ASK for confirmation. The user must reply with explicit authorization on the NEXT turn (e.g. "yes", "go ahead", "fix it", "update X", "delete it") before you retry. A problem report ("I am getting error X", "this is broken") is NOT authorization — it is a request for diagnosis.',
+    _error: `Refused: ${toolName}(action=${action}) is a destructive write, but this conversation turn does not authorize it. Reason: ${wa.reason || 'no authorization detected'}. NOTE: the tool itself IS available and working — this is a per-turn authorization gate, NOT a missing tool. Never tell the user the tool does not exist, and never fall back to a different tool for the same write.`,
+    _hint: 'Tell the user EXACTLY what change you propose: object name + ID + before → after. Then ASK for confirmation. The user must reply with explicit authorization on the NEXT turn (e.g. "yes", "go ahead", "fix it", "update X", "delete it") — then retry THIS SAME tool call, not a substitute. A problem report ("I am getting error X", "this is broken") is NOT authorization — it is a request for diagnosis.',
     _refused: { tool: toolName, action, target: descriptor || null },
     _scope: 'requires_user_confirmation',
   };
@@ -1280,6 +1327,10 @@ async function clearConversationState() {
   dhis2.knownIdsSeedSize = 0;
   dhis2.knownIcons = null;
   dhis2.recentCreations = null;
+  // Cross-turn write-approval memory: a proposal from the old thread must not
+  // be redeemable by a bare "yes" in the new one.
+  dhis2.lastRefusedWrite = null;
+  dhis2.turnCounter = 0;
 
   await saveState();
 }
@@ -6364,7 +6415,10 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   // head circumference chart, child growth.
   const wantsGrowthChartIntent =
     /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/.test(combinedText)
-    || (/\bgrowth\b/.test(combinedText) && /\b(plugin|chart|standard|percentile|z-?score)\b/.test(combinedText));
+    // "growth" + datastore/config wording is plugin setup too — "set up the
+    // child growth data store" (verified miss 2026-07-10) previously routed to
+    // generic dataStore writes because this trigger lacked the datastore nouns.
+    || (/\bgrowth\b/.test(combinedText) && /\b(plugin|chart|standard|percentile|z-?score|data\s*store|datastore)\b/.test(combinedText));
   // ── Validation-rule intent ──
   // "validation rule(s)", or a data-quality/consistency/plausibility check that
   // co-occurs with rule/check/dataset/data-element terms. Conservative: the bare
@@ -6865,7 +6919,7 @@ async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = fa
     || /\b(re-?label|re-?name|change|reword|customi[sz]e)\b.{0,40}\b(label|string|text|wording|caption|button|title|heading|menu\s*item)\b/i.test(text);
   const wantsGrowthChartPrompt =
     /\b(growth\s*chart|growth\s*monitoring|who\s*growth|anthropomet|weight[-\s]?for[-\s]?age|height[-\s]?for[-\s]?age|length[-\s]?for[-\s]?age|head\s*circumference)\b/i.test(text)
-    || (/\bgrowth\b/i.test(text) && /\b(plugin|chart|standard|percentile|z-?score)\b/i.test(text));
+    || (/\bgrowth\b/i.test(text) && /\b(plugin|chart|standard|percentile|z-?score|data\s*store|datastore)\b/i.test(text));
   const wantsValidationRulePrompt =
     /\bvalidation\s*rules?\b/i.test(text)
     || (/\b(data\s*quality|consistency|cross[-\s]?check|plausibility|sanity\s*check)\b/i.test(text)
@@ -9954,6 +10008,31 @@ async function executeTool(name, args) {
             }
           }
         } catch { /* body not JSON — let the request through */ }
+      }
+    }
+
+    // Guard: growth-chart plugin dataStore writes MUST go through
+    // manage_growth_chart_plugin. Observed live (2026-07-10): the model
+    // hand-wrote a config into an INVENTED namespace (childGrowthPlugin) with
+    // a made-up shape (including BMI/nutrition DEs the plugin never reads) —
+    // the plugin only reads captureGrowthChart/config in its canonical shape,
+    // so the user saw "it's not working" with no error anywhere. Allow DELETE
+    // on non-official growth namespaces (cleaning up junk is fine); block all
+    // other writes on any growth-ish namespace.
+    if (method !== 'GET') {
+      const dsMatch = safePath.match(/^dataStore\/([^/?]+)/);
+      if (dsMatch) {
+        let ns = dsMatch[1];
+        try { ns = decodeURIComponent(ns); } catch { /* keep raw */ }
+        const growthish = /growth/i.test(ns);
+        const isOfficial = ns === GROWTH_CHART_NS;
+        if (growthish && !(method === 'DELETE' && !isOfficial)) {
+          return {
+            _error: `Blocked: dataStore namespace "${ns}" is growth-chart plugin territory — hand-written configs are exactly how broken setups happen. The WHO Capture Growth Chart plugin ONLY reads ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY} in its canonical shape; a config written anywhere else (or shaped differently) is silently ignored and the chart never renders.`,
+            _hint: `Use manage_growth_chart_plugin instead: action=status (inspect), action=configure with program_id (auto-detects the DOB/gender attributes and weight/height/head-circumference data elements, validates them, writes the canonical config, and returns the dashboard_attach steps), action=remove (delete the official config). The tool IS available in this conversation.`,
+            _redirect: 'manage_growth_chart_plugin',
+          };
+        }
       }
     }
 

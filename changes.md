@@ -2097,3 +2097,68 @@ auth-gate unit suite 18/18, `node --check` clean.
 **Scope of impact:** manage_program_indicators (all actions), create_program's embedded
 program_indicators, PI lint + manuals. Event-type PI behavior unchanged except the new
 always-serialized `displayInForm:false` default, which matches DHIS2's own default.
+
+## 36. Growth-chart transcript autopsy: scoped "yes" authorization, growth dataStore guard, routing trigger, anti-"tool doesn't exist" refusals (v2.8.10)
+
+**Files:** `background.js`, `manifest.json`
+**Functions:** `classifyWriteAuthorization`, `requireWriteAuth`, dhis2_query guard chain,
+`getContextualTools` (wantsGrowthChartIntent), `buildSystemPrompt` (wantsGrowthChartPrompt),
+`resetConversationForNewThread` fields
+**Type of change:** Bug fixes — write-gate design + tool routing (found via the user's
+growth-chart transcript on localhost:8081, v2.8.7 build)
+
+**The transcript, distilled (all reproduced live):**
+1. "set up the child growth data store ID based of these data elements" → the growth-chart
+   tool was never surfaced (intent regex needed chart/plugin words; "data store" wasn't a
+   trigger), so the model treated it as a generic dataStore write and asked namespace/key.
+2. The model then hand-wrote a config into an INVENTED namespace (`childGrowthPlugin`) with a
+   made-up shape (including BMI/nutrition DEs the plugin never reads) via raw dhis2_query —
+   nothing blocked it. The plugin only reads `captureGrowthChart/config`, so "it's not
+   working" with no error anywhere.
+3. The per-turn write refusal made the model conclude — and TELL the user, twice — that
+   `manage_growth_chart_plugin` "does not exist in my environment".
+4. Worst: after proposing the growth-chart configure and getting "yes", the model spent that
+   authorization on `manage_metadata(delete dataElements/<BMI Z-score>)` + remove_from_stage
+   — a destructive delete the user never asked for, unblocked because ANY bare "yes" granted
+   turn-wide broad write access.
+
+**Fixes:**
+- **Scoped affirmations (gate redesign):** `requireWriteAuth` now RECORDS every refusal
+  (`dhis2.lastRefusedWrite` = tool/action/turn). If the next turn is a BARE affirmation
+  ("yes", "go ahead", "do it", …), `classifyWriteAuthorization` returns
+  `scope:'scoped', tool:<the refused tool>` instead of broad: only that tool may write; any
+  other gated write (including raw dhis2_query writes) is refused with "the user's bare
+  'yes' authorizes ONLY <tool>(<action>) — call it now". The first matching call widens the
+  scope to broad for the rest of the turn, so legitimate follow-up writes of the same plan
+  still work. Affirmations with substantive content ("yes, and also delete X") and bare
+  affirmations with no pending proposal stay broad (unchanged behavior). Proposal memory is
+  turn-scoped (expires unless redeemed on the immediately-next turn) and cleared on new
+  threads. Turn counting lives in `classifyWriteAuthorization` — the shared per-turn entry
+  point of the agentic loop and the harness.
+- **Growth dataStore guard:** dhis2_query now BLOCKS non-GET requests to any dataStore
+  namespace matching /growth/i (DELETE of non-official junk namespaces stays allowed for
+  cleanup) and redirects to manage_growth_chart_plugin with the canonical-namespace
+  explanation.
+- **Anti-hallucination refusal wording:** every gate refusal now states the tool "IS
+  available and working — this is a per-turn authorization gate, NOT a missing tool", and
+  instructs retrying THE SAME call after confirmation, never a substitute tool.
+- **Routing trigger:** "growth" + "data store/datastore" now surfaces
+  manage_growth_chart_plugin (tool selection AND the 3-line system-prompt routing stub). The
+  lazy two-tier manual design is untouched — the stub stays decide-time-only; full usage
+  docs still arrive via the first-call manual gate.
+- **Instance repair (localhost:8081):** BMI Z-score restored to the Child Growth stage
+  (sortOrder 7), junk `childGrowthPlugin` namespace deleted, canonical
+  `captureGrowthChart/config` verified intact.
+
+**Verification:** `test-growth-chart-flow.js` against localhost:8081 — 19/19: turn-1 phrasing
+surfaces the tool + prompt stub; POST/PUT to invented AND official growth namespaces blocked
+with redirect (junk-namespace DELETE still allowed); "choose the … plugin" stays read_only;
+refusal wording includes availability note and records the proposal; bare "yes" → scoped;
+the delete-BMI disaster call REFUSED; dhis2_query bypass REFUSED; approved configure runs and
+widens scope; config canonical; BMI still in stage; no-proposal "go ahead" stays broad.
+Regressions: auth-gate unit suite 18/18, child-health scenario 20/20 (localhost),
+tomcat-brackets 7/7 (localhost), e2e-happy-path 8/8 (play 2.43). `node --check` clean.
+
+**Scope of impact:** the write gate change affects ALL write tools uniformly and only in the
+bare-affirmation-after-refusal case, where it strictly narrows (never widens) what a "yes"
+can do. Guard + routing changes are additive.
