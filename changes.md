@@ -1954,3 +1954,83 @@ issues now works on strict (Tomcat) AND relaxed (nginx) front-ends. On relaxed s
 is byte-for-byte identical (server decodes the escapes). No tool logic, schema, or result shape
 changed; this only makes the requests spec-compliant. Fixes the custom-forms failure and the
 broader context-load failures on self-hosted DHIS2 in one place.
+
+## 34. Existing metadata is NEVER recreated — reuse guarantees, loud dedup probes, name-conflict self-healing, and a verb-targeted write-auth negation guard (v2.8.8)
+
+**Files:** `background.js`, `manifest.json`
+**Functions:** `createFullProgram`, `postMetadataPayload`, `classifyWriteAuthorization`,
+`handleManageMetadata` (add_program_attributes), `growthChartScaffoldProgram`, `TOOLS` schema
+(`program_attributes`), `TOOL_SUMMARIES.create_metadata`, `KB_CREATE_PROGRAM_DETAILS`
+**Type of change:** Bug fixes + defense-in-depth (duplicate-prevention correctness)
+
+**Incident (user's local Tomcat instance `http://localhost:8081`, 2026-07-10):** a simple
+"Child health" tracker-program request produced a cascade of tool errors. The user was testing
+the **v2.8.5 build** (predates the v2.8.7 bracket-encoding fix), so every query with raw `[ ]`
+400'd on Tomcat. That single transport failure surfaced four distinct latent weaknesses, each
+now fixed at the root so the class of failure cannot recur EVEN IF a probe fails again:
+
+1. **Silent dedup-probe failures → duplicate creation attempts.** In `createFullProgram` the
+   existing-object probes (`optionSets`/`dataElements`/`trackedEntityAttributes`
+   `filter=name:in:[…]`) swallowed error envelopes (`resp?.X || []`), so a failed probe was
+   indistinguishable from "nothing exists" and the tool tried to CREATE TEAs (`Full name`,
+   `DoB`, `Sex`) that already existed — three atomic-import failures in a row.
+   **Fix:** probe failures now ABORT create_program before any import (`phase: 'pre_check'`,
+   `nothing_created: true`) with an explicit hint. Same loud-abort added to the
+   `add_program_attributes` per-name probe and the growth-chart scaffold TEA probe.
+
+2. **No self-healing on "already exists" name conflicts.** Even when a duplicate slips past
+   the probes (race, comma-in-name splitting the `in:` filter, …), DHIS2's error carries BOTH
+   UIDs (`… on object X [newUid] (Klass) already exists on object existingUid`).
+   **Fix:** new `tryAutofixNameConflicts` inside `postMetadataPayload` — for classes where
+   same-name means same-thing (TrackedEntityAttribute, DataElement, OptionSet,
+   TrackedEntityType, CategoryOption, Category, CategoryCombo) it REMOVES our would-be
+   duplicate from the payload, rewrites every reference from the pre-generated UID to the
+   existing one, and retries once (VALIDATE and COMMIT paths, alongside the existing shortName
+   auto-suffixer). ProgramStage/ProgramIndicator name conflicts get a rename-with-suffix
+   instead (reuse would hijack another program's object). Results carry
+   `_name_conflict_remaps` + `_recovery_note`; `createFullProgram` syncs its name→ID maps so
+   the returned summary/ID handles point at the REAL reused objects.
+
+3. **Case-variant duplicates were created silently.** DHIS2's unique-name constraint is
+   case-SENSITIVE: requesting `DOB` when the server has `DoB` would "succeed" and pollute the
+   instance with a near-duplicate.
+   **Fix:** a second, case-insensitive reuse pass (`name:ilike:` + exact case-insensitive
+   equality client-side) for any DE/TEA the exact-match probe missed. Non-fatal on probe error
+   (layer 2 still catches the residue).
+
+4. **The write-auth negation guard nuked legitimate authorization.** The user's reply
+   "use these attributes that are already there, **don't recreate them, go ahead**" was
+   REFUSED (`no explicit write authorization detected`) because ANY bare "don't" anywhere
+   forced read_only, overriding the explicit "go ahead".
+   **Fix:** `classifyWriteAuthorization` now strips only the verb phrase each negation
+   directly precedes ("don't recreate them") before testing for write verbs, plus a hard
+   refusal pattern for "no, don't / no thanks, leave it / no, just diagnose". 15-case unit
+   suite covers the transcript phrase, pure negations, declines, problem reports, and
+   constraint+affirmative mixes.
+
+Also: `program_attributes` now accepts `id` (verified against the server pre-import; phantom
+UIDs abort with `nothing_created`) so a known existing TEA can be pinned explicitly;
+`required` relaxed to `['name']` (value_type only needed for genuinely new TEAs); the
+schema description, `TOOL_SUMMARIES.create_metadata`, `KB_CREATE_PROGRAM_DETAILS`, and the
+atomic-failure `_hint` all now state the invariant in MUST language: **existing attributes are
+reused, never recreated, and never dodged via name variants**.
+
+**Verification (all live):**
+- `harness/test-child-health-scenario.js` against the user's Tomcat instance
+  (localhost:8081, 20/20 PASS): one-call create_program reusing `Full name`/`Sex` exactly and
+  `DOB`→existing `DoB` case-insensitively; server shows the program bound to the 3 existing
+  UIDs with zero new TEAs; add_program_attributes loads the program (no 400) and skips an
+  attribute already on the program; forced duplicate-"Sex" payload self-heals (duplicate NOT
+  created, sibling DE in same payload created, remap recorded); auth-gate transcript phrase →
+  broad, pure diagnosis → read_only; full cleanup verified, existing TEAs untouched.
+- `harness/test-mixed-attrs-playground.js` on play 2.43 (9/9 PASS): reuse of existing
+  "First name" + creation of a genuinely new TEA in the same call — creation still works.
+- Regression: `test-tomcat-brackets.js` (7/7), `e2e-happy-path.js` (8/8), tool sweep
+  byte-identical failures to the pre-change baseline (all 6 are stale test arg-shapes, not
+  regressions).
+- `node --check` passes for background.js and panel.js; manifest valid.
+
+**Scope of impact:** create_metadata/create_program, manage_metadata(add_program_attributes),
+growth-chart scaffold, every postMetadataPayload caller (shared self-healing — strictly
+additive), and the per-turn write-auth gate (strictly more accurate). No result shapes
+changed; existing success paths byte-identical.

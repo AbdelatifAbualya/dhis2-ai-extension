@@ -231,12 +231,23 @@ const SAVE_FAILURE_RE = new RegExp(
 
 function classifyWriteAuthorization(userText) {
   const text = String(userText || '');
-  const isBroad = WRITE_AUTH_BROAD_RE.test(text);
+  // Negation guard, verb-targeted: a "don't" only neutralizes the verb it
+  // directly precedes ("don't recreate them", "do not delete anything") — it
+  // must NOT nuke a separate affirmative in the same message. "use these
+  // attributes that are already there, don't recreate them, go ahead" IS
+  // authorization (verified wrong refusal 2026-07-10, Child health scenario:
+  // the old bare-"don't" guard read_only'd an explicit "go ahead"). Strip each
+  // negated verb phrase, then look for a surviving write verb.
+  const negStripped = text.replace(
+    /\b(?:please\s+)?(?:don'?t|do\s+not|never)\s+(?:ever\s+|just\s+|simply\s+)?[\w-]+(?:\s+(?:it|them|this|that|these|those|anything))?/gi,
+    ' '
+  );
+  const isBroad = WRITE_AUTH_BROAD_RE.test(negStripped);
   const isDiag = WRITE_AUTH_DIAG_RE.test(text);
   const isProblem = WRITE_AUTH_PROBLEM_RE.test(text);
-  // Negation guard: "don't fix it" / "don't update" / "no, leave it" → read_only
-  const isNegated = /\b(?:don'?t|do not|please don'?t|no(?:\s+thanks)?,?\s+(?:don'?t|do not|leave|just diagnose|just check))\b/i.test(text);
-  if (isBroad && !isNegated) {
+  // Hard refusal: an explicit "no, …" decline always wins over any verb match.
+  const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text);
+  if (isBroad && !isRefusal) {
     return { scope: 'broad', reason: 'user message contains explicit write/fix verb (or affirmative response)' };
   }
   if (isDiag) return { scope: 'read_only', reason: 'user asked to diagnose/check/inspect — no fix authorization' };
@@ -4198,9 +4209,10 @@ If user enabled web browsing from UI, this tool should usually be called before 
             items: {
               type: 'object',
               properties: {
-                name: { type: 'string' },
+                id: { type: 'string', description: 'Existing trackedEntityAttribute UID to REUSE as-is (from search_metadata or an "already exists on object <UID>" server error). When set, NO new TEA is created and value_type is ignored.' },
+                name: { type: 'string', description: 'Attribute display name. If a TEA with this EXACT name already exists on the server it is automatically REUSED (never duplicated); otherwise a new one is created.' },
                 short_name: { type: 'string' },
-                value_type: { type: 'string', description: 'e.g. TEXT, DATE, BOOLEAN, NUMBER, PHONE_NUMBER, EMAIL' },
+                value_type: { type: 'string', description: 'e.g. TEXT, DATE, BOOLEAN, NUMBER, PHONE_NUMBER, EMAIL. Required only when a NEW attribute must be created.' },
                 option_set: {
                   type: 'object',
                   properties: {
@@ -4213,9 +4225,9 @@ If user enabled web browsing from UI, this tool should usually be called before 
                 searchable: { type: 'boolean' },
                 display_in_list: { type: 'boolean' }
               },
-              required: ['name', 'value_type']
+              required: ['name']
             },
-            description: 'Tracked entity attributes for the program (for create_program with tracker programs). Creates new TEAs and assigns them as programTrackedEntityAttributes.'
+            description: 'Tracked entity attributes for the program (for create_program with tracker programs). Common attributes (First/Full name, Date of birth/DoB, Sex, National ID, phone …) usually ALREADY EXIST on the instance — NEVER try to recreate them: list them by their exact existing name (or pass id) and the tool reuses the existing TEA; only genuinely new names are created.'
           },
           org_unit_ids: {
             type: 'array',
@@ -5671,7 +5683,7 @@ const MANUAL_TOOLS = new Set([
 // "never do this via dhis2_query" routing rules); HOW to call it lives in the
 // manual.
 const TOOL_SUMMARIES = {
-  create_metadata: 'Create DHIS2 metadata: programs (with stages, data elements, inline option sets, program rules, program indicators — ALL in ONE atomic create_program call), standalone option sets, standalone data elements (+ category combos for disaggregation), or add stages/DEs/rules to an existing program. Handles the full dependency chain and name→ID resolution; never create a program\'s components with separate calls.',
+  create_metadata: 'Create DHIS2 metadata: programs (with stages, data elements, inline option sets, program rules, program indicators — ALL in ONE atomic create_program call), standalone option sets, standalone data elements (+ category combos for disaggregation), or add stages/DEs/rules to an existing program. Handles the full dependency chain and name→ID resolution, and REUSES existing TEAs/DEs/option sets by exact name (never pre-create them, never recreate an attribute that already exists); never create a program\'s components with separate calls.',
   manage_metadata: 'Metadata lifecycle manager: remove DEs from a stage, delete objects with reference checking, check_references, update a program\'s org-unit assignment, update sharing/access, add TEAs to an existing program, set icon/color (discover_icons FIRST, then update_style), convert value types (e.g. to MULTI_TEXT multi-select, cascaded). Use INSTEAD of dhis2_query for all of these — raw sharing/style/TEA/delete writes fail on DHIS2.',
   manage_program_rules: 'CRUD + audit for program rules, rule variables and rule actions on a program. Actions: list, get, create, update, delete, list_variables, audit, bulk_fix_conditions. For "broken / non-working rules" ALWAYS audit first, then bulk_fix_conditions. NEVER PUT/PATCH programRules via dhis2_query (409/415).',
   manage_program_indicators: 'CRUD + audit + cross-program discovery + OU ranking for tracker/event PROGRAM indicators. Actions: list, get, create, update, delete, audit, bulk_fix, bulk_fix_expressions, discover (cross-program "complex/top/heavy indicators", no program_id needed), rank_ou ("which OUs/districts have the most data/events"). NEVER PUT/PATCH programIndicators via dhis2_query; never invent UIDs.',
@@ -5763,7 +5775,7 @@ The tool handles the FULL dependency chain atomically and auto-resolves all inte
 
 **Input slots for the single create_program call:**
 - \`tracked_entity_type_id\` (WITH_REGISTRATION programs only): NEVER hardcode/guess a UID here. Either omit it (defaults to the TrackedEntityType named "Person") or pass the exact TrackedEntityType NAME (e.g. "Person", "Household") — the tool resolves the name to its real UID for you. If unsure such a type exists, check first with architect_metadata(action="check_existing", object_type="trackedEntityTypes").
-- \`program_attributes\`: tracked entity attributes (with inline \`option_set\` if needed)
+- \`program_attributes\`: tracked entity attributes (with inline \`option_set\` if needed). **Existing attributes are REUSED, never recreated:** common TEAs (First/Full name, Date of birth/DoB, Sex, National ID, phone number, address, …) almost always already exist on the instance. Just list them by name — if the EXACT name exists the tool attaches the existing TEA instead of creating a duplicate; you can also pin one explicitly with \`id: "<UID>"\`. If the server ever answers "already exists on object <UID>", that UID IS the attribute to reuse (pass it as \`id\`) — NEVER dodge the error by renaming ("Full name 2", "Sex (new)"): that pollutes the instance with near-duplicates.
 - \`org_unit_ids\`: the org units the program should be assigned to for Capture/Tracker use. If the user mentions districts/facilities/org units, resolve them first and pass them here.
 - \`assign_all_org_units: true\`: use this WHEN THE USER SAYS "all OUs", "all org units", "all levels", "all facilities", "every org unit" — the tool fetches every org unit server-side in ONE call. DO NOT paginate org units yourself.
 - \`sharing\`: \`{ public_access: "rwrw----", include_current_user: true, user_ids: [...], user_group_ids: [...] }\`. Set \`include_current_user: true\` when the user says "include me", "share with me", "I should have access", etc. Sharing is auto-applied to stages + DEs + option sets + TEAs unless \`apply_to_children: false\`. **DHIS2 only permits data-level sharing (positions 3-4 of the access string) on Program + ProgramStage — DataElement, OptionSet, TrackedEntityAttribute, ProgramIndicator are metadata-only.** The tool strips the data bits automatically for those classes, so a single \`public_access: "rwrw----"\` is safe everywhere.
@@ -5778,7 +5790,7 @@ Options → OptionSets → TrackedEntityAttributes → DataElements → Program 
 - "Data sharing is not enabled for X" → the tool now strips data bits itself; if you still see this, a custom class changed — retry with \`sharing.apply_to_children: false\` and then run \`manage_metadata(action=update_sharing)\` per object.
 - "Property X is required" on a specific klass → add that field to the matching input slot and retry the WHOLE create_program (the rollback is atomic).
 - Validation rejects ONE stage (name clash, bad DE) → keep the other stage in a retry minus the bad one, then use \`add_stage\` / \`add_data_elements_to_stage\` afterwards to fix the rejected piece.
-- Option-set or DE already exists by name → the tool reuses it automatically; no action needed.
+- "already exists on object <UID>" (TEA / DE / option set) → the tool auto-reuses the existing object and retries by itself; if the error still surfaces, re-issue passing that existing <UID> (\`id\` for program_attributes) or the exact existing name — NEVER a renamed variant.
 Never retry by looping through children one-at-a-time when the single atomic retry can succeed. Decompose only on targeted rejection.
 
 ### Category combos / disaggregation (create_category_combo, create_data_elements)
@@ -16933,6 +16945,10 @@ async function growthChartScaffoldProgram(args) {
   const teaResp = await safeDhis2Fetch(
     `trackedEntityAttributes?fields=id,displayName,valueType,optionSet[id,options[code,displayName]]&paging=false&filter=displayName:in:[${wantTeas.map(t => t.name).join(',')}]`
   );
+  // Probe failure ≠ "none exist" — creating blindly would duplicate the demo TEAs.
+  if (teaResp?._error) {
+    return { _error: `Could not check for existing attributes (${teaResp._error}). Aborting BEFORE creating anything to avoid duplicates. Nothing was changed — verify connectivity and retry.` };
+  }
   const foundTeas = teaResp?.trackedEntityAttributes || [];
   const teaIds = {};
   let optionSetId = null, femaleCode = 'Female', maleCode = 'Male';
@@ -17160,6 +17176,83 @@ async function postMetadataPayload(payload, dryRunOnly) {
     return patched;
   }
 
+  // ── NAME-conflict self-healing ──────────────────────────────────────────────
+  // DHIS2 name uniqueness errors carry BOTH UIDs:
+  //   "Property `name` with value `Sex` on object Sex [kzqq7s1sirO]
+  //    (TrackedEntityAttribute) already exists on object WCffUc0Cp2j"
+  // For classes where same-name means same-thing (TEA, DE, option set, TET,
+  // category objects) the ONLY correct move is to REUSE the existing object:
+  // drop our would-be duplicate from the payload and rewrite every reference
+  // from our pre-generated UID to the existing one, then retry. Never let the
+  // model "fix" this by inventing a name variant — that creates near-duplicate
+  // metadata. For classes whose name is unique but instance-specific
+  // (ProgramStage, ProgramIndicator) reuse would hijack another program's
+  // object, so those get a rename-with-suffix instead (mirrors the pre-probe
+  // convention). The duplicate object is REMOVED, not imported as an update —
+  // importing it would overwrite the existing object's fields (optionSet,
+  // description, unique flag, …) with our minimal stub.
+  const REUSE_ON_NAME_CONFLICT = new Set([
+    'TrackedEntityAttribute', 'DataElement', 'OptionSet', 'TrackedEntityType',
+    'CategoryOption', 'Category', 'CategoryCombo',
+  ]);
+  const RENAME_ON_NAME_CONFLICT = new Set(['ProgramStage', 'ProgramIndicator']);
+  const nameConflictRemaps = [];  // [{klass, name, from, to}] — deduped → reused existing UID
+  const nameConflictRenames = []; // [{klass, from, to, id}]  — renamed to dodge unique name
+  function remapUidInPayload(fromUid, toUid) {
+    const walk = (node) => {
+      if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+      if (node && typeof node === 'object') {
+        for (const k of Object.keys(node)) {
+          if (node[k] === fromUid) node[k] = toUid;
+          else walk(node[k]);
+        }
+      }
+    };
+    walk(payload);
+  }
+  function tryAutofixNameConflicts(errorMessages) {
+    if (!Array.isArray(errorMessages) || !errorMessages.length) return false;
+    let patched = false;
+    for (const msg of errorMessages) {
+      const m = String(msg || '').match(
+        /Property\s+`name`\s+with value\s+`([^`]*)`\s+on object .*?\[([A-Za-z][A-Za-z0-9]{10})\]\s+\((\w+)\)\s+already exists on object\s+([A-Za-z][A-Za-z0-9]{10})/i
+      );
+      if (!m) continue;
+      const [, dupName, newUid, klass, existingUid] = m;
+      if (newUid === existingUid) continue;
+      if (REUSE_ON_NAME_CONFLICT.has(klass)) {
+        for (const key of Object.keys(payload)) {
+          if (Array.isArray(payload[key])) payload[key] = payload[key].filter(o => !(o && o.id === newUid));
+        }
+        remapUidInPayload(newUid, existingUid);
+        nameConflictRemaps.push({ klass, name: dupName, from: newUid, to: existingUid });
+        patched = true;
+      } else if (RENAME_ON_NAME_CONFLICT.has(klass)) {
+        for (const key of Object.keys(payload)) {
+          if (!Array.isArray(payload[key])) continue;
+          for (const o of payload[key]) {
+            if (o && o.id === newUid && o.name) {
+              const renamed = `${String(o.name).slice(0, 225).replace(/\s+$/, '')} ${generateDhis2Uid().slice(-4)}`;
+              nameConflictRenames.push({ klass, from: o.name, to: renamed, id: newUid });
+              o.name = renamed;
+              patched = true;
+            }
+          }
+        }
+      }
+    }
+    return patched;
+  }
+  // Recovery summary attached to every return so callers (and the model) see
+  // that duplicates were auto-reused, and can sync their name→ID maps.
+  const recoveryInfo = () => ({
+    ...(nameConflictRemaps.length ? {
+      _name_conflict_remaps: nameConflictRemaps,
+      _recovery_note: `Auto-reused ${nameConflictRemaps.length} object(s) that ALREADY EXISTED on the server by name instead of creating duplicates: ${nameConflictRemaps.map(r => `${r.klass} "${r.name}" → ${r.to}`).join(', ')}.`,
+    } : {}),
+    ...(nameConflictRenames.length ? { _name_conflict_renames: nameConflictRenames } : {}),
+  });
+
   // Helper: check if response indicates failure (HTTP error OR status=ERROR)
   function isResponseError(resp) {
     if (!resp) return 'Empty response from DHIS2';
@@ -17184,8 +17277,10 @@ async function postMetadataPayload(payload, dryRunOnly) {
     // Extract detailed errors from the response body (e.g., 409 responses contain typeReports)
     const detailedErrors = validateResp._body ? extractErrors(validateResp._body) : [];
     const allErrors = detailedErrors.length > 0 ? detailedErrors : [validateError];
-    // Defense-in-depth: auto-fix shortName conflicts and revalidate once.
-    if (tryAutofixShortNameConflicts(allErrors)) {
+    // Defense-in-depth: auto-fix shortName + name conflicts and revalidate once.
+    const fixedShort = tryAutofixShortNameConflicts(allErrors);
+    const fixedName = tryAutofixNameConflicts(allErrors);
+    if (fixedShort || fixedName) {
       validateResp = await safeDhis2Fetch('metadata?importMode=VALIDATE&atomicMode=ALL', {
         method: 'POST',
         body: payload,
@@ -17197,7 +17292,7 @@ async function postMetadataPayload(payload, dryRunOnly) {
       const errorMsg = detailedErrors2.length > 0
         ? `Validation failed with ${detailedErrors2.length} error(s): ${detailedErrors2.slice(0, 5).join('; ')}`
         : `Validation failed: ${validateError}`;
-      return { success: false, _error: errorMsg, phase: 'validation', errors: detailedErrors2.length > 0 ? detailedErrors2 : [validateError] };
+      return { success: false, _error: errorMsg, phase: 'validation', errors: detailedErrors2.length > 0 ? detailedErrors2 : [validateError], ...recoveryInfo() };
     }
   }
 
@@ -17205,8 +17300,10 @@ async function postMetadataPayload(payload, dryRunOnly) {
   let errors = extractErrors(validateResp);
 
   if (errors.length > 0) {
-    // Auto-fix shortName conflicts and revalidate once before failing.
-    if (tryAutofixShortNameConflicts(errors)) {
+    // Auto-fix shortName + name conflicts and revalidate once before failing.
+    const fixedShort = tryAutofixShortNameConflicts(errors);
+    const fixedName = tryAutofixNameConflicts(errors);
+    if (fixedShort || fixedName) {
       validateResp = await safeDhis2Fetch('metadata?importMode=VALIDATE&atomicMode=ALL', {
         method: 'POST',
         body: payload,
@@ -17215,12 +17312,12 @@ async function postMetadataPayload(payload, dryRunOnly) {
       errors = extractErrors(validateResp);
     }
     if (errors.length > 0) {
-      return { success: false, _error: `Validation failed with ${errors.length} error(s): ${errors[0]}`, phase: 'validation', errors, stats };
+      return { success: false, _error: `Validation failed with ${errors.length} error(s): ${errors[0]}`, phase: 'validation', errors, stats, ...recoveryInfo() };
     }
   }
 
   if (dryRunOnly) {
-    return { success: true, phase: 'dry_run', message: 'Validation passed. No import performed (dry_run_only=true).', stats };
+    return { success: true, phase: 'dry_run', message: 'Validation passed. No import performed (dry_run_only=true).', stats, ...recoveryInfo() };
   }
 
   // Actual import
@@ -17234,10 +17331,12 @@ async function postMetadataPayload(payload, dryRunOnly) {
   if (importError) {
     const detailedImportErrors = importResp._body ? extractErrors(importResp._body) : [];
     const allImportErrors = detailedImportErrors.length > 0 ? detailedImportErrors : [importError];
-    // Defense-in-depth for the rare race-condition shortName conflict that
+    // Defense-in-depth for the rare race-condition shortName/name conflict that
     // slipped past pre-probe (another import committed between our probe
-    // and our COMMIT). Auto-suffix and retry once.
-    if (tryAutofixShortNameConflicts(allImportErrors)) {
+    // and our COMMIT). Auto-suffix / auto-reuse and retry once.
+    const fixedShort = tryAutofixShortNameConflicts(allImportErrors);
+    const fixedName = tryAutofixNameConflicts(allImportErrors);
+    if (fixedShort || fixedName) {
       importResp = await safeDhis2Fetch('metadata?importMode=COMMIT&atomicMode=ALL', {
         method: 'POST',
         body: payload,
@@ -17249,7 +17348,7 @@ async function postMetadataPayload(payload, dryRunOnly) {
       const importErrMsg = detailedImportErrors2.length > 0
         ? `Import failed with ${detailedImportErrors2.length} error(s): ${detailedImportErrors2.slice(0, 5).join('; ')}`
         : `Import failed: ${importError}`;
-      return { success: false, _error: importErrMsg, phase: 'import', errors: detailedImportErrors2.length > 0 ? detailedImportErrors2 : [importError] };
+      return { success: false, _error: importErrMsg, phase: 'import', errors: detailedImportErrors2.length > 0 ? detailedImportErrors2 : [importError], ...recoveryInfo() };
     }
   }
 
@@ -17257,7 +17356,9 @@ async function postMetadataPayload(payload, dryRunOnly) {
   let importErrors = extractErrors(importResp);
 
   if (importErrors.length > 0) {
-    if (tryAutofixShortNameConflicts(importErrors)) {
+    const fixedShort = tryAutofixShortNameConflicts(importErrors);
+    const fixedName = tryAutofixNameConflicts(importErrors);
+    if (fixedShort || fixedName) {
       importResp = await safeDhis2Fetch('metadata?importMode=COMMIT&atomicMode=ALL', {
         method: 'POST',
         body: payload,
@@ -17266,7 +17367,7 @@ async function postMetadataPayload(payload, dryRunOnly) {
       importErrors = extractErrors(importResp);
     }
     if (importErrors.length > 0) {
-      return { success: false, _error: `Import failed with ${importErrors.length} error(s): ${importErrors[0]}`, phase: 'import', errors: importErrors, stats: importStats };
+      return { success: false, _error: `Import failed with ${importErrors.length} error(s): ${importErrors[0]}`, phase: 'import', errors: importErrors, stats: importStats, ...recoveryInfo() };
     }
   }
 
@@ -17274,10 +17375,10 @@ async function postMetadataPayload(payload, dryRunOnly) {
   const created = importStats.created || 0;
   const updated = importStats.updated || 0;
   if (created === 0 && updated === 0 && (importStats.ignored || 0) > 0) {
-    return { success: false, _error: `Import completed but all ${importStats.ignored} objects were ignored. Check for duplicate names or missing references.`, phase: 'import', stats: importStats };
+    return { success: false, _error: `Import completed but all ${importStats.ignored} objects were ignored. Check for duplicate names or missing references.`, phase: 'import', stats: importStats, ...recoveryInfo() };
   }
 
-  return { success: true, phase: 'import', stats: importStats };
+  return { success: true, phase: 'import', stats: importStats, ...recoveryInfo() };
 }
 
 async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
@@ -17504,8 +17605,16 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   }
 
   // Collect tracked entity attributes for tracker programs
+  const explicitTeaIds = []; // [{id, name}] — reused-by-UID entries, verified against the server below
   if (isTracker && args.program_attributes?.length) {
     for (const attr of args.program_attributes) {
+      // Explicit reuse by UID: the attribute already exists on the server —
+      // reference it as-is, create NOTHING for it.
+      if (attr.id && /^[A-Za-z][A-Za-z0-9]{10}$/.test(attr.id)) {
+        teaUidMap[attr.name || attr.id] = attr.id;
+        explicitTeaIds.push({ id: attr.id, name: attr.name || attr.id });
+        continue;
+      }
       // Handle inline option set for attribute
       if (attr.option_set && attr.option_set.name && attr.option_set.options?.length) {
         if (!optionSetUidMap[attr.option_set.name]) {
@@ -17560,6 +17669,18 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
       return safeDhis2Fetch(`optionSets?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
     }));
+    // Fail LOUD on probe errors — see the DE/TEA probe block below for why.
+    const osProbeFailures = osResponses.filter(r => r?._error).map(r => `optionSets name probe: ${r._error}`);
+    if (osProbeFailures.length) {
+      return {
+        success: false,
+        nothing_created: true,
+        phase: 'pre_check',
+        _error: `Aborted BEFORE creating anything: could not check the server for existing option sets (${osProbeFailures.join('; ')})`,
+        errors: osProbeFailures,
+        _hint: 'The duplicate-check query against DHIS2 failed, so existing option sets could not be detected and creating blindly would duplicate them. Nothing was imported. Verify connectivity/permissions and retry the SAME create_program call.',
+      };
+    }
     for (const resp of osResponses) {
       for (const ex of (resp?.optionSets || [])) {
         const os = allOptionSets.find(o => o.name === ex.name);
@@ -17609,7 +17730,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     for (let i = 0; i < teaNames.length; i += 50) teaBatches.push(teaNames.slice(i, i + 50));
   }
 
-  const [deResponses, teaResponses] = await Promise.all([
+  const [deResponses, teaResponses, explicitTeaResp] = await Promise.all([
     Promise.all(deBatches.map(batch => {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
       return safeDhis2Fetch(`dataElements?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
@@ -17618,7 +17739,49 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
       return safeDhis2Fetch(`trackedEntityAttributes?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
     })),
+    explicitTeaIds.length
+      ? safeDhis2Fetch(`trackedEntityAttributes?filter=id:in:[${explicitTeaIds.map(t => t.id).join(',')}]&fields=id,name&paging=false`)
+      : Promise.resolve(null),
   ]);
+
+  // ── Dedup probes MUST succeed before we import ─────────────────────────────
+  // If a probe errored (network, auth, a strict proxy rejecting the URL, …) we
+  // know NOTHING about what already exists — proceeding would blindly create
+  // duplicates of objects that may already be there, and the atomic import
+  // would bounce with confusing "already exists" errors (or worse, near-
+  // duplicates would be created). Verified live 2026-07-10 on a Tomcat-fronted
+  // 2.42: silent probe 400s caused create_program to recreate the existing
+  // "Full name"/"DoB"/"Sex" TEAs three times in a row. Fail LOUD instead.
+  {
+    const probeFailures = [];
+    for (const r of deResponses) if (r?._error) probeFailures.push(`dataElements name probe: ${r._error}`);
+    for (const r of teaResponses) if (r?._error) probeFailures.push(`trackedEntityAttributes name probe: ${r._error}`);
+    if (explicitTeaResp?._error) probeFailures.push(`trackedEntityAttributes id probe: ${explicitTeaResp._error}`);
+    if (probeFailures.length) {
+      return {
+        success: false,
+        nothing_created: true,
+        phase: 'pre_check',
+        _error: `Aborted BEFORE creating anything: could not check the server for existing objects (${probeFailures.length} probe failure(s)): ${probeFailures.join('; ')}`,
+        errors: probeFailures,
+        _hint: 'The duplicate-check queries against DHIS2 failed, so existing data elements / tracked entity attributes could not be detected. Creating blindly would duplicate metadata that may already exist. Nothing was imported. Verify connectivity/permissions to the DHIS2 instance and retry the SAME create_program call.',
+      };
+    }
+    // Explicit reuse-by-UID entries must point at REAL attributes.
+    if (explicitTeaIds.length) {
+      const foundIds = new Set((explicitTeaResp?.trackedEntityAttributes || []).map(t => t.id));
+      const phantom = explicitTeaIds.filter(t => !foundIds.has(t.id));
+      if (phantom.length) {
+        return {
+          success: false,
+          nothing_created: true,
+          phase: 'pre_check',
+          _error: `Aborted BEFORE creating anything: program_attributes reference ${phantom.length} trackedEntityAttribute UID(s) that do not exist on this server: ${phantom.map(t => `${t.name} [${t.id}]`).join(', ')}.`,
+          _hint: 'Only pass id for a TEA you have VERIFIED on this instance (via search_metadata or an "already exists on object <UID>" server error). To create a new attribute instead, drop the id and pass name + value_type.',
+        };
+      }
+    }
+  }
 
   // Apply DE dedup
   for (const resp of deResponses) {
@@ -17627,7 +17790,6 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       if (de) { deUidMap[de.name] = ex.id; de._skip = true; }
     }
   }
-  const filteredDataElements = allDataElements.filter(de => !de._skip);
 
   // Apply TEA dedup
   for (const resp of teaResponses) {
@@ -17636,6 +17798,30 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       if (tea) { teaUidMap[tea.name] = ex.id; tea._skip = true; }
     }
   }
+
+  // Second pass: case-insensitive reuse for names the exact-match probe missed
+  // ("DOB" requested vs existing "DoB"). DHIS2's unique-name constraint is
+  // case-SENSITIVE, so a case variant imports "successfully" as a silent
+  // near-duplicate — exactly what reuse-by-name exists to prevent (observed
+  // 2026-07-10: the first Child-health attempt would have created "DOB"
+  // alongside the instance's existing "DoB"). ilike = case-insensitive
+  // contains; we only accept full-string case-insensitive equality. Probe
+  // errors here are non-fatal — the exact probes above already proved
+  // connectivity, and a residual duplicate is still caught by the
+  // name-conflict self-healing in postMetadataPayload.
+  {
+    const ciReuse = async (obj, resource, key, uidMap) => {
+      const resp = await safeDhis2Fetch(`${resource}?filter=name:ilike:${encodeURIComponent(obj.name)}&fields=id,name&pageSize=10`);
+      if (resp?._error) return;
+      const hit = (resp?.[key] || []).find(x => String(x.name || '').toLowerCase() === String(obj.name).toLowerCase());
+      if (hit) { uidMap[obj.name] = hit.id; obj._skip = true; }
+    };
+    await Promise.all([
+      ...allDataElements.filter(d => !d._skip).map(d => ciReuse(d, 'dataElements', 'dataElements', deUidMap)),
+      ...allTrackedEntityAttributes.filter(t => !t._skip).map(t => ciReuse(t, 'trackedEntityAttributes', 'trackedEntityAttributes', teaUidMap)),
+    ]);
+  }
+  const filteredDataElements = allDataElements.filter(de => !de._skip);
   const filteredTEAs = allTrackedEntityAttributes.filter(tea => !tea._skip);
 
   // ── Server-side shortName collision resolution ──────────────────────────────
@@ -17761,7 +17947,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // Add tracked entity attributes to program
   if (Object.keys(teaUidMap).length > 0 && args.program_attributes?.length) {
     program.programTrackedEntityAttributes = args.program_attributes.map((attr, i) => ({
-      trackedEntityAttribute: { id: teaUidMap[attr.name] },
+      trackedEntityAttribute: { id: teaUidMap[attr.name || attr.id] },
       mandatory: attr.mandatory || false,
       searchable: attr.searchable || false,
       displayInList: attr.display_in_list !== false, // default true
@@ -18061,6 +18247,27 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     }
   }
 
+  // If postMetadataPayload self-healed a name conflict by reusing an existing
+  // object, our local name→ID maps still hold the discarded pre-generated UID.
+  // Sync them so the summary / returned ID handles point at the REAL objects.
+  if (result?._name_conflict_remaps?.length) {
+    for (const r of result._name_conflict_remaps) {
+      for (const map of [deUidMap, teaUidMap, optionSetUidMap]) {
+        for (const [n, id] of Object.entries(map)) { if (id === r.from) map[n] = r.to; }
+      }
+    }
+  }
+  // Stage objects renamed by the name-conflict autofix live in payload.programStages
+  // (same references as stageObjects) — mirror any rename into the summary names.
+  if (result?._name_conflict_renames?.length) {
+    for (let i = 0; i < stageObjects.length; i++) {
+      if (stageObjects[i]?.name && stageObjects[i].name !== resolvedStageNames[i]) {
+        stageRenames.push({ original: resolvedStageNames[i], final: stageObjects[i].name });
+        resolvedStageNames[i] = stageObjects[i].name;
+      }
+    }
+  }
+
   // Create program indicators as follow-up (they need stage UIDs from the created program)
   let indicatorResults = [];
   if (args.program_indicators?.length && result.success && !args.dry_run_only) {
@@ -18171,10 +18378,13 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // "Program OuyEAzGOp5i could not be found" — observed 2026-07-06 on the MCH
   // scenario after a validation failure).
   if (!result || result.success !== true) {
+    const dupHint = (result?.errors || []).some(e => /already exists on object/i.test(String(e)))
+      ? ' ⚠ For every "already exists on object <UID>" error: that object ALREADY EXISTS on the server — you MUST NOT recreate it, and you MUST NOT dodge the error by inventing a name variant (that creates near-duplicate metadata). Reuse it instead: for attributes pass { id: "<the existing UID from the error>" } in program_attributes; for data elements / option sets keep the EXACT existing name and the tool reuses them automatically.'
+      : '';
     return {
       ...result,
       nothing_created: true,
-      _hint: `${result?._hint ? result._hint + ' ' : ''}The import is ATOMIC and it failed — NOTHING was created (no program, stages, data elements, or rules exist on the server). Do NOT reuse any IDs from this attempt and do NOT call add_program_rules/add_stage for this program. Fix the reported error and re-issue the ENTIRE create_program call.`,
+      _hint: `${result?._hint ? result._hint + ' ' : ''}The import is ATOMIC and it failed — NOTHING was created (no program, stages, data elements, or rules exist on the server). Do NOT reuse any IDs from this attempt and do NOT call add_program_rules/add_stage for this program. Fix the reported error and re-issue the ENTIRE create_program call.${dupHint}`,
     };
   }
 
@@ -18850,6 +19060,11 @@ async function executeManageMetadata(args) {
         const found = await safeDhis2Fetch(
           `trackedEntityAttributes?filter=name:eq:${encodeURIComponent(a.name)}&fields=id,name&pageSize=1`
         );
+        // Probe failure ≠ "does not exist". Creating here would duplicate an
+        // attribute we simply could not see — abort loudly instead.
+        if (found?._error) {
+          return { _error: `Could not check for an existing attribute named "${a.name}" (${found._error}). Aborting BEFORE creating anything to avoid duplicating an attribute that may already exist. Nothing was changed — verify connectivity and retry.` };
+        }
         teaId = found?.trackedEntityAttributes?.[0]?.id || null;
       }
 
