@@ -2034,3 +2034,66 @@ reused, never recreated, and never dodged via name variants**.
 growth-chart scaffold, every postMetadataPayload caller (shared self-healing — strictly
 additive), and the per-turn write-auth gate (strictly more accurate). No result shapes
 changed; existing success paths byte-identical.
+
+## 35. Program-indicator deep test (MCH scenario): widget visibility, boundary correctness, real parser grammar (v2.8.9)
+
+**Files:** `background.js`, `manifest.json`
+**Functions:** `_buildAndPostProgramIndicator`, `executeManageProgramIndicators` (create/update/get/audit/bulk_fix/bulk_fix_expressions), `createFullProgram` (embedded program_indicators), `lintProgramIndicatorExpression`, `VALID_PI_D2_FUNCS`, `KB_PI_GRAMMAR`, `manage_program_indicators` schema
+**Type of change:** Bug fixes + capability (found by driving the full MCH indicator→data→dashboard flow through the real tools)
+
+**Scenario that exposed the defects (2026-07-10, play 2.42.5.1):** built the user's
+"Maternal and Child Health (MCH) Program" out end-to-end with the extension's own tools —
+12 WHO-ANC-DAK-derived complex program indicators, 5 shown in the Tracker Capture
+"Indicators" widget, a 12-woman tracker cohort (12 enrollments, 67 events) entered via
+dhis2_query tracker bundles, analytics run, and a 6-tile dashboard (COLUMN, LINE,
+PIVOT_TABLE, SINGLE_VALUE, STACKED_COLUMN + text) via manage_dashboards. Three tool defects
+surfaced and were fixed at the root:
+
+1. **`displayInForm` was unsupported and silently wiped.** The indicator schema had no way
+   to put an indicator in the right-side data-entry "Indicators" widget, and because the
+   metadata import replaces the full object, ANY update/bulk_fix through the tool reset a
+   widget-visible indicator back to hidden.
+   **Fix:** new `indicator.display_in_form` field (create + update); `_buildAndPostProgramIndicator`
+   always serializes `displayInForm`; update, bulk_fix and bulk_fix_expressions fetch and
+   thread the existing flag through; `get` returns it. Round-trip proven on 2.42.5.1 before
+   coding (probe import → GET displayInForm:true → delete).
+
+2. **ENROLLMENT indicators were created with EVENT_DATE analytics boundaries** (hard-coded
+   pair). Verified live consequences: each enrollment is counted in EVERY period containing
+   one of its events (a first-trimester-booking indicator returned 58 with only 25
+   enrollments in the program), and `d2:count()`-style filters see only same-period events —
+   "women with 4+ ANC contacts" returned 0 forever.
+   **Fix:** boundary target now follows the analytics type (ENROLLMENT_DATE for enrollment
+   PIs, EVENT_DATE for event PIs) in BOTH `_buildAndPostProgramIndicator` and
+   create_program's embedded-PI path; updating an indicator's analytics_type regenerates the
+   pair; **audit** now flags existing ENROLLMENT PIs with EVENT_DATE-only boundaries.
+   After delete+recreate through the fixed tool: 4+ANC 0→12, first-trimester 58→14, IFA
+   44→20 (all ≤ 25 enrollments — sane).
+
+3. **The d2-function whitelist matched the docs, not the parser.** The docs list floor/ceil/
+   round/modulus/addDays/left/right/substring/split/concatenate/length/validatePattern/
+   inOrgUnitGroup/lastEventDate/zScore* for PIs — the actual ANTLR parser on BOTH 2.42.5.1
+   and 2.43.0-1 rejects every one of them ("Item d2:<fn>( not supported for this type of
+   expression"); `d2:hasValue` parses in FILTERS only. The lint therefore passed expressions
+   the server then bounced with a generic error (cost: 1 wasted RTT + vague hint), and the
+   OUG{} hint recommended the equally-unsupported d2:inOrgUnitGroup.
+   **Fix:** whitelist reduced to the 16 parser-verified functions; the documented-but-rejected
+   set gets an instant local error with a targeted workaround (rounding → plain arithmetic +
+   `decimals`; org-unit scoping → the visualization's ou dimension); hasValue-in-expression
+   caught locally; KB_PI_GRAMMAR rewritten to the verified sets + a display_in_form section.
+
+**Verification (all live on play 2.42.5.1 via the chrome-shim harness driving the real
+executeTool):** `mch-pi-drive.js` 26/26 (12 complex PIs incl. d2:daysBetween first-trimester,
+d2:count 4+ visits, d2:countIfValue IFA — with one model-style self-correction on a rejected
+boolean literal; displayInForm exact per indicator; description-only update preserves the
+widget flag), `mch-pi-retry.js` 3/3 (d2:floor now blocked locally with the decimals hint;
+corrected gestational-age expression creates widget-visible), `mch-data-entry.js` 7/7 (91
+tracker objects imported through dhis2_query bundle rewrite), `mch-fix-enrollment-pis.js`
+13/13 (audit flags → delete → recreate → ENROLLMENT_DATE on server → analytics values sane),
+`mch-dashboard.js` (dashboard ON7Mo5bJtd8: 6 tiles, 11 PI dimension items, add_items
+non-destructive). Regressions: e2e-happy-path 8/8 (full agentic loop incl. PI create),
+auth-gate unit suite 18/18, `node --check` clean.
+
+**Scope of impact:** manage_program_indicators (all actions), create_program's embedded
+program_indicators, PI lint + manuals. Event-type PI behavior unchanged except the new
+always-serialized `displayInForm:false` default, which matches DHIS2's own default.

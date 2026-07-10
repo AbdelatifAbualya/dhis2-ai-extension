@@ -4645,7 +4645,8 @@ Actions:
               filter: { type: 'string', description: 'Condition restricting which events/enrollments count. Examples: "V{program_stage_id} == \'stageId\'", "#{stageId.deId} == \'value\'"' },
               analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'], description: 'EVENT=aggregate over events, ENROLLMENT=aggregate over enrollments/TEIs' },
               aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'], description: 'How to aggregate. Default: COUNT' },
-              decimals: { type: 'integer', description: 'Decimal places in output. Optional.' }
+              decimals: { type: 'integer', description: 'Decimal places in output. Optional.' },
+              display_in_form: { type: 'boolean', description: 'Show this indicator in the right-side "Indicators" widget of Tracker Capture / Capture data entry (DHIS2 displayInForm). Set true when the user wants the indicator visible during data entry. Default false.' }
             }
           },
           dry_run_only: { type: 'boolean', description: 'Validate without committing. Default: false.' },
@@ -5736,9 +5737,11 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
 
 **Operators:** \`== != < > <= >=\` (==/= behave the same way — **exact-string match** for strings, even on MULTI_TEXT), \`&& ||\`, \`+ - * /\`. There is **NO** \`LIKE\`, \`ILIKE\`, \`IN\`, \`position()\`, \`regexp_match()\`, \`coalesce()\`, or \`~\` regex in PI grammar. The parser will say "Invalid string token 'LIKE'" or similar.
 
-**Allowed d2: functions in PI:** \`condition\`, \`count\`, \`countIfValue\`, \`countIfCondition\`, \`hasValue\`, \`daysBetween\`, \`weeksBetween\`, \`monthsBetween\`, \`yearsBetween\`, \`minutesBetween\`, \`oizp\`, \`zing\`, \`zpvc\`, \`relationshipCount\`, \`ceil\`, \`floor\`, \`round\`, \`modulus\`, \`addDays\`, \`left\`, \`right\`, \`substring\`, \`split\`, \`concatenate\`, \`length\`, \`validatePattern\`, \`inOrgUnitGroup\`, \`lastEventDate\`, \`zScoreHFA\`/\`WFA\`/\`WFH\`.
+**Allowed d2: functions in PI (parser-verified live on 2.42 + 2.43 — the docs list MORE, but the parser rejects them):** \`condition\`, \`count\`, \`countIfValue\`, \`countIfCondition\`, \`hasValue\` (**FILTER only** — the expression parser rejects it), \`daysBetween\`, \`weeksBetween\`, \`monthsBetween\`, \`yearsBetween\`, \`minutesBetween\`, \`minValue\`, \`maxValue\`, \`oizp\`, \`zing\`, \`zpvc\`, \`relationshipCount\`.
 
-**FORBIDDEN d2: functions in PI** (these exist only in Program Rules — using them in a PI filter creates a PI that **looks** saved but returns HTTP 409 from analytics forever after): \`d2:contains\`, \`d2:containsString\`, \`d2:inOrgUnit\` (use \`d2:inOrgUnitGroup\` instead), \`d2:hasUserRole\`, \`d2:removeMin\`.
+**Documented-but-REJECTED by the PI parser** ("Item d2:<fn>( not supported for this type of expression", verified 2.42/2.43): \`ceil\`, \`floor\`, \`round\`, \`modulus\`, \`addDays\`, \`left\`, \`right\`, \`substring\`, \`split\`, \`concatenate\`, \`length\`, \`validatePattern\`, \`inOrgUnitGroup\`, \`lastEventDate\`, \`zScoreHFA\`/\`WFA\`/\`WFH\`. For rounding, keep plain arithmetic and set the indicator's \`decimals\` (e.g. gestational weeks = \`d2:daysBetween(#{stage.lmp}, V{event_date}) / 7\` with \`decimals: 0\`). For org-unit scoping use the visualization's ou dimension, never the PI.
+
+**FORBIDDEN d2: functions in PI** (these exist only in Program Rules — using them in a PI filter creates a PI that **looks** saved but returns HTTP 409 from analytics forever after): \`d2:contains\`, \`d2:containsString\`, \`d2:inOrgUnit\`, \`d2:hasUserRole\`, \`d2:removeMin\`.
 
 **Quoting inside d2:condition:** the first arg is a STRING. To embed a string literal you need different outer-quotes — use **double-quoted outer**: \`d2:condition("#{stage.de} == 'X'", 1, 0) == 1\`. Single-quoted outer with escaped inner does NOT parse.
 
@@ -5756,6 +5759,8 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
 - \`analyticsType\`: \`EVENT\` (one row per event) or \`ENROLLMENT\` (one row per enrollment, latest event values per stage).
 - \`aggregationType\`: \`COUNT\` for count-of-rows, \`SUM\`/\`AVERAGE\`/\`MIN\`/\`MAX\` for numeric aggregations.
 - "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{tei_count}\`. \`V{enrollment_count}\` is also valid; \`V{event_count}\` is for EVENT-type PIs.
+
+**Indicators widget during data entry:** when the user wants an indicator visible in the right-side "Indicators" widget of Tracker Capture / Capture (e.g. live gestational age, risk flags), pass \`display_in_form: true\` in the indicator object (create or update). Per-event calculations (EVENT analytics) read most naturally there.
 
 **Validation safety net (you don't manage this — it just runs):**
 - Every \`manage_program_indicators(action=create|update)\` call validates expression+filter via DHIS2's \`/programIndicators/expression/description\` and \`/filter/description\` endpoints BEFORE saving. If either returns \`status: ERROR\`, the create/update is refused and the parser's exact error string is returned to you in \`_error\` along with a hint in \`_hint\`. Read both, fix the expression, and retry — do NOT loop with the same broken filter.`;
@@ -18285,10 +18290,18 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         expression: pi.expression || 'V{event_count}',
         filter: pi.filter || '',
         description: pi.description || '',
-        analyticsPeriodBoundaries: [
-          { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
-          { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
-        ],
+        // Boundary target must match the analytics type — ENROLLMENT PIs with
+        // EVENT_DATE boundaries over-count and break d2:count filters (see
+        // _buildAndPostProgramIndicator for the verified failure mode).
+        analyticsPeriodBoundaries: (pi.analytics_type === 'ENROLLMENT'
+          ? [
+            { boundaryTarget: 'ENROLLMENT_DATE', analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
+            { boundaryTarget: 'ENROLLMENT_DATE', analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
+          ]
+          : [
+            { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
+            { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
+          ]),
       };
       if (piSharing) { obj.sharing = piSharing; obj.publicAccess = piSharing.public; }
       return obj;
@@ -21229,14 +21242,23 @@ function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKe
 // expression OR filter. Keep in sync with VALID_D2_FUNCS in audit (line ~12854).
 // d2:contains / d2:containsString / d2:inOrgUnit / d2:hasUserRole / d2:removeMin
 // look tempting because they exist in Program Rules — they DO NOT exist in PI.
+// Functions the PI ANTLR parser ACTUALLY accepts — every entry verified live
+// against /programIndicators/{expression|filter}/description on BOTH
+// play 2.42.5.1 and 2.43.0-1 (2026-07-10). The DHIS2 docs list many more
+// (floor/ceil/round, string fns, zScore*, inOrgUnitGroup, lastEventDate) but
+// the parser rejects them with "Item d2:<fn>( not supported for this type of
+// expression" — docs-derived whitelisting produced false "valid" lints.
 const VALID_PI_D2_FUNCS = new Set([
   'condition', 'count', 'countIfValue', 'countIfCondition', 'daysBetween',
   'hasValue', 'maxValue', 'minValue', 'monthsBetween', 'oizp', 'relationshipCount',
   'weeksBetween', 'yearsBetween', 'minutesBetween', 'zing', 'zpvc',
-  'zScoreHFA', 'zScoreWFA', 'zScoreWFH',
-  'addDays', 'ceil', 'floor', 'round', 'modulus', 'validatePattern',
+]);
+// Documented-but-rejected: caught locally with a targeted workaround hint so
+// the model self-corrects in one step instead of bouncing off the server.
+const PI_D2_FUNCS_PARSER_REJECTS = new Set([
+  'ceil', 'floor', 'round', 'modulus', 'addDays', 'validatePattern',
   'left', 'right', 'substring', 'split', 'concatenate', 'length',
-  'inOrgUnitGroup', 'lastEventDate',
+  'inOrgUnitGroup', 'lastEventDate', 'zScoreHFA', 'zScoreWFA', 'zScoreWFH',
 ]);
 
 // lintProgramIndicatorExpression — fast local check before round-tripping to
@@ -21266,15 +21288,35 @@ function lintProgramIndicatorExpression(text, kind) {
     };
   }
 
-  // Unknown d2 function — catch typos and made-up names early.
+  // Unknown or parser-rejected d2 function — catch typos, made-up names, and
+  // the documented-but-unsupported set early with a targeted workaround.
+  const SUPPORTED_LIST = 'condition, count, countIfValue, countIfCondition, hasValue (FILTER only), daysBetween, weeksBetween, monthsBetween, yearsBetween, minutesBetween, minValue, maxValue, oizp, zing, zpvc, relationshipCount';
   const d2Calls = [...t.matchAll(/d2:([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)];
   for (const [, fn] of d2Calls) {
+    if (PI_D2_FUNCS_PARSER_REJECTS.has(fn)) {
+      const isRounding = fn === 'floor' || fn === 'ceil' || fn === 'round';
+      return {
+        error: `\`d2:${fn}(\` appears in the DHIS2 docs but the program-indicator parser REJECTS it ("Item d2:${fn}( not supported for this type of expression") — verified live on 2.42 and 2.43.`,
+        hint: isRounding
+          ? 'For rounding, drop the function and keep the plain arithmetic (e.g. `d2:daysBetween(#{stage.lmp}, V{event_date}) / 7`), then set the indicator\'s `decimals` (0 for whole numbers) — analytics rounds the displayed value. Supported functions: ' + SUPPORTED_LIST + '.'
+          : `Restructure without d2:${fn}. Supported PI d2 functions (parser-verified): ${SUPPORTED_LIST}. String/date manipulation beyond these belongs in program RULES or the Line Listing app, and org-unit scoping belongs in the visualization's ou dimension, not the PI.`,
+      };
+    }
     if (!VALID_PI_D2_FUNCS.has(fn)) {
       return {
         error: `Unknown program-indicator function: \`d2:${fn}(\`.`,
-        hint: 'Supported PI d2 functions: condition, count, countIfValue, countIfCondition, hasValue, daysBetween, weeksBetween, monthsBetween, yearsBetween, minutesBetween, oizp, zing, zpvc, relationshipCount, ceil, floor, round, modulus, addDays, left, right, substring, split, concatenate, length, validatePattern, inOrgUnitGroup, lastEventDate, zScoreHFA/WFA/WFH.',
+        hint: `Supported PI d2 functions (parser-verified on 2.42/2.43): ${SUPPORTED_LIST}.`,
       };
     }
+  }
+
+  // d2:hasValue parses ONLY in filter context — in an expression the parser
+  // returns "not supported for this type of expression" (verified 2.42 + 2.43).
+  if (kind === 'expression' && /d2:hasValue\s*\(/.test(t)) {
+    return {
+      error: '`d2:hasValue(` is FILTER-only in the program-indicator grammar — the expression parser rejects it (verified live on 2.42 and 2.43).',
+      hint: 'Move the has-value check into the indicator\'s `filter`, or in the expression use a numeric proxy like `d2:count(#{stage.de}) > 0` inside a d2:condition.',
+    };
   }
 
   // subExpression(...) — Indicator (regular) feature; PI parser returns
@@ -21301,7 +21343,7 @@ function lintProgramIndicatorExpression(text, kind) {
   // regular indicators but not in program indicators.
   if (/\bC\{[^}]+\}/.test(t)) return { error: 'C{} (category option combo) references are not valid in program indicators.', hint: 'Use #{stageId.deId}, A{teaId}, V{var}, or a constant value instead.' };
   if (/\bI\{[^}]+\}/.test(t)) return { error: 'I{} (indicator) references are not valid in program indicators.', hint: 'Compose the calculation directly in this PI using #{stage.de} / A{tea}.' };
-  if (/\bOUG\{[^}]+\}/.test(t)) return { error: 'OUG{} (org unit group) references are not valid in program indicators.', hint: 'Use d2:inOrgUnitGroup(\'<ougId>\') instead.' };
+  if (/\bOUG\{[^}]+\}/.test(t)) return { error: 'OUG{} (org unit group) references are not valid in program indicators.', hint: 'Scope by org unit in the ANALYTICS request instead: put the org-unit group / OUs in the visualization\'s ou dimension (e.g. OU_GROUP-<ougId> in dhis2 analytics, or org_units in manage_dashboards). The PI itself must stay OU-agnostic — d2:inOrgUnitGroup is rejected by the PI parser on 2.42/2.43.' };
 
   // Same-field equality against two DIFFERENT literals is impossible ONLY when the
   // comparisons are AND-ed: `#{X} == 'A' && #{X} == 'B'`. The OR form
@@ -22586,6 +22628,11 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       if (!pi.analyticsPeriodBoundaries || pi.analyticsPeriodBoundaries.length === 0) {
         piIssues.push('Missing analyticsPeriodBoundaries — indicator will not compute in analytics');
       }
+      if (pi.analyticsType === 'ENROLLMENT'
+          && Array.isArray(pi.analyticsPeriodBoundaries) && pi.analyticsPeriodBoundaries.length
+          && pi.analyticsPeriodBoundaries.every(b => b.boundaryTarget === 'EVENT_DATE')) {
+        piIssues.push('ENROLLMENT indicator with EVENT_DATE-only boundaries — values are distorted: each enrollment is counted in EVERY period containing one of its events, and d2:count()-style filters see only same-period events (often always 0). Recreate the boundaries with boundaryTarget ENROLLMENT_DATE (update the indicator with analytics_type ENROLLMENT after clearing boundaries, or delete + re-create via this tool).');
+      }
       if (!pi.expression || !pi.expression.trim()) {
         piIssues.push('Empty expression — indicator has no measure defined');
       }
@@ -22809,7 +22856,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     const fetchErrors = [];
     for (const indId of args.indicator_ids) {
       const existing = await safeDhis2Fetch(
-        `programIndicators/${indId}?fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,program[id],categoryCombo[id],attributeCombo[id],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType]`
+        `programIndicators/${indId}?fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,displayInForm,program[id],categoryCombo[id],attributeCombo[id],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType]`
       );
       if (existing._error) { fetchErrors.push({ id: indId, error: existing._error }); continue; }
 
@@ -22831,6 +22878,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       };
       if (existing.description !== undefined) pi.description = existing.description;
       if (existing.decimals  !== undefined) pi.decimals  = existing.decimals;
+      pi.displayInForm = existing.displayInForm === true;
       piObjects.push(pi);
     }
 
@@ -22879,7 +22927,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       if (!fix.indicator_id) { fetchErrors.push({ error: 'fix entry missing indicator_id', entry: fix }); continue; }
 
       const existing = await safeDhis2Fetch(
-        `programIndicators/${fix.indicator_id}?fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,program[id],categoryCombo[id],attributeCombo[id],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType]`
+        `programIndicators/${fix.indicator_id}?fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,displayInForm,program[id],categoryCombo[id],attributeCombo[id],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType]`
       );
       if (existing._error) { fetchErrors.push({ id: fix.indicator_id, error: existing._error }); continue; }
 
@@ -22918,6 +22966,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       };
       if (existing.description !== undefined) pi.description = existing.description;
       if (existing.decimals !== undefined)    pi.decimals    = existing.decimals;
+      pi.displayInForm = existing.displayInForm === true;
 
       changes.push({
         id: pi.id,
@@ -23009,7 +23058,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
   if (action === 'get') {
     if (!args.indicator_id) return { _error: 'indicator_id required for get' };
     return safeDhis2Fetch(
-      `programIndicators/${args.indicator_id}?fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,program[id,displayName],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType],categoryCombo[id,name],attributeCombo[id,name]`
+      `programIndicators/${args.indicator_id}?fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,displayInForm,program[id,displayName],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType],categoryCombo[id,name],attributeCombo[id,name]`
     );
   }
 
@@ -23032,7 +23081,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
 
     // Verify the indicator exists BEFORE touching it. 404 → STOP.
     const _verify = await verifyTargetExists('programIndicators', args.indicator_id, 'manage_program_indicators', 'update',
-      'id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,program[id],categoryCombo[id],attributeCombo[id],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType]');
+      'id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,displayInForm,program[id],categoryCombo[id],attributeCombo[id],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType]');
     if (!_verify.exists) return _verify.refusal;
     const existing = _verify.data;
 
@@ -23052,9 +23101,12 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
         analytics_type:   args.indicator.analytics_type   ?? existing.analyticsType,
         aggregation_type: args.indicator.aggregation_type ?? existing.aggregationType,
         decimals:         args.indicator.decimals         ?? existing.decimals,
+        display_in_form:  args.indicator.display_in_form  ?? existing.displayInForm,
         _catComboId:      existing.categoryCombo?.id,
         _attrComboId:     existing.attributeCombo?.id,
-        _boundaries:      existing.analyticsPeriodBoundaries,
+        // Changing the analytics type invalidates the old boundary pair — drop
+        // it so the type-correct defaults regenerate.
+        _boundaries:      (args.indicator.analytics_type && args.indicator.analytics_type !== existing.analyticsType) ? null : existing.analyticsPeriodBoundaries,
       }, args.dry_run_only);
       if (updateResult && typeof updateResult === 'object' && !Array.isArray(updateResult)) {
         updateResult.backup = backup.block;
@@ -23071,9 +23123,10 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       analytics_type:   args.indicator.analytics_type   ?? existing.analyticsType,
       aggregation_type: args.indicator.aggregation_type ?? existing.aggregationType,
       decimals:         args.indicator.decimals         ?? existing.decimals,
+      display_in_form:  args.indicator.display_in_form  ?? existing.displayInForm,
       _catComboId:      existing.categoryCombo?.id,
       _attrComboId:     existing.attributeCombo?.id,
-      _boundaries:      existing.analyticsPeriodBoundaries,
+      _boundaries:      (args.indicator.analytics_type && args.indicator.analytics_type !== existing.analyticsType) ? null : existing.analyticsPeriodBoundaries,
     }, args.dry_run_only);
   }
 
@@ -23111,6 +23164,15 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
     || 'bjDvmb4bfuf';
 
   const uid = indicatorId || generateDhis2Uid();
+  // Boundary target MUST follow the analytics type. An ENROLLMENT indicator
+  // with EVENT_DATE boundaries silently corrupts the numbers (verified live on
+  // play 2.42.5.1, 2026-07-10): each enrollment is counted in EVERY period
+  // that contains one of its events (massive over-count), and d2:count()
+  // filters see only same-period events, so "4+ ANC visits" style indicators
+  // return 0 forever. The Maintenance app uses ENROLLMENT_DATE for enrollment
+  // PIs — mirror that.
+  const analyticsType = indicator.analytics_type || 'EVENT';
+  const boundaryTarget = analyticsType === 'ENROLLMENT' ? 'ENROLLMENT_DATE' : 'EVENT_DATE';
   const pi = {
     id: uid,
     name: indicator.name,
@@ -23118,18 +23180,22 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
     program: { id: programId },
     expression: indicator.expression || 'V{event_count}',
     filter: indicator.filter || '',
-    analyticsType: indicator.analytics_type || 'EVENT',
+    analyticsType,
     aggregationType: indicator.aggregation_type || 'COUNT',
     categoryCombo:  { id: catComboId },
     attributeCombo: { id: indicator._attrComboId || catComboId },
-    // Preserve existing boundaries on update; generate standard pair on create
+    // Preserve existing boundaries on update; generate the type-correct pair on create
     analyticsPeriodBoundaries: indicator._boundaries || [
-      { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
-      { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
+      { boundaryTarget, analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
+      { boundaryTarget, analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
     ],
   };
   if (indicator.description !== undefined) pi.description = indicator.description;
   if (indicator.decimals !== undefined) pi.decimals = indicator.decimals;
+  // Always serialize displayInForm: the metadata import replaces the FULL
+  // object, so omitting it on update would silently reset a widget-visible
+  // indicator back to hidden. Callers thread existing.displayInForm through.
+  pi.displayInForm = indicator.display_in_form === true;
 
   // Pre-flight validation. DHIS2 happily returns 201 on a syntactically broken
   // filter (e.g. d2:contains is a program-rule fn, not a PI fn) — but analytics
