@@ -18934,15 +18934,58 @@ async function executeManageMetadata(args) {
       };
     }
 
+    // Programs own rules / rule variables / indicators that DHIS2 2.4x does
+    // NOT reliably cascade — deleting a program that still has programRules or
+    // PRVs 500s with "Transaction silently rolled back because it has been
+    // marked as rollback-only" (verified live on 2.42, 2026-07-11; the same
+    // delete succeeds once the dependents are removed first). Gather the
+    // wholly-owned dependents so they are snapshotted WITH the program and
+    // deleted child→parent before the program itself.
+    const cascadePlan = [];
+    if (args.object_type === 'programs') {
+      const [piResp, ruleResp, prvResp] = await Promise.all([
+        safeDhis2Fetch(`programIndicators?filter=program.id:eq:${args.object_id}&fields=id,name&pageSize=200`),
+        safeDhis2Fetch(`programRules?filter=program.id:eq:${args.object_id}&fields=id,name&pageSize=200`),
+        safeDhis2Fetch(`programRuleVariables?filter=program.id:eq:${args.object_id}&fields=id,name&pageSize=200`),
+      ]);
+      const add = (arr, type) => { for (const o of (arr || [])) if (o?.id) cascadePlan.push({ type, id: o.id, name: o.name }); };
+      add(piResp.programIndicators, 'programIndicators');
+      add(ruleResp.programRules, 'programRules');
+      add(prvResp.programRuleVariables, 'programRuleVariables');
+    }
+
     // Snapshot the object BEFORE attempting deletion. The reference-check
     // above filters most failure cases; if the delete still fails, the
     // backup is preserved so the user can inspect what would have been lost.
     const backup = await ensureBackupOrBail(
       { operation: 'delete', tool: 'manage_metadata', action: 'delete', reason: `Deleting ${args.object_type}/${args.object_id} (${objName})` },
-      [{ object_type: args.object_type, object_id: args.object_id, role: 'primary' }],
+      [
+        { object_type: args.object_type, object_id: args.object_id, role: 'primary' },
+        ...cascadePlan.map(c => ({ object_type: c.type, object_id: c.id, role: 'cascade' })),
+      ],
       args
     );
     if (!backup.ok) return backup.error;
+
+    // Delete the program's owned dependents first (indicators, then rules —
+    // whose actions cascade — then rule variables).
+    const cascade_deleted = [];
+    for (const type of ['programIndicators', 'programRules', 'programRuleVariables']) {
+      const idsOfType = cascadePlan.filter(c => c.type === type).map(c => ({ id: c.id }));
+      if (!idsOfType.length) continue;
+      const r = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
+        method: 'POST',
+        body: { [type]: idsOfType },
+      });
+      if (r._error) {
+        return {
+          _error: `Deletion aborted: could not remove the program's ${type} first (${r._error}). The program itself was NOT deleted.`,
+          cascade_deleted,
+          backup: backup.block,
+        };
+      }
+      cascade_deleted.push({ type, count: idsOfType.length });
+    }
 
     // Attempt deletion via POST /api/metadata?importStrategy=DELETE
     const deletePayload = { [args.object_type]: [{ id: args.object_id }] };
@@ -18952,7 +18995,7 @@ async function executeManageMetadata(args) {
     });
 
     if (delResp._error) {
-      return { _error: `Deletion failed: ${delResp._error}`, backup: backup.block };
+      return { _error: `Deletion failed: ${delResp._error}`, backup: backup.block, ...(cascade_deleted.length ? { cascade_deleted } : {}) };
     }
 
     const stats = delResp?.response?.stats || delResp?.stats || {};
@@ -18963,6 +19006,7 @@ async function executeManageMetadata(args) {
         success: true,
         deleted: { type: args.object_type, id: args.object_id, name: objName },
         message: `Successfully deleted ${objName}.`,
+        ...(cascade_deleted.length ? { cascade_deleted } : {}),
         backup: backup.block,
       };
     }

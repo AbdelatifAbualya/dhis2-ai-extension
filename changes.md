@@ -2205,6 +2205,10 @@ Root-caused and fixed the three failure classes reported from the MCH (play 2.43
   silently never fires.
 - **Instance repair (localhost:8081, TB program):** the five broken "Show …" twin rules
   deleted via the fixed tool path; the correct one-rule hide set remains; audit clean.
+- **Program cascade delete (found during deep testing):** manage_metadata(delete, programs)
+  used to 500 ("Transaction silently rolled back") while the program still had rules/PRVs —
+  it now snapshots + deletes owned programIndicators/programRules/programRuleVariables
+  child→parent first, reporting `cascade_deleted`.
 
 **Verification:** unit suite 27/27 (lint + resolver, incl. the exact live TB rule shapes and
 regression checks for legit hide/mandate-inverse pairs and HIDEALLFIELDS sugar); live E2E
