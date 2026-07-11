@@ -1,7 +1,25 @@
 /* ══════════════════════════════════════════════════════════════════════════════
-   DHIS2 AI Assistant — Background Service Worker (v3.0)
+   DHIS2 AI Assistant — Background Service Worker (v2.9.0)
    Handles: DHIS2 detection, metadata, multi-provider LLM agentic loop, tool exec
    ══════════════════════════════════════════════════════════════════════════════ */
+
+importScripts('background/core.js', 'shared/tool-catalog.js');
+
+const {
+  contextIdentityChanged,
+  extractDhis2IdFromInput,
+  extractDhis2IdFromText,
+  getChatCompletionsUrl: buildChatCompletionsUrl,
+  hasUidShape,
+  isLikelyDhisUid,
+  isLocalProviderUrl,
+  isValidProviderUrl,
+  normalizePlainText,
+  normalizeSearchText,
+  sanitizeHeaderValue,
+  stableStringify,
+} = globalThis.Dhis2AiCore;
+const TOOL_PRESENTATION = globalThis.Dhis2ToolCatalog;
 
 // ── Universal Model Provider ─────────────────────────────────────────────────
 // Default: Ollama (local, no API key, fully offline). Also supports any
@@ -29,29 +47,10 @@ const DEFAULT_PROVIDER_CONFIG = {
   visionModelId: '',
 };
 
-// Hosts that don't require an API key. Used to relax the "no key configured"
-// gate so users can run a local Ollama out of the box.
-const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1']);
-function isLocalProviderUrl(rawUrl) {
-  if (!rawUrl) return false;
-  let u;
-  try { u = new URL(rawUrl); } catch { return false; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-  const h = u.hostname.toLowerCase();
-  return LOCAL_HOSTNAMES.has(h) || h.endsWith('.local');
-}
 function isLocalProvider(cfg) {
   if (!cfg) return false;
   if (cfg.providerType === 'ollama') return true;
   return isLocalProviderUrl(cfg.apiBaseUrl);
-}
-// Strict validator for user-supplied provider/vision URLs.
-// Rejects javascript:, data:, file: and anything that doesn't parse.
-function isValidProviderUrl(rawUrl) {
-  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return false;
-  let u;
-  try { u = new URL(rawUrl.trim()); } catch { return false; }
-  return u.protocol === 'http:' || u.protocol === 'https:';
 }
 
 let _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };
@@ -62,31 +61,7 @@ function getProviderConfig() {
 }
 
 function getChatCompletionsUrl(baseUrl) {
-  // Normalize: ensure base URL ends properly and append /chat/completions
-  let url = (baseUrl || DEFAULT_PROVIDER_CONFIG.apiBaseUrl).replace(/\/+$/, '');
-  // If URL already ends with /chat/completions, use as-is
-  if (url.endsWith('/chat/completions')) return url;
-  // Google Gemini: bare domain needs /v1beta/openai prefix for OpenAI-compat
-  if (url.match(/generativelanguage\.googleapis\.com\/?$/) || url.endsWith('googleapis.com')) {
-    return url + '/v1beta/openai/chat/completions';
-  }
-  // If URL ends with /v1, /v1beta/openai, or similar versioned path, append /chat/completions
-  return url + '/chat/completions';
-}
-
-// HTTP header values must be ISO-8859-1 (Latin-1). API keys pasted from web UIs
-// frequently carry invisible Unicode characters (zero-width space, NBSP, smart
-// quotes, stray newlines), which cause fetch() to throw
-// "String contains non ISO-8859-1 code point". Strip anything outside the
-// printable ASCII range plus normal whitespace trimming.
-function sanitizeHeaderValue(v) {
-  if (v == null) return null;
-  // Remove ASCII control chars (including CR/LF) and any non-ASCII code points,
-  // then trim whitespace. Preserves the rest of the key as-is. Hard-cap at 4 KB
-  // to prevent oversized values from inflating every request body / header.
-  const cleaned = String(v).replace(/[^\x20-\x7E]/g, '').trim();
-  if (!cleaned) return null;
-  return cleaned.length > 4096 ? cleaned.slice(0, 4096) : cleaned;
+  return buildChatCompletionsUrl(baseUrl, DEFAULT_PROVIDER_CONFIG.apiBaseUrl);
 }
 
 // Load cached settings at startup
@@ -110,7 +85,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
 const TAVILY_SEARCH_URL = 'https://api.tavily.com/search';
 const LINE_LISTING_JSON_PATH = 'line-listing/dhis2_linelisting_tool.json';
 const LINE_LISTING_SYSTEM_PROMPT_PATH = 'line-listing/dhis2_chrome_extension_system_prompt.md';
-const LINE_LISTING_ROUTER_PATH = 'line-listing/dhis2_extension_router.js';
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -149,7 +123,6 @@ let conversationEpoch = 0;
 let lineListingAssets = {
   loaded: false,
   systemPromptMd: '',
-  routerSource: '',
   toolJson: null,
 };
 
@@ -328,7 +301,7 @@ function destructive404StopOrNull(toolName, action) {
   if (n < 2) return null;
   return {
     _error: `STOP: ${n} consecutive destructive ${toolName} lookups have hit 404 (target not found) in this turn. Further write attempts are blocked.`,
-    _hint: 'The IDs being targeted do NOT exist in the current metadata. Inspect logs may carry stale IDs from old/unrelated contexts — those are not proof of a current defect, and inventing "stale cache" explanations is hallucination. STOP modifying things. Show the user the 404 history and ask which CURRENT object (if any) should be acted on. Use manage_program_rules(action=list) / manage_program_indicators(action=list) to see what actually exists.',
+    _hint: 'The IDs being targeted do NOT exist in the current metadata. Prior conversation or external diagnostics may carry stale IDs from old/unrelated contexts — those are not proof of a current defect, and inventing "stale cache" explanations is hallucination. STOP modifying things. Show the user the 404 history and ask which CURRENT object (if any) should be acted on. Use manage_program_rules(action=list) / manage_program_indicators(action=list) to see what actually exists.',
     _scope: 'destructive_404_limit_reached',
     _history: (dhis2.destructive404History || []).slice(-5),
   };
@@ -337,8 +310,8 @@ function destructive404StopOrNull(toolName, action) {
 // ── Per-turn known-IDs registry & verify-before-call gate ───────────────────
 // EVERY API call must derive from verified data. The chatbot must never
 // construct a path/UID from a guess. dhis2.knownIds is seeded each turn from
-// (a) the user message, (b) page context, (c) inspect-snapshot text, (d)
-// already-loaded program/OU/viz/map metadata, (e) the persisted conversation
+// (a) the user message, (b) page context, (c) already-loaded
+// program/OU/viz/map metadata, and (d) the persisted conversation
 // history — every UID the model can literally see in its context window
 // (objects it created or read in PRIOR turns) counts as verified — and is
 // extended by every tool result in the same turn.
@@ -360,15 +333,10 @@ function harvestUidsInto(set, value, depth = 0) {
   for (const v of Object.values(value)) harvestUidsInto(set, v, depth + 1);
 }
 
-function seedKnownIds(userText, ctx, inspectSnapshot) {
+function seedKnownIds(userText, ctx) {
   const set = new Set();
   harvestUidsInto(set, userText);
   harvestUidsInto(set, ctx || {});
-  if (inspectSnapshot) {
-    harvestUidsInto(set, inspectSnapshot.insights || {});
-    // The raw logs also frequently contain UIDs (rule IDs, program IDs in URLs).
-    harvestUidsInto(set, (inspectSnapshot.logs || []).map(l => `${l.text || ''} ${l.url || ''}`).join('\n'));
-  }
   harvestUidsInto(set, dhis2.programMetadata);
   harvestUidsInto(set, dhis2.ouContext);
   harvestUidsInto(set, dhis2.visualizationContext);
@@ -432,8 +400,7 @@ function harvestIconKeysInto(set, value, depth = 0) {
 
 function seedKnownIcons() {
   // Fresh empty Set per turn — no static seeding (keys must be proven via API
-  // discovery this turn to count as "known"). Could later seed from the inspect
-  // snapshot if /icons responses showed up there.
+  // discovery this turn to count as "known").
   dhis2.knownIcons = new Set();
 }
 
@@ -573,18 +540,6 @@ const IDENTICAL_FAILURE_LIMIT = 1;   // deterministic error: block from the 2nd 
 const IDENTICAL_TRANSIENT_LIMIT = 2; // transient error: allow ONE identical retry, block the 3rd
 const SAME_ERROR_FAMILY_LIMIT = 4;   // same tool+action+error family, any args: hard block after 4
 
-// Deterministic stringify (sorted keys, recursively) so the same logical call
-// always produces the same signature regardless of key order in the model's JSON.
-function stableStringify(value) {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined';
-  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
-  return '{' + Object.keys(value)
-    .filter(k => value[k] !== undefined)
-    .sort()
-    .map(k => JSON.stringify(k) + ':' + stableStringify(value[k]))
-    .join(',') + '}';
-}
-
 function failedCallSignature(toolName, args) {
   return `${toolName}|${stableStringify(args || {})}`;
 }
@@ -720,7 +675,7 @@ function preflightCheckCall(toolName, args) {
   if (!unknown.length) return null;
   return {
     _error: `Refused: ${toolName} called with UID(s) that have not appeared in any verified source: ${unknown.join(', ')}.`,
-    _hint: 'Every API call must derive from verified data. The UID(s) above were not in: the user message, page context, inspect logs, the conversation history, or any prior tool result. Possible causes: (a) the UID is hallucinated — call a discovery tool first (search_metadata / list / get_program_info) to find the real UID, (b) the UID came from a stale source — verify it exists. Do NOT construct paths from guesses. IMPORTANT: this refusal is a client-side gate and says NOTHING about server state — never tell the user the object "is already gone", "was deleted", or "does not exist" based on this refusal.',
+    _hint: 'Every API call must derive from verified data. The UID(s) above were not in: the user message, page context, the conversation history, or any prior tool result. Possible causes: (a) the UID is hallucinated — call a discovery tool first (search_metadata / list / get_program_info) to find the real UID, (b) the UID came from a stale source — verify it exists. Do NOT construct paths from guesses. IMPORTANT: this refusal is a client-side gate and says NOTHING about server state — never tell the user the object "is already gone", "was deleted", or "does not exist" based on this refusal.',
     _refused: { tool: toolName, unknown_uids: unknown },
     _known_id_count: dhis2.knownIds.size,
     _scope: 'unknown_uid_in_args',
@@ -743,7 +698,7 @@ async function verifyTargetExists(resourcePath, id, toolName, action, fields) {
       exists: false,
       refusal: {
         _error: `${resourcePath} with id "${id}" does not exist (404). Do NOT proceed with ${toolName}(action=${action}).`,
-        _hint: 'Inspect logs and prior conversation may reference IDs that are not in the current metadata. Do NOT invent context like "stale cache" — DHIS2 has no client-side rule cache that returns ghost objects. Either (a) confirm with the user which CURRENT object to operate on, or (b) call the corresponding list action to see what actually exists.',
+        _hint: 'Prior conversation or external diagnostics may reference IDs that are not in the current metadata. Do NOT invent context like "stale cache" — DHIS2 has no client-side rule cache that returns ghost objects. Either (a) confirm with the user which CURRENT object to operate on, or (b) call the corresponding list action to see what actually exists.',
         _verified_404: true,
         _attempted: { resource: resourcePath, id },
         _scope: 'target_not_found',
@@ -756,205 +711,6 @@ async function verifyTargetExists(resourcePath, id, toolName, action, fields) {
   }
   return { exists: true, data };
 }
-
-const INSPECT_MAX_LOGS = 250;
-const INSPECT_MAX_REQUESTS = 300;
-const INSPECT_TEXT_LIMIT = 1800;
-const inspectCapture = {
-  active: false,
-  attached: false,
-  tabId: null,
-  url: null,
-  startedAt: null,
-  logs: [],
-  requests: new Map(),
-};
-
-function inspectNow() {
-  return new Date().toISOString();
-}
-
-function clipText(value, limit = INSPECT_TEXT_LIMIT) {
-  const s = String(value ?? '');
-  return s.length > limit ? s.slice(0, limit) + '...[truncated]' : s;
-}
-
-function getArgText(arg) {
-  if (!arg) return '';
-  if (Object.prototype.hasOwnProperty.call(arg, 'value')) {
-    try {
-      return typeof arg.value === 'string' ? arg.value : JSON.stringify(arg.value);
-    } catch {
-      return String(arg.value);
-    }
-  }
-  return arg.description || arg.unserializableValue || arg.className || arg.type || '';
-}
-
-
-function pushInspectLog(entry) {
-  if (!inspectCapture.active || !inspectCapture.tabId) return;
-  const normalized = {
-    time: entry.time || inspectNow(),
-    level: entry.level || 'info',
-    source: entry.source || 'unknown',
-    kind: entry.kind || entry.source || 'log',
-    text: clipText(entry.text || ''),
-    url: entry.url || null,
-    line: entry.line ?? null,
-    column: entry.column ?? null,
-    requestId: entry.requestId || null,
-    method: entry.method || null,
-    status: entry.status ?? null,
-    statusText: entry.statusText || null,
-    stack: entry.stack || null,
-  };
-  inspectCapture.logs.push(normalized);
-  if (inspectCapture.logs.length > INSPECT_MAX_LOGS) {
-    inspectCapture.logs.splice(0, inspectCapture.logs.length - INSPECT_MAX_LOGS);
-  }
-}
-
-function rememberInspectRequest(requestId, data) {
-  if (!requestId) return;
-  inspectCapture.requests.set(requestId, {
-    ...(inspectCapture.requests.get(requestId) || {}),
-    ...data,
-  });
-  if (inspectCapture.requests.size > INSPECT_MAX_REQUESTS) {
-    const firstKey = inspectCapture.requests.keys().next().value;
-    inspectCapture.requests.delete(firstKey);
-  }
-}
-
-function formatStackTrace(stackTrace) {
-  const frames = stackTrace?.callFrames || [];
-  if (!frames.length) return null;
-  return frames.slice(0, 6).map(f => ({
-    functionName: f.functionName || '(anonymous)',
-    url: f.url || null,
-    line: f.lineNumber != null ? f.lineNumber + 1 : null,
-    column: f.columnNumber != null ? f.columnNumber + 1 : null,
-  }));
-}
-
-function parseProgramRuleInsight(text) {
-  const s = String(text || '');
-  if (!/\bRule\b/.test(s) || !/\braised an\b|\braised an unexpected exception\b/.test(s)) return null;
-  const idMatch = s.match(/\bwith id ([A-Za-z][A-Za-z0-9]{10})\b/);
-  const nameMatch = s.match(/^Rule\s+(.+?)\s+with id\s+[A-Za-z][A-Za-z0-9]{10}\s+executed/s);
-  const errorMatch = s.match(/\braised an (?:unexpected exception|error):\s*([\s\S]+)/);
-  const refs = Array.from(new Set(Array.from(s.matchAll(/#\{([^}]+)\}/g)).map(m => m[1]))).slice(0, 60);
-  const functions = Array.from(new Set(Array.from(s.matchAll(/\bd2:[A-Za-z0-9_]+/g)).map(m => m[0]))).slice(0, 30);
-  return {
-    type: 'program_rule_error',
-    rule_id: idMatch?.[1] || null,
-    rule_name: nameMatch?.[1]?.trim() || null,
-    error: clipText(errorMatch?.[1] || s, 1000),
-    referenced_variables: refs,
-    d2_functions: functions,
-  };
-}
-
-// Classifies a log entry as a known-benign pattern that should NOT trigger
-// destructive "fixes". Returns the reason string if benign, else null.
-// Keeping this list tight on purpose: only patterns we know the DHIS2 server
-// returns by design or are unrelated to app functionality.
-function classifyBenignInspectPattern(log) {
-  const txt = String(log?.text || '');
-  const url = String(log?.url || '');
-  const status = Number(log?.status);
-
-  // staticContent/logo_banner|logo_front 404 = no custom logo uploaded (normal).
-  if (/staticContent\/(logo_banner|logo_front)/i.test(url + ' ' + txt) && (status === 404 || /404/.test(txt))) {
-    return 'staticContent logo 404: no custom logo set — DHIS2 falls back to default. Harmless.';
-  }
-  // dataStore namespace keys for app-owned caches 404 = lazy-init, not a defect.
-  if (/dataStore\/(capture|settings|user-settings|userDataStore)\//i.test(url + ' ' + txt) && (status === 404 || /404/.test(txt))) {
-    return 'dataStore namespace key 404: app-owned cache key not yet created. The owning app recreates it on first use. Do NOT write defaults from the assistant.';
-  }
-  // Vendor-prefix CSS warnings from the style injector.
-  if (/stylesheet|css/i.test(log?.kind || '') && /(-moz-|-ms-|-webkit-|vendor prefix|-o-)/i.test(txt)) {
-    return 'Vendor-prefix CSS rejection: cosmetic browser behavior. Unrelated to app load.';
-  }
-  if (/rule was ignored due to bad selector|unknown property name|unreachable code after return statement/i.test(txt)) {
-    return 'Browser CSS/JS style lint: cosmetic. Unrelated to app functionality.';
-  }
-  // Favicons, source maps, and manifest 404s.
-  if (/(favicon\.ico|\.map(\b|$)|site\.webmanifest|apple-touch-icon)/i.test(url + ' ' + txt) && (status === 404 || /404/.test(txt))) {
-    return 'Asset 404 (favicon/sourcemap/manifest): cosmetic. Unrelated to app failure.';
-  }
-  return null;
-}
-
-function parseInspectInsights(logs) {
-  const ruleErrors = [];
-  const missingResources = [];
-  const unknownFunctions = [];
-  const benign = [];
-  for (const log of logs) {
-    const txt = log.text || '';
-    const rule = parseProgramRuleInsight(txt);
-    if (rule) {
-      ruleErrors.push(rule);
-      if (/Unknown function or constant/i.test(txt)) unknownFunctions.push(rule);
-      continue;
-    }
-    const status = Number(log.status);
-    const looksLikeError = status >= 400 || /\bstatus of 4\d\d\b|\bstatus of 5\d\d\b|Failed to load resource/i.test(txt);
-    if (looksLikeError) {
-      const benignReason = classifyBenignInspectPattern(log);
-      if (benignReason) {
-        benign.push({
-          status: status || null,
-          url: log.url || extractUrlFromText(txt),
-          reason: benignReason,
-          text: clipText(txt, 300),
-        });
-      } else {
-        missingResources.push({
-          status: status || null,
-          url: log.url || extractUrlFromText(txt),
-          text: clipText(txt, 600),
-        });
-      }
-    }
-  }
-  return {
-    rule_errors: ruleErrors.slice(-20),
-    network_errors: missingResources.slice(-30),
-    unknown_rule_functions: unknownFunctions.slice(-10),
-    benign_ignored: benign.slice(-20),
-    _diagnostic_policy: 'network_errors and rule_errors may indicate real defects. benign_ignored is the server/browser behaving as designed — do NOT propose fixes for these. If only benign_ignored entries are present, the Inspect logs do not justify destructive metadata changes.',
-  };
-}
-
-function extractUrlFromText(text) {
-  const hit = String(text || '').match(/https?:\/\/\S+|\/api\/\S+|\/[A-Za-z0-9/_?=&.%:-]+/);
-  return hit ? hit[0].replace(/[),.;]+$/, '') : null;
-}
-
-function buildInspectSnapshot() {
-  const logs = inspectCapture.logs.slice(-120);
-  const counts = logs.reduce((acc, l) => {
-    const key = l.level || 'info';
-    acc[key] = (acc[key] || 0) + 1;
-    return acc;
-  }, {});
-  return {
-    enabled: inspectCapture.active,
-    attached: inspectCapture.attached,
-    tabId: inspectCapture.tabId,
-    url: inspectCapture.url,
-    startedAt: inspectCapture.startedAt,
-    captured: inspectCapture.logs.length,
-    included: logs.length,
-    counts,
-    insights: parseInspectInsights(logs),
-    logs,
-  };
-}
-
 
 // ── Auth policy ────────────────────────────────────────────────────────────
 // This extension authenticates to DHIS2 ONLY via the browser session of the
@@ -975,138 +731,20 @@ function buildInspectSnapshot() {
   } catch {}
 })();
 
-function normalizeText(v) {
-  return String(v || '').toLowerCase();
-}
-
-function isLikelyDhisUid(v) {
-  const s = String(v || '');
-  if (!/^[A-Za-z][A-Za-z0-9]{10}$/.test(s)) return false;
-  // Reject English-word-shaped tokens. DHIS2 generates base62 UIDs, so a real
-  // UID virtually always contains a digit OR mixes upper+lower case after
-  // position 0 (e.g. "XGcG2PFIvOU", "a3kGcGpz8FJ"). Single-case words like
-  // "Respiratory", "Information", "Development", "Environment" — all 11 chars
-  // — must NOT be accepted; when they are, free-text scans mis-fire and
-  // trigger bogus API calls (e.g. get_visualization_details with id=Respiratory).
-  if (/\d/.test(s)) return true;
-  const rest = s.slice(1);
-  return /[A-Z]/.test(rest) && /[a-z]/.test(rest);
-}
-// Structural UID match from trusted positions (URL path/query/hash). DHIS2
-// serves these directly so we accept the full 11-char charset without the
-// entropy requirement above.
-function hasUidShape(v) {
-  return /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(v || ''));
-}
-
 function extractVisualizationIdFromInput(input) {
-  const raw = String(input || '').trim();
-  if (!raw) return null;
-  if (isLikelyDhisUid(raw)) return raw;
-
-  // Attempt URL parse. If this IS a URL we ONLY accept UIDs from well-known
-  // structural positions (path segment after `/visualizations/`, query `id=`,
-  // hash-route `#/<UID>`). We deliberately do NOT fall back to raw word-scanning
-  // inside URL strings — e.g. "valorie-insinuative-wanda.ngrok-free.dev"
-  // contains the 11-char token "insinuative" which passes isLikelyDhisUid but
-  // is obviously not a DHIS2 UID.
-  let isUrl = false;
-  try {
-    const u = new URL(raw);
-    isUrl = true;
-    const hash = u.hash || '';
-    const hashRoute = hash.split('?')[0] || '';
-    if (hashRoute.startsWith('#/')) {
-      const seg = decodeURIComponent(hashRoute.slice(2)).split('/')[0];
-      if (hasUidShape(seg)) return seg;
-    }
-
-    if (hash.includes('?')) {
-      const hp = new URLSearchParams(hash.split('?')[1]);
-      const hashId = hp.get('id') || hp.get('visualization');
-      if (hasUidShape(hashId)) return hashId;
-    }
-
-    const qpId = u.searchParams.get('id') || u.searchParams.get('visualization');
-    if (hasUidShape(qpId)) return qpId;
-
-    const pathParts = u.pathname.split('/').filter(Boolean);
-    const pIdx = pathParts.findIndex((p) => p === 'visualizations');
-    if (pIdx !== -1 && pathParts[pIdx + 1]) {
-      const pId = pathParts[pIdx + 1].replace(/\.json$/i, '');
-      if (hasUidShape(pId)) return pId;
-    }
-  } catch {}
-
-  if (isUrl) return null; // never word-scan inside an URL
-  // Free-text word scan: use strict isLikelyDhisUid so English words like
-  // "Respiratory"/"Information" (11-char, all-lowercase-after-capital) do NOT
-  // match — they would otherwise trigger bogus get_visualization_details 404s.
-  const directHit = raw.match(/\b([A-Za-z][A-Za-z0-9]{10})\b/);
-  return directHit && isLikelyDhisUid(directHit[1]) ? directHit[1] : null;
+  return extractDhis2IdFromInput(input, 'visualizations', ['id', 'visualization']);
 }
 
 function extractVisualizationIdFromText(text) {
-  const t = String(text || '');
-  if (!t) return null;
-  const urlHit = t.match(/https?:\/\/\S+/i);
-  if (urlHit) {
-    const fromUrl = extractVisualizationIdFromInput(urlHit[0]);
-    if (fromUrl) return fromUrl;
-  }
-  // Strip URLs before the fallback word-scan so tokens inside hostnames
-  // (e.g. "insinuative" in "valorie-insinuative-wanda.ngrok.dev") are not
-  // mistaken for DHIS2 UIDs.
-  const stripped = t.replace(/https?:\/\/\S+/gi, ' ');
-  const uidHit = stripped.match(/\b([A-Za-z][A-Za-z0-9]{10})\b/);
-  return uidHit ? uidHit[1] : null;
+  return extractDhis2IdFromText(text, 'visualizations', ['id', 'visualization']);
 }
 
 function extractMapIdFromInput(input) {
-  const raw = String(input || '').trim();
-  if (!raw) return null;
-  if (isLikelyDhisUid(raw)) return raw;
-
-  try {
-    const u = new URL(raw);
-    const hash = u.hash || '';
-    const hashRoute = hash.split('?')[0] || '';
-    if (hashRoute.startsWith('#/')) {
-      const seg = decodeURIComponent(hashRoute.slice(2)).split('/')[0];
-      if (hasUidShape(seg)) return seg;
-    }
-
-    if (hash.includes('?')) {
-      const hp = new URLSearchParams(hash.split('?')[1]);
-      const hashId = hp.get('id') || hp.get('map');
-      if (hasUidShape(hashId)) return hashId;
-    }
-
-    const qpId = u.searchParams.get('id') || u.searchParams.get('map');
-    if (hasUidShape(qpId)) return qpId;
-
-    const pathParts = u.pathname.split('/').filter(Boolean);
-    const pIdx = pathParts.findIndex((p) => p === 'maps');
-    if (pIdx !== -1 && pathParts[pIdx + 1]) {
-      const pId = pathParts[pIdx + 1].replace(/\.json$/i, '');
-      if (hasUidShape(pId)) return pId;
-    }
-  } catch {}
-
-  const directHit = raw.match(/\b([A-Za-z][A-Za-z0-9]{10})\b/);
-  return directHit && isLikelyDhisUid(directHit[1]) ? directHit[1] : null;
+  return extractDhis2IdFromInput(input, 'maps', ['id', 'map']);
 }
 
 function extractMapIdFromText(text) {
-  const t = String(text || '');
-  if (!t) return null;
-  const urlHit = t.match(/https?:\/\/\S+/i);
-  if (urlHit) {
-    const fromUrl = extractMapIdFromInput(urlHit[0]);
-    if (fromUrl) return fromUrl;
-  }
-  const uidHit = t.match(/\b([A-Za-z][A-Za-z0-9]{10})\b/);
-  return uidHit ? uidHit[1] : null;
+  return extractDhis2IdFromText(text, 'maps', ['id', 'map']);
 }
 
 // DHIS2 auth is handled ENTIRELY by the browser session of the logged-in
@@ -1115,7 +753,7 @@ function extractMapIdFromText(text) {
 // stored by the extension.
 
 function userExplicitlyWantsDescendants(userText) {
-  const t = normalizeText(userText);
+  const t = normalizePlainText(userText);
   if (!t) return false;
   return [
     'all facilities',
@@ -1153,38 +791,17 @@ function userExplicitlyWantsDescendants(userText) {
 })();
 
 async function ensureConnected() {
-  // Even when we have a live connection, verify it still matches the active
-  // DHIS2 tab. Without this, switching between two DHIS2 instances leaves
-  // dhis2.baseUrl pointing at the prior server and tools (notably the
-  // create_program name-collision probe) silently hit the wrong instance and
-  // return stale UIDs.
+  // The active tab is authoritative. Never restore a previously persisted
+  // connection when that tab points at another server: doing so can send the
+  // next tool call to the wrong DHIS2 instance.
   try {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (activeTab?.url) {
-      const activeBaseUrl = extractBaseUrl(activeTab.url);
-      if (activeBaseUrl && dhis2.baseUrl && activeBaseUrl !== dhis2.baseUrl) {
-        const r = await initializeFromUrl(activeTab.url);
-        if (!r?.error) return dhis2.connected && !!dhis2.baseUrl;
-        // Re-init failed — fall through and try the legacy paths so we still
-        // return a usable answer (better than blocking the user entirely).
-      }
-    }
-  } catch {}
-
-  if (dhis2.connected && dhis2.baseUrl) return true;
-  try {
-    const stored = await chrome.storage.session.get(['dhis2Full']);
-    if (stored.dhis2Full?.connected && stored.dhis2Full?.baseUrl) {
-      Object.assign(dhis2, stored.dhis2Full);
-      return true;
-    }
-  } catch {}
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url) {
-      const result = await initializeFromUrl(tab.url);
-      return result.success === true;
-    }
+    const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!activeTab?.url) return false;
+    const activeBaseUrl = extractBaseUrl(activeTab.url);
+    if (!activeBaseUrl) return false;
+    if (dhis2.connected && dhis2.baseUrl === activeBaseUrl) return true;
+    const result = await syncPageContextFromUrl(activeTab.url);
+    return result.success === true && dhis2.connected && dhis2.baseUrl === activeBaseUrl;
   } catch {}
   return false;
 }
@@ -1280,7 +897,7 @@ function buildTurnHistory(messages, persistFromIdx, userContentOverride) {
       out.push(a);
     } else if (m.role === 'user') {
       // Persist the compact user text (override) for the turn's own user
-      // message — the live array may carry large inspect-log/web blocks we do
+      // message — the live array may carry large image/web context blocks we do
       // not want to retain across turns.
       const useOverride = k === persistFromIdx && typeof userContentOverride !== 'undefined';
       out.push({ role: 'user', content: useOverride ? userContentOverride : m.content });
@@ -1311,9 +928,7 @@ async function saveState() {
 // connected/ouMaxLevel/metadataAuditSupport) so reconnecting is fast; the
 // task-specific caches below are re-fetched fresh by initializeFromUrl on the
 // next INITIALIZE/CHAT_MESSAGE, satisfying "context must be fetched again".
-async function clearConversationState() {
-  historyExplicitlyCleared = true;
-  conversationEpoch++;
+function resetTaskScopedState() {
   conversationHistory = [];
   prefetchedIds = { viz: null, map: null };
   lastUserText = '';
@@ -1336,11 +951,31 @@ async function clearConversationState() {
   dhis2.knownIdsSeedSize = 0;
   dhis2.knownIcons = null;
   dhis2.recentCreations = null;
+  dhis2.writeAuth = null;
+  dhis2.failedCallSigs = null;
+  dhis2.toolErrorFamilies = null;
   // Cross-turn write-approval memory: a proposal from the old thread must not
   // be redeemable by a bare "yes" in the new one.
   dhis2.lastRefusedWrite = null;
   dhis2.turnCounter = 0;
+}
 
+function resetForServerSwitch() {
+  historyExplicitlyCleared = true;
+  conversationEpoch++;
+  resetTaskScopedState();
+  dhis2.baseUrl = null;
+  dhis2.apiVersion = null;
+  dhis2.systemInfo = null;
+  dhis2.metadataAuditSupport = null;
+  dhis2.ouMaxLevel = null;
+  dhis2.connected = false;
+}
+
+async function clearConversationState() {
+  historyExplicitlyCleared = true;
+  conversationEpoch++;
+  resetTaskScopedState();
   await saveState();
 }
 
@@ -2892,7 +2527,7 @@ async function enrichAnalyticsPathWithVisualizationContext(path, vizId) {
 }
 
 function isVisualizationValueQuestion(text) {
-  const t = normalizeText(text);
+  const t = normalizePlainText(text);
   if (!t) return false;
   const keys = [
     'value', 'values', 'how much', 'number', 'count', 'total',
@@ -3131,7 +2766,14 @@ async function initializeFromUrl(url) {
   // per-turn UID/icon registries from the previous instance and probes (e.g.
   // create_program's name-collision check) hit the wrong server.
   const previousBaseUrl = dhis2.baseUrl;
-  const baseUrlChanged = previousBaseUrl && previousBaseUrl !== baseUrl;
+  const baseUrlChanged = !!previousBaseUrl && previousBaseUrl !== baseUrl;
+  if (baseUrlChanged) {
+    // Conversation history contains server-scoped UIDs too. Reset it together
+    // with metadata caches before attempting the new connection, so even a
+    // failed login cannot later resurrect identifiers from the old server.
+    resetForServerSwitch();
+    console.log(`[initializeFromUrl] Server switched: ${previousBaseUrl} → ${baseUrl}. Cleared server-scoped state.`);
+  }
 
   if (dhis2.baseUrl !== baseUrl || !dhis2.connected) {
     try {
@@ -3147,7 +2789,10 @@ async function initializeFromUrl(url) {
       });
       if (resp.type === 'opaqueredirect' || resp.status === 0) {
         dhis2.baseUrl = null;
+        dhis2.apiVersion = null;
+        dhis2.systemInfo = null;
         dhis2.connected = false;
+        await saveState();
         return { error: 'Not signed in to this DHIS2 instance. Log in to this server in the tab, then reopen the panel.' };
       }
       if (!resp.ok) throw new Error(resp.status);
@@ -3158,27 +2803,12 @@ async function initializeFromUrl(url) {
       dhis2.ouMaxLevel = null;
     } catch {
       if (dhis2.baseUrl === baseUrl) dhis2.baseUrl = null;
+      dhis2.apiVersion = null;
+      dhis2.systemInfo = null;
       dhis2.connected = false;
+      await saveState();
       return { error: 'Could not connect to DHIS2' };
     }
-  }
-
-  if (baseUrlChanged) {
-    // UIDs are server-scoped: a program/OU/icon ID from server A is meaningless
-    // on server B. Wipe every cached identifier and metadata blob so the model
-    // re-discovers state from the new instance.
-    dhis2.programMetadata = null;
-    dhis2.programRulesCount = null;
-    dhis2.ouContext = null;
-    dhis2.visualizationContext = null;
-    dhis2.mapContext = null;
-    dhis2.datasetContext = null;
-    dhis2.lastFacilityOu = null;
-    dhis2.metadataAuditSupport = null;
-    dhis2.knownIds = null;
-    dhis2.knownIdsSeedSize = 0;
-    dhis2.knownIcons = null;
-    console.log(`[initializeFromUrl] Server switched: ${previousBaseUrl} → ${baseUrl}. Cleared server-tied caches.`);
   }
 
   const ctx = extractContext(url);
@@ -3208,6 +2838,10 @@ async function initializeFromUrl(url) {
 
   // Fetch program metadata
   if (ctx.programId && (!dhis2.programMetadata || dhis2.programMetadata.id !== ctx.programId)) {
+    // Never expose the previous program while a replacement fetch is pending
+    // or fails. The URL context remains authoritative.
+    dhis2.programMetadata = null;
+    dhis2.programRulesCount = null;
     try {
       const fields = [
         'id,displayName,description,programType',
@@ -3237,6 +2871,9 @@ async function initializeFromUrl(url) {
 
   // Fetch OU context
   if (ctx.orgUnitId && (!dhis2.ouContext || dhis2.ouContext.id !== ctx.orgUnitId)) {
+    // As above, a failed lookup must not leave the old OU attached to the new
+    // page context.
+    dhis2.ouContext = null;
     try {
       dhis2.ouContext = await dhis2Fetch(apiUrl(
         `organisationUnits/${ctx.orgUnitId}?fields=id,displayName,code,path,level,ancestors[id,displayName,level],children[id,displayName]`
@@ -3344,6 +2981,66 @@ async function initializeFromUrl(url) {
   return { success: true, state: getSerializableState() };
 }
 
+// Reconcile the single background context with an active-tab URL. Identity
+// changes (including dataset and OU changes) go through initializeFromUrl so
+// their metadata caches are refreshed; lightweight changes such as period,
+// stage, TEI, or section selection update and persist without extra API calls.
+async function performPageContextSync(url) {
+  // A queued request may have become stale while an earlier metadata fetch was
+  // running. Re-read the authoritative tab at execution time and always sync
+  // its newest URL.
+  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (activeTab?.url) url = activeTab.url;
+
+  const freshBaseUrl = extractBaseUrl(url);
+  if (!freshBaseUrl) return { error: 'Not a DHIS2 page' };
+
+  const previous = dhis2.pageContext || {};
+  const fresh = extractContext(url);
+  const preservedStageId = !fresh.stageId
+    && fresh.programId
+    && fresh.programId === previous.programId
+    ? previous.stageId || null
+    : null;
+  if (preservedStageId) fresh.stageId = preservedStageId;
+
+  const cacheMissing =
+    (!!fresh.programId && dhis2.programMetadata?.id !== fresh.programId) ||
+    (!!fresh.orgUnitId && dhis2.ouContext?.id !== fresh.orgUnitId) ||
+    (!!fresh.datasetId && dhis2.datasetContext?.id !== fresh.datasetId) ||
+    (!!fresh.visualizationId && dhis2.visualizationContext?.id !== fresh.visualizationId) ||
+    (!!fresh.mapId && dhis2.mapContext?.id !== fresh.mapId);
+
+  if (
+    !dhis2.connected ||
+    freshBaseUrl !== dhis2.baseUrl ||
+    cacheMissing ||
+    contextIdentityChanged(previous, fresh)
+  ) {
+    const result = await initializeFromUrl(url);
+    if (result.success && preservedStageId && !dhis2.pageContext?.stageId) {
+      dhis2.pageContext.stageId = preservedStageId;
+      await saveState();
+      return { success: true, state: getSerializableState() };
+    }
+    return result;
+  }
+
+  dhis2.pageContext = fresh;
+  await saveState();
+  return { success: true, state: getSerializableState() };
+}
+
+// SPA navigation, tab activation, and a chat send can all request a refresh at
+// nearly the same time. Serialize them so a slower stale request cannot finish
+// last and overwrite the newest active-tab context.
+let pageContextSyncQueue = Promise.resolve();
+function syncPageContextFromUrl(url) {
+  const task = pageContextSyncQueue.then(() => performPageContextSync(url));
+  pageContextSyncQueue = task.catch(() => {});
+  return task;
+}
+
 function getSerializableState() {
   return {
     baseUrl: dhis2.baseUrl,
@@ -3386,12 +3083,6 @@ function getSerializableState() {
     programRulesCount: dhis2.programRulesCount,
     trackedEntityType: dhis2.programMetadata?.trackedEntityType?.displayName,
     connected: dhis2.connected,
-    inspect: {
-      enabled: inspectCapture.active,
-      count: inspectCapture.logs.length,
-      url: inspectCapture.url,
-      startedAt: inspectCapture.startedAt,
-    },
   };
 }
 
@@ -3475,15 +3166,13 @@ const LINE_LISTING_KEYWORD_ROUTES = Object.freeze({
 async function ensureLineListingAssetsLoaded() {
   if (lineListingAssets.loaded && lineListingAssets.toolJson) return true;
   try {
-    const [jsonResp, mdResp, routerResp] = await Promise.all([
+    const [jsonResp, mdResp] = await Promise.all([
       fetch(chrome.runtime.getURL(LINE_LISTING_JSON_PATH)),
       fetch(chrome.runtime.getURL(LINE_LISTING_SYSTEM_PROMPT_PATH)),
-      fetch(chrome.runtime.getURL(LINE_LISTING_ROUTER_PATH)),
     ]);
     if (!jsonResp.ok) throw new Error(`Could not load ${LINE_LISTING_JSON_PATH}`);
     lineListingAssets.toolJson = await jsonResp.json();
     lineListingAssets.systemPromptMd = mdResp.ok ? await mdResp.text() : '';
-    lineListingAssets.routerSource = routerResp.ok ? await routerResp.text() : '';
     lineListingAssets.loaded = true;
     return true;
   } catch (e) {
@@ -5653,40 +5342,18 @@ Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrateg
   }
 ];
 
-const TOOL_ROUTER = Object.freeze({
-  dhis2_query: true,
-  count_records: true,
-  get_event_analytics: true,
-  get_program_info: true,
-  get_program_recent_changes: true,
-  search_metadata: true,
-  resolve_option_codes: true,
-  detect_enrollment_abnormalities: true,
-  cross_stage_entity_intersection: true,
-  line_listing_guide: true,
-  get_visualization_details: true,
-  get_map_details: true,
-  browse_web: true,
-  render_chart: true,
-  create_metadata: true,
-  architect_metadata: true,
-  manage_program_rules: true,
-  manage_program_indicators: true,
-  manage_metadata: true,
-  manage_program_notifications: true,
-  manage_datasets: true,
-  manage_custom_forms: true,
-  manage_custom_translations: true,
-  manage_growth_chart_plugin: true,
-  manage_validation_rules: true,
-  manage_org_units: true,
-  manage_indicators: true,
-  manage_option_sets: true,
-  manage_legend_sets: true,
-  manage_dashboards: true,
-  manage_maps: true,
-  manage_backups: true,
-});
+// The schemas are the source of truth for callable tool names. Deriving the
+// router removes a second hand-maintained allowlist that could silently drift.
+const TOOL_NAMES = TOOLS.map(tool => tool?.function?.name).filter(Boolean);
+const duplicateToolNames = TOOL_NAMES.filter((name, index) => TOOL_NAMES.indexOf(name) !== index);
+if (duplicateToolNames.length) {
+  throw new Error(`Duplicate tool definitions: ${[...new Set(duplicateToolNames)].join(', ')}`);
+}
+const TOOL_ROUTER = Object.freeze(Object.fromEntries(TOOL_NAMES.map(name => [name, true])));
+const missingToolPresentation = TOOL_NAMES.filter(name => !TOOL_PRESENTATION[name]);
+if (missingToolPresentation.length) {
+  console.warn('[tools] Missing shared presentation metadata:', missingToolPresentation.join(', '));
+}
 
 // ── Lazy Tool Manuals (two-tier tool docs) ───────────────────────────────────
 // Progressive disclosure of tool documentation, so the per-iteration LLM
@@ -6345,23 +6012,9 @@ function stubToolContentForHistory(content) {
 // Keeping the tool list small prevents context-window overflow and helps
 // the model make better routing decisions.  Every extra tool is wasted
 // context tokens and an invitation for the LLM to pick the wrong one.
-function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
+function getContextualTools(ctx, userText, browseWeb) {
   const appType = (ctx?.appType || '');
-  const lowerText = String(userText || '').toLowerCase();
-  const inspectText = inspectSnapshot?.enabled
-    ? JSON.stringify({
-        insights: inspectSnapshot.insights,
-        sample: (inspectSnapshot.logs || []).slice(-20).map(l => ({
-          level: l.level,
-          source: l.source,
-          kind: l.kind,
-          text: l.text,
-          url: l.url,
-          status: l.status,
-        })),
-      }).toLowerCase()
-    : '';
-  const combinedText = `${lowerText}\n${inspectText}`;
+  const combinedText = String(userText || '').toLowerCase();
   const wantsProgramChangeHistory =
     /\b(recent changes|what changed|changes made|change history|history of changes|recent modifications|modified in the last|updated in the last|changes in the last)\b/.test(combinedText)
     && /\bprogram|stage|data element|metadata|family health file|this program\b/.test(combinedText);
@@ -6554,19 +6207,15 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     + '|(?:which|what|top)\\s+(?:ous?|org ?units?|districts?|regions?|facilities|facility|provinces?|countries|sites?|health ?facilities)'
     + '|(?:ous?|org ?units?|districts?|regions?|facilities|facility|provinces?|sites?)\\s+(?:with|having|that have|that has)\\s+(?:the most|most|a lot|lots|many|highest|largest))\\b'
   ).test(combinedText);
-  const hasInspectRuleErrors = !!inspectSnapshot?.insights?.rule_errors?.length;
-  const hasInspectNetworkErrors = !!inspectSnapshot?.insights?.network_errors?.length;
-
   // ── Save-failure diagnostic intent ──
   // Triggered by phrasings like "error saving enrollment", "can't save",
-  // "failed to save", "409 conflict", or a 409 visible in inspect logs.
+  // "failed to save", or "409 conflict".
   // When detected AND the user has NOT authorized writes this turn, we hide
   // every destructive tool from the model — the model can read everything to
   // diagnose, but cannot "fix" until the user gives explicit authorization on
   // a later turn. This blocks the failure mode where the model edited program
   // rules in response to a save error that had nothing to do with rules.
-  const hasInspect409 = !!inspectSnapshot?.insights?.network_errors?.some(e => Number(e.status) === 409);
-  const wantsSaveErrorDiagnosis = SAVE_FAILURE_RE.test(combinedText) || hasInspect409;
+  const wantsSaveErrorDiagnosis = SAVE_FAILURE_RE.test(combinedText);
   const writeAuthScope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
   const saveDiagnosisReadOnly = wantsSaveErrorDiagnosis && writeAuthScope === 'read_only';
 
@@ -6819,19 +6468,6 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('manage_backups');
   }
 
-  if (inspectSnapshot?.enabled) {
-    selected.add('dhis2_query');
-    selected.add('search_metadata');
-    selected.add('get_program_info');
-    if (hasInspectRuleErrors) {
-      selected.add('manage_program_rules');
-      selected.add('manage_program_indicators');
-    }
-    if (hasInspectNetworkErrors || hasInspectRuleErrors) {
-      selected.add('resolve_option_codes');
-    }
-  }
-
   // ── Web browsing ──
   if (browseWeb) selected.add('browse_web');
 
@@ -6862,14 +6498,13 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
 
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false, inspectSnapshot = null) {
+async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false) {
   const ctx = dhis2.pageContext || {};
   const ou = dhis2.ouContext;
   const prog = dhis2.programMetadata;
 
   // Intent detection — used to conditionally include sections
-  const inspectIntentText = inspectSnapshot?.enabled ? JSON.stringify(inspectSnapshot.insights || {}).toLowerCase() : '';
-  const text = `${(userText || '').toLowerCase()}\n${inspectIntentText}`;
+  const text = (userText || '').toLowerCase();
   const isCreating  = /\b(create|build|design|new program|set up a program|make a program)\b/.test(text)
     || /\badd\b.{0,50}\b(data elements?|fields?|stages?|rules?|option sets?)\b/.test(text)
     || /\b(add|assign)\b.{1,80}\bto\b.{1,50}\bstage\b/.test(text);
@@ -7144,49 +6779,11 @@ Use importStrategy=CREATE_AND_UPDATE to create new records AND update existing o
 `;
   }
 
-  if (inspectSnapshot?.enabled) {
-    p += `
-## Inspect Mode
-Inspect mode is ENABLED. The user turned on page inspection before asking this question. You have captured browser console, runtime exception, and network error logs for the current active tab only.
-- Treat the [Inspect Logs] block in the user message as first-class diagnostic evidence.
-- First classify each important error: network/API status, JavaScript/runtime exception, DHIS2 program rule/program indicator expression error, permission/session issue, or harmless warning.
-- For DHIS2 program rule errors, the rule ID in the logs is a HYPOTHESIS, not a verified target. First call manage_program_rules(action="get", rule_id=...) — if it returns 404, the ID is stale or from a prior context. STOP and DO NOT proceed with any "fix"; do not invent "stale cache" explanations (DHIS2 has no such cache). Instead, call manage_program_rules(action=list, program_id=Current Program ID) to see the actual current rules, or ask the user which rule.
-- For DHIS2 program indicator expression errors, use manage_program_indicators(action="get" or action="audit") instead of guessing — and apply the same 404-means-stop rule.
-- If a log contains "Failed to coerce value 'null' to Boolean", explain that the condition is evaluating a null/empty value as a Boolean. Recommend wrapping that comparison in d2:hasValue(...) or rewriting the OR group so every nullable value is guarded.
-- If a log contains "Unknown function or constant", explain that the expression uses a function not supported by this DHIS2 expression engine/version or not valid in that expression type. Fetch the rule/indicator metadata before proposing an exact replacement.
-- For 404/409/500 API logs, inspect the endpoint, UID, program, TEI, enrollment, stage, and current context. Use dhis2_query only for safe GET context checks unless the user explicitly asks you to fix metadata.
-- Do not hide browser error details. Summarize the practical meaning and the next concrete fix steps.
-
-### Diagnose BEFORE destroying metadata
-- **Default to read-only.** Inspect mode gives you browser logs — those are symptoms, not proof of a specific metadata defect. Start by *explaining what the logs mean* and listing candidate causes, then ask the user before deleting or PATCH-ing anything.
-- **Benign patterns — DO NOT "fix":**
-  - \`staticContent/logo_banner\` 404 — DHIS2 returns 404 when no custom logo is uploaded; the app falls back to the default logo. This is not a bug. Never POST to staticContent (it's multipart-only and will return 500).
-  - \`dataStore/capture/*\` or \`dataStore/settings/*\` 404 — those keys are app-owned and get created lazily on first use; do NOT write defaults yourself.
-  - Vendor-prefix CSS rejections (\`-moz-\`, \`-ms-\`, \`-webkit-\`) in StyleSheet warnings — browser cosmetic, unrelated to app load.
-  - Favicon / manifest / service-worker 404s — cosmetic, not a cause of app failure.
-  - Mixed-content or extension-CSP warnings from the side panel or other extensions.
-- **Never bulk-delete from Inspect conclusions.** "Orphan program rule variables" reported by audit are a *code-quality* finding, not a guaranteed cause of Capture load failure. Deleting them without confirmation removes authoring work and is rarely the right fix. If you believe deletion is necessary, list the exact IDs you propose to delete and ask "do you want me to delete these N items?" — wait for explicit "yes" before any DELETE / importStrategy=DELETE call.
-- **Escalate to the user, not the DELETE endpoint.** If the Inspect logs show only harmless 404s / CSS warnings and no JS exception with a clear stack, say so: "The logs do not show a metadata defect. The app-load failure is likely <hypothesis>. Want me to gather more details (network waterfall, DHIS2 server logs, permissions) before making changes?"
-- Prefer \`manage_metadata(action=delete, ...)\` or \`manage_program_rules(action=delete, rule_id=...)\` for single-object deletes (they check references first) — not raw \`dhis2_query\` with \`importStrategy=DELETE\`. Bulk delete via dhis2_query now requires \`confirm_bulk_delete:true\` AND is still a last resort.
-
-### Verify before modify (mandatory)
-- Before ANY destructive call (update/delete/bulk_fix on rules, indicators, metadata), the chatbot's tool layer auto-verifies the target ID via GET. **A 404 from that lookup is a STOP — do not proceed, do not invent a "stale cached rule" explanation, do not retry with a different action that performs the same write.**
-- Inspect logs may carry rule IDs from previous app loads or unrelated programs. The DHIS2 rule engine evaluates against the live database; **there is no "stale rule cache"** that returns ghost objects. If a rule ID is in the logs but the live API says 404, the ID is wrong (or already deleted) — full stop.
-- After 2 consecutive 404s on destructive lookups in this turn, ALL further write attempts are hard-blocked. If you hit this, summarize the 404 history to the user and ask which ACTUAL current object should be acted on.
-
-### NEVER recommend cache-clearing as a DHIS2 fix
-- ❌ Do NOT recommend "Hard refresh", "Ctrl+Shift+R", "Cmd+Shift+R", "clear browser cache", "incognito mode", "App Management → resource cache", or "clear DHIS2 cache".
-- DHIS2 server-side errors (404/409/500 from /api/...) have nothing to do with browser cache. Recommending cache-clearing for these is hallucination and wastes the user's time. The only legitimate use of "hard refresh" is when the *Capture/Tracker app bundle itself* fails to load due to a stale service-worker — and even then, ask the user before recommending it.
-`;
-  }
-
   // ── Save / Load failure diagnosis (enrollment, event, TEI, dataset) ──
-  // Triggered when the user reports a save/load failure or when inspect logs
-  // show a 409 from the tracker API. This is the canonical KB the model must
+  // Triggered when the user reports a save/load failure. This is the canonical KB the model must
   // consult BEFORE forming any hypothesis. It blocks the failure mode where
   // "error saving enrollment" was misdiagnosed as a program-rule issue.
-  const saveFailureMode = SAVE_FAILURE_RE.test(text)
-    || (inspectSnapshot?.enabled && /\b409\b|enroll/i.test(JSON.stringify(inspectSnapshot.insights || {})));
+  const saveFailureMode = SAVE_FAILURE_RE.test(text);
   if (saveFailureMode) {
     p += `
 ## Save / Load failure diagnosis — investigate AUTOMATICALLY
@@ -7239,9 +6836,8 @@ Every user message is classified into a write-authorization scope. A problem rep
 EVERY tool call MUST derive from data you have already verified. Verified sources are:
 1. The user's message text (UIDs the user pasted).
 2. The page context (current program/TEI/visualization/map IDs from the URL).
-3. Inspect-mode snapshot insights and logs (when present).
-4. Prior tool results in THIS conversation turn.
-5. The conversation history — objects you created or read in PRIOR turns stay verified; reference them directly by the UID from the earlier result instead of re-listing.
+3. Prior tool results in THIS conversation turn.
+4. The conversation history — objects you created or read in PRIOR turns stay verified; reference them directly by the UID from the earlier result instead of re-listing.
 
 When you need to operate on a resource you have not yet seen:
 1. **First call must be a discovery call.** Use \`search_metadata\`, \`manage_program_rules(action=list)\`, \`manage_program_indicators(action=list)\`, \`get_program_info\`, or a list endpoint via \`dhis2_query\` (e.g. \`programs?fields=id,displayName\`).
@@ -7641,7 +7237,6 @@ For "can't see / not appearing / no access" issues: (1) for programs in Capture/
   if (hasVizCtx)  p += `| Explain this chart/table | get_visualization_details |\n`;
   if (hasMapCtx)  p += `| Explain this map | get_map_details |\n`;
   if (browseWeb)  p += `| External / web search | browse_web |\n`;
-  if (inspectSnapshot?.enabled) p += `| Explain captured page errors | inspect logs + DHIS2 tools |\n`;
   if (wantsChart) p += `| Render a chart | render_chart |\n`;
   if (isCreating) p += `| Create program (ONE call, all components) | create_metadata(action=create_program) |\n| Design/verify metadata | architect_metadata |\n`;
   if (isCreating || wantsSharingAccess) p += `| Update program OU assignment | manage_metadata(action=update_program_org_units) |\n`;
@@ -7740,7 +7335,7 @@ The user's image has been analyzed; the description is under [Attached Image Ana
 - Routed block IDs: ${llBlockIds.join(', ')}
 - Use ONLY these blocks for Line Listing UI guidance in this turn.
 - Primary source: ${LINE_LISTING_JSON_PATH}
-- Extra references loaded: ${LINE_LISTING_SYSTEM_PROMPT_PATH}, ${LINE_LISTING_ROUTER_PATH}
+- Additional prompt source: ${LINE_LISTING_SYSTEM_PROMPT_PATH}
 
 ### Line Listing Guidance Rules
 ${compactRules.map(r => `- ${r}`).join('\n')}
@@ -9082,15 +8677,8 @@ const TEXT_STOPWORDS = new Set([
   'known', 'family', 'pregnancy', 'pregnancies', 'medical',
 ]);
 
-function normalizeText(input) {
-  return String(input || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
 function tokenize(input) {
-  return normalizeText(input)
+  return normalizeSearchText(input)
     .split(/\s+/)
     .filter(Boolean)
     .filter(w => w.length >= 3 && !TEXT_STOPWORDS.has(w));
@@ -9771,7 +9359,7 @@ async function executeTool(name, args) {
     }
 
     // Guard: bulk deletion via POST metadata?importStrategy=DELETE must be gated.
-    // Previously inspect-mode runs deleted 84 program rule variables + 10 rules in a
+    // Previously automated repair runs deleted 84 program rule variables + 10 rules in a
     // single call, based only on audit heuristics that flagged them as "orphan". The
     // caller must pass args.confirm_bulk_delete: true to authorize this path, OR use
     // manage_metadata / manage_program_rules which do safer per-object handling.
@@ -10753,7 +10341,6 @@ async function executeTool(name, args) {
       source: {
         json: LINE_LISTING_JSON_PATH,
         system_prompt: LINE_LISTING_SYSTEM_PROMPT_PATH,
-        router: LINE_LISTING_ROUTER_PATH,
       },
       usage: {
         mode: 'route-first',
@@ -10824,10 +10411,8 @@ async function executeTool(name, args) {
     }).filter(Boolean);
 
     // ── Batch-resolve data item names and descriptions ──
-    // Group unresolved items by type for efficient batch fetching
-    const unresolvedIndicators = dataItems.filter(d => d.type === 'INDICATOR' && !d.name).map(d => d.id);
-    const unresolvedDataElements = dataItems.filter(d => d.type === 'DATA_ELEMENT' && !d.name).map(d => d.id);
-    const unresolvedProgramIndicators = dataItems.filter(d => d.type === 'PROGRAM_INDICATOR' && !d.name).map(d => d.id);
+    // Group every item by type because descriptions are needed even when a
+    // display name was embedded in the visualization response.
     const allIndicatorIds = dataItems.filter(d => d.type === 'INDICATOR').map(d => d.id);
     const allDataElementIds = dataItems.filter(d => d.type === 'DATA_ELEMENT').map(d => d.id);
     const allProgramIndicatorIds = dataItems.filter(d => d.type === 'PROGRAM_INDICATOR').map(d => d.id);
@@ -13531,13 +13116,6 @@ async function createLegendSet(args) {
 // All shared helpers (generateDhis2Uid, postMetadataPayload, safeDhis2Fetch,
 // requireWriteAuth) are reused with their existing signatures — no shared
 // code's behaviour changes.
-
-// DHIS2 minor version as a number (e.g. 42), or null if unknown. dhis2.apiVersion
-// is set to info.version.split('.')[1] on connect, so it is already the minor.
-function getDhis2MinorVersion() {
-  const v = parseInt(dhis2.apiVersion, 10);
-  return Number.isFinite(v) ? v : null;
-}
 
 // Locate an existing analytics favorite (chart / pivot) regardless of DHIS2
 // version. 2.34+ unifies them under `visualizations`; older servers split them
@@ -24575,16 +24153,26 @@ function summarizeSaveErrorDiagnosis(diag) {
 
 // ── Agentic Loop ─────────────────────────────────────────────────────────────
 
-async function runAgenticLoop(userText, imageBase64, browseWeb = false, inspectMode = false) {
+async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
   acquireKeepalive();
   try {
-    return await _runAgenticLoopInner(userText, imageBase64, browseWeb, inspectMode);
+    return await _runAgenticLoopInner(userText, imageBase64, browseWeb);
   } finally {
     releaseKeepalive();
   }
 }
 
-async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, inspectMode = false) {
+async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
+  // Capture the thread identity before the first await. A reset during prompt
+  // assembly, vision analysis, or a reliability prefetch must abort this old
+  // turn rather than letting it adopt the newly-cleared conversation epoch.
+  const turnEpoch = conversationEpoch;
+  const priorConversationHistory = conversationHistory.slice();
+  const turnStartIdx = 1 + priorConversationHistory.length;
+  const charts = [];
+  const turnWasReset = () => turnEpoch !== conversationEpoch;
+  const abortedTurnResult = () => ({ text: '', charts, streamed: false, aborted: true });
+
   lastUserText = userText || '';
 
   // ── Per-turn write-authorization gate ──
@@ -24602,21 +24190,17 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   console.log(`[AgenticLoop] writeAuth = ${dhis2.writeAuth.scope} (${dhis2.writeAuth.reason})`);
 
   const ctx = dhis2.pageContext || {};
-  const inspectSnapshot = inspectMode ? buildInspectSnapshot() : null;
 
   // Seed the known-IDs registry from every verified source available BEFORE
-  // any tool call: user text, page context, inspect logs, already-loaded
-  // program/OU/viz/map metadata. The registry grows as tools return data.
-  seedKnownIds(userText, ctx, inspectSnapshot);
+  // any tool call: user text, page context, and already-loaded program/OU/viz/map
+  // metadata. The registry grows as tools return data.
+  seedKnownIds(userText, ctx);
   seedKnownIcons();
   seedRecentCreations();
   console.log(`[AgenticLoop] knownIds seeded with ${dhis2.knownIds.size} UID(s); knownIcons + recentCreations reset`);
-  const routingText = inspectSnapshot?.enabled
-    ? `${userText || ''}\n\n[Inspect diagnostics]\n${JSON.stringify(inspectSnapshot.insights || {})}`
-    : userText;
 
   // ── Dynamic tool selection — send only tools relevant to this request ──
-  const contextualTools = getContextualTools(ctx, routingText, browseWeb, inspectSnapshot);
+  const contextualTools = getContextualTools(ctx, userText, browseWeb);
   const contextualToolNames = new Set(contextualTools.map(t => t.function.name));
   console.log(`[AgenticLoop] Using ${contextualTools.length}/${TOOLS.length} tools:`,
     [...contextualToolNames].join(', '));
@@ -24628,7 +24212,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   const wireTools = toWireTools(contextualTools);
   const deliveredManuals = new Set();
 
-  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb, inspectSnapshot);
+  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb);
+  if (turnWasReset()) return abortedTurnResult();
 
   // If image is attached, analyze with a vision model first, then include description
   let userContent;
@@ -24637,6 +24222,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   if (imageBase64) {
     broadcast({ type: 'AI_THINKING', iteration: 0, label: 'Analyzing attached image' });
     const imageAnalysis = await analyzeImage(imageBase64, userText);
+    if (turnWasReset()) return abortedTurnResult();
     if (imageAnalysis) {
       // Vision model succeeded — include description in text for the main model
       const enrichedText = `${userText}\n\n[Attached Image Analysis]\n${imageAnalysis}`;
@@ -24655,25 +24241,6 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       : userText;
   }
 
-  if (inspectSnapshot?.enabled) {
-    const inspectBlock =
-      `\n\n[Inspect Logs]\n` +
-      `Captured ${inspectSnapshot.captured} console/runtime/network entries for the active tab since ${inspectSnapshot.startedAt}.\n` +
-      `Active tab URL: ${inspectSnapshot.url || 'unknown'}\n` +
-      `${JSON.stringify({
-        counts: inspectSnapshot.counts,
-        insights: inspectSnapshot.insights,
-        logs: inspectSnapshot.logs,
-      })}`;
-    if (typeof userContent === 'string') {
-      userContent += inspectBlock;
-      historyText += `\n\n[Inspect Logs attached: ${inspectSnapshot.captured} entries]`;
-    } else if (Array.isArray(userContent) && userContent[0]?.type === 'text') {
-      userContent[0].text += inspectBlock;
-      historyText += `\n\n[Inspect Logs attached: ${inspectSnapshot.captured} entries]`;
-    }
-  }
-
   if (browseWeb) {
     if (typeof userContent === 'string') {
       if (!userContent.includes('[Web Browsing Enabled]')) {
@@ -24686,11 +24253,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
 
   const messages = [
     { role: 'system', content: systemPrompt },
-    ...conversationHistory,
+    ...priorConversationHistory,
     { role: 'user', content: userContent },
   ];
 
-  const charts = [];
   const apiCallsLog = [];
   // Only harvest a "pasted viz ID" from free text when the user actually included
   // an explicit DHIS2-looking URL. Bare-word scanning is too permissive even with
@@ -24724,6 +24290,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       };
       broadcast({ type: 'AI_TOOL_CALL', tool: 'get_visualization_details', args: prefetchArgs });
       const prefetch = await executeTool('get_visualization_details', prefetchArgs);
+      if (turnWasReset()) return abortedTurnResult();
       const summary = prefetch._error
         ? (prefetch._error || 'Failed').slice(0, 80)
         : `${prefetch.visualization?.name || prefetchVizId}${prefetch.visualization?.type ? ` (${prefetch.visualization.type})` : ''}`;
@@ -24802,6 +24369,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       };
       broadcast({ type: 'AI_TOOL_CALL', tool: 'get_map_details', args: prefetchArgs });
       const prefetch = await executeTool('get_map_details', prefetchArgs);
+      if (turnWasReset()) return abortedTurnResult();
       const summary = prefetch._error
         ? (prefetch._error || 'Failed').slice(0, 80)
         : `${prefetch.map?.name || prefetchMapId} (${prefetch.layers?.length || 0} layers)`;
@@ -24864,13 +24432,12 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   // system message so the model can identify the likely cause WITHOUT asking
   // the user for the error code — the chatbot has tools, it should use them.
   const saveDiagText = (userText || '').toLowerCase();
-  const saveDiagInspect = inspectSnapshot?.enabled ? JSON.stringify(inspectSnapshot.insights || {}).toLowerCase() : '';
-  const saveDiagDetected = SAVE_FAILURE_RE.test(saveDiagText + '\n' + saveDiagInspect)
-    || (inspectSnapshot?.enabled && /\b409\b/.test(saveDiagInspect));
+  const saveDiagDetected = SAVE_FAILURE_RE.test(saveDiagText);
   if (saveDiagDetected && ctx.programId) {
     broadcast({ type: 'AI_THINKING', iteration: 0, label: 'Diagnosing save error' });
     try {
       const diag = await prefetchSaveErrorContext(ctx);
+      if (turnWasReset()) return abortedTurnResult();
       if (diag) {
         // Extend known IDs from this prefetched bundle so subsequent calls work
         recordKnownIdsFromResult(diag);
@@ -24882,8 +24449,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           summary: summary.headline,
         });
         broadcast({
-          type: 'AI_TOOL_RESULT',
+          type: 'AI_TOOL_DONE',
           tool: 'diagnose_save_error',
+          success: true,
           summary: summary.headline,
           apiPath: `programs/${ctx.programId}?fields=...`,
         });
@@ -24904,28 +24472,6 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     }
   }
 
-  // Contextual thinking labels based on tool that just completed
-  const thinkingAfterTool = {
-    count_records: 'Analyzing count results',
-    get_event_analytics: 'Interpreting analytics data',
-    get_program_info: 'Reviewing program structure',
-    get_program_recent_changes: 'Reviewing recent program changes',
-    search_metadata: 'Reviewing search results',
-    resolve_option_codes: 'Resolving display names',
-    detect_enrollment_abnormalities: 'Analyzing abnormalities',
-    cross_stage_entity_intersection: 'Matching conditions',
-    line_listing_guide: 'Preparing guidance',
-    get_visualization_details: 'Interpreting visualization',
-    get_map_details: 'Interpreting map layers',
-    browse_web: 'Processing web results',
-    dhis2_query: 'Processing API response',
-    render_chart: 'Preparing chart',
-    create_metadata: 'Processing metadata creation',
-    architect_metadata: 'Reviewing architecture',
-    manage_program_rules: 'Processing program rules',
-    manage_program_indicators: 'Processing program indicators',
-    manage_metadata: 'Processing metadata changes',
-  };
   const thinkingLabels = [
     'Analyzing your question',
     'Planning approach',
@@ -24940,22 +24486,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
 
   // Marker: everything in `messages` from this index on is THIS turn (the user
   // message + any prefetch + every assistant/tool message the loop adds). The
-  // array was built as [system, ...conversationHistory, userMsg], and
-  // conversationHistory is not mutated until turn end, so the user message sits
-  // at exactly 1 + conversationHistory.length. At turn end we persist
+  // array was built as [system, ...priorConversationHistory, userMsg], so the
+  // user message sits at exactly 1 + priorConversationHistory.length. At turn
+  // end we persist
   // messages.slice(turnStartIdx) so the next turn remembers the actual tool
   // calls + results, not just the final prose.
-  const turnStartIdx = 1 + conversationHistory.length;
-  // Snapshot the thread identity. If a new-thread reset happens while this turn
-  // is still running (panel reopened / "+" clicked mid-generation), the epoch
-  // changes and every persistence site below drops this turn instead of
-  // re-seeding the freshly-cleared history with the old task.
-  const turnEpoch = conversationEpoch;
-
   for (let i = 0; i < 50; i++) {
+    if (turnWasReset()) return abortedTurnResult();
     // Contextual thinking label
     const thinkLabel = lastToolName
-      ? thinkingAfterTool[lastToolName] || 'Processing results'
+      ? TOOL_PRESENTATION[lastToolName]?.resultLabel || 'Processing results'
       : thinkingLabels[Math.min(i, thinkingLabels.length - 1)];
     broadcast({ type: 'AI_THINKING', iteration: i + 1, label: thinkLabel });
     lastToolName = null;
@@ -24970,6 +24510,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     const FLUSH_MS = 40;
     const flushChunks = () => {
       flushTimer = null;
+      if (turnWasReset()) {
+        chunkBuffer = '';
+        return;
+      }
       if (chunkBuffer) {
         broadcast({ type: 'AI_STREAM_CHUNK', text: chunkBuffer });
         chunkBuffer = '';
@@ -24978,6 +24522,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     let result;
     try {
       result = await callProviderStreaming(messages, true, (chunk) => {
+        if (turnWasReset()) return;
         if (chunk === null) {
           broadcast({ type: 'AI_STREAM_START' });
           streamStartBroadcast = true;
@@ -24989,6 +24534,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     } catch (provErr) {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       chunkBuffer = '';
+      if (turnWasReset()) return abortedTurnResult();
       // A mid-stream stall before ANY text reached the panel can be retried
       // transparently — `messages` was not mutated for this iteration, so the
       // request is safely repeatable. If text already streamed, rethrow so the
@@ -25000,6 +24546,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         continue;
       }
       throw provErr;
+    }
+    if (turnWasReset()) {
+      if (flushTimer) clearTimeout(flushTimer);
+      return abortedTurnResult();
     }
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (chunkBuffer) {
@@ -25033,6 +24583,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
 
     if (validToolCalls.length > 0) {
       for (const tc of validToolCalls) {
+        if (turnWasReset()) return abortedTurnResult();
         let args;
         try {
           const rawArgs = tc.function.arguments;
@@ -25072,6 +24623,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             } catch (toolErr) {
               toolResult = { _error: `Tool failed: ${toolErr.message}` };
             }
+            if (turnWasReset()) return abortedTurnResult();
             // ── Post-flight: harvest UIDs from the result so subsequent calls
             //    can reference them, and bump the HTTP-error counter on 4xx/5xx. ──
             recordKnownIdsFromResult(toolResult);
@@ -25331,6 +24883,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   // summarizes what succeeded (names + IDs), what failed (exact errors), and
   // what to do next. The system nudge is transient — buildTurnHistory drops it.
   try {
+    if (turnWasReset()) return abortedTurnResult();
     messages.push({
       role: 'system',
       content:
@@ -25347,9 +24900,14 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     let finalTimer = null;
     const flushFinal = () => {
       finalTimer = null;
+      if (turnWasReset()) {
+        finalBuf = '';
+        return;
+      }
       if (finalBuf) { broadcast({ type: 'AI_STREAM_CHUNK', text: finalBuf }); finalBuf = ''; }
     };
     const finalResult = await callProviderStreaming(messages, false, (chunk) => {
+      if (turnWasReset()) return;
       if (chunk === null) {
         broadcast({ type: 'AI_STREAM_START' });
         finalStreamStarted = true;
@@ -25358,6 +24916,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         if (!finalTimer) finalTimer = setTimeout(flushFinal, 40);
       }
     }, [], 49);
+    if (turnWasReset()) {
+      if (finalTimer) clearTimeout(finalTimer);
+      return abortedTurnResult();
+    }
     if (finalTimer) { clearTimeout(finalTimer); finalTimer = null; }
     if (finalBuf) { broadcast({ type: 'AI_STREAM_CHUNK', text: finalBuf }); finalBuf = ''; }
     const finalText = finalResult?.choices?.[0]?.message?.content || '';
@@ -25441,6 +25003,7 @@ function injectedScreenshotSelection() {
 
   const overlay = document.createElement('div');
   overlay.id = '__dhis2_screenshot_overlay__';
+  overlay.tabIndex = -1;
   Object.assign(overlay.style, {
     position: 'fixed',
     inset: '0',
@@ -25531,21 +25094,84 @@ function injectedScreenshotSelection() {
     }, 80);
   });
 
-  const cancelHandler = (e) => {
+  overlay.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       overlay.remove();
-      document.removeEventListener('keydown', cancelHandler);
     }
-  };
-  document.addEventListener('keydown', cancelHandler);
+  });
 
   document.body.appendChild(overlay);
+  overlay.focus({ preventScroll: true });
 }
 
 // ── Broadcasting ─────────────────────────────────────────────────────────────
 
 function broadcast(data) {
   chrome.runtime.sendMessage(data).catch(() => {});
+}
+
+async function isCurrentActiveTab(tabId) {
+  if (!tabId) return false;
+  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  return activeTab?.id === tabId;
+}
+
+async function handleContextUpdateMessage(msg, sender) {
+  if (sender.tab?.id && !(await isCurrentActiveTab(sender.tab.id))) {
+    return { success: true, ignored: 'inactive_tab' };
+  }
+  const url = msg.payload?.url || sender.tab?.url;
+  if (!url) return { error: 'Context update did not include a URL.' };
+  const result = await syncPageContextFromUrl(url);
+  if (result.success) broadcast({ type: 'CONTEXT_UPDATED', state: result.state });
+  return result;
+}
+
+async function handleStageDetectedMessage(msg, sender) {
+  if (sender.tab?.id && !(await isCurrentActiveTab(sender.tab.id))) {
+    return { success: true, ignored: 'inactive_tab' };
+  }
+
+  // Content script detected the active stage (from URL hash or DOM observation).
+  // The structural UID is cross-checked against the current program's stages.
+  const detectedStageId = msg.payload?.stageId;
+  if (!detectedStageId || !hasUidShape(detectedStageId)) {
+    return { success: false, error: 'Invalid stage ID.' };
+  }
+
+  const currentStageId = dhis2.pageContext?.stageId;
+  if (detectedStageId === currentStageId) return { success: true, changed: false };
+  const knownStages = dhis2.programMetadata?.programStages;
+  if (knownStages && !knownStages.some(stage => stage.id === detectedStageId)) {
+    return { success: false, error: 'Stage does not belong to the current program.' };
+  }
+
+  if (!dhis2.pageContext) dhis2.pageContext = {};
+  dhis2.pageContext.stageId = detectedStageId;
+  await saveState();
+  console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${msg.payload?.source || 'unknown'})`);
+  broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+  return { success: true, changed: true };
+}
+
+function parseScreenshotArea(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const area = {
+    x: Number(payload.x),
+    y: Number(payload.y),
+    width: Number(payload.width),
+    height: Number(payload.height),
+    devicePixelRatio: Number(payload.devicePixelRatio),
+  };
+  if (!Object.values(area).every(Number.isFinite)) return null;
+  if (area.x < 0 || area.y < 0 || area.width < 10 || area.height < 10) return null;
+  if (area.devicePixelRatio < 0.25 || area.devicePixelRatio > 8) return null;
+  const pixelWidth = area.width * area.devicePixelRatio;
+  const pixelHeight = area.height * area.devicePixelRatio;
+  if (pixelWidth > 16384 || pixelHeight > 16384 || pixelWidth * pixelHeight > 25_000_000) {
+    return null;
+  }
+  return area;
 }
 
 // ── Message Handler ──────────────────────────────────────────────────────────
@@ -25557,44 +25183,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== 'string') return false;
   switch (msg.type) {
     case 'DHIS2_CONTEXT_UPDATE': {
-      const url = msg.payload?.url || sender.tab?.url;
-      if (url) {
-        initializeFromUrl(url).then(r => {
-          broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-          sendResponse(r);
-        }).catch(e => sendResponse({ error: e.message }));
-      }
+      handleContextUpdateMessage(msg, sender)
+        .then(sendResponse)
+        .catch(error => sendResponse({ error: error.message }));
       return true;
     }
 
     case 'DHIS2_STAGE_DETECTED': {
-      // Content script detected the active stage (from URL hash or DOM observation)
-      // Use hasUidShape (loose) — the stage ID comes from a DHIS2-served URL
-      // and is further cross-checked against knownStages below.
-      const detectedStageId = msg.payload?.stageId;
-      if (detectedStageId && hasUidShape(detectedStageId)) {
-        // Only update if different from current and it's a valid stage in the program
-        const currentStageId = dhis2.pageContext?.stageId;
-        if (detectedStageId !== currentStageId) {
-          // Validate against known stages if program metadata is loaded
-          const knownStages = dhis2.programMetadata?.programStages;
-          if (!knownStages || knownStages.some(s => s.id === detectedStageId)) {
-            if (!dhis2.pageContext) dhis2.pageContext = {};
-            dhis2.pageContext.stageId = detectedStageId;
-            console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${msg.payload?.source || 'unknown'})`);
-            broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-          }
-        }
-      }
-      sendResponse({ success: true });
+      handleStageDetectedMessage(msg, sender)
+        .then(sendResponse)
+        .catch(error => sendResponse({ error: error.message }));
       return true;
     }
 
     case 'INITIALIZE': {
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      chrome.tabs.query({ active: true, lastFocusedWindow: true }, async (tabs) => {
         if (tabs[0]?.url) {
           try {
-            const r = await initializeFromUrl(tabs[0].url);
+            const r = await syncPageContextFromUrl(tabs[0].url);
             sendResponse(r);
           } catch (e) { sendResponse({ error: e.message }); }
         } else {
@@ -25618,60 +25224,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case 'CHAT_MESSAGE': {
+      const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
       sendResponse({ status: 'processing' });
       (async () => {
-        await ensureConnected();
-        // Re-extract context from current tab for SPA navigation
-        try {
-          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (tab?.url && dhis2.baseUrl) {
-            const freshBaseUrl = extractBaseUrl(tab.url);
-            const freshCtx = extractContext(tab.url);
-            const oldProgramId = dhis2.pageContext?.programId;
-            const oldOrgUnitId = dhis2.pageContext?.orgUnitId;
-            const oldAppType = dhis2.pageContext?.appType;
-            const oldStageId = dhis2.pageContext?.stageId;
-            const oldVisualizationId = dhis2.pageContext?.visualizationId;
-            const oldMapId = dhis2.pageContext?.mapId;
-
-            // Rebuild pageContext from the current URL instead of merging onto stale state.
-            // Preserve a DOM-detected stage only when staying in the same tracker program.
-            dhis2.pageContext = { ...freshCtx };
-            if (!freshCtx.stageId && freshCtx.programId && freshCtx.programId === oldProgramId && oldStageId) {
-              dhis2.pageContext.stageId = oldStageId;
-            }
-
-            // Re-run full initialization whenever page type or top-level context changes.
-            // This clears stale app-specific state when navigating away from Data Visualizer/Maps.
-            // baseUrl mismatch must force a refresh — otherwise we'd keep talking to the
-            // previous DHIS2 instance and tools would return that server's UIDs.
-            const baseUrlChanged = !!(freshBaseUrl && freshBaseUrl !== dhis2.baseUrl);
-            const needsFullRefresh =
-              baseUrlChanged ||
-              freshCtx.appType !== oldAppType ||
-              freshCtx.programId !== oldProgramId ||
-              freshCtx.visualizationId !== oldVisualizationId ||
-              freshCtx.mapId !== oldMapId ||
-              (!freshCtx.programId && !!oldProgramId);
-
-            if (needsFullRefresh) {
-              await initializeFromUrl(tab.url);
-            } else if (freshCtx.orgUnitId && freshCtx.orgUnitId !== oldOrgUnitId) {
-              try {
-                dhis2.ouContext = await dhis2Fetch(apiUrl(
-                  `organisationUnits/${freshCtx.orgUnitId}?fields=id,displayName,code,path,level,ancestors[id,displayName,level],children[id,displayName]`
-                ));
-                await getMaxOuLevel();
-                rememberFacilityOu(dhis2.ouContext);
-                await saveState();
-              } catch {}
-            } else if (!freshCtx.orgUnitId && oldOrgUnitId) {
-              dhis2.ouContext = null;
-              await saveState();
-            }
-          }
-        } catch {}
-        return runAgenticLoop(msg.payload.text, msg.payload.imageBase64, !!msg.payload.browseWeb, !!msg.payload.inspect);
+        if (!(await ensureConnected())) {
+          throw new Error('Could not connect to the active DHIS2 tab. Open a signed-in DHIS2 page and allow access to that server.');
+        }
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (!tab?.url) throw new Error('No active tab found.');
+        const contextResult = await syncPageContextFromUrl(tab.url);
+        if (!contextResult.success) throw new Error(contextResult.error || 'Could not refresh DHIS2 page context.');
+        return runAgenticLoop(payload.text || '', payload.imageBase64, !!payload.browseWeb);
       })()
         .then(r => {
           // If response was already streamed, only send AI_RESPONSE for non-text cleanup (charts, state reset)
@@ -25814,38 +25377,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'START_SCREENSHOT_CAPTURE': {
       // Inject screenshot selection overlay directly via scripting API (works on any page)
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        if (!tabs[0]?.id) return;
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tabs[0].id },
-            func: injectedScreenshotSelection,
-          });
-        } catch (e) {
+      (async () => {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (!tab?.id) throw new Error('No active tab found.');
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: injectedScreenshotSelection,
+        });
+        return { ok: true };
+      })()
+        .then(sendResponse)
+        .catch((error) => {
           broadcast({ type: 'AI_ERROR', error: 'Cannot capture this page. Try on a regular web page.' });
-        }
-      });
-      sendResponse({ ok: true });
+          sendResponse({ error: error.message });
+        });
       return true;
     }
 
     case 'SCREENSHOT_AREA_SELECTED': {
       // Capture the visible tab, then crop to the selected area
-      const { x, y, width, height, devicePixelRatio } = msg.payload;
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        if (!tabs[0]?.id) { sendResponse({ error: 'No active tab' }); return; }
-        try {
-          const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-          // Crop the captured image to the selected region
-          const cropped = await cropImage(dataUrl, x, y, width, height, devicePixelRatio);
-          // Send the cropped image back to the side panel
-          broadcast({ type: 'SCREENSHOT_RESULT', dataUrl: cropped });
-          sendResponse({ ok: true });
-        } catch (e) {
-          broadcast({ type: 'AI_ERROR', error: 'Screenshot failed: ' + e.message });
-          sendResponse({ error: e.message });
+      const area = parseScreenshotArea(msg.payload);
+      if (!area) {
+        sendResponse({ error: 'Invalid screenshot selection.' });
+        return false;
+      }
+      (async () => {
+        if (!sender.tab?.id || !(await isCurrentActiveTab(sender.tab.id))) {
+          throw new Error('Screenshot selection came from an inactive tab.');
         }
-      });
+        const tab = await chrome.tabs.get(sender.tab.id);
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        const cropped = await cropImage(
+          dataUrl,
+          area.x,
+          area.y,
+          area.width,
+          area.height,
+          area.devicePixelRatio
+        );
+        broadcast({ type: 'SCREENSHOT_RESULT', dataUrl: cropped });
+        return { ok: true };
+      })()
+        .then(sendResponse)
+        .catch((error) => {
+          broadcast({ type: 'AI_ERROR', error: 'Screenshot failed: ' + error.message });
+          sendResponse({ error: error.message });
+        });
       return true;
     }
 
@@ -25872,17 +25449,15 @@ chrome.action.onClicked.addListener(async (tab) => {
 // ── Tab URL Change ───────────────────────────────────────────────────────────
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.url && (tab.url.includes('/dhis-web-') || tab.url.includes('/apps/') || tab.url.includes('/api/'))) {
-    initializeFromUrl(tab.url).then(() => {
-      broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-    }).catch(() => {});
+  if (info.url && (tab.url?.includes('/dhis-web-') || tab.url?.includes('/apps/') || tab.url?.includes('/api/'))) {
+    syncFromTab(tabId);
   }
 });
 
 chrome.webNavigation?.onReferenceFragmentUpdated?.addListener?.((details) => {
   if (details.url && (details.url.includes('/dhis-web-') || details.url.includes('/apps/'))) {
-    initializeFromUrl(details.url).then(() => {
-      broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+    chrome.tabs.get(details.tabId).then((tab) => {
+      if (tab.active) syncFromTab(details.tabId);
     }).catch(() => {});
   }
 });
@@ -25893,19 +25468,11 @@ chrome.webNavigation?.onReferenceFragmentUpdated?.addListener?.((details) => {
 // "program already exists with id X" false-positive across servers).
 async function syncFromTab(tabId) {
   try {
+    if (!(await isCurrentActiveTab(tabId))) return;
     const tab = await chrome.tabs.get(tabId);
     if (!tab?.url) return;
-    const candidateBase = extractBaseUrl(tab.url);
-    if (!candidateBase) return;
-    if (candidateBase === dhis2.baseUrl && dhis2.connected) {
-      // Same server — only refresh page context (cheap), don't re-fetch system info.
-      const ctx = extractContext(tab.url);
-      dhis2.pageContext = ctx;
-      broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-      return;
-    }
-    await initializeFromUrl(tab.url);
-    broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+    const result = await syncPageContextFromUrl(tab.url);
+    if (result.success) broadcast({ type: 'CONTEXT_UPDATED', state: result.state });
   } catch {}
 }
 
@@ -25919,9 +25486,11 @@ chrome.windows?.onFocusChanged?.addListener?.(async (windowId) => {
   } catch {}
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.sidePanel.setOptions({ enabled: true });
-  syncContentScriptsToGrantedOrigins();
+chrome.runtime.onInstalled.addListener(async () => {
+  await chrome.sidePanel.setOptions({ enabled: true });
+  await syncContentScriptsToGrantedOrigins();
+  const granted = await chrome.permissions.getAll().catch(() => ({ origins: [] }));
+  await injectMonitorIntoOpenTabs(granted.origins || []);
 });
 
 chrome.runtime.onStartup?.addListener?.(() => {

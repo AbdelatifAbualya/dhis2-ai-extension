@@ -6,6 +6,8 @@
 (() => {
   'use strict';
 
+  const TOOL_PRESENTATION = globalThis.Dhis2ToolCatalog || Object.freeze({});
+
   // ── Health Chart Palette ─────────────────────────────────────────────────
   const PALETTE = [
     '#2E86AB','#E8655A','#F2B134','#5B8C5A','#8B5CF6',
@@ -243,8 +245,17 @@
   }
 
   // ── Listeners ────────────────────────────────────────────────────────────
+  function closeTransientMenus() {
+    attachDropdown?.classList.add('hidden');
+    $('chat-download-dropdown')?.classList.add('hidden');
+    document.querySelectorAll('.download-dropdown').forEach(menu => menu.classList.add('hidden'));
+  }
+
   function setupListeners() {
     btnSend.addEventListener('click', sendMessage);
+    // One delegated outside-click handler for every current and future
+    // download menu. Per-message handlers retained cleared chat DOM forever.
+    document.addEventListener('click', closeTransientMenus);
 
     // Grant access to the current DHIS2 server. Must run inside this click
     // handler (no awaits before the request) so the user gesture is preserved
@@ -297,7 +308,9 @@
 
     btnClear.addEventListener('click', () => {
       chrome.runtime.sendMessage({ type: 'CLEAR_HISTORY' });
+      finalizeStream();
       messagesDiv.innerHTML = '';
+      toolTimers.clear();
       welcome.classList.remove('hidden');
       chartInstances.forEach(c => { if (c._resizeObserver) c._resizeObserver.disconnect(); c.dispose(); });
       chartInstances = [];
@@ -311,7 +324,6 @@
         e.stopPropagation();
         chatDownloadDropdown.classList.toggle('hidden');
       });
-      document.addEventListener('click', () => chatDownloadDropdown.classList.add('hidden'));
       chatDownloadDropdown.addEventListener('click', (e) => e.stopPropagation());
       chatDownloadDropdown.querySelectorAll('.chat-download-option').forEach(opt => {
         opt.addEventListener('click', () => {
@@ -335,7 +347,6 @@
       e.stopPropagation();
       attachDropdown.classList.toggle('hidden');
     });
-    document.addEventListener('click', () => attachDropdown.classList.add('hidden'));
     attachDropdown.addEventListener('click', (e) => e.stopPropagation());
 
     // Upload image option
@@ -385,13 +396,6 @@
       }
     });
 
-    // Listen for screenshot result from background
-    chrome.runtime.onMessage.addListener((msg) => {
-      if (msg.type === 'SCREENSHOT_RESULT' && msg.dataUrl) {
-        setPendingImage(msg.dataUrl);
-      }
-    });
-
     // Messages from background
     chrome.runtime.onMessage.addListener(handleBackgroundMessage);
   }
@@ -399,7 +403,6 @@
   // ── Streaming state ────────────────────────────────────────────────────
   let streamingBubble = null;      // The DOM element currently being streamed into
   let streamingRawText = '';       // Accumulated raw markdown text during streaming
-  let streamingRenderTimer = null; // Debounce timer for re-rendering markdown
   let streamingRafId = null;       // requestAnimationFrame ID for smooth rendering
   let streamingDirty = false;      // Whether new chunks arrived since last render
   let streamingLastHtml = '';      // Last rendered HTML — used for incremental DOM patching
@@ -455,6 +458,9 @@
       case 'CONTEXT_UPDATED':
         updateState(msg.state);
         break;
+      case 'SCREENSHOT_RESULT':
+        if (msg.dataUrl) setPendingImage(msg.dataUrl);
+        break;
       case 'AI_THINKING':
         showThinking(msg.iteration, msg.label);
         break;
@@ -477,8 +483,10 @@
         handleStreamEnd(msg.text);
         break;
       case 'AI_RESPONSE':
+        cancelProgressWatchdog();
         removeThinking();
         markAllToolsDone();
+        finalizeStream();
         // If response was already streamed, text is null — just finalize state
         if (!msg.streamed && msg.text) addMessage('assistant', msg.text);
         isSending = false;
@@ -486,6 +494,7 @@
         chatInput.focus();
         break;
       case 'AI_ERROR':
+        cancelProgressWatchdog();
         removeThinking();
         markAllToolsDone();
         finalizeStream();
@@ -1090,7 +1099,6 @@
         e.stopPropagation();
         dlDropdown.classList.toggle('hidden');
       });
-      document.addEventListener('click', () => dlDropdown.classList.add('hidden'));
       dlDropdown.addEventListener('click', (e) => e.stopPropagation());
 
       feedbackBar.querySelectorAll('.download-option').forEach(opt => {
@@ -1592,79 +1600,11 @@ ${turnXml}
     toolTimers.set(toolId, Date.now());
 
     const isChart = tool === 'render_chart';
-    const iconMap = {
-      render_chart: { cls: 'tool-icon-chart', icon: '\u{1F4CA}' },
-      count_records: { cls: 'tool-icon-count', icon: '\u{1F522}' },
-      get_event_analytics: { cls: 'tool-icon-analytics', icon: '\u{1F4C8}' },
-      get_program_info: { cls: 'tool-icon-info', icon: '\u{2139}\uFE0F' },
-      get_program_recent_changes: { cls: 'tool-icon-info', icon: '\u{1F4DD}' },
-      search_metadata: { cls: 'tool-icon-search', icon: '\u{1F50E}' },
-      resolve_option_codes: { cls: 'tool-icon-search', icon: '\u{1F3F7}' },
-      detect_enrollment_abnormalities: { cls: 'tool-icon-warning', icon: '\u26A0\uFE0F' },
-      cross_stage_entity_intersection: { cls: 'tool-icon-analytics', icon: '\u{1F517}' },
-      line_listing_guide: { cls: 'tool-icon-info', icon: '\u{1F5FA}\uFE0F' },
-      get_visualization_details: { cls: 'tool-icon-chart', icon: '\u{1F4CA}' },
-      get_map_details: { cls: 'tool-icon-map', icon: '\u{1F5FA}\uFE0F' },
-      browse_web: { cls: 'tool-icon-search', icon: '\u{1F30D}' },
-      dhis2_query: { cls: 'tool-icon-api', icon: '\u{1F50D}' },
-      create_metadata: { cls: 'tool-icon-create', icon: '\u{1F3D7}\uFE0F' },
-      architect_metadata: { cls: 'tool-icon-architect', icon: '\u{1F9E0}' },
-      manage_program_rules: { cls: 'tool-icon-info', icon: '\u{1F4CB}' },
-      manage_program_indicators: { cls: 'tool-icon-analytics', icon: '\u{1F4CF}' },
-      manage_metadata: { cls: 'tool-icon-create', icon: '\u{1F527}' },
-      manage_program_notifications: { cls: 'tool-icon-notification', icon: '\u{1F4E8}' },
-      manage_datasets: { cls: 'tool-icon-dataset', icon: '\u{1F4D1}' },
-      manage_custom_forms: { cls: 'tool-icon-create', icon: '\u{1F4DD}' },
-      manage_custom_translations: { cls: 'tool-icon-create', icon: '\u{1F310}' },
-      manage_growth_chart_plugin: { cls: 'tool-icon-create', icon: '\u{1F4C8}' },
-      manage_validation_rules: { cls: 'tool-icon-info', icon: '\u{2705}' },
-      manage_org_units: { cls: 'tool-icon-create', icon: '\u{1F3E2}' },
-      manage_indicators: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
-      manage_option_sets: { cls: 'tool-icon-create', icon: '\u{1F5C2}' },
-      manage_legend_sets: { cls: 'tool-icon-create', icon: '\u{1F3A8}' },
-      manage_dashboards: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
-      manage_maps: { cls: 'tool-icon-create', icon: '\u{1F5FA}' },
-      manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
-      diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
-    };
-    const iconInfo = iconMap[tool] || { cls: 'tool-icon-api', icon: '\u{1F50D}' };
-
-    const toolLabels = {
-      render_chart: 'Rendering chart',
-      dhis2_query: 'Querying DHIS2 API',
-      count_records: 'Counting records',
-      get_event_analytics: 'Fetching analytics',
-      get_program_info: 'Loading program info',
-      get_program_recent_changes: 'Loading recent changes',
-      search_metadata: 'Searching metadata',
-      resolve_option_codes: 'Resolving codes to names',
-      detect_enrollment_abnormalities: 'Scanning abnormalities',
-      cross_stage_entity_intersection: 'Intersecting conditions',
-      line_listing_guide: 'Loading line-listing guide',
-      get_visualization_details: 'Loading visualization details',
-      get_map_details: 'Loading map details',
-      browse_web: 'Browsing the web',
-      create_metadata: 'Creating metadata',
-      architect_metadata: 'Architecting metadata',
-      manage_program_rules: 'Managing program rules',
-      manage_program_indicators: 'Managing program indicators',
-      manage_metadata: 'Managing metadata',
-      manage_program_notifications: 'Managing program notifications',
-      manage_datasets: 'Managing datasets',
-      manage_custom_forms: 'Designing custom form',
-      manage_custom_translations: 'Managing custom translations',
-      manage_growth_chart_plugin: 'Setting up growth chart plugin',
-      manage_validation_rules: 'Managing validation rules',
-      manage_org_units: 'Managing org units',
-      manage_indicators: 'Managing indicators',
-      manage_option_sets: 'Managing option sets',
-      manage_legend_sets: 'Managing legend sets',
-      manage_dashboards: 'Building dashboards',
-      manage_maps: 'Building maps',
-      manage_backups: 'Managing backups',
-      diagnose_save_error: 'Diagnosing save error',
-    };
-    const label = toolLabels[tool] || 'Querying DHIS2';
+    const presentation = TOOL_PRESENTATION[tool];
+    const iconInfo = presentation
+      ? { cls: presentation.iconClass, icon: presentation.icon }
+      : { cls: 'tool-icon-api', icon: '\u{1F50D}' };
+    const label = presentation?.activeLabel || 'Querying DHIS2';
 
     // Build detailed info showing actual API call
     let detail = '';
@@ -2027,6 +1967,7 @@ ${turnXml}
   function markAllToolsDone() {
     messagesDiv.querySelectorAll('.tool-card:not(.tool-done)').forEach(card => {
       card.classList.add('tool-done');
+      if (card.dataset.toolId) toolTimers.delete(card.dataset.toolId);
       const spinner = card.querySelector('.tool-spinner');
       if (spinner) {
         spinner.classList.add('hidden');

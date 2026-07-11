@@ -16,13 +16,13 @@
 - **Knows where you are.** Detects program / org unit / stage / TEI / dataset / visualization / map from the URL of your active DHIS2 tab. The system prompt narrows itself to the relevant tools and rules every turn.
 - **Runs as an agent.** The model picks tools, calls them, reads the JSON, and continues — up to 50 iterations per turn — without you driving the API.
 - **Authors metadata atomically.** Programs, stages, data elements, option sets, TEAs, program rules, program indicators, datasets, sections, **category combinations + disaggregation**, sharing, org-unit assignment, icons / colors, all in single bundled `/api/metadata` POSTs with auto-backup before every destructive write.
-- **Streams answers and downloads them.** Real-time chat with progress indicators per tool call; every response can be exported as HTML / Word / CSV / JSON.
+- **Streams answers and downloads them.** Real-time chat with progress indicators per tool call; every response can be exported as HTML / Word / CSV / JSON / XML.
 
 ---
 
 ## The 32 tools
 
-Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → panel.js iconMap + toolLabels → CSS`. The model is given only the subset relevant to the current page and request — usually 6–12 of them.
+Each callable tool is defined once in the `TOOLS` schema array; `TOOL_ROUTER` is derived from those schemas. Execution stays in `executeTool()`, while progress labels/icons live in the shared `shared/tool-catalog.js` used by both the worker and panel. The model is given only the subset relevant to the current page and request — usually 6–12 tools.
 
 | # | Tool | Purpose |
 |---|------|---------|
@@ -69,7 +69,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 | Aggregate Data Entry / Data Entry / Dataset Report / Maintenance > dataSet | `manage_datasets`, `manage_metadata` | Dataset Context (active OU + period + AOC + form type + DE/section/OU counts + can-write-data flag), DHIS2 Datasets KB, Category-Combo creation flow |
 | Data Visualizer | `get_visualization_details` | Visualization Context (with prefetched analytics) |
 | Maps | `get_map_details` | Map Context |
-| TEI / enrollment in URL | tracker tools | TEI prefetch context |
+| TEI / enrollment in URL | tracker tools | Current IDs + patient-data privacy boundary (no automatic TEI fetch) |
 | Line Listing | `line_listing_guide` | Line Listing protocol |
 
 ---
@@ -79,17 +79,17 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 ```
 ┌──────────────────────┐    ┌────────────────────────────┐    ┌──────────────────────┐
 │   Content Script      │   │  Background Service Worker  │   │    Side Panel         │
-│   (content.js)        │──▶│  (background.js, ~18k LOC)  │──▶│  (sidepanel/)         │
+│   (content.js)        │──▶│  (background.js + core)     │──▶│  (sidepanel/)         │
 │                       │   │                             │   │                       │
 │ • URL change monitor  │   │ • DHIS2 detection & session │   │ • Chat interface      │
 │ • hashchange/popstate │   │ • Page-context extraction   │   │ • Streaming display   │
 │ • 2s polling fallback │   │ • Universal LLM streaming   │   │ • Tool progress UI    │
-│ • Sends ctx updates   │   │ • 31-tool agentic loop      │   │ • Chart rendering     │
+│ • Sends ctx updates   │   │ • 32-tool agentic loop      │   │ • Chart rendering     │
 │ • Self-heal on        │   │ • Tracker write pipeline    │   │ • Image attachments   │
 │   "context invalid"   │   │ • Atomic metadata bundles   │   │ • Settings modal      │
 │   after extension     │   │ • Auto-backup + restore     │   │ • Theme switching     │
 │   reload              │   │ • Smart retry (429/503)     │   │ • Download HTML/Word/ │
-│                       │   │ • SW keep-alive ping        │   │   CSV / JSON          │
+│                       │   │ • SW keep-alive ping        │   │   CSV / JSON / XML    │
 └──────────────────────┘    └────────────────────────────┘    └──────────────────────┘
 ```
 
@@ -97,10 +97,10 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 
 1. **Context extraction** — read URL of active DHIS2 tab → app type, program, stage, dataset, OU, TEI, viz, map.
 2. **System prompt assembly** — base rules + only the conditional blocks the request needs.
-3. **Reliability prefetch** — TEI details / visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
+3. **Reliability prefetch** — visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
 4. **Tool selection** — `getContextualTools()` filters the 32 tools down to the 6–12 relevant for the request.
 5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 50 iterations per turn, 3 consecutive empty responses trigger bailout.
-6. **Persistence** — per-turn state (`knownIds`, `knownIcons`, `recentCreations`, `writeAuth`, …) survives service-worker restarts via stripped JSON snapshots.
+6. **Persistence** — conversation and page state survive service-worker restarts; ephemeral registries such as `knownIds`, `knownIcons`, and write authorization are deliberately rebuilt every turn.
 
 ### Write pipeline (the strict path destructive operations follow)
 
@@ -163,7 +163,7 @@ Two-step: image → vision model description → text-model context. If `visionM
 
 1. **Clone or download** this folder.
 2. Open `chrome://extensions/` and enable **Developer mode**.
-3. Click **Load unpacked** and select the `dhis2-AI/` folder.
+3. Click **Load unpacked** and select the `dhis2-ai-extension/` folder.
 4. **(Default path: Ollama)** install Ollama from [ollama.com](https://ollama.com) and run `ollama pull llama3.2`. The extension will use it out-of-the-box with no key.
 5. Navigate to any DHIS2 instance you're logged into (e.g. [https://play.im.dhis2.org/stable-2-41-8](https://play.im.dhis2.org/stable-2-41-8) — admin / district).
 6. Click the extension icon to open the side panel.
@@ -197,6 +197,7 @@ Every assistant response can be downloaded from the feedback bar:
 | **Word** | `.doc` | Microsoft Word-compatible (HTML + Office XML namespaces, UTF-8 BOM). Opens cleanly in Word, LibreOffice, Google Docs |
 | **CSV** | `.csv` | All tables in the response → comma-separated rows. UTF-8 BOM for Excel. If no tables, exports plain text as `.txt` |
 | **JSON** | `.json` | Structured: `meta` (generatedAt / program / orgUnit / dhis2Version), `content.markdown`, `content.text`, `content.tables[]` parsed as named-key arrays |
+| **XML** | `.xml` | Structured metadata, rendered text, Markdown source, and response tables in a portable XML document |
 
 Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
@@ -205,9 +206,13 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 ## File layout
 
 ```
-dhis2-AI/
-├── manifest.json              MV3 config (v2.7.0)
-├── background.js              Service worker — all AI + API logic (~18.2k LOC)
+dhis2-ai-extension/
+├── manifest.json              MV3 config (v2.9.0)
+├── background.js              Service-worker orchestration, tool schemas and executors
+├── background/
+│   └── core.js                Pure URL, UID, normalization and context helpers
+├── shared/
+│   └── tool-catalog.js        Canonical tool progress labels and icons
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
 │   ├── panel.html             Side panel UI
@@ -215,14 +220,28 @@ dhis2-AI/
 │   └── panel.js               Chat UI, streaming, tool progress, downloads (~2.5k LOC)
 ├── line-listing/
 │   ├── dhis2_chrome_extension_system_prompt.md
-│   ├── dhis2_extension_router.js
 │   └── dhis2_linelisting_tool.json
 ├── libs/
 │   └── echarts.min.js
 ├── icons/
 │   ├── icon16.png  icon48.png  icon128.png
+├── scripts/
+│   └── validate.js            Dependency-free syntax/entry-point validation
+├── tests/
+│   ├── core.test.js
+│   └── source-contracts.test.js
+├── package.json               Validation commands (no runtime dependencies)
 └── README.md
 ```
+
+---
+
+### Maintenance boundaries
+
+- Keep Chrome APIs, DHIS2 session state, agent orchestration, and tool execution in `background.js`; those paths share safety gates and transactional state.
+- Put browser-independent parsing and decision helpers in `background/core.js` so they can be unit tested without mocking Chrome.
+- Put presentation metadata shared by the service worker and panel in `shared/tool-catalog.js`. Do not create another tool-name/label map in either runtime.
+- Add a tool by defining its schema in `TOOLS`, implementing it in `executeTool()`, selecting it in `getContextualTools()`, and adding one shared catalog record. The router derives itself and the tests fail on missing or duplicate records.
 
 ---
 
@@ -231,8 +250,9 @@ dhis2-AI/
 No build step — pure HTML / CSS / JS.
 
 1. Edit source files.
-2. `chrome://extensions/` → click the refresh button on the extension card.
-3. Reload the DHIS2 tab.
+2. Run `npm run check` and `npm test`.
+3. `chrome://extensions/` → click the refresh button on the extension card.
+4. Reload the DHIS2 tab.
 
 Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district). Every feature in this README has been verified against that instance.
 
@@ -248,5 +268,3 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 ## License
 
 [MIT](LICENSE) — free to use, fork, modify, and redistribute. Built for the DHIS2 community.
-
-
