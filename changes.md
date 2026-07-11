@@ -2034,3 +2034,190 @@ reused, never recreated, and never dodged via name variants**.
 growth-chart scaffold, every postMetadataPayload caller (shared self-healing — strictly
 additive), and the per-turn write-auth gate (strictly more accurate). No result shapes
 changed; existing success paths byte-identical.
+
+## 35. Program-indicator deep test (MCH scenario): widget visibility, boundary correctness, real parser grammar (v2.8.9)
+
+**Files:** `background.js`, `manifest.json`
+**Functions:** `_buildAndPostProgramIndicator`, `executeManageProgramIndicators` (create/update/get/audit/bulk_fix/bulk_fix_expressions), `createFullProgram` (embedded program_indicators), `lintProgramIndicatorExpression`, `VALID_PI_D2_FUNCS`, `KB_PI_GRAMMAR`, `manage_program_indicators` schema
+**Type of change:** Bug fixes + capability (found by driving the full MCH indicator→data→dashboard flow through the real tools)
+
+**Scenario that exposed the defects (2026-07-10, play 2.42.5.1):** built the user's
+"Maternal and Child Health (MCH) Program" out end-to-end with the extension's own tools —
+12 WHO-ANC-DAK-derived complex program indicators, 5 shown in the Tracker Capture
+"Indicators" widget, a 12-woman tracker cohort (12 enrollments, 67 events) entered via
+dhis2_query tracker bundles, analytics run, and a 6-tile dashboard (COLUMN, LINE,
+PIVOT_TABLE, SINGLE_VALUE, STACKED_COLUMN + text) via manage_dashboards. Three tool defects
+surfaced and were fixed at the root:
+
+1. **`displayInForm` was unsupported and silently wiped.** The indicator schema had no way
+   to put an indicator in the right-side data-entry "Indicators" widget, and because the
+   metadata import replaces the full object, ANY update/bulk_fix through the tool reset a
+   widget-visible indicator back to hidden.
+   **Fix:** new `indicator.display_in_form` field (create + update); `_buildAndPostProgramIndicator`
+   always serializes `displayInForm`; update, bulk_fix and bulk_fix_expressions fetch and
+   thread the existing flag through; `get` returns it. Round-trip proven on 2.42.5.1 before
+   coding (probe import → GET displayInForm:true → delete).
+
+2. **ENROLLMENT indicators were created with EVENT_DATE analytics boundaries** (hard-coded
+   pair). Verified live consequences: each enrollment is counted in EVERY period containing
+   one of its events (a first-trimester-booking indicator returned 58 with only 25
+   enrollments in the program), and `d2:count()`-style filters see only same-period events —
+   "women with 4+ ANC contacts" returned 0 forever.
+   **Fix:** boundary target now follows the analytics type (ENROLLMENT_DATE for enrollment
+   PIs, EVENT_DATE for event PIs) in BOTH `_buildAndPostProgramIndicator` and
+   create_program's embedded-PI path; updating an indicator's analytics_type regenerates the
+   pair; **audit** now flags existing ENROLLMENT PIs with EVENT_DATE-only boundaries.
+   After delete+recreate through the fixed tool: 4+ANC 0→12, first-trimester 58→14, IFA
+   44→20 (all ≤ 25 enrollments — sane).
+
+3. **The d2-function whitelist matched the docs, not the parser.** The docs list floor/ceil/
+   round/modulus/addDays/left/right/substring/split/concatenate/length/validatePattern/
+   inOrgUnitGroup/lastEventDate/zScore* for PIs — the actual ANTLR parser on BOTH 2.42.5.1
+   and 2.43.0-1 rejects every one of them ("Item d2:<fn>( not supported for this type of
+   expression"); `d2:hasValue` parses in FILTERS only. The lint therefore passed expressions
+   the server then bounced with a generic error (cost: 1 wasted RTT + vague hint), and the
+   OUG{} hint recommended the equally-unsupported d2:inOrgUnitGroup.
+   **Fix:** whitelist reduced to the 16 parser-verified functions; the documented-but-rejected
+   set gets an instant local error with a targeted workaround (rounding → plain arithmetic +
+   `decimals`; org-unit scoping → the visualization's ou dimension); hasValue-in-expression
+   caught locally; KB_PI_GRAMMAR rewritten to the verified sets + a display_in_form section.
+
+**Verification (all live on play 2.42.5.1 via the chrome-shim harness driving the real
+executeTool):** `mch-pi-drive.js` 26/26 (12 complex PIs incl. d2:daysBetween first-trimester,
+d2:count 4+ visits, d2:countIfValue IFA — with one model-style self-correction on a rejected
+boolean literal; displayInForm exact per indicator; description-only update preserves the
+widget flag), `mch-pi-retry.js` 3/3 (d2:floor now blocked locally with the decimals hint;
+corrected gestational-age expression creates widget-visible), `mch-data-entry.js` 7/7 (91
+tracker objects imported through dhis2_query bundle rewrite), `mch-fix-enrollment-pis.js`
+13/13 (audit flags → delete → recreate → ENROLLMENT_DATE on server → analytics values sane),
+`mch-dashboard.js` (dashboard ON7Mo5bJtd8: 6 tiles, 11 PI dimension items, add_items
+non-destructive). Regressions: e2e-happy-path 8/8 (full agentic loop incl. PI create),
+auth-gate unit suite 18/18, `node --check` clean.
+
+**Scope of impact:** manage_program_indicators (all actions), create_program's embedded
+program_indicators, PI lint + manuals. Event-type PI behavior unchanged except the new
+always-serialized `displayInForm:false` default, which matches DHIS2's own default.
+
+## 36. Growth-chart transcript autopsy: scoped "yes" authorization, growth dataStore guard, routing trigger, anti-"tool doesn't exist" refusals (v2.8.10)
+
+**Files:** `background.js`, `manifest.json`
+**Functions:** `classifyWriteAuthorization`, `requireWriteAuth`, dhis2_query guard chain,
+`getContextualTools` (wantsGrowthChartIntent), `buildSystemPrompt` (wantsGrowthChartPrompt),
+`resetConversationForNewThread` fields
+**Type of change:** Bug fixes — write-gate design + tool routing (found via the user's
+growth-chart transcript on localhost:8081, v2.8.7 build)
+
+**The transcript, distilled (all reproduced live):**
+1. "set up the child growth data store ID based of these data elements" → the growth-chart
+   tool was never surfaced (intent regex needed chart/plugin words; "data store" wasn't a
+   trigger), so the model treated it as a generic dataStore write and asked namespace/key.
+2. The model then hand-wrote a config into an INVENTED namespace (`childGrowthPlugin`) with a
+   made-up shape (including BMI/nutrition DEs the plugin never reads) via raw dhis2_query —
+   nothing blocked it. The plugin only reads `captureGrowthChart/config`, so "it's not
+   working" with no error anywhere.
+3. The per-turn write refusal made the model conclude — and TELL the user, twice — that
+   `manage_growth_chart_plugin` "does not exist in my environment".
+4. Worst: after proposing the growth-chart configure and getting "yes", the model spent that
+   authorization on `manage_metadata(delete dataElements/<BMI Z-score>)` + remove_from_stage
+   — a destructive delete the user never asked for, unblocked because ANY bare "yes" granted
+   turn-wide broad write access.
+
+**Fixes:**
+- **Scoped affirmations (gate redesign):** `requireWriteAuth` now RECORDS every refusal
+  (`dhis2.lastRefusedWrite` = tool/action/turn). If the next turn is a BARE affirmation
+  ("yes", "go ahead", "do it", …), `classifyWriteAuthorization` returns
+  `scope:'scoped', tool:<the refused tool>` instead of broad: only that tool may write; any
+  other gated write (including raw dhis2_query writes) is refused with "the user's bare
+  'yes' authorizes ONLY <tool>(<action>) — call it now". The first matching call widens the
+  scope to broad for the rest of the turn, so legitimate follow-up writes of the same plan
+  still work. Affirmations with substantive content ("yes, and also delete X") and bare
+  affirmations with no pending proposal stay broad (unchanged behavior). Proposal memory is
+  turn-scoped (expires unless redeemed on the immediately-next turn) and cleared on new
+  threads. Turn counting lives in `classifyWriteAuthorization` — the shared per-turn entry
+  point of the agentic loop and the harness.
+- **Growth dataStore guard:** dhis2_query now BLOCKS non-GET requests to any dataStore
+  namespace matching /growth/i (DELETE of non-official junk namespaces stays allowed for
+  cleanup) and redirects to manage_growth_chart_plugin with the canonical-namespace
+  explanation.
+- **Anti-hallucination refusal wording:** every gate refusal now states the tool "IS
+  available and working — this is a per-turn authorization gate, NOT a missing tool", and
+  instructs retrying THE SAME call after confirmation, never a substitute tool.
+- **Routing trigger:** "growth" + "data store/datastore" now surfaces
+  manage_growth_chart_plugin (tool selection AND the 3-line system-prompt routing stub). The
+  lazy two-tier manual design is untouched — the stub stays decide-time-only; full usage
+  docs still arrive via the first-call manual gate.
+- **Instance repair (localhost:8081):** BMI Z-score restored to the Child Growth stage
+  (sortOrder 7), junk `childGrowthPlugin` namespace deleted, canonical
+  `captureGrowthChart/config` verified intact.
+
+**Verification:** `test-growth-chart-flow.js` against localhost:8081 — 19/19: turn-1 phrasing
+surfaces the tool + prompt stub; POST/PUT to invented AND official growth namespaces blocked
+with redirect (junk-namespace DELETE still allowed); "choose the … plugin" stays read_only;
+refusal wording includes availability note and records the proposal; bare "yes" → scoped;
+the delete-BMI disaster call REFUSED; dhis2_query bypass REFUSED; approved configure runs and
+widens scope; config canonical; BMI still in stage; no-proposal "go ahead" stays broad.
+Regressions: auth-gate unit suite 18/18, child-health scenario 20/20 (localhost),
+tomcat-brackets 7/7 (localhost), e2e-happy-path 8/8 (play 2.43). `node --check` clean.
+
+**Scope of impact:** the write gate change affects ALL write tools uniformly and only in the
+bare-affirmation-after-refusal case, where it strictly narrows (never widens) what a "yes"
+can do. Guard + routing changes are additive.
+
+---
+
+## 37. v2.8.11 — Program-rule correctness: cross-turn UID memory, one-rule visibility doctrine (lint + audit), display-name token healing, in-place action updates
+
+**Files:** `background.js`, `manifest.json` (2.8.10 → 2.8.11)
+**Detailed write-up:** `CHANGES_program_rule_correctness.md`
+
+Root-caused and fixed the three failure classes reported from the MCH (play 2.43) and TB
+(localhost) sessions of 2026-07-11:
+
+- **Cross-turn knownIds (`seedKnownIds`):** the verified-UID registry now also harvests
+  `conversationHistory`, so objects the chatbot itself created/read in PRIOR turns pass the
+  UID gate instead of being refused ("have not appeared in any verified source this turn")
+  and forcing pointless re-list calls. Refusal text now also forbids interpreting the gate
+  as evidence an object "is already gone" (observed live: the model told the user an orphaned
+  action was deleted when its DELETE had merely been refused client-side).
+- **In-place rule-action updates (`manage_program_rules` update):** a new actions array now
+  REUSES the existing programRuleAction UIDs positionally, so a SHOWWARNING→DISPLAYTEXT swap
+  updates the row in place — no new action row, no orphan, no post-import DELETE, no 409
+  ("could not automatically delete the old action" is structurally impossible in the N→N
+  case). Surplus-action deletes fall back to `metadata?importStrategy=DELETE` on 409.
+- **Visibility-semantics lint (`lintRuleVisibilitySemantics` + helpers):** DHIS2 has NO
+  "show" action — the TB program was found live with "Show X when Yes" rules carrying
+  HIDEFIELD+SETMANDATORYFIELD on the same field under the positive condition, paired with
+  complementary "Hide X when No" twins: fields hidden in EVERY case / hidden-and-mandatory
+  (the un-selectable multi-select). All three shapes are now hard-refused at lint time in
+  create_program, add_program_rules, manage_program_rules create AND update — including
+  new-vs-EXISTING-rule twins — and `action=audit` reports them on existing programs as
+  `cross_rule_issues` so diagnosis finds the true cause instead of inventing "DHIS2
+  rendering issues". Manuals (KB_PROGRAM_RULE_SYNTAX, KB_CREATE_PROGRAM_DETAILS, both wire
+  schemas) teach the one-rule doctrine explicitly.
+- **Display-name token healing (`resolveRuleTokenBindings`):** tokens are sanitized before
+  matching, so `A{Date of Birth}` resolves to the TEA "Date of Birth" and is auto-rewritten
+  to `A{date_of_birth}` (reported as `rule_token_rewrites`) instead of refusing the whole
+  create_program ("references unresolved variable(s)"). `A{}` on a data element heals to
+  `#{}`; tokens matching an existing PRV's sanitized name rewrite onto that PRV.
+- **Update-path token validation:** `manage_program_rules(action=update)` with a changed
+  condition now resolves #{}/A{} tokens against the program (auto-creating PRVs, healing
+  display names) and REFUSES unknown tokens — previously such an update saved a rule that
+  silently never fires.
+- **Instance repair (localhost:8081, TB program):** the five broken "Show …" twin rules
+  deleted via the fixed tool path; the correct one-rule hide set remains; audit clean.
+
+**Verification:** unit suite 27/27 (lint + resolver, incl. the exact live TB rule shapes and
+regression checks for legit hide/mandate-inverse pairs and HIDEALLFIELDS sugar); live E2E
+through the real preflight+executeTool layer: localhost:8081 (2.42, Tomcat-strict URLs)
+32/32 and play stable-2-43-0-1 28/28 — display-name-token create heals + PRV auto-created;
+broken pair refused with NOTHING imported; twin-of-existing refused naming the existing rule;
+audit flags the live TB contradictions; repair delete works; cross-turn history UID passes
+the gate then write-auth asks + scoped "yes" updates FIRST TRY; action UID identical after
+DISPLAYTEXT swap with exactly 1 action row server-side; update-path token heal + unknown-token
+refusal; full ZZTEST cleanup verified on both servers. `node --check` clean on all scripts.
+
+**Scope of impact:** knownIds change strictly WIDENS accepted UIDs (to what the model can
+already see in its context) — hallucinated-UID protection is unchanged for genuinely unseen
+IDs. The semantics lint only refuses combinations that are always wrong (hidden-in-every-case,
+hidden-and-mandatory, duplicate twins). Token healing only rewrites when a unique match
+exists; ambiguous/unknown tokens still refuse exactly as before.
