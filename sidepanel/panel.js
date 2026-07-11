@@ -72,6 +72,7 @@
     openrouter:  { url: 'https://openrouter.ai/api/v1', model: 'anthropic/claude-sonnet-4', keyHint: 'sk-or-...', think: false },
     together:    { url: 'https://api.together.xyz/v1', model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', keyHint: '', think: false },
     groq:        { url: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile', keyHint: 'gsk_...', think: false },
+    grok:        { url: 'https://api.x.ai/v1', model: 'grok-4.5', keyHint: 'xai-...', think: false },
     custom:      { url: '', model: '', keyHint: '', think: false },
   };
 
@@ -849,6 +850,25 @@
     if (!isLocal && !key) {
       showKeyStatus('This provider requires an API key. Paste it above, or pick "Ollama (local)".', true);
       return;
+    }
+
+    // Ask Chrome for host access to remote provider origins so background
+    // fetches aren't CORS-blocked on APIs that don't send permissive CORS
+    // headers (built-in presets happen to, arbitrary custom endpoints may not).
+    // Must fire synchronously from the Save click to count as a user gesture;
+    // already-granted origins resolve silently without a prompt. Denial is
+    // non-fatal — the save proceeds and CORS-friendly APIs still work.
+    const permissionOrigins = [];
+    for (const raw of [baseUrl, visionBase]) {
+      if (!raw || isLocalUrlValue(raw)) continue;
+      try { permissionOrigins.push(new URL(raw).origin + '/*'); } catch {}
+    }
+    if (permissionOrigins.length && chrome.permissions?.request) {
+      try {
+        chrome.permissions.request({ origins: permissionOrigins }, () => {
+          void chrome.runtime.lastError;
+        });
+      } catch {}
     }
 
     const tasks = [];

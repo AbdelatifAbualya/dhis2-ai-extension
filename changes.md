@@ -2225,3 +2225,64 @@ already see in its context) — hallucinated-UID protection is unchanged for gen
 IDs. The semantics lint only refuses combinations that are always wrong (hidden-in-every-case,
 hidden-and-mandatory, duplicate twins). Token healing only rewrites when a unique match
 exists; ambiguous/unknown tokens still refuse exactly as before.
+
+---
+
+## 38. v2.8.12 — xAI Grok provider preset + custom-provider fixes (URL normalization, host-permission grant, reasoning progress)
+
+**Files:** `background.js`, `sidepanel/panel.js`, `sidepanel/panel.html`, `README.md`, `manifest.json`
+**Type of change:** Modified (4 targeted fixes + 1 new provider preset)
+
+### The issue
+
+Connecting xAI Grok (`grok-4.5`) through the **Custom / Other** provider failed even with a
+valid API key. Live-tested against `https://api.x.ai` (2026-07-12): the API itself is fully
+OpenAI-compatible — streaming, `tools`/`tool_choice`, null-content assistant messages, and
+multi-turn tool loops all work, and it sends `access-control-allow-origin: *`. The failures
+were entirely on the extension side:
+
+1. **Bare-domain base URL 404s.** `getChatCompletionsUrl('https://api.x.ai')` built
+   `https://api.x.ai/chat/completions` (missing `/v1`) → HTTP 404 (verified live).
+2. **Docs-copied endpoint URL 404s.** xAI's docs example uses the Responses API
+   (`https://api.x.ai/v1/responses`); pasting that as Base URL built
+   `…/v1/responses/chat/completions` → HTTP 404 "No handler found on route" (verified live).
+3. **No host permission requested for provider origins.** Saving a provider config never
+   called `chrome.permissions.request` for the API origin, so any custom endpoint whose API
+   does NOT send permissive CORS headers is unreachable from the MV3 service worker (x.ai
+   happens to send `*`; arbitrary custom endpoints often don't).
+4. **Reasoning models look frozen.** grok-4.5 streams `delta.reasoning_content` before any
+   `content`/`tool_calls`. The SSE loop ignored that field, so the panel showed no activity
+   for the whole reasoning phase.
+
+### The fixes
+
+**`background.js` — `getChatCompletionsUrl` (~line 64):** strips a trailing `/responses`
+segment (docs-copied Responses endpoint), and appends `/v1` when the URL has no path (bare
+domain) before adding `/chat/completions`. Existing behaviors regression-tested — 11 URL
+shapes verified (Ollama with/without `/v1`, Google bare + prefixed, OpenAI/Groq/OpenRouter,
+x.ai ×4): all normalize correctly.
+
+**`background.js` — SSE loop in `callFireworksStreaming` (~line 8055):** new
+`delta.reasoning_content` handler broadcasts `Reasoning…` / `Reasoning… (N words)`
+AI_THINKING labels (same cadence as the `<think>`-block path: first delta, then every 60).
+Reasoning text is never added to the visible answer.
+
+**`background.js` — `SAVE_PROVIDER_CONFIG` (~line 25786):** `grok` added to
+`ALLOWED_PROVIDERS`.
+
+**`sidepanel/panel.js` — `PROVIDER_PRESETS`:** new `grok` preset
+(`https://api.x.ai/v1`, model `grok-4.5`, key hint `xai-...`).
+**`sidepanel/panel.html`:** new "xAI Grok" option in the provider dropdown.
+
+**`sidepanel/panel.js` — `saveSettings`:** on save, synchronously (within the click gesture)
+calls `chrome.permissions.request` for the remote provider/vision origins
+(`optional_host_permissions` already covers `https://*/*`). Already-granted origins resolve
+silently; denial is non-fatal (CORS-friendly APIs keep working exactly as before).
+
+**Verification:** `node --check` passes on both JS files; live x.ai API tests above; URL
+normalization unit-tested (11/11 pass).
+
+**Scope of impact:** No change for existing configured providers (all previous URL shapes
+normalize identically). New: bare-domain and `/responses` base URLs now work, Grok is a
+one-click preset, custom endpoints without CORS headers become reachable after the
+permission grant, and reasoning-model streams show live progress.

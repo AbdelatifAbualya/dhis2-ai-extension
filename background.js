@@ -6,7 +6,7 @@
 // ── Universal Model Provider ─────────────────────────────────────────────────
 // Default: Ollama (local, no API key, fully offline). Also supports any
 // OpenAI-compatible cloud provider (Fireworks, OpenAI, Anthropic, Google,
-// OpenRouter, Together, Groq, custom) via the same configurable fields:
+// OpenRouter, Together, Groq, xAI Grok, custom) via the same configurable fields:
 //   - providerType: routing hint (anthropic uses /v1/messages; others share OAI path)
 //   - apiBaseUrl:   e.g. http://localhost:11434/v1 (Ollama)
 //                        https://api.openai.com/v1
@@ -16,7 +16,7 @@
 // Vision model is separately configurable for image analysis.
 
 const DEFAULT_PROVIDER_CONFIG = {
-  // ollama|fireworks|openai|anthropic|google|openrouter|together|groq|custom
+  // ollama|fireworks|openai|anthropic|google|openrouter|together|groq|grok|custom
   providerType: 'ollama',
   apiBaseUrl: 'http://localhost:11434/v1',
   modelId: 'llama3.2',
@@ -66,10 +66,20 @@ function getChatCompletionsUrl(baseUrl) {
   let url = (baseUrl || DEFAULT_PROVIDER_CONFIG.apiBaseUrl).replace(/\/+$/, '');
   // If URL already ends with /chat/completions, use as-is
   if (url.endsWith('/chat/completions')) return url;
+  // Users paste full endpoint URLs from provider docs (e.g. xAI's
+  // https://api.x.ai/v1/responses) — strip the endpoint back to the base.
+  url = url.replace(/\/responses$/, '');
   // Google Gemini: bare domain needs /v1beta/openai prefix for OpenAI-compat
   if (url.match(/generativelanguage\.googleapis\.com\/?$/) || url.endsWith('googleapis.com')) {
     return url + '/v1beta/openai/chat/completions';
   }
+  // Bare domain (no path): OpenAI-compatible APIs serve under /v1 — e.g.
+  // https://api.x.ai → https://api.x.ai/v1/chat/completions. Users who really
+  // need a root-path endpoint can enter the full …/chat/completions URL.
+  try {
+    const u = new URL(url);
+    if (u.pathname === '/' || u.pathname === '') url += '/v1';
+  } catch {}
   // If URL ends with /v1, /v1beta/openai, or similar versioned path, append /chat/completions
   return url + '/chat/completions';
 }
@@ -8003,6 +8013,7 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
   let thinkBuffer = '';         // accumulates content until </think> or stream end
   let thinkTokenCount = 0;      // tracks streaming deltas received during think block
   let toolArgTokenCount = 0;    // tracks tool-argument deltas (progress signal for long payloads)
+  let reasoningTokenCount = 0;  // tracks delta.reasoning_content deltas (xAI Grok, DeepSeek-style)
 
   while (true) {
     let readResult;
@@ -8036,6 +8047,21 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
       if (choice.finish_reason) finishReason = choice.finish_reason;
       const delta = choice.delta;
       if (!delta) continue;
+
+      // ── Reasoning deltas ──
+      // Reasoning models on OpenAI-compatible APIs (xAI Grok, DeepSeek-R1)
+      // stream thinking as delta.reasoning_content before any content or
+      // tool_calls arrive. It's not part of the answer — just surface progress
+      // so the panel shows activity instead of looking frozen for minutes.
+      if (delta.reasoning_content) {
+        reasoningTokenCount++;
+        if (reasoningTokenCount === 1) {
+          broadcast({ type: 'AI_THINKING', iteration: iteration + 1, label: 'Reasoning…' });
+        } else if (reasoningTokenCount % 60 === 0) {
+          const approxWords = Math.round(reasoningTokenCount * 0.75);
+          broadcast({ type: 'AI_THINKING', iteration: iteration + 1, label: `Reasoning… (${approxWords} words)` });
+        }
+      }
 
       // ── Tool call deltas ──
       if (delta.tool_calls) {
@@ -25785,7 +25811,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Validate providerType against the known set.
       const ALLOWED_PROVIDERS = new Set([
         'ollama', 'fireworks', 'openai', 'anthropic', 'google',
-        'openrouter', 'together', 'groq', 'custom',
+        'openrouter', 'together', 'groq', 'grok', 'custom',
       ]);
       if (newCfg.providerType && !ALLOWED_PROVIDERS.has(newCfg.providerType)) {
         sendResponse({ error: `Unknown providerType: ${newCfg.providerType}` });
