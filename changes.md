@@ -2162,3 +2162,62 @@ tomcat-brackets 7/7 (localhost), e2e-happy-path 8/8 (play 2.43). `node --check` 
 **Scope of impact:** the write gate change affects ALL write tools uniformly and only in the
 bare-affirmation-after-refusal case, where it strictly narrows (never widens) what a "yes"
 can do. Guard + routing changes are additive.
+
+---
+
+## 37. v2.8.11 — Program-rule correctness: cross-turn UID memory, one-rule visibility doctrine (lint + audit), display-name token healing, in-place action updates
+
+**Files:** `background.js`, `manifest.json` (2.8.10 → 2.8.11)
+**Detailed write-up:** `CHANGES_program_rule_correctness.md`
+
+Root-caused and fixed the three failure classes reported from the MCH (play 2.43) and TB
+(localhost) sessions of 2026-07-11:
+
+- **Cross-turn knownIds (`seedKnownIds`):** the verified-UID registry now also harvests
+  `conversationHistory`, so objects the chatbot itself created/read in PRIOR turns pass the
+  UID gate instead of being refused ("have not appeared in any verified source this turn")
+  and forcing pointless re-list calls. Refusal text now also forbids interpreting the gate
+  as evidence an object "is already gone" (observed live: the model told the user an orphaned
+  action was deleted when its DELETE had merely been refused client-side).
+- **In-place rule-action updates (`manage_program_rules` update):** a new actions array now
+  REUSES the existing programRuleAction UIDs positionally, so a SHOWWARNING→DISPLAYTEXT swap
+  updates the row in place — no new action row, no orphan, no post-import DELETE, no 409
+  ("could not automatically delete the old action" is structurally impossible in the N→N
+  case). Surplus-action deletes fall back to `metadata?importStrategy=DELETE` on 409.
+- **Visibility-semantics lint (`lintRuleVisibilitySemantics` + helpers):** DHIS2 has NO
+  "show" action — the TB program was found live with "Show X when Yes" rules carrying
+  HIDEFIELD+SETMANDATORYFIELD on the same field under the positive condition, paired with
+  complementary "Hide X when No" twins: fields hidden in EVERY case / hidden-and-mandatory
+  (the un-selectable multi-select). All three shapes are now hard-refused at lint time in
+  create_program, add_program_rules, manage_program_rules create AND update — including
+  new-vs-EXISTING-rule twins — and `action=audit` reports them on existing programs as
+  `cross_rule_issues` so diagnosis finds the true cause instead of inventing "DHIS2
+  rendering issues". Manuals (KB_PROGRAM_RULE_SYNTAX, KB_CREATE_PROGRAM_DETAILS, both wire
+  schemas) teach the one-rule doctrine explicitly.
+- **Display-name token healing (`resolveRuleTokenBindings`):** tokens are sanitized before
+  matching, so `A{Date of Birth}` resolves to the TEA "Date of Birth" and is auto-rewritten
+  to `A{date_of_birth}` (reported as `rule_token_rewrites`) instead of refusing the whole
+  create_program ("references unresolved variable(s)"). `A{}` on a data element heals to
+  `#{}`; tokens matching an existing PRV's sanitized name rewrite onto that PRV.
+- **Update-path token validation:** `manage_program_rules(action=update)` with a changed
+  condition now resolves #{}/A{} tokens against the program (auto-creating PRVs, healing
+  display names) and REFUSES unknown tokens — previously such an update saved a rule that
+  silently never fires.
+- **Instance repair (localhost:8081, TB program):** the five broken "Show …" twin rules
+  deleted via the fixed tool path; the correct one-rule hide set remains; audit clean.
+
+**Verification:** unit suite 27/27 (lint + resolver, incl. the exact live TB rule shapes and
+regression checks for legit hide/mandate-inverse pairs and HIDEALLFIELDS sugar); live E2E
+through the real preflight+executeTool layer: localhost:8081 (2.42, Tomcat-strict URLs)
+32/32 and play stable-2-43-0-1 28/28 — display-name-token create heals + PRV auto-created;
+broken pair refused with NOTHING imported; twin-of-existing refused naming the existing rule;
+audit flags the live TB contradictions; repair delete works; cross-turn history UID passes
+the gate then write-auth asks + scoped "yes" updates FIRST TRY; action UID identical after
+DISPLAYTEXT swap with exactly 1 action row server-side; update-path token heal + unknown-token
+refusal; full ZZTEST cleanup verified on both servers. `node --check` clean on all scripts.
+
+**Scope of impact:** knownIds change strictly WIDENS accepted UIDs (to what the model can
+already see in its context) — hallucinated-UID protection is unchanged for genuinely unseen
+IDs. The semantics lint only refuses combinations that are always wrong (hidden-in-every-case,
+hidden-and-mandatory, duplicate twins). Token healing only rewrites when a unique match
+exists; ambiguous/unknown tokens still refuse exactly as before.

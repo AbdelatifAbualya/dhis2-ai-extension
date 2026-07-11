@@ -338,8 +338,10 @@ function destructive404StopOrNull(toolName, action) {
 // EVERY API call must derive from verified data. The chatbot must never
 // construct a path/UID from a guess. dhis2.knownIds is seeded each turn from
 // (a) the user message, (b) page context, (c) inspect-snapshot text, (d)
-// already-loaded program/OU/viz/map metadata, and is extended by every tool
-// result in the same turn.
+// already-loaded program/OU/viz/map metadata, (e) the persisted conversation
+// history — every UID the model can literally see in its context window
+// (objects it created or read in PRIOR turns) counts as verified — and is
+// extended by every tool result in the same turn.
 //
 // Pre-flight checks at the dispatch layer use this set to refuse calls that
 // reference a UID not present anywhere in verified sources — that almost
@@ -373,6 +375,13 @@ function seedKnownIds(userText, ctx, inspectSnapshot) {
   harvestUidsInto(set, dhis2.mapContext);
   harvestUidsInto(set, dhis2.datasetContext);
   harvestUidsInto(set, dhis2.lastFacilityOu);
+  // Cross-turn verified sources: the conversation history (assistant replies +
+  // persisted tool results from PRIOR turns) is context the model legitimately
+  // sees, so any UID in it was either user-supplied or returned by a tool.
+  // Without this, an object the chatbot ITSELF created one turn ago gets
+  // refused as "unknown UID" the next turn — forcing a pointless re-list (or
+  // worse, teaching the model the object no longer exists).
+  harvestUidsInto(set, conversationHistory);
   // System-level UIDs that always exist in DHIS2 instances — pre-add common ones.
   set.add('bjDvmb4bfuf'); // default categoryCombo / attributeCombo
   dhis2.knownIds = set;
@@ -710,8 +719,8 @@ function preflightCheckCall(toolName, args) {
   const unknown = uids.filter(u => !dhis2.knownIds.has(u));
   if (!unknown.length) return null;
   return {
-    _error: `Refused: ${toolName} called with UID(s) that have not appeared in any verified source this turn: ${unknown.join(', ')}.`,
-    _hint: 'Every API call must derive from verified data. The UID(s) above were not in: the user message, page context, inspect logs, or any prior tool result this turn. Possible causes: (a) the UID is hallucinated — call a discovery tool first (search_metadata / list / get_program_info) to find the real UID, (b) the UID came from a stale source — verify it exists. Do NOT construct paths from guesses.',
+    _error: `Refused: ${toolName} called with UID(s) that have not appeared in any verified source: ${unknown.join(', ')}.`,
+    _hint: 'Every API call must derive from verified data. The UID(s) above were not in: the user message, page context, inspect logs, the conversation history, or any prior tool result. Possible causes: (a) the UID is hallucinated — call a discovery tool first (search_metadata / list / get_program_info) to find the real UID, (b) the UID came from a stale source — verify it exists. Do NOT construct paths from guesses. IMPORTANT: this refusal is a client-side gate and says NOTHING about server state — never tell the user the object "is already gone", "was deleted", or "does not exist" based on this refusal.',
     _refused: { tool: toolName, unknown_uids: unknown },
     _known_id_count: dhis2.knownIds.size,
     _scope: 'unknown_uid_in_args',
@@ -4346,7 +4355,7 @@ If user enabled web browsing from UI, this tool should usually be called before 
                   items: {
                     type: 'object',
                     properties: {
-                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages).' },
+                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages). NO SHOW action exists: "show X when C" = ONE HIDEFIELD rule with the NEGATED condition (fields re-appear automatically) — show/hide pairs and HIDEFIELD+SETMANDATORYFIELD on the same field are refused.' },
                       data_element_name: { type: 'string', description: 'Target DE name (resolved to ID automatically)' },
                       tracked_entity_attribute_name: { type: 'string', description: 'Target TEA name for HIDEFIELD on a tracked entity attribute (resolved to ID automatically)' },
                       program_stage_name: { type: 'string', description: 'Target stage NAME (for HIDEPROGRAMSTAGE/CREATEEVENT). In create_program ALWAYS use this — stage IDs are generated during the call and cannot be known in advance; the tool resolves the name to the new stage UID.' },
@@ -4618,7 +4627,7 @@ Actions:
                 items: {
                   type: 'object',
                   properties: {
-                    type: { type: 'string', enum: ['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE', 'SHOWWARNINGINFORMATION', 'HIDEFIELD', 'HIDEPROGRAMSTAGE', 'HIDESECTION', 'HIDEALLFIELDS', 'ASSIGN', 'SETMANDATORYFIELD', 'DISPLAYTEXT', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP', 'CREATEEVENT', 'SENDMESSAGE'], description: 'Action type. HIDEPROGRAMSTAGE hides an entire stage tab (needs program_stage_id). HIDESECTION hides a section within a stage (needs program_stage_section_id). HIDEALLFIELDS = chatbot-internal sugar: pass exclude_data_element_ids: [<trigger DE id>] and the tool auto-expands into HIDEFIELD per DE in the trigger\'s stage + HIDEPROGRAMSTAGE for every other stage. SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/SHOWWARNINGINFORMATION concatenate static content + evaluated data — put #{var}/A{attr} in data, not content.' },
+                    type: { type: 'string', enum: ['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE', 'SHOWWARNINGINFORMATION', 'HIDEFIELD', 'HIDEPROGRAMSTAGE', 'HIDESECTION', 'HIDEALLFIELDS', 'ASSIGN', 'SETMANDATORYFIELD', 'DISPLAYTEXT', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP', 'CREATEEVENT', 'SENDMESSAGE'], description: 'Action type. HIDEPROGRAMSTAGE hides an entire stage tab (needs program_stage_id). HIDESECTION hides a section within a stage (needs program_stage_section_id). HIDEALLFIELDS = chatbot-internal sugar: pass exclude_data_element_ids: [<trigger DE id>] and the tool auto-expands into HIDEFIELD per DE in the trigger\'s stage + HIDEPROGRAMSTAGE for every other stage. SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/SHOWWARNINGINFORMATION concatenate static content + evaluated data — put #{var}/A{attr} in data, not content. NO SHOW action exists: "show X when C" = ONE hide rule with the NEGATED condition (targets re-appear automatically when it turns false) — show/hide twin rules and HIDEFIELD+SETMANDATORYFIELD on the same field are refused at lint.' },
                     content: { type: 'string', description: 'Static message text shown by SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/SHOWWARNINGINFORMATION/DISPLAYTEXT. Variables placed here are shown LITERALLY — put dynamic refs in `data` instead.' },
                     data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: assigned to the target DE/TEA. SHOWWARNING/SHOWERROR/etc: appended after content (e.g. data="#{maternal_risk_factors}" or data="d2:concatenate(\\"prefix \\", #{a}, \\", \\", #{b})"). The tool auto-moves trailing #{var}/A{attr} from content into data when content has variable refs and data is empty.' },
                     exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE referenced in the condition).' },
@@ -5764,6 +5773,8 @@ const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
 - HIDEFIELD on TEA: use \`tracked_entity_attribute_name\`; on DE: use \`data_element_name\`
 - Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, WARNINGONCOMPLETE, ERRORONCOMPLETE, SHOWWARNINGINFORMATION
 - Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
+- ⛔ **There is NO "show field" action — visibility is ONE hide rule, never a show/hide pair.** Fields, sections and stages are visible by default; a HIDE action hides while its condition is TRUE and the engine re-shows AUTOMATICALLY the moment it turns false. Therefore "show X only when Y is Yes" = EXACTLY ONE rule: \`{ name: "Hide X when Y is not Yes", condition: "!d2:hasValue(#{y}) || #{y} != true", actions: [{ type: "HIDEFIELD", data_element_name: "X" }] }\`. NEVER ALSO create a second "Show X when Y is Yes" rule — a complementary twin hides the target in EVERY case (permanently hidden). NEVER put a HIDE action under the positive/"show" condition. NEVER combine HIDEFIELD and SETMANDATORYFIELD on the same field in one rule (hidden-AND-mandatory renders the field broken/un-selectable in Capture — this is exactly what breaks multi-select option sets). If X must be required when visible, that is a SEPARATE rule: \`{ name: "Require X when Y is Yes", condition: "#{y} == true", actions: [{ type: "SETMANDATORYFIELD", data_element_name: "X" }] }\`. The tool hard-refuses all three broken shapes (phase "lint") — emit the one-rule pattern from the start.
+- 🔎 **"Field shows but can't be used / options not selectable / field never appears" → run \`action=audit\` FIRST.** Its \`cross_rule_issues\` detects hide+mandate contradictions and complementary show/hide twins on existing programs. NEVER blame "a DHIS2 rendering issue" without audit evidence — these symptoms are almost always contradictory program rules.
 - **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE / SHOWWARNINGINFORMATION** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
 - **DISPLAYTEXT** (instructions banner) takes \`content\` only — keep it static.
 - **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
@@ -5779,7 +5790,7 @@ const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
   • is empty or No: \`!d2:hasValue(#{flag}) || #{flag} != true\`
   ⚠ Never write \`#{flag} == false\`, \`== 'true'\`, \`== 'Yes'\`, or \`== 'No'\` — these fail silently on DHIS2.
 - Option-set fields: compare to the option CODE in quotes, e.g. \`#{status} == 'APPROVED'\`. All auto-created PRVs for option-set DEs/TEAs get \`useCodeForOptionSet: true\` (a false value makes #{var} yield the option NAME so \`== 'CODE'\` never matches — a silent, rule-never-fires failure). Auto-generated codes are UPPER_SNAKE of the option name ("Live Birth" → \`LIVE_BIRTH\`). The tool also auto-maps option-NAME literals in conditions/ASSIGN data to their codes (condition_option_rewrites in the result) and flags literals matching neither name nor code (condition_option_advisories) — read those advisories, they mean the rule will never fire as written.
-- ⚠ **Every \`#{name}\` MUST resolve to a programRuleVariable for the rule to fire.** For \`manage_program_rules(action=create)\` on an existing program: just use \`#{sanitized_de_display_name}\` (e.g. DE "Is breathing abnormal" → \`#{is_breathing_abnormal}\`) — the tool auto-creates the PRV by matching the sanitized name to the program's DEs and picks the correct sourceType (CURRENT_EVENT when the rule acts on the same stage, NEWEST_EVENT_PROGRAM otherwise) plus valueType + optionSet from the DE. Pass \`variables:[]\` only if you need to override the source_type, reference a DE whose displayName does not match, or wire a TEI_ATTRIBUTE variable. If a \`#{name}\` does not match any existing PRV or program DE, the tool refuses the POST and returns \`unresolved[]\` with suggestions — correct the name or add an explicit \`variables[]\` entry and retry.`;
+- ⚠ **Every \`#{name}\` MUST resolve to a programRuleVariable for the rule to fire.** For \`manage_program_rules(action=create)\` on an existing program: just use \`#{sanitized_de_display_name}\` (e.g. DE "Is breathing abnormal" → \`#{is_breathing_abnormal}\`) — the tool auto-creates the PRV by matching the sanitized name to the program's DEs and picks the correct sourceType (CURRENT_EVENT when the rule acts on the same stage, NEWEST_EVENT_PROGRAM otherwise) plus valueType + optionSet from the DE. Pass \`variables:[]\` only if you need to override the source_type, reference a DE whose displayName does not match, or wire a TEI_ATTRIBUTE variable. If a \`#{name}\` does not match any existing PRV or program DE, the tool refuses the POST and returns \`unresolved[]\` with suggestions — correct the name or add an explicit \`variables[]\` entry and retry. Display-name tokens (e.g. \`A{Date of Birth}\`, \`#{Danger Signs}\`) are auto-sanitized and rewritten to canonical form (\`A{date_of_birth}\`) — reported as \`rule_token_rewrites\` — but emit the sanitized form from the start.`;
 
 const KB_PI_GRAMMAR = `### Program-Indicator EXPRESSION GRAMMAR (DHIS2 2.41) — read this BEFORE writing any PI
 The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:\` syntax but have DIFFERENT function sets and different semantics. The chatbot lints every PI expression+filter both locally and via DHIS2's /expression/description endpoint before saving — broken PIs are rejected at create-time, not silently saved.
@@ -5836,7 +5847,7 @@ The tool handles the FULL dependency chain atomically and auto-resolves all inte
 - \`assign_all_org_units: true\`: use this WHEN THE USER SAYS "all OUs", "all org units", "all levels", "all facilities", "every org unit" — the tool fetches every org unit server-side in ONE call. DO NOT paginate org units yourself.
 - \`sharing\`: \`{ public_access: "rwrw----", include_current_user: true, user_ids: [...], user_group_ids: [...] }\`. Set \`include_current_user: true\` when the user says "include me", "share with me", "I should have access", etc. Sharing is auto-applied to stages + DEs + option sets + TEAs unless \`apply_to_children: false\`. **DHIS2 only permits data-level sharing (positions 3-4 of the access string) on Program + ProgramStage — DataElement, OptionSet, TrackedEntityAttribute, ProgramIndicator are metadata-only.** The tool strips the data bits automatically for those classes, so a single \`public_access: "rwrw----"\` is safe everywhere.
 - \`stages\`: data elements (with inline \`option_set\` if needed)
-- \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`). Stage-targeting actions (HIDEPROGRAMSTAGE, CREATEEVENT) MUST reference the stage by \`program_stage_name\` (a stage name from this same call) — stage IDs do not exist yet and an unresolvable stage fails the pre-flight lint.
+- \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`). Stage-targeting actions (HIDEPROGRAMSTAGE, CREATEEVENT) MUST reference the stage by \`program_stage_name\` (a stage name from this same call) — stage IDs do not exist yet and an unresolvable stage fails the pre-flight lint. ⛔ Visibility = ONE hide rule per target: there is NO SHOW action (fields re-appear automatically when the hide condition turns false), so NEVER emit show/hide rule pairs, never hide under the positive/"show" condition, and never combine HIDEFIELD + SETMANDATORYFIELD on the same field in one rule — all three shapes are refused at lint time.
 - \`program_indicators\`: indicators with expressions and filters
 
 **Internal dependency order** the tool enforces in the atomic payload (you never build this yourself — it's here so you understand recovery):
@@ -7225,11 +7236,12 @@ Every user message is classified into a write-authorization scope. A problem rep
   p += `
 
 ## Verify-before-call (universal, applies to every tool)
-EVERY tool call MUST derive from data you have already verified in this turn. Verified sources are:
+EVERY tool call MUST derive from data you have already verified. Verified sources are:
 1. The user's message text (UIDs the user pasted).
 2. The page context (current program/TEI/visualization/map IDs from the URL).
 3. Inspect-mode snapshot insights and logs (when present).
 4. Prior tool results in THIS conversation turn.
+5. The conversation history — objects you created or read in PRIOR turns stay verified; reference them directly by the UID from the earlier result instead of re-listing.
 
 When you need to operate on a resource you have not yet seen:
 1. **First call must be a discovery call.** Use \`search_metadata\`, \`manage_program_rules(action=list)\`, \`manage_program_indicators(action=list)\`, \`get_program_info\`, or a list endpoint via \`dhis2_query\` (e.g. \`programs?fields=id,displayName\`).
@@ -15197,32 +15209,71 @@ function sanitizeVariableName(name) {
 // sanitized-name match first, then a UNIQUE prefix match either way round
 // (e.g. #{muac} → DE "MUAC in cm" whose sanitized name muac_in_cm starts with
 // the token). Tokens already backed by an existing PRV name are skipped.
-// Ambiguous or unmatched tokens land in `unresolved` so the caller can REFUSE
-// the import instead of silently creating rules that never fire (E2E-verified
-// failure mode: condition "#{muac} >= 11.5" with no muac PRV imports fine but
-// the rule engine rejects the expression at runtime).
+//
+// The token is SANITIZED before matching, so a display-name token like
+// A{Date of Birth} resolves to the TEA "Date of Birth" and the rule text is
+// auto-rewritten to the canonical sanitized form (A{date_of_birth}) — models
+// routinely emit display names here, and refusing over pure spelling was the
+// single most common create_program failure ("references unresolved
+// variable(s): A{Date of Birth}"). An A{token} that matches a DATA ELEMENT is
+// healed to #{token} (A{} is attribute-only in the rule grammar). Every such
+// rewrite is reported in `rewrites` so callers can surface it.
+//
+// Genuinely ambiguous or unmatched tokens land in `unresolved` so the caller
+// can REFUSE the import instead of silently creating rules that never fire
+// (E2E-verified failure mode: condition "#{muac} >= 11.5" with no muac PRV
+// imports fine but the rule engine rejects the expression at runtime).
 function resolveRuleTokenBindings(rule, deNames, teaNames, existingVarNames = new Set()) {
   const text = `${rule.condition || ''} ${(rule.actions || []).map(a => a.data || '').join(' ')}`;
   const bindings = [];
   const unresolved = [];
+  const rewrites = [];
   const seen = new Set();
+  // sanitize(existing PRV name) → actual PRV name, so a display-name token can
+  // be rewritten onto a PRV that already exists under the sanitized name.
+  const existingBySanitized = new Map();
+  for (const n of existingVarNames) existingBySanitized.set(sanitizeVariableName(n), n);
+  const rewriteToken = (teaOnly, fromToken, toToken, toTeaForm) => {
+    const from = (teaOnly ? 'A{' : '#{') + fromToken + '}';
+    const to = (toTeaForm === undefined ? teaOnly : toTeaForm) ? `A{${toToken}}` : `#{${toToken}}`;
+    if (from === to) return;
+    rule.condition = String(rule.condition || '').split(from).join(to);
+    for (const act of (rule.actions || [])) {
+      if (act.data) act.data = String(act.data).split(from).join(to);
+    }
+    rewrites.push({ from, to });
+  };
   const resolve = (token, teaOnly) => {
-    if (!teaOnly) {
-      for (const n of deNames) if (sanitizeVariableName(n) === token) return { kind: 'de', name: n };
-    }
-    for (const n of teaNames) if (sanitizeVariableName(n) === token) return { kind: 'tea', name: n };
-    const cands = [];
-    if (!teaOnly) {
-      for (const n of deNames) {
+    // Exact sanitized-name match, preferred kind first. An A{} token that
+    // actually names a DATA ELEMENT still matches (kind 'de') and the caller
+    // heals the brace style to #{} — refusing over the wrong prefix helps
+    // nobody.
+    const exact = (names, kind) => {
+      for (const n of names) if (sanitizeVariableName(n) === token) return { kind, name: n };
+      return null;
+    };
+    const prefix = (names, kind) => {
+      const out = [];
+      for (const n of names) {
         const s = sanitizeVariableName(n);
-        if (s.startsWith(token) || token.startsWith(s)) cands.push({ kind: 'de', name: n });
+        if (s.startsWith(token) || token.startsWith(s)) out.push({ kind, name: n });
       }
+      return out;
+    };
+    const kinds = teaOnly
+      ? [[teaNames, 'tea'], [deNames, 'de']]
+      : [[deNames, 'de'], [teaNames, 'tea']];
+    for (const [names, kind] of kinds) {
+      const hit = exact(names, kind);
+      if (hit) return hit;
     }
-    for (const n of teaNames) {
-      const s = sanitizeVariableName(n);
-      if (s.startsWith(token) || token.startsWith(s)) cands.push({ kind: 'tea', name: n });
-    }
-    return cands.length === 1 ? cands[0] : null;
+    // UNIQUE prefix match: preferred kind wins outright; the other kind only
+    // counts when the preferred kind had no candidate at all.
+    const preferred = prefix(kinds[0][0], kinds[0][1]);
+    if (preferred.length === 1) return preferred[0];
+    if (preferred.length > 1) return null;
+    const other = prefix(kinds[1][0], kinds[1][1]);
+    return other.length === 1 ? other[0] : null;
   };
   for (const [re, teaOnly] of [[/#\{([^}]+)\}/g, false], [/A\{([^}]+)\}/g, true]]) {
     for (const m of text.matchAll(re)) {
@@ -15231,12 +15282,26 @@ function resolveRuleTokenBindings(rule, deNames, teaNames, existingVarNames = ne
       if (seen.has(key)) continue;
       seen.add(key);
       if (existingVarNames.has(token)) continue; // already a PRV on the program
-      const b = resolve(token, teaOnly);
-      if (b) bindings.push({ token, ...b });
-      else unresolved.push(teaOnly ? `A{${token}}` : `#{${token}}`);
+      const sanToken = sanitizeVariableName(token);
+      // Display-name/casing variant of an existing PRV → rewrite onto it.
+      if (sanToken !== token && existingBySanitized.has(sanToken)) {
+        rewriteToken(teaOnly, token, existingBySanitized.get(sanToken));
+        continue;
+      }
+      const b = resolve(sanToken, teaOnly);
+      if (b) {
+        // Canonicalize: sanitized token, #{} for DEs / A{} for TEAs.
+        const wantTeaForm = b.kind === 'tea';
+        if (sanToken !== token || wantTeaForm !== teaOnly) {
+          rewriteToken(teaOnly, token, sanToken, wantTeaForm);
+        }
+        bindings.push({ token: sanToken, ...b });
+      } else {
+        unresolved.push(teaOnly ? `A{${token}}` : `#{${token}}`);
+      }
     }
   }
-  return { bindings, unresolved };
+  return { bindings, unresolved, rewrites };
 }
 
 // DHIS2 icon search is prefix-matched against the keyword tree (e.g. the
@@ -18046,6 +18111,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const prvCreated = {}; // track created variables by name
   let ruleConditionAdvisories = [];
   let ruleConditionRewrites = [];
+  let ruleTokenRewrites = [];
   let ruleAutoGuards = [];
 
   if (args.program_rules?.length) {
@@ -18062,6 +18128,20 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         phase: 'lint',
         errors: lintErrors,
         _hint: 'Fix the condition(s) using the suggested canonical form, then retry.',
+      };
+    }
+
+    // Pre-flight: visibility semantics — hide+mandate contradictions, show/hide
+    // twin rules, inverted "Show X" rules. These import fine and break only in
+    // front of the data-entry user, so they are hard errors here.
+    const semanticErrors = lintRuleVisibilitySemantics(args.program_rules);
+    if (semanticErrors.length) {
+      return {
+        success: false,
+        _error: `Program rule semantics lint failed (${semanticErrors.length}): ${semanticErrors.join(' | ')}`,
+        phase: 'lint',
+        errors: semanticErrors,
+        _hint: 'Rewrite the flagged rules as ONE hide rule per target (condition = the HIDE case) and retry the whole create_program. Do not work around this by re-wording rule names.',
       };
     }
 
@@ -18155,9 +18235,11 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         }
       }
       // Resolve every #{}/A{} token in condition + action data to a DE/TEA
-      // (exact sanitized name, then unique prefix). The PRV is created under
-      // the TOKEN name so the expression resolves exactly as written.
-      const { bindings, unresolved } = resolveRuleTokenBindings(rule, deNamesAll, teaNamesAll);
+      // (exact sanitized name, then unique prefix; display-name tokens are
+      // auto-rewritten to the canonical sanitized form). The PRV is created
+      // under the TOKEN name so the expression resolves exactly as written.
+      const { bindings, unresolved, rewrites } = resolveRuleTokenBindings(rule, deNamesAll, teaNamesAll);
+      if (rewrites.length) ruleTokenRewrites.push({ rule: rule.name, rewrites });
       if (unresolved.length) {
         return {
           success: false,
@@ -18443,6 +18525,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     ...(ruleAutoGuards.length ? { auto_guarded_conditions: ruleAutoGuards } : {}),
     ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
     ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
+    ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
   };
 
   // Record successful program create in the per-turn registry so a duplicate
@@ -19720,6 +19803,29 @@ async function addProgramRules(args) {
     };
   }
 
+  // Pre-flight: visibility semantics — checked against BOTH the batch itself
+  // and the rules already on the program (a "Show X when Yes" twin of an
+  // existing "Hide X when No" is the classic broken pattern). A failed
+  // existing-rules read degrades to batch-only linting rather than blocking.
+  {
+    const existingRulesResp = await safeDhis2Fetch(
+      `programRules?filter=program.id:eq:${args.program_id}&fields=id,name,condition,programRuleActions%5BprogramRuleActionType,dataElement%5Bid,displayName%5D,trackedEntityAttribute%5Bid,displayName%5D,programStage%5Bid,displayName%5D,programStageSection%5Bid,displayName%5D%5D&pageSize=100`
+    );
+    const semanticErrors = lintRuleVisibilitySemantics(
+      args.program_rules,
+      existingRulesResp._error ? [] : (existingRulesResp.programRules || [])
+    );
+    if (semanticErrors.length) {
+      return {
+        success: false,
+        _error: `Program rule semantics lint failed (${semanticErrors.length}): ${semanticErrors.join(' | ')}`,
+        phase: 'lint',
+        errors: semanticErrors,
+        _hint: 'Rewrite as ONE hide rule per target (condition = the HIDE case); mandatory-when-visible goes in a separate SETMANDATORYFIELD-only rule with the positive condition. Then retry. Do not work around this by re-wording rule names.',
+      };
+    }
+  }
+
   // Auto-rewrite SHOWWARNING content + expand HIDEALLFIELDS sugar before processing actions.
   // Side effects: PUT each affected stage with compulsory→false; auto-append a sibling
   // SETMANDATORYFIELD rule that re-mandates those DEs when the trigger condition is false.
@@ -19812,6 +19918,7 @@ async function addProgramRules(args) {
   const deNamesAll = Object.keys(deNameToId);
   const teaNamesAll = Object.keys(teaNameToId);
   const autoGuardedConditions = [];
+  const ruleTokenRewrites = [];
   for (const rule of args.program_rules) {
     // Bare `#{x} < n` fires on EMPTY fields (empty coerces to 0) — wrap with
     // d2:hasValue so warnings/hides don't trigger on a blank form.
@@ -19823,10 +19930,12 @@ async function addProgramRules(args) {
       }
     }
     // Resolve #{}/A{} tokens (condition + action data) to program DEs/TEAs —
-    // exact sanitized name, then unique prefix; tokens naming an existing PRV
-    // pass through. Unresolved tokens REFUSE the import (rules with unknown
+    // exact sanitized name, then unique prefix; display-name tokens are
+    // auto-rewritten to canonical form; tokens naming an existing PRV pass
+    // through. Unresolved tokens REFUSE the import (rules with unknown
     // variables save fine but never fire).
-    const { bindings, unresolved } = resolveRuleTokenBindings(rule, deNamesAll, teaNamesAll, existingVarNames);
+    const { bindings, unresolved, rewrites } = resolveRuleTokenBindings(rule, deNamesAll, teaNamesAll, existingVarNames);
+    if (rewrites.length) ruleTokenRewrites.push({ rule: rule.name, rewrites });
     if (unresolved.length) {
       return {
         success: false,
@@ -19993,6 +20102,7 @@ async function addProgramRules(args) {
       ...(autoGuardedConditions.length ? { auto_guarded_conditions: autoGuardedConditions } : {}),
       ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
       ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
+      ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
     },
   };
 }
@@ -20630,9 +20740,98 @@ async function executeManageProgramRules(args, ctxProgramId) {
       }
     }
 
+    // Visibility semantics on the merged rule: refuse an update that would
+    // leave the rule hiding + mandating the same field, or "showing" a field
+    // by hiding it (same checks as create — see lintRuleVisibilitySemantics).
+    if (merged.actions) {
+      const semanticErrors = lintRuleVisibilitySemantics([
+        { name: merged.name, condition: merged.condition, actions: merged.actions },
+      ]);
+      if (semanticErrors.length) {
+        return {
+          success: false,
+          _error: `Program rule semantics lint failed: ${semanticErrors.join(' | ')}`,
+          phase: 'lint',
+          errors: semanticErrors,
+          _hint: 'Rewrite as ONE hide rule per target (condition = the HIDE case); mandatory-when-visible goes in a separate SETMANDATORYFIELD-only rule with the positive condition. Then retry.',
+        };
+      }
+    }
+
+    // Token resolution on the UPDATED condition / action data. Without this,
+    // an update whose new condition references #{a_de_never_variable_ized}
+    // saves fine but the rule silently never fires — the same failure class
+    // the create paths already refuse. Display-name tokens are auto-rewritten
+    // to canonical form; tokens that resolve to a program DE/TEA get their
+    // PRV auto-created; genuinely unknown tokens refuse the update.
+    const tokenRewrites = [];
+    if (args.rule.condition !== undefined || (merged.actions || []).some(a => a.data)) {
+      const [progStructResp, prvResp] = await Promise.all([
+        safeDhis2Fetch(`programs/${pid}?fields=programStages%5Bid,programStageDataElements%5BdataElement%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D%5D,programTrackedEntityAttributes%5BtrackedEntityAttribute%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D`),
+        safeDhis2Fetch(`programRuleVariables?filter=program.id:eq:${pid}&fields=id,name&pageSize=200`),
+      ]);
+      if (!progStructResp._error && !prvResp._error) {
+        const deInfo = new Map();   // displayName → {id, valueType, optionSet, stageId}
+        for (const ps of (progStructResp.programStages || [])) {
+          for (const psde of (ps.programStageDataElements || [])) {
+            const de = psde.dataElement;
+            if (de?.id && !deInfo.has(de.displayName)) deInfo.set(de.displayName, { ...de, stageId: ps.id });
+          }
+        }
+        const teaInfo = new Map();
+        for (const ptea of (progStructResp.programTrackedEntityAttributes || [])) {
+          const tea = ptea.trackedEntityAttribute;
+          if (tea?.id) teaInfo.set(tea.displayName, tea);
+        }
+        const existingVarNames = new Set((prvResp.programRuleVariables || []).map(v => v.name));
+        for (const v of (merged.variables || [])) if (v.name) existingVarNames.add(v.name);
+        const pseudoRule = { name: merged.name, condition: merged.condition, actions: merged.actions || [] };
+        const { bindings, unresolved, rewrites } = resolveRuleTokenBindings(
+          pseudoRule, [...deInfo.keys()], [...teaInfo.keys()], existingVarNames
+        );
+        if (unresolved.length) {
+          return {
+            success: false,
+            phase: 'lint',
+            _error: `Updated rule "${merged.name}" references unresolved variable(s): ${unresolved.join(', ')} — no program rule variable, data element or attribute of this program matches. The rule would save but NEVER fire. Nothing was changed.`,
+            unresolved,
+            available_variables: [...existingVarNames].map(n => `#{${n}}`),
+            available_data_elements: [...deInfo.keys()].map(n => `#{${sanitizeVariableName(n)}}`),
+            available_attributes: [...teaInfo.keys()].map(n => `A{${sanitizeVariableName(n)}}`),
+            _hint: 'Reference an existing program rule variable, or #{sanitized_data_element_name} / A{sanitized_attribute_name} of this program. Fix the token(s) and retry.',
+          };
+        }
+        merged.condition = pseudoRule.condition;
+        tokenRewrites.push(...rewrites);
+        // Auto-create the PRVs the (re)written expression needs.
+        for (const b of bindings) {
+          if (b.kind === 'de') {
+            const de = deInfo.get(b.name);
+            allPRVs.push({
+              id: generateDhis2Uid(), name: b.token, program: { id: pid },
+              programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+              valueType: de.valueType || 'TEXT',
+              useCodeForOptionSet: !!de.optionSet,
+              dataElement: { id: de.id },
+              ...(de.stageId ? { programStage: { id: de.stageId } } : {}),
+            });
+          } else {
+            const tea = teaInfo.get(b.name);
+            allPRVs.push({
+              id: generateDhis2Uid(), name: b.token, program: { id: pid },
+              programRuleVariableSourceType: 'TEI_ATTRIBUTE',
+              valueType: tea.valueType || 'TEXT',
+              useCodeForOptionSet: !!tea.optionSet,
+              trackedEntityAttribute: { id: tea.id },
+            });
+          }
+        }
+      }
+    }
+
     // Decide which actions to use
     const actionsToPost = merged.actions
-      ? merged.actions  // new set provided — will replace old ones
+      ? merged.actions  // new set provided — will replace all old ones
       : (existing.programRuleActions || []).map(a => ({
           // re-use existing actions unchanged
           _existingId: a.id,
@@ -20645,9 +20844,17 @@ async function executeManageProgramRules(args, ctxProgramId) {
           evaluation_time: a.evaluationTime,
         }));
 
+    // Reuse the existing action UIDs positionally when a new actions array is
+    // provided: the metadata import (mergeMode REPLACE) then UPDATES each old
+    // row in place — type/content/target all swap cleanly — instead of
+    // creating new rows and orphaning the old ones. The orphan-delete used to
+    // 409 ("could not automatically delete the old action") and leave junk
+    // programRuleAction rows behind; with ID reuse the common N→N action swap
+    // produces zero orphans and zero DELETE calls.
+    const reusableOldIds = merged.actions ? [...oldActionIds] : [];
     const newActionIds = [];
     for (const act of actionsToPost) {
-      const praId = act._existingId || generateDhis2Uid();
+      const praId = act._existingId || reusableOldIds.shift() || generateDhis2Uid();
       newActionIds.push(praId);
       const pra = {
         id: praId,
@@ -20711,19 +20918,29 @@ async function executeManageProgramRules(args, ctxProgramId) {
 
     const result = await postMetadataPayload(payload, false);
 
-    // Delete orphaned old actions that the update replaced.
+    // Delete surplus old actions the update no longer uses (only possible when
+    // the new actions array is SHORTER than the old one — equal/longer arrays
+    // reuse every old UID in place and leave nothing to clean up).
     const orphan_cleanup = { attempted: [], deleted: [], failed: [] };
     if (result.success && merged.actions && oldActionIds.length) {
       const toDelete = oldActionIds.filter(id => !newActionIds.includes(id));
       orphan_cleanup.attempted = toDelete;
       for (const aid of toDelete) {
-        const d = await safeDhis2Fetch(`programRuleActions/${aid}`, { method: 'DELETE', allowEmptyBody: true });
+        let d = await safeDhis2Fetch(`programRuleActions/${aid}`, { method: 'DELETE', allowEmptyBody: true });
+        if (d._error) {
+          // Raw DELETE on programRuleActions can 409 right after the rule
+          // import; the metadata import path handles the reference bookkeeping
+          // and succeeds where the raw endpoint conflicts.
+          d = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL',
+            { method: 'POST', body: { programRuleActions: [{ id: aid }] } });
+        }
         if (d._error) orphan_cleanup.failed.push({ id: aid, error: d._error });
         else orphan_cleanup.deleted.push(aid);
       }
     }
 
     const response = { ...result, updated_rule_id: args.rule_id, rule_name: merged.name, backup: backup.block };
+    if (tokenRewrites.length) response.rule_token_rewrites = tokenRewrites;
     if (orphan_cleanup.attempted.length) {
       response.orphan_cleanup = orphan_cleanup;
       if (orphan_cleanup.failed.length) {
@@ -21028,6 +21245,14 @@ async function executeManageProgramRules(args, ctxProgramId) {
       }
     }
 
+    // ── Cross-rule visibility-semantics scan ──
+    // Same checks the create/update paths enforce at lint time, run over the
+    // EXISTING rule set: hide+mandate contradictions inside one rule, show/hide
+    // twin rules that hide the same target under complementary conditions
+    // (target permanently hidden — the classic "field shows but can't be
+    // used" / "field never appears" complaint), and duplicate hide rules.
+    const crossRuleIssues = lintRuleVisibilitySemantics(allRules);
+
     // Build fix hints for the conditions that only need a lint-driven rewrite.
     const conditionFixHints = [];
     for (const r of ruleIssues) {
@@ -21056,14 +21281,15 @@ async function executeManageProgramRules(args, ctxProgramId) {
       variable_issues: varIssues.slice(0, 200),
       _has_more_rule_issues: ruleIssues.length > 200,
       _has_more_variable_issues: varIssues.length > 200,
+      ...(crossRuleIssues.length ? { cross_rule_issues: crossRuleIssues.slice(0, 50) } : {}),
       ...(fetchErrors.length ? { _fetch_errors: fetchErrors } : {}),
       ...(conditionFixHints.length ? {
         _condition_fix_hints: conditionFixHints,
         _condition_fix_action: `manage_program_rules(action=bulk_fix_conditions, fixes=[...])`,
       } : {}),
-      summary: (ruleIssues.length + varIssues.length) === 0
+      summary: (ruleIssues.length + varIssues.length + crossRuleIssues.length) === 0
         ? `All ${allRules.length} rules and ${allVars.length} variables are structurally sound.`
-        : `Found ${ruleIssues.length} rule(s) and ${varIssues.length} variable(s) with issues. ${conditionFixHints.length ? 'Use bulk_fix_conditions to apply the suggested condition rewrites.' : 'Fix action targets / variable references via update/create/delete.'} NEVER use dhis2_query PUT/PATCH for program rule metadata.`,
+        : `Found ${ruleIssues.length} rule(s), ${varIssues.length} variable(s)${crossRuleIssues.length ? `, and ${crossRuleIssues.length} cross-rule contradiction(s)` : ''} with issues. ${crossRuleIssues.length ? 'Cross-rule contradictions make fields permanently hidden or hidden-and-mandatory — fix by DELETING the redundant "Show …" twin rule (there is no SHOW action in DHIS2; fields re-appear when the hide condition is false). ' : ''}${conditionFixHints.length ? 'Use bulk_fix_conditions to apply the suggested condition rewrites.' : 'Fix action targets / variable references via update/create/delete.'} NEVER use dhis2_query PUT/PATCH for program rule metadata.`,
     };
   }
 
@@ -21210,6 +21436,157 @@ function lintProgramRuleCondition(condition, ruleName) {
   }
 
   return null;
+}
+
+// ── Visibility-semantics lint ───────────────────────────────────────────────
+// DHIS2 has NO "show field" action: everything is visible by default, HIDEFIELD
+// / HIDESECTION / HIDEPROGRAMSTAGE hide while their condition is TRUE and the
+// engine re-shows automatically when it turns false. Models that don't know
+// this emit catastrophic rule sets — observed live (TB program, 2026-07-11):
+//   • "Show Primary Symptoms when X is Yes"  = HIDEFIELD + SETMANDATORYFIELD
+//     on the SAME field under the positive condition → selecting Yes hides the
+//     field AND makes it mandatory at once (multi-select rendered unusable);
+//   • paired with "Hide Primary Symptoms when X is No" (complementary
+//     condition, same target) → the field is hidden in EVERY case.
+// These import fine and fail only in front of the health worker, so they are
+// blocked at lint time. Handles both the tool-input shape ({actions:[{type,
+// data_element_name,...}]}) and the server shape ({programRuleActions:[...]}).
+
+const PR_HIDE_ACTION_TYPES = new Set(['HIDEFIELD', 'HIDESECTION', 'HIDEPROGRAMSTAGE']);
+
+// Reduce a condition to the comparison that drives it: strip whitespace noise,
+// the two canonical emptiness-guard prefixes, and redundant outer parens.
+function _prCoreCondition(cond) {
+  let s = String(cond || '').replace(/\s+/g, ' ').trim();
+  let m = s.match(/^!\s*d2:hasValue\(\s*([#A]\{[^}]+\})\s*\)\s*\|\|\s*(.+)$/i);
+  if (m) s = m[2].trim();
+  else if ((m = s.match(/^d2:hasValue\(\s*([#A]\{[^}]+\})\s*\)\s*&&\s*(.+)$/i))) s = m[2].trim();
+  for (;;) {
+    if (!(s.startsWith('(') && s.endsWith(')'))) break;
+    let depth = 0, wraps = true;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')') { depth--; if (depth === 0 && i < s.length - 1) { wraps = false; break; } }
+    }
+    if (!wraps) break;
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+function _prConditionsComplementary(a, b) {
+  const ca = _prCoreCondition(a), cb = _prCoreCondition(b);
+  if (!ca || !cb) return false;
+  const parse = (s) => {
+    const m = s.match(/^([#A]\{[^}]+\})\s*(==|!=)\s*(.+)$/);
+    return m ? { ref: m[1], op: m[2], lit: m[3].trim() } : null;
+  };
+  const pa = parse(ca), pb = parse(cb);
+  if (pa && pb && pa.ref === pb.ref && pa.lit === pb.lit && pa.op !== pb.op) return true;
+  return `!(${ca})` === cb || `!(${cb})` === ca;
+}
+
+function _prConditionsEquivalent(a, b) {
+  const ca = _prCoreCondition(a), cb = _prCoreCondition(b);
+  return !!ca && ca === cb;
+}
+
+// Normalize one rule (either shape) → { name, condition, actions:[{type, keys:Set,
+// label, hasHideAllFields}] }. `keys` holds every identifier the action's target
+// answers to (kind-prefixed UID and sanitized display name) so input-shape rules
+// (names) and server-shape rules (ids) can be matched against each other.
+function _prNormalizeRuleForLint(rule) {
+  const rawActions = rule.programRuleActions || rule.actions || [];
+  const actions = [];
+  let hasHideAllFields = false;
+  for (const a of rawActions) {
+    const type = a.programRuleActionType || a.type;
+    if (type === 'HIDEALLFIELDS') hasHideAllFields = true;
+    const keys = new Set();
+    let label = null;
+    const add = (prefix, id, name) => {
+      if (id) keys.add(`${prefix}:${id}`);
+      if (name) { keys.add(`${prefix}:${sanitizeVariableName(name)}`); label = label || name; }
+    };
+    add('de', a.data_element_id || a.dataElement?.id, a.data_element_name || a.dataElement?.displayName);
+    add('tea', a.tei_attribute_id || a.trackedEntityAttribute?.id, a.tracked_entity_attribute_name || a.trackedEntityAttribute?.displayName);
+    add('stage', a.program_stage_id || a.programStage?.id, a.program_stage_name || a.programStage?.displayName);
+    add('section', a.program_stage_section_id || a.programStageSection?.id, a.programStageSection?.displayName);
+    if (!label) label = a.data_element_id || a.tei_attribute_id || a.program_stage_id || a.program_stage_section_id
+      || a.dataElement?.id || a.trackedEntityAttribute?.id || a.programStage?.id || a.programStageSection?.id || null;
+    actions.push({ type, keys, label });
+  }
+  return { id: rule.id || null, name: rule.name || '', condition: rule.condition || '', actions, hasHideAllFields };
+}
+
+const _prKeysIntersect = (a, b) => { for (const k of a) if (b.has(k)) return true; return false; };
+
+const PR_ONE_RULE_DOCTRINE = 'DHIS2 has NO SHOW action — fields/sections/stages are visible by default, and a HIDE action automatically un-hides when its condition turns false. "Show X only when C" = exactly ONE rule: condition = the HIDE case (e.g. !d2:hasValue(#{c}) || #{c} != true), action = HIDEFIELD on X. If X must also be mandatory when visible, add a SEPARATE rule with the positive condition and SETMANDATORYFIELD only. NEVER create show/hide rule pairs and NEVER put HIDEFIELD under the "show" condition.';
+
+// Lint new rules (tool-input or server shape) against each other AND against
+// the program's existing rules. Returns an array of error strings — callers
+// refuse the import when any are present.
+function lintRuleVisibilitySemantics(newRules, existingRules = []) {
+  const errors = [];
+  const news = (newRules || []).map(_prNormalizeRuleForLint);
+  const olds = (existingRules || []).map(_prNormalizeRuleForLint);
+
+  // 1. Same-rule contradiction: HIDE + SETMANDATORYFIELD on the same target.
+  for (const r of news) {
+    for (const hide of r.actions) {
+      if (!PR_HIDE_ACTION_TYPES.has(hide.type)) continue;
+      const mand = r.actions.find(a => a.type === 'SETMANDATORYFIELD' && _prKeysIntersect(a.keys, hide.keys));
+      if (mand) {
+        errors.push(`Rule "${r.name}": contradictory actions — ${hide.type} and SETMANDATORYFIELD both target "${hide.label}" in the SAME rule, so when the condition is true the field is hidden AND mandatory at once (the field renders broken/un-fillable in Capture). ${PR_ONE_RULE_DOCTRINE}`);
+      }
+    }
+    // 2. Inverted "Show X" rule: the rule's name promises to SHOW the very
+    // target its action HIDES while the condition is true.
+    if (!r.hasHideAllFields && /^\s*(show|display|reveal|unhide)\b/i.test(r.name)) {
+      const nameSan = `_${sanitizeVariableName(r.name)}_`;
+      for (const act of r.actions) {
+        if (!PR_HIDE_ACTION_TYPES.has(act.type)) continue;
+        if (act.label && nameSan.includes(`_${sanitizeVariableName(String(act.label))}_`)) {
+          errors.push(`Rule "${r.name}" claims to SHOW "${act.label}" but its ${act.type} action HIDES it while the condition is true — inverted semantics. ${PR_ONE_RULE_DOCTRINE}`);
+          break;
+        }
+      }
+    }
+  }
+
+  // 3. Complementary / duplicate hide pairs on the same target (batch-internal
+  // and new-vs-existing). Complementary pair ⇒ the target is hidden in EVERY
+  // case; duplicate ⇒ redundant twin rule.
+  const hideEntries = (list, isNew) => {
+    const out = [];
+    for (const r of list) {
+      for (const act of r.actions) {
+        if (PR_HIDE_ACTION_TYPES.has(act.type)) out.push({ rule: r, act, isNew });
+      }
+    }
+    return out;
+  };
+  const newHides = hideEntries(news, true);
+  const allHides = [...newHides, ...hideEntries(olds, false)];
+  const flagged = new Set();
+  for (const a of newHides) {
+    for (const b of allHides) {
+      if (a === b || a.rule === b.rule) continue;
+      if (a.act.type !== b.act.type || !_prKeysIntersect(a.act.keys, b.act.keys)) continue;
+      const pairKey = [a.rule.name, b.rule.name, a.act.label].sort().join('|');
+      if (flagged.has(pairKey)) continue;
+      if (_prConditionsComplementary(a.rule.condition, b.rule.condition)) {
+        flagged.add(pairKey);
+        const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
+        errors.push(`Rule "${a.rule.name}" and ${bDesc} BOTH hide "${a.act.label}" under COMPLEMENTARY conditions ("${a.rule.condition}" vs "${b.rule.condition}") — together they hide it in every case, so the field/stage never appears. Keep ONLY the rule whose condition expresses when to HIDE and drop the other. ${PR_ONE_RULE_DOCTRINE}`);
+      } else if (_prConditionsEquivalent(a.rule.condition, b.rule.condition)) {
+        flagged.add(pairKey);
+        const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
+        errors.push(`Rule "${a.rule.name}" duplicates ${bDesc}: same ${a.act.type} target "${a.act.label}" under an equivalent condition. Do not create duplicate rules — keep one.`);
+      }
+    }
+  }
+  return errors;
 }
 
 // ── Auto-guard bare `< / <=` numeric comparisons against EMPTY fields ──
@@ -21767,6 +22144,28 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   );
   if (progResp._error) {
     return { success: false, _error: `Could not load program ${programId}: ${progResp._error}`, phase: 'preflight' };
+  }
+
+  // 1b. Visibility-semantics lint against the batch AND the program's existing
+  // rules (show/hide twins, hide+mandate contradictions, inverted "Show X"
+  // rules). A failed existing-rules read degrades to batch-only linting.
+  {
+    const existingRulesResp = await safeDhis2Fetch(
+      `programRules?filter=program.id:eq:${programId}&fields=id,name,condition,programRuleActions%5BprogramRuleActionType,dataElement%5Bid,displayName%5D,trackedEntityAttribute%5Bid,displayName%5D,programStage%5Bid,displayName%5D,programStageSection%5Bid,displayName%5D%5D&pageSize=100`
+    );
+    const semanticErrors = lintRuleVisibilitySemantics(
+      rules,
+      existingRulesResp._error ? [] : (existingRulesResp.programRules || [])
+    );
+    if (semanticErrors.length) {
+      return {
+        success: false,
+        _error: `Program rule semantics lint failed (${semanticErrors.length}): ${semanticErrors.join(' | ')}`,
+        phase: 'lint',
+        errors: semanticErrors,
+        _hint: 'Rewrite as ONE hide rule per target (condition = the HIDE case); mandatory-when-visible goes in a separate SETMANDATORYFIELD-only rule with the positive condition. Then retry. Do not work around this by re-wording rule names.',
+      };
+    }
   }
 
   // 2a/2b. Apply the shared rule-action sugar: auto-move #{var}/A{attr} from
