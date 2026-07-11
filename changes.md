@@ -2286,3 +2286,64 @@ normalization unit-tested (11/11 pass).
 normalize identically). New: bare-domain and `/responses` base URLs now work, Grok is a
 one-click preset, custom endpoints without CORS headers become reachable after the
 permission grant, and reasoning-model streams show live progress.
+
+---
+
+## 39. v2.8.13 — create_program stops dead-looping on one bad rule (skip-and-continue + mechanical circuit breaker)
+
+**File:** `background.js` (+ `manifest.json` version bump 2.8.12 → 2.8.13)
+**Type of change:** Modified — `createFullProgram` rule-building path + the agentic loop
+
+### The reported failure
+
+A full TB tracker prompt (5 attributes, 3 stages, ~6 rules, 3 PIs) on **grok-4.5**
+looped: `create_program` failed with `references unresolved variable(s):
+A{date_of_birth} … Nothing was imported`, then the model re-sent the identical
+call ~12 times (each `BLOCKED`), creating nothing. The user confirmed the SAME
+prompt/model/instance worked at LLM **temperature 0.1 but not 0**.
+
+### Root cause — two defects
+
+1. **Trigger:** one unresolvable rule token made the WHOLE atomic create fail
+   ("Nothing was imported") — the entire program was discarded over one rule.
+2. **Amplifier:** the repeated-failure guard only *asks* the model to stop. At
+   temperature 0 the model is deterministic (same history → same output), so it
+   re-emitted the byte-identical blocked call until the 50-iteration budget was
+   gone. 0.1's randomness merely let it stumble onto a self-consistent payload.
+
+### Fixes
+
+**A. Skip-and-continue (`createFullProgram`, ~line 18150 + ~18270 + ~18620).**
+Each rule is built into local scratch; a rule that references an unresolved
+variable / unresolvable stage / unresolvable section / broken boolean condition
+is now SKIPPED and recorded, instead of aborting the whole import. Program +
+stages + DEs + TEAs + all valid rules + indicators still import. A **successful**
+result carries `_skipped_rules`, `_skipped_rules_warning`, and `_next_step`
+(add them via `manage_program_rules`), so the model doesn't retry the create.
+The cross-rule visibility-semantics lint stays a hard error (ambiguous which rule
+to drop) but is bounded by fix B.
+
+**B. Mechanical circuit breaker (agentic loop, ~line 25040 + ~25185).** The loop
+counts per-tool guard blocks; after `TOOL_BLOCK_DISABLE_THRESHOLD` (3) a tool is
+removed from the wire schema for the rest of the turn and a hard directive is
+injected, so a deterministic model physically cannot re-emit the call and must
+answer. Bounds ANY deterministic tool loop; legitimate fix-and-retry (different
+signature) is never counted.
+
+Panel: `create_metadata` summary now appends "(N rules skipped — need follow-up)";
+a disabled tool shows "Stopped retrying … disabled for this turn".
+
+### Verification
+
+Offline, real code in a Node VM shim (no server): resolver unit test; skip E2E
+(DOB present → created; DOB misnamed → bad rule skipped, program created); broken
+condition skipped; fully-valid 3-rule program → all 3 created / 0 skipped;
+circuit-breaker E2E through the real loop with a deterministic fake provider →
+tool disabled after 3 blocks, loop ends at 6 calls (budget 50) with a final
+answer. `node --check background.js` passes.
+
+### Scope of impact
+
+Valid programs are unchanged (0 false skips). Programs with a bad rule now import
+(minus that rule) instead of failing wholesale. Deterministic retry loops are
+mechanically bounded across all tools, not just create_program.

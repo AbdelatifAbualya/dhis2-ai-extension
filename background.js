@@ -5857,13 +5857,15 @@ The tool handles the FULL dependency chain atomically and auto-resolves all inte
 - \`assign_all_org_units: true\`: use this WHEN THE USER SAYS "all OUs", "all org units", "all levels", "all facilities", "every org unit" — the tool fetches every org unit server-side in ONE call. DO NOT paginate org units yourself.
 - \`sharing\`: \`{ public_access: "rwrw----", include_current_user: true, user_ids: [...], user_group_ids: [...] }\`. Set \`include_current_user: true\` when the user says "include me", "share with me", "I should have access", etc. Sharing is auto-applied to stages + DEs + option sets + TEAs unless \`apply_to_children: false\`. **DHIS2 only permits data-level sharing (positions 3-4 of the access string) on Program + ProgramStage — DataElement, OptionSet, TrackedEntityAttribute, ProgramIndicator are metadata-only.** The tool strips the data bits automatically for those classes, so a single \`public_access: "rwrw----"\` is safe everywhere.
 - \`stages\`: data elements (with inline \`option_set\` if needed)
-- \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`). Stage-targeting actions (HIDEPROGRAMSTAGE, CREATEEVENT) MUST reference the stage by \`program_stage_name\` (a stage name from this same call) — stage IDs do not exist yet and an unresolvable stage fails the pre-flight lint. ⛔ Visibility = ONE hide rule per target: there is NO SHOW action (fields re-appear automatically when the hide condition turns false), so NEVER emit show/hide rule pairs, never hide under the positive/"show" condition, and never combine HIDEFIELD + SETMANDATORYFIELD on the same field in one rule — all three shapes are refused at lint time.
+- \`program_rules\`: rules with \`#{sanitized_name}\` conditions and actions (\`data_element_name\` or \`tracked_entity_attribute_name\`). Stage-targeting actions (HIDEPROGRAMSTAGE, CREATEEVENT) MUST reference the stage by \`program_stage_name\` (a stage name from this same call) — stage IDs do not exist yet. ⛔ Visibility = ONE hide rule per target: there is NO SHOW action (fields re-appear automatically when the hide condition turns false), so NEVER emit show/hide rule pairs, never hide under the positive/"show" condition, and never combine HIDEFIELD + SETMANDATORYFIELD on the same field in one rule — all three shapes are refused at lint time. ⚠ **Every \`A{}\`/\`#{}\` in a rule MUST name an attribute/data element you ALSO define in this same call** (e.g. a rule using \`A{date_of_birth}\` requires a \`program_attributes\` entry named "Date of Birth"). An individual rule that references an unresolvable variable/stage/section is now **SKIPPED** — the program and everything else still import — and reported back under \`_skipped_rules\` with a \`_next_step\`. When you see \`_skipped_rules\`: do NOT re-run create_program; report the created program to the user AND add each skipped rule with \`manage_program_rules(action=create, program_id=...)\` referencing a real variable (or tell the user which attribute is missing).
 - \`program_indicators\`: indicators with expressions and filters
 
 **Internal dependency order** the tool enforces in the atomic payload (you never build this yourself — it's here so you understand recovery):
 Options → OptionSets → TrackedEntityAttributes → DataElements → Program + ProgramStages (stages carry programStageDataElements) → ProgramRuleVariables → ProgramRuleActions → ProgramRules → (follow-up POST) ProgramIndicators. Sharing attaches to Program/Stage in full; DE/OS/TEA/PI get metadata-only. OrgUnit assignment rides inside the Program object.
 
-**If create_program returns \`success: false\`, read \`errors[]\` — and remember the import is ATOMIC: NOTHING was created.** Never call add_program_rules / add_stage / manage_custom_forms with IDs from a failed attempt (they don't exist — you'll get a 404); fix the input and re-issue the whole create_program.
+**\`success: true\` with \`_skipped_rules\`** = the program WAS created but some rules could not be built (unresolvable variable/stage/section). This is NOT a failure and NOT a reason to retry create_program — the returned \`program_id\`/\`stage_ids\` are real. Follow \`_next_step\`: add each skipped rule via \`manage_program_rules\`, then summarize for the user what exists and what still needs the missing reference.
+
+**If create_program returns \`success: false\`, read \`errors[]\` — and remember the import is ATOMIC: NOTHING was created.** Never call add_program_rules / add_stage / manage_custom_forms with IDs from a failed attempt (they don't exist — you'll get a 404); fix the input and re-issue the whole create_program. Do NOT re-send a byte-identical create_program call after a failure — an exact repeat is refused, and after repeated identical failures the tool is disabled for the rest of the turn; change the failing input or stop and report.
 - "Data sharing is not enabled for X" → the tool now strips data bits itself; if you still see this, a custom class changed — retry with \`sharing.apply_to_children: false\` and then run \`manage_metadata(action=update_sharing)\` per object.
 - "Property X is required" on a specific klass → add that field to the matching input slot and retry the WHOLE create_program (the rollback is atomic).
 - Validation rejects ONE stage (name clash, bad DE) → keep the other stage in a retry minus the bad one, then use \`add_stage\` / \`add_data_elements_to_stage\` afterwards to fix the rejected piece.
@@ -18139,28 +18141,38 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   let ruleConditionRewrites = [];
   let ruleTokenRewrites = [];
   let ruleAutoGuards = [];
+  // Rules that could not be built (unresolved variable/stage/section refs) are
+  // SKIPPED — the rest of the program still imports — and reported here so the
+  // model can heal them via manage_program_rules against the created program.
+  // Rationale: one bad token in one rule must NOT nuke a whole 3-stage program
+  // (verified failure: a deterministic model then retries the identical create
+  // forever, creating nothing — the TB program loop, 2026-07-12).
+  const skippedRules = [];
 
+  // Rules that survive the per-rule condition lint. A rule with a known-broken
+  // boolean pattern is SKIPPED (recorded) rather than aborting the whole import,
+  // so one bad condition can't sink an entire program (and can't trap a
+  // deterministic model in an identical-retry loop).
+  let buildableRules = args.program_rules || [];
   if (args.program_rules?.length) {
-    // Pre-flight: lint conditions for known-broken boolean patterns.
-    const lintErrors = [];
+    // Pre-flight: lint conditions for known-broken boolean patterns → skip failers.
+    buildableRules = [];
     for (const rule of args.program_rules) {
       const err = lintProgramRuleCondition(rule.condition, rule.name);
-      if (err) lintErrors.push(err);
-    }
-    if (lintErrors.length) {
-      return {
-        success: false,
-        _error: `Program rule condition lint failed (${lintErrors.length}): ${lintErrors.join(' | ')}`,
-        phase: 'lint',
-        errors: lintErrors,
-        _hint: 'Fix the condition(s) using the suggested canonical form, then retry.',
-      };
+      if (err) {
+        skippedRules.push({ rule: rule.name, reason: 'condition_lint', detail: err });
+      } else {
+        buildableRules.push(rule);
+      }
     }
 
     // Pre-flight: visibility semantics — hide+mandate contradictions, show/hide
     // twin rules, inverted "Show X" rules. These import fine and break only in
-    // front of the data-entry user, so they are hard errors here.
-    const semanticErrors = lintRuleVisibilitySemantics(args.program_rules);
+    // front of the data-entry user. Unlike the per-rule checks above, this one
+    // is about combinations of rules (which rule to drop is ambiguous), so it
+    // stays a hard error — but the loop's circuit breaker now bounds any retry
+    // storm it might trigger.
+    const semanticErrors = lintRuleVisibilitySemantics(buildableRules);
     if (semanticErrors.length) {
       return {
         success: false,
@@ -18250,7 +18262,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     const deNamesAll = Object.keys(deUidMap);
     const teaNamesAll = Object.keys(teaUidMap);
     const autoGuardedConditions = [];
-    for (const rule of args.program_rules) {
+    for (const rule of buildableRules) {
       // Bare `#{x} < n` fires on EMPTY fields (empty coerces to 0) — wrap with
       // d2:hasValue so warnings/hides don't trigger on a blank form.
       {
@@ -18264,41 +18276,30 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       // (exact sanitized name, then unique prefix; display-name tokens are
       // auto-rewritten to the canonical sanitized form). The PRV is created
       // under the TOKEN name so the expression resolves exactly as written.
+      //
+      // On ANY unresolved token or unbuildable action, the rule is SKIPPED
+      // (recorded in skippedRules) instead of aborting the whole import. To keep
+      // a skipped rule from leaving orphan PRVs/actions behind, everything for
+      // this rule is built into LOCAL scratch first and only committed to the
+      // shared arrays once the whole rule is known to be valid.
       const { bindings, unresolved, rewrites } = resolveRuleTokenBindings(rule, deNamesAll, teaNamesAll);
-      if (rewrites.length) ruleTokenRewrites.push({ rule: rule.name, rewrites });
       if (unresolved.length) {
-        return {
-          success: false,
-          phase: 'lint',
-          _error: `Program rule "${rule.name}" references unresolved variable(s): ${unresolved.join(', ')} — no data element or attribute in this request matches (exactly or by prefix). Nothing was imported.`,
+        skippedRules.push({
+          rule: rule.name,
+          reason: 'unresolved_variable',
           unresolved,
-          available_variables: deNamesAll.map(n => `#{${sanitizeVariableName(n)}}`),
-          available_attributes: teaNamesAll.map(n => `A{${sanitizeVariableName(n)}}`),
-          _hint: 'Use #{sanitized_data_element_name} for DEs and A{sanitized_attribute_name} for TEAs, matching a data element/attribute defined in this same call. Fix the token(s) and retry the whole create_program.',
-        };
-      }
-      for (const b of bindings) {
-        if (b.kind === 'de') pushDePrv(b.token, b.name); else pushTeaPrv(b.token, b.name);
-      }
-
-      // Action-target DEs/TEAs also get a PRV under their sanitized name
-      // (pre-existing behavior — harmless and occasionally referenced later).
-      for (const act of (rule.actions || [])) {
-        if (act.data_element_name && deUidMap[act.data_element_name]) {
-          pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name);
-        }
-        if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) {
-          pushTeaPrv(sanitizeVariableName(act.tracked_entity_attribute_name), act.tracked_entity_attribute_name);
-        }
+          detail: `references variable(s) with no matching data element or attribute in this program: ${unresolved.join(', ')}`,
+        });
+        continue;
       }
 
       // Build program rule + separate actions (top-level programRuleActions array)
       const prUid = generateDhis2Uid();
-      const actionRefs = [];
+      const pendingActions = [];
+      let ruleSkip = null;
 
       for (const act of (rule.actions || [])) {
         const praUid = generateDhis2Uid();
-        actionRefs.push({ id: praUid });
         const pra = {
           id: praUid,
           programRuleActionType: act.type,
@@ -18316,36 +18317,53 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         if (stageId) pra.programStage = { id: stageId };
         if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
 
-        // Fail FAST (before any server call) on stage-targeting actions that
-        // could not resolve — the server rejects the whole atomic import with
-        // "ProgramRuleAction: ProgramStage cannot be null" otherwise.
+        // Stage-targeting actions that could not resolve would make the server
+        // reject the whole atomic import ("ProgramRuleAction: ProgramStage
+        // cannot be null") — skip the RULE rather than the whole program.
         if ((act.type === 'HIDEPROGRAMSTAGE' || act.type === 'CREATEEVENT') && !pra.programStage) {
-          return {
-            success: false,
-            phase: 'lint',
-            _error: `Program rule "${rule.name}" has a ${act.type} action whose target stage could not be resolved${act.program_stage_name || act.program_stage_id ? ` from "${act.program_stage_name || act.program_stage_id}"` : ' (no stage reference given)'}. Nothing was imported.`,
-            valid_stage_names: stages.map(s => s.name),
-            _hint: 'Stage IDs do not exist yet during create_program — reference the stage by NAME via program_stage_name (one of valid_stage_names) and the tool resolves it to the client-generated stage UID. Fix the action and retry the whole create_program.',
+          ruleSkip = {
+            rule: rule.name,
+            reason: 'unresolved_stage',
+            detail: `${act.type} action's target stage could not be resolved${act.program_stage_name || act.program_stage_id ? ` from "${act.program_stage_name || act.program_stage_id}"` : ' (no stage reference given)'}; valid stage names: ${stages.map(s => s.name).join(', ')}`,
           };
+          break;
         }
         if (act.type === 'HIDESECTION' && !pra.programStageSection) {
-          return {
-            success: false,
-            phase: 'lint',
-            _error: `Program rule "${rule.name}" has a HIDESECTION action without a program_stage_section_id — create_program does not create sections, so there is no section to hide. Nothing was imported.`,
-            _hint: 'Use HIDEFIELD per data element (or HIDEPROGRAMSTAGE with program_stage_name for a whole stage) instead, or create the sections first and add the rule afterwards via manage_program_rules.',
+          ruleSkip = {
+            rule: rule.name,
+            reason: 'unresolved_section',
+            detail: 'HIDESECTION needs a program_stage_section_id, but create_program does not create sections. Use HIDEFIELD per data element or HIDEPROGRAMSTAGE, or add this rule after the sections exist.',
           };
+          break;
         }
-        allProgramRuleActions.push(pra);
+        pendingActions.push(pra);
       }
 
+      if (ruleSkip) { skippedRules.push(ruleSkip); continue; }
+
+      // ── Commit: the whole rule is valid, so publish its PRVs, actions, rule ──
+      if (rewrites.length) ruleTokenRewrites.push({ rule: rule.name, rewrites });
+      for (const b of bindings) {
+        if (b.kind === 'de') pushDePrv(b.token, b.name); else pushTeaPrv(b.token, b.name);
+      }
+      // Action-target DEs/TEAs also get a PRV under their sanitized name
+      // (pre-existing behavior — harmless and occasionally referenced later).
+      for (const act of (rule.actions || [])) {
+        if (act.data_element_name && deUidMap[act.data_element_name]) {
+          pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name);
+        }
+        if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) {
+          pushTeaPrv(sanitizeVariableName(act.tracked_entity_attribute_name), act.tracked_entity_attribute_name);
+        }
+      }
+      for (const pra of pendingActions) allProgramRuleActions.push(pra);
       allProgramRules.push({
         id: prUid,
         name: rule.name,
         description: rule.description || '',
         program: { id: programUid },
         condition: rule.condition,
-        programRuleActions: actionRefs, // ID refs only, not full objects
+        programRuleActions: pendingActions.map(a => ({ id: a.id })), // ID refs only
       });
     }
 
@@ -18552,6 +18570,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
     ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
     ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
+    ...(skippedRules.length ? { skipped_rules: skippedRules } : {}),
   };
 
   // Record successful program create in the per-turn registry so a duplicate
@@ -18589,8 +18608,24 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     };
   }
 
+  // Skipped rules: the program IS created — surface them prominently so the
+  // model heals them against the now-real program instead of retrying the whole
+  // create (which, at temperature 0, would reproduce the identical failure).
+  let skipInfo = {};
+  if (skippedRules.length) {
+    const teaHint = skippedRules.some(r => r.reason === 'unresolved_variable')
+      ? ` Available attributes: ${Object.keys(teaUidMap).map(n => `A{${sanitizeVariableName(n)}}`).join(', ') || '(none)'}. Available data elements: ${Object.keys(deUidMap).map(n => `#{${sanitizeVariableName(n)}}`).join(', ') || '(none)'}.`
+      : '';
+    skipInfo = {
+      _skipped_rules: skippedRules,
+      _skipped_rules_warning: `The program was created successfully, but ${skippedRules.length} program rule(s) were SKIPPED because they could not be resolved: ${skippedRules.map(r => `"${r.rule}" (${r.detail})`).join('; ')}.`,
+      _next_step: `Do NOT re-run create_program. To add the skipped rule(s), call manage_program_rules(action=create, program_id="${programUid}") for each one, referencing an EXISTING variable.${teaHint} If a needed attribute/data element genuinely does not exist, tell the user which one is missing and ask how to proceed. Then give the user a summary that lists what was created AND which rules still need to be added.`,
+    };
+  }
+
   return {
     ...result,
+    ...skipInfo,
     program_id: programUid,
     stage_ids,
     data_element_ids: { ...deUidMap },
@@ -25008,6 +25043,22 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   let emptyResponseCount = 0; // Guard against infinite think-only loops
   let providerStallRetries = 0; // Transparent retries for mid-stream stalls (nothing shown to the user yet)
 
+  // ── Mechanical circuit breaker for deterministic retry loops ────────────────
+  // The repeated-failure guard (preflightCheckCall) only ASKS the model to stop
+  // — it returns an error telling it to change approach. A model at temperature
+  // 0 is deterministic: identical history → identical output, so it re-emits the
+  // exact same blocked call every iteration until the budget is exhausted (the
+  // TB create_program loop, 2026-07-12). Politeness cannot break that; removal
+  // can. Once a tool has been BLOCKED by the guard this many times, it is pulled
+  // from the wire schema for the rest of the turn so the model physically cannot
+  // call it again and is forced to answer or take a different path.
+  const TOOL_BLOCK_DISABLE_THRESHOLD = 3;
+  const toolBlockCounts = new Map();   // toolName → # of preflight blocks this turn
+  const disabledToolNames = new Set(); // tools removed from the wire schema this turn
+  // Wire tools sent to the provider each iteration, minus anything disabled.
+  const effectiveWireTools = () =>
+    disabledToolNames.size ? wireTools.filter(t => !disabledToolNames.has(t?.function?.name)) : wireTools;
+
   // Marker: everything in `messages` from this index on is THIS turn (the user
   // message + any prefetch + every assistant/tool message the loop adds). The
   // array was built as [system, ...conversationHistory, userMsg], and
@@ -25055,7 +25106,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           chunkBuffer += chunk;
           if (!flushTimer) flushTimer = setTimeout(flushChunks, FLUSH_MS);
         }
-      }, wireTools, i);
+      }, effectiveWireTools(), i);
     } catch (provErr) {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       chunkBuffer = '';
@@ -25117,6 +25168,19 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         }
 
         let toolResult;
+        // ── Circuit breaker: a tool disabled earlier this turn is gone from the
+        //    wire schema, but guard against a model that re-emits the call anyway
+        //    (hallucinated tool) — never execute it; return the stop directive.
+        if (disabledToolNames.has(tc.function.name)) {
+          toolResult = {
+            _error: `${tc.function.name} is disabled for the rest of this turn (it was retried too many times with the same failure) and was NOT executed.`,
+            _scope: 'circuit_breaker_tool_disabled',
+            _hint: `Do not call ${tc.function.name} again. Write your final answer now from the results already gathered: what was created (names + IDs), what failed and why, and one recommended next step.`,
+          };
+          broadcast({ type: 'AI_TOOL_DONE', tool: tc.function.name, success: false, summary: `${tc.function.name} is disabled for this turn — not executed`, details: { scope: 'circuit_breaker_tool_disabled' } });
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult) });
+          continue;
+        }
         // ── Manual gate (two-tier tool docs): the FIRST call to a
         //    MANUAL_TOOLS member this turn returns its full usage manual
         //    instead of executing, so the model always reads the complete
@@ -25136,6 +25200,29 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           const preflightStop = preflightCheckCall(tc.function.name, args);
           if (preflightStop) {
             toolResult = preflightStop;
+            // Mechanical circuit breaker: a repeated-failure/HTTP-limit block is
+            // only advisory to the model. Count blocks per tool and, once a tool
+            // trips the threshold, remove it from the wire schema for the rest of
+            // the turn AND inject a hard directive. A deterministic model that
+            // keeps re-emitting the blocked call is then physically unable to,
+            // and must answer or switch tools — breaking the loop for real.
+            const isLoopBlock = preflightStop._scope === 'repeated_identical_failure'
+              || preflightStop._scope === 'same_error_family_limit'
+              || preflightStop._scope === 'http_error_limit_reached';
+            if (isLoopBlock) {
+              const n = (toolBlockCounts.get(tc.function.name) || 0) + 1;
+              toolBlockCounts.set(tc.function.name, n);
+              if (n >= TOOL_BLOCK_DISABLE_THRESHOLD && !disabledToolNames.has(tc.function.name)) {
+                disabledToolNames.add(tc.function.name);
+                console.warn(`[AgenticLoop] Circuit breaker: disabling ${tc.function.name} for this turn after ${n} blocked attempts`);
+                toolResult = {
+                  ...toolResult,
+                  _tool_disabled_this_turn: tc.function.name,
+                  _scope: 'circuit_breaker_tool_disabled',
+                  _hint: `${tc.function.name} has now been DISABLED for the rest of this turn — you attempted it ${n} times and every attempt was blocked with the same error, so it has been removed from your available tools. You CANNOT call it again. Stop retrying and, using ONLY the tool results already in this conversation, write your final answer to the user now: (1) exactly what was created this turn (names + IDs), (2) what failed and the verbatim error, (3) one concrete recommended next step. If earlier steps DID create objects (e.g. a program), report them as successes — do not describe the whole task as failed.`,
+                };
+              }
+            }
           } else {
             try {
               toolResult = await executeTool(tc.function.name, args);
@@ -25177,6 +25264,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         let apiPath = toolResult._apiPath || null;
         if (toolResult._tool_manual) {
           summary = 'Loaded usage manual — validating the call against it';
+        } else if (toolResult._tool_disabled_this_turn) {
+          summary = `Stopped retrying ${toolResult._tool_disabled_this_turn} — it failed repeatedly with the same error and is disabled for the rest of this turn`;
         } else if (toolResult._error) {
           // Show the full error sentence in the inline summary (was 80 chars,
           // which truncated mid-message). The expandable details panel below
@@ -25247,6 +25336,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             if (s.updated) parts.push(`${s.updated} updated`);
             summary = parts.length ? parts.join(', ') : `Import OK`;
             if (toolResult.summary?.program?.name) summary += ` — ${toolResult.summary.program.name}`;
+            // Surface skipped rules so the user sees the program imported but N
+            // rules still need adding (rather than a silent partial success).
+            const skipN = toolResult._skipped_rules?.length || toolResult.summary?.skipped_rules?.length || 0;
+            if (skipN) summary += ` (${skipN} rule${skipN > 1 ? 's' : ''} skipped — need follow-up)`;
           }
         } else if (tc.function.name === 'architect_metadata') {
           if (toolResult._error) {
