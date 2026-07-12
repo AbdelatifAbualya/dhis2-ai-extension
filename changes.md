@@ -2368,3 +2368,28 @@ mechanically bounded across all tools, not just create_program.
 4. **Added `scripts/verify.js`** (`npm run verify`), a dependency-free check that `node --check`s every file, loads the six modules under a `chrome` shim, and asserts the safety-critical gates (write-auth, UID entropy, patient-data privacy path gate, the two normalizers, strict query encoding). Added a minimal `package.json` (no dependencies, no build) and `ARCHITECTURE.md`.
 
 **Scope of impact:** No tool schema, prompt, DHIS2 request shape, or safety gate changed — except the intended `sub-` descendant-trigger restoration. The safety review's heavier recommendations (single tool registry, typed state stores, `Dhis2Client`, `panel.js` split, TypeScript) were deliberately deferred and are listed in `ARCHITECTURE.md`.
+
+---
+
+## 41. create_program correctness — zero-error TB tracker program (COMPLETEENROLLMENT, HIDEOPTION, stage sections, "continue" auth)
+
+**Files:** `src/tools-programs.js`, `src/registry.js`, `src/core.js`.
+**Full detail + playground evidence:** `CHANGES_create_program_correctness.md`.
+
+**Type of change:** Correctness fixes to the create_program flow, proven on the live 2.43 playground.
+
+**Context:** A real session creating the "Tuberculosis Case Surveillance and Treatment" tracker program hit a cascade of failed API calls (a 500/409 on an invalid rule action, repeated "Option cannot be null", missing visual sections). Each root cause was reproduced and fixed via a Node harness running the REAL `executeTool` against `https://play.im.dhis2.org/stable-2-43-0-1`; the full program now imports with **32 API calls, 0 errors** (10 rules, 3 indicators, 5 sections), and all test metadata was cleaned up.
+
+**What changed:**
+
+1. **Invalid program-rule action types can no longer 409 the whole atomic import.** `createFullProgram` now normalizes every action `type` through the new `normalizeRuleActionType()` (`VALID_PR_ACTION_TYPES` whitelist + `PR_ACTION_TYPE_ALIASES`): valid types pass; model-invented `COMPLETEENROLLMENT`/`CLOSEENROLLMENT`/… are **translated to a `SHOWWARNING` completion prompt** (DHIS2 has no complete-enrollment action); anything else is dropped. Adjustments are surfaced in a new `rule_action_fixes` result field. Previously `programRuleActionType: act.type` was passed through unchecked → Jackson enum-deserialization 500/409 that killed the entire import.
+
+2. **HIDEOPTION resolves and binds the option UID.** The action loop resolves the target option from the option set built for `data_element_name` in this same call (exact name → code → forgiving match) and sets `programRuleAction.option`. Unresolvable → the rule is skipped cleanly. `src/registry.js` adds `option_name`/`option_code` to the rule-action schema. Fixes the repeated "Option cannot be null" validation failures.
+
+3. **create_program builds visual stage sections.** Stages accept `sections: [{name, data_elements:[…]}]`; sections are emitted as a **top-level `programStageSections` collection** (stage references by id — nesting them fails with "Invalid reference (ProgramStageSection)"). `src/registry.js` adds `sections` to the stage schema. Previously sections could not be created at all.
+
+4. **"continue" now authorizes writes.** Added `continue` to `WRITE_AUTH_BROAD_RE` and the bare-affirmation regex in `classifyWriteAuthorization()` (next to `proceed`), so the assistant's own suggested word ("Reply 'continue' and I will create…") no longer gets refused. Negation guard still neutralises "don't continue".
+
+**Scope of impact:** Only the create_program / manage_program_rules build paths and the write-auth classifier changed. No other tool altered. The action-type guard and HIDEOPTION resolution make every rule-building path more robust (they can no longer emit an un-deserializable enum or an unbound HIDEOPTION). Not addressed (model behaviour, not a tool bug): the session's guessed icon-key 404s — the circuit breaker correctly stopped those; a create_program-side icon-keyword resolver is a noted follow-up.
+
+**Verification:** Live playground reproduce-then-fix for each error; full TB program imports with 0 API errors; server read-back confirms 10/10 rules (incl. bound HIDEOPTION + translated completion), 3/3 indicators, 5/5 sections; playground left clean; `npm run verify` green.

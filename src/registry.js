@@ -817,11 +817,23 @@ If user enabled web browsing from UI, this tool should usually be called before 
                     },
                     required: ['name', 'value_type']
                   }
+                },
+                sections: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      name: { type: 'string' },
+                      data_elements: { type: 'array', items: { type: 'string' }, description: "Names of this stage's data elements to place in this section (must match names in data_elements above)." }
+                    },
+                    required: ['name', 'data_elements']
+                  },
+                  description: 'Optional visual sections that group the stage\'s data elements (e.g. "Signs and Risk Screening", "Laboratory Investigation"). Each section lists a subset of THIS stage\'s data element NAMES; the tool builds programStageSections so the stage renders as sections in Capture.'
                 }
               },
               required: ['name', 'data_elements']
             },
-            description: 'Stages with data elements (for create_program)'
+            description: 'Stages with data elements and optional visual sections (for create_program)'
           },
           program_rules: {
             type: 'array',
@@ -836,14 +848,16 @@ If user enabled web browsing from UI, this tool should usually be called before 
                   items: {
                     type: 'object',
                     properties: {
-                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages). NO SHOW action exists: "show X when C" = ONE HIDEFIELD rule with the NEGATED condition (fields re-appear automatically) — show/hide pairs and HIDEFIELD+SETMANDATORYFIELD on the same field are refused.' },
+                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, HIDEOPTION. HIDEOPTION hides ONE option of an option-set field — pass data_element_name + option_name (never leave the option unbound). There is NO complete/close-enrollment action; a completion request becomes a SHOWWARNING prompt. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages). NO SHOW action exists: "show X when C" = ONE HIDEFIELD rule with the NEGATED condition (fields re-appear automatically) — show/hide pairs and HIDEFIELD+SETMANDATORYFIELD on the same field are refused.' },
                       data_element_name: { type: 'string', description: 'Target DE name (resolved to ID automatically)' },
                       tracked_entity_attribute_name: { type: 'string', description: 'Target TEA name for HIDEFIELD on a tracked entity attribute (resolved to ID automatically)' },
                       program_stage_name: { type: 'string', description: 'Target stage NAME (for HIDEPROGRAMSTAGE/CREATEEVENT). In create_program ALWAYS use this — stage IDs are generated during the call and cannot be known in advance; the tool resolves the name to the new stage UID.' },
                       program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE on an EXISTING program, e.g. add_program_rules). During create_program use program_stage_name instead.' },
                       content: { type: 'string', description: 'Static message text for SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/DISPLAYTEXT. Variables in content are shown literally — use the data field for dynamic refs.' },
                       data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: target value. SHOWWARNING/SHOWERROR/etc: dynamic content appended after the static content prefix (e.g. data="#{my_de}" or data="d2:concatenate(\\"X=\\", #{a})").' },
-                      exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE).' }
+                      exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE).' },
+                      option_name: { type: 'string', description: "For HIDEOPTION: exact display name of the option to hide (an option of data_element_name's option set created in THIS call)." },
+                      option_code: { type: 'string', description: 'For HIDEOPTION: the option CODE to hide (alternative to option_name).' }
                     },
                     required: ['type']
                   }

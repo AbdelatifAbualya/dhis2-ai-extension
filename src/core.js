@@ -199,7 +199,7 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   + '|style\\s+(?:a|an|the|this|that|it)\\b|lay\\s?out\\s+(?:a|an|the|this)\\b'
   + '|restore|revert|roll ?back|undo|link|unlink'
   + '|enable|disable|turn (?:on|off)|share|grant|revoke|merge|split|rename|migrate|swap|convert|attach|assign|unassign|detach'
-  + '|approve|confirm|proceed|do it|do this|go ahead|just do it'
+  + '|approve|confirm|proceed|continue|do it|do this|go ahead|just do it'
   + '|yes(?:,?\\s*(?:please|do it|go ahead|fix(?: it)?|update|delete|remove))?'
   + '|let\'?s? (?:fix|update|delete|remove|do)'
   + ')\\b',
@@ -266,7 +266,7 @@ function classifyWriteAuthorization(userText) {
     // an answer to THAT proposal — scope the authorization to the proposed
     // tool so it cannot be spent on an unrelated write (observed live: "yes"
     // meant for growth-chart configure spent on deleting a data element).
-    const bareAffirm = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|confirm(?:ed)?|do\s+it|go\s+ahead(?:\s+and\s+(?:do|run)\s+it)?|proceed|go\s+for\s+it|run\s+it|yes,?\s*please)[.!\s]*$/i.test(text);
+    const bareAffirm = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|confirm(?:ed)?|do\s+it|go\s+ahead(?:\s+and\s+(?:do|run)\s+it)?|proceed|continue|go\s+for\s+it|run\s+it|yes,?\s*please)[.!\s]*$/i.test(text);
     const lrw = D.lastRefusedWrite;
     if (bareAffirm && lrw && lrw.tool && lrw.turn === D.turnCounter - 1) {
       return { scope: 'scoped', tool: lrw.tool, action: lrw.action, reason: `bare affirmation — authorization scoped to the write proposed last turn: ${lrw.tool}(${lrw.action})` };

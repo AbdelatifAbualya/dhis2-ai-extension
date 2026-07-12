@@ -1238,7 +1238,8 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const allDataElements = [];
   const allTrackedEntityAttributes = [];
   const optionSetUidMap = {}; // name → uid
-  const optionSetOptionsByName = {}; // option set name → [{name, code}] as BUILT locally
+  const optionSetOptionsByName = {}; // option set name → [{id, name, code}] as BUILT locally
+  const optionSetNameByDeName = {}; // data element name → its inline option set name (for HIDEOPTION)
   const deUidMap = {}; // name → uid
   const teaUidMap = {}; // name → uid
   // Per-class shortName dedupe — DHIS2 enforces shortName uniqueness within
@@ -1259,8 +1260,9 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           allOptions.push(...options);
           allOptionSets.push(optionSet);
           optionSetUidMap[de.option_set.name] = osUid;
-          optionSetOptionsByName[de.option_set.name] = options.map(o => ({ name: o.name, code: o.code }));
+          optionSetOptionsByName[de.option_set.name] = options.map(o => ({ id: o.id, name: o.name, code: o.code }));
         }
+        optionSetNameByDeName[de.name] = de.option_set.name;
       }
       // Build data element (skip duplicates by name)
       if (!deUidMap[de.name]) {
@@ -1544,6 +1546,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // Build program
   const programUid = generateDhis2Uid();
   const stageObjects = [];
+  const allProgramStageSections = []; // top-level collection — DHIS2 rejects sections nested inside the stage
   const stageUids = [];
   const stageRenames = []; // summary for caller: [{original, final}] when renamed
 
@@ -1560,6 +1563,28 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       sortOrder: j + 1,
     }));
 
+    // Optional visual sections: group a subset of this stage's data elements.
+    // DHIS2 renders a stage as sections when programStageSections exist; each
+    // section's dataElements must already be programStageDataElements of the
+    // stage (they are, by construction). UIDs are pre-generated so the atomic
+    // import wires the references. Unknown/empty sections are skipped, not sent.
+    const psSections = [];
+    for (let k = 0; k < (stage.sections || []).length; k++) {
+      const sec = stage.sections[k];
+      const deRefs = (sec && (sec.data_elements || sec.dataElements) || [])
+        .map(n => deUidMap[typeof n === 'string' ? n : (n && n.name)])
+        .filter(Boolean)
+        .map(id => ({ id }));
+      if (!sec || !sec.name || !deRefs.length) continue;
+      psSections.push({
+        id: generateDhis2Uid(),
+        name: sec.name,
+        sortOrder: k + 1,
+        programStage: { id: stageUid },
+        dataElements: deRefs,
+      });
+    }
+
     const stageObj = {
       id: stageUid,
       name: finalStageName,
@@ -1568,6 +1593,10 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       repeatable: stage.repeatable || false,
       programStageDataElements: psdes,
     };
+    if (psSections.length) {
+      for (const s of psSections) allProgramStageSections.push(s);
+      stageObj.programStageSections = psSections.map(s => ({ id: s.id })); // stage refs sections by id
+    }
     if (sharingBlock && applySharingToChildren) {
       stageObj.sharing = sharingBlock;
       stageObj.publicAccess = sharingBlock.public;
@@ -1638,6 +1667,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // (verified failure: a deterministic model then retries the identical create
   // forever, creating nothing — the TB program loop, 2026-07-12).
   const skippedRules = [];
+  const ruleActionFixes = []; // invalid/aliased action types adjusted client-side so the import can't 409 on a bad enum
 
   // Rules that survive the per-rule condition lint. A rule with a known-broken
   // boolean pattern is SKIPPED (recorded) rather than aborting the whole import,
@@ -1789,13 +1819,24 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       let ruleSkip = null;
 
       for (const act of (rule.actions || [])) {
+        // Guard the action type FIRST: an invalid enum (e.g. model-invented
+        // COMPLETEENROLLMENT) 409s the whole atomic import at deserialization,
+        // before validation — so it must never reach the server. Aliases map to
+        // the closest real action; anything unknown is dropped, not sent.
+        const norm = normalizeRuleActionType(act.type, act.content);
+        if (norm.skip) {
+          ruleActionFixes.push({ rule: rule.name, action_type: act.type, outcome: 'dropped', detail: norm.note });
+          continue;
+        }
+        if (norm.note) ruleActionFixes.push({ rule: rule.name, action_type: act.type, outcome: `translated to ${norm.type}`, detail: norm.note });
         const praUid = generateDhis2Uid();
         const pra = {
           id: praUid,
-          programRuleActionType: act.type,
+          programRuleActionType: norm.type,
           programRule: { id: prUid },
         };
-        if (act.content) pra.content = act.content;
+        const actContent = act.content || norm.content;
+        if (actContent) pra.content = actContent;
         if (act.data) pra.data = act.data;
         if (act.data_element_name && deUidMap[act.data_element_name]) {
           pra.dataElement = { id: deUidMap[act.data_element_name] };
@@ -1807,22 +1848,48 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         if (stageId) pra.programStage = { id: stageId };
         if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
 
+        // HIDEOPTION needs the specific option's UID, or the atomic import 409s
+        // with "Option cannot be null". Resolve it from the option set built for
+        // the target data element IN THIS call (exact name, then code, then a
+        // forgiving prefix/contains match). Unresolvable → skip the rule cleanly.
+        if (norm.type === 'HIDEOPTION') {
+          const optLabel = act.option_name || act.option_code || act.option || '';
+          const osName = optionSetNameByDeName[act.data_element_name];
+          const opts = osName ? optionSetOptionsByName[osName] : null;
+          const want = String(optLabel).trim().toLowerCase();
+          const opt = (opts && want) ? (
+            opts.find(o => String(o.name).toLowerCase() === want) ||
+            opts.find(o => String(o.code).toLowerCase() === want) ||
+            opts.find(o => String(o.name).toLowerCase().startsWith(want)) ||
+            opts.find(o => String(o.name).toLowerCase().includes(want))
+          ) : null;
+          if (!opt || !opt.id) {
+            ruleSkip = {
+              rule: rule.name,
+              reason: 'unresolved_option',
+              detail: `HIDEOPTION could not resolve option "${optLabel || '(none given)'}" on data element "${act.data_element_name || '(none)'}"${osName ? ` in option set "${osName}"` : ' — that data element has no inline option set in this call'}. Pass option_name (exact display name) or option_code; only options created in THIS call can be resolved here.`,
+            };
+            break;
+          }
+          pra.option = { id: opt.id };
+        }
+
         // Stage-targeting actions that could not resolve would make the server
         // reject the whole atomic import ("ProgramRuleAction: ProgramStage
         // cannot be null") — skip the RULE rather than the whole program.
-        if ((act.type === 'HIDEPROGRAMSTAGE' || act.type === 'CREATEEVENT') && !pra.programStage) {
+        if ((norm.type === 'HIDEPROGRAMSTAGE' || norm.type === 'CREATEEVENT') && !pra.programStage) {
           ruleSkip = {
             rule: rule.name,
             reason: 'unresolved_stage',
-            detail: `${act.type} action's target stage could not be resolved${act.program_stage_name || act.program_stage_id ? ` from "${act.program_stage_name || act.program_stage_id}"` : ' (no stage reference given)'}; valid stage names: ${stages.map(s => s.name).join(', ')}`,
+            detail: `${norm.type} action's target stage could not be resolved${act.program_stage_name || act.program_stage_id ? ` from "${act.program_stage_name || act.program_stage_id}"` : ' (no stage reference given)'}; valid stage names: ${stages.map(s => s.name).join(', ')}`,
           };
           break;
         }
-        if (act.type === 'HIDESECTION' && !pra.programStageSection) {
+        if (norm.type === 'HIDESECTION' && !pra.programStageSection) {
           ruleSkip = {
             rule: rule.name,
             reason: 'unresolved_section',
-            detail: 'HIDESECTION needs a program_stage_section_id, but create_program does not create sections. Use HIDEFIELD per data element or HIDEPROGRAMSTAGE, or add this rule after the sections exist.',
+            detail: 'HIDESECTION needs a program_stage_section_id. Pass sections in the stage (create_program now builds them) and target the section by program_stage_section_id, or use HIDEFIELD per data element / HIDEPROGRAMSTAGE.',
           };
           break;
         }
@@ -1830,6 +1897,12 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       }
 
       if (ruleSkip) { skippedRules.push(ruleSkip); continue; }
+      // Every action was dropped as invalid — a rule with no actions is useless
+      // and some servers reject it, so skip the whole rule (recorded above).
+      if ((rule.actions || []).length && pendingActions.length === 0) {
+        skippedRules.push({ rule: rule.name, reason: 'no_valid_actions', detail: 'all actions had invalid/unsupported types and were dropped.' });
+        continue;
+      }
 
       // ── Commit: the whole rule is valid, so publish its PRVs, actions, rule ──
       if (rewrites.length) ruleTokenRewrites.push({ rule: rule.name, rewrites });
@@ -1919,6 +1992,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   if (filteredDataElements.length) payload.dataElements = filteredDataElements;
   payload.programs = [program];
   if (stageObjects.length) payload.programStages = stageObjects;
+  if (allProgramStageSections.length) payload.programStageSections = allProgramStageSections;
   if (allProgramRuleVariables.length) payload.programRuleVariables = allProgramRuleVariables;
   if (allProgramRuleActions.length) payload.programRuleActions = allProgramRuleActions;
   if (allProgramRules.length) payload.programRules = allProgramRules;
@@ -2061,6 +2135,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
     ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
     ...(skippedRules.length ? { skipped_rules: skippedRules } : {}),
+    ...(ruleActionFixes.length ? { rule_action_fixes: ruleActionFixes } : {}),
   };
 
   // Record successful program create in the per-turn registry so a duplicate
@@ -5048,6 +5123,54 @@ function lintProgramRuleCondition(condition, ruleName) {
 // data_element_name,...}]}) and the server shape ({programRuleActions:[...]}).
 
 const PR_HIDE_ACTION_TYPES = new Set(['HIDEFIELD', 'HIDESECTION', 'HIDEPROGRAMSTAGE']);
+
+// Every ProgramRuleActionType the DHIS2 server accepts (union across 2.40–2.43).
+// Anything else fails Jackson enum deserialization with a 409/500 that kills the
+// WHOLE atomic import before validation even runs — so an invalid type must be
+// caught client-side and never reach the server. (Verified live 2026-07-12: a
+// model-invented "COMPLETEENROLLMENT" 409'd the entire create_program import.)
+const VALID_PR_ACTION_TYPES = new Set([
+  'DISPLAYTEXT', 'DISPLAYKEYVALUEPAIR', 'HIDEFIELD', 'HIDESECTION', 'HIDEPROGRAMSTAGE',
+  'ASSIGN', 'SHOWWARNING', 'WARNINGONCOMPLETE', 'SHOWERROR', 'ERRORONCOMPLETE',
+  'CREATEEVENT', 'SETMANDATORYFIELD', 'SENDMESSAGE', 'SCHEDULEMESSAGE', 'SCHEDULEEVENT',
+  'HIDEOPTION', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP',
+]);
+
+// Model-invented action types that map to a real, closest-intent action. DHIS2
+// has NO "complete/close enrollment" rule action, so the documented best effort
+// is a visible completion PROMPT (SHOWWARNING with static content).
+const PR_COMPLETE_PROMPT = 'This case meets the completion criteria — complete the enrollment to close the tracker file. (DHIS2 has no automatic complete-enrollment program-rule action.)';
+const PR_ACTION_TYPE_ALIASES = {
+  COMPLETEENROLLMENT: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
+  COMPLETEEVENT: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
+  CLOSEENROLLMENT: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
+  MARKCOMPLETE: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
+  FINISHENROLLMENT: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
+};
+
+// Normalize a program-rule action's type BEFORE it is put on the wire. Returns
+// one of:
+//   { type }                       — a valid type (canonical upper-case)
+//   { type, content, note }        — an aliased invalid type + fallback content
+//   { skip: true, note }           — an unusable type; caller drops this action
+// so no create_program / manage_program_rules path can 409 the whole import on a
+// bad enum. Shared by every rule-building path (create_program, add_program_rules).
+function normalizeRuleActionType(rawType, existingContent) {
+  const t = String(rawType || '').toUpperCase().replace(/[^A-Z]/g, '');
+  if (VALID_PR_ACTION_TYPES.has(t)) return { type: t };
+  const alias = PR_ACTION_TYPE_ALIASES[t];
+  if (alias) {
+    return {
+      type: alias.type,
+      content: existingContent || alias.content,
+      note: `action type "${rawType}" is not a DHIS2 program-rule action — translated to ${alias.type} (visible completion prompt) so the import does not fail.`,
+    };
+  }
+  return {
+    skip: true,
+    note: `action type "${rawType}" is not a valid DHIS2 ProgramRuleActionType and was dropped. Valid types: ${[...VALID_PR_ACTION_TYPES].join(', ')}.`,
+  };
+}
 
 // Reduce a condition to the comparison that drives it: strip whitespace noise,
 // the two canonical emptiness-guard prefixes, and redundant outer parens.
