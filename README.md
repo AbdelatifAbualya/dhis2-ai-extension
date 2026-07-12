@@ -145,6 +145,7 @@ Universal OpenAI-compatible. Configure `apiBaseUrl`, `modelId`, optional `apiKey
 | Fireworks AI | `https://api.fireworks.ai/inference/v1` | `accounts/fireworks/models/kimi-k2p5` | Yes |
 | OpenRouter | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4` | Yes |
 | Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | Yes |
+| xAI Grok | `https://api.x.ai/v1` | `grok-4.5` | Yes |
 | Together | `https://api.together.xyz/v1` | `meta-llama/Llama-3-70b-chat-hf` | Yes |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash-exp` | Yes |
 | Custom / self-hosted | any OpenAI-compatible `/chat/completions` | — | depends |

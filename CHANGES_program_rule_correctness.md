@@ -104,3 +104,24 @@ tokens.
 
 Harness: rebuilt per `playground-tool-harness` memory (chrome-shim + `__harness.turn` /
 `endTurn` / `call`), now also simulating cross-turn history persistence.
+
+## 5. Found during deep testing: program delete 500s while rules/PRVs exist
+
+`manage_metadata(action=delete, object_type=programs)` hit DHIS2 500 "Transaction silently
+rolled back because it has been marked as rollback-only" whenever the program still had
+programRules / programRuleVariables (verified live on 2.42 — the identical delete succeeds
+once the dependents are removed first). DHIS2 does not reliably cascade these.
+
+**Fix:** the delete action now gathers the program's wholly-owned dependents
+(programIndicators → programRules → programRuleVariables), includes them in the pre-delete
+backup snapshot, deletes them child→parent via `metadata?importStrategy=DELETE`, then deletes
+the program. The result reports `cascade_deleted` per type. Non-program object types are
+unaffected.
+
+**Deep-scenario verification (both servers):** 3-stage "ZZDEEP Maternal Outcomes" program —
+option sets, MULTI_TEXT, TEA reuse, 5 rules (canonical hide + mandate-when-visible pair,
+A{Date of Birth} healing, option NAME→CODE mapping in a HIDEPROGRAMSTAGE-by-name rule,
+SHOWWARNING with data expr), 2 inline PIs + 1 follow-up PI with a #{stage.de} filter,
+twin-rule refusal against the live program, full cleanup through the tools themselves:
+localhost:8081 (2.42) 33/33, play stable-2-43-0-1 (2.43) 33/33 — with an explicit
+zero-unexpected-tool-errors assertion across every call in the scenario.
