@@ -22,7 +22,7 @@
 
 ## The 32 tools
 
-Each callable tool is defined once in the `TOOLS` schema array; `TOOL_ROUTER` is derived from those schemas. Execution stays in `executeTool()`, while progress labels/icons live in the shared `shared/tool-catalog.js` used by both the worker and panel. The model is given only the subset relevant to the current page and request — usually 6–12 tools.
+Each callable tool is defined once in the `TOOLS` schema array in `background/tool-definitions.js`; `TOOL_ROUTER` is derived from those schemas. Execution enters through `executeTool()` in `background/tools-read.js` and delegates to the two coarse metadata/program implementation modules. Progress labels/icons live in the shared `shared/tool-catalog.js` used by both the worker and panel. The model is given only the subset relevant to the current page and request — usually 6–12 tools.
 
 | # | Tool | Purpose |
 |---|------|---------|
@@ -79,7 +79,7 @@ Each callable tool is defined once in the `TOOLS` schema array; `TOOL_ROUTER` is
 ```
 ┌──────────────────────┐    ┌────────────────────────────┐    ┌──────────────────────┐
 │   Content Script      │   │  Background Service Worker  │   │    Side Panel         │
-│   (content.js)        │──▶│  (background.js + core)     │──▶│  (sidepanel/)         │
+│   (content.js)        │──▶│  (background.js + modules)  │──▶│  (sidepanel/)         │
 │                       │   │                             │   │                       │
 │ • URL change monitor  │   │ • DHIS2 detection & session │   │ • Chat interface      │
 │ • hashchange/popstate │   │ • Page-context extraction   │   │ • Streaming display   │
@@ -92,6 +92,21 @@ Each callable tool is defined once in the `TOOLS` schema array; `TOOL_ROUTER` is
 │                       │   │ • SW keep-alive ping        │   │   CSV / JSON / XML    │
 └──────────────────────┘    └────────────────────────────┘    └──────────────────────┘
 ```
+
+### Background module design
+
+The service worker remains build-free and uses extension-local classic scripts loaded synchronously with `importScripts()`. The order in `background.js` is intentional because the modules share one worker-global scope; `tests/worker-loading.test.js` loads that same graph in a VM and verifies its cross-file bindings.
+
+| File | Responsibility |
+|------|----------------|
+| `background.js` | Worker state, write-safety gates, DHIS2 request pipeline, persistence, agent loop, screenshots, Chrome messages, and lifecycle listeners |
+| `background/context.js` | URL parsing, DHIS2 initialization, active-tab synchronization, and line-listing assets |
+| `background/tool-definitions.js` | All 32 schemas, lazy manuals, contextual selection, and system-prompt construction |
+| `background/providers.js` | OpenAI-compatible and Anthropic streaming, vision analysis, and Tavily search |
+| `background/tools-read.js` | Read/analytics helpers, privacy enforcement, and central `executeTool()` dispatch |
+| `background/tools-metadata.js` | Aggregate metadata, datasets, dashboards, maps, forms, translations, plugins, backups, and creation flows |
+| `background/tools-programs.js` | Program metadata, notifications, program rules, program indicators, and architecture operations |
+| `background/core.js` | Pure URL, UID, normalization, and context-identity helpers that run directly in Node tests |
 
 ### Agentic loop (per turn)
 
@@ -208,9 +223,15 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 ```
 dhis2-ai-extension/
 ├── manifest.json              MV3 config (v2.9.0)
-├── background.js              Service-worker orchestration, tool schemas and executors
+├── background.js              Worker state, API safety, agent loop, messaging and lifecycle (~4.2k LOC)
 ├── background/
-│   └── core.js                Pure URL, UID, normalization and context helpers
+│   ├── core.js                Pure URL, UID, normalization and context helpers
+│   ├── context.js             Page context, DHIS2 connection and line-listing assets
+│   ├── tool-definitions.js    Tool schemas, manuals, contextual selection and prompt
+│   ├── providers.js           Model streaming, Anthropic adapter, vision and web search
+│   ├── tools-read.js          Read/analytics tools, privacy gate and central dispatcher
+│   ├── tools-metadata.js      Aggregate/general metadata management implementations
+│   └── tools-programs.js      Program, rule, indicator and architect implementations
 ├── shared/
 │   └── tool-catalog.js        Canonical tool progress labels and icons
 ├── content.js                 URL monitor with self-heal on extension reload
@@ -229,7 +250,8 @@ dhis2-ai-extension/
 │   └── validate.js            Dependency-free syntax/entry-point validation
 ├── tests/
 │   ├── core.test.js
-│   └── source-contracts.test.js
+│   ├── source-contracts.test.js
+│   └── worker-loading.test.js
 ├── package.json               Validation commands (no runtime dependencies)
 └── README.md
 ```
@@ -238,10 +260,14 @@ dhis2-ai-extension/
 
 ### Maintenance boundaries
 
-- Keep Chrome APIs, DHIS2 session state, agent orchestration, and tool execution in `background.js`; those paths share safety gates and transactional state.
+- Keep shared worker state, request/write safety, persistence, agent orchestration, Chrome messages, and lifecycle listeners in `background.js`.
+- Put page/server detection and context-cache loading in `background/context.js`.
+- Put tool schemas, manuals, contextual selection, and prompt text together in `background/tool-definitions.js`.
+- Put model-provider protocol code in `background/providers.js`; it must not own DHIS2 state or tool policy.
+- Route every tool through the single `executeTool()` dispatcher in `background/tools-read.js`; place implementations in the existing read, metadata, or program module instead of creating one file per tool.
 - Put browser-independent parsing and decision helpers in `background/core.js` so they can be unit tested without mocking Chrome.
 - Put presentation metadata shared by the service worker and panel in `shared/tool-catalog.js`. Do not create another tool-name/label map in either runtime.
-- Add a tool by defining its schema in `TOOLS`, implementing it in `executeTool()`, selecting it in `getContextualTools()`, and adding one shared catalog record. The router derives itself and the tests fail on missing or duplicate records.
+- Add a tool by defining its schema, routing it through `executeTool()`, implementing it in the matching coarse tool module, selecting it in `getContextualTools()`, and adding one shared catalog record. The router derives itself and the tests fail on missing, duplicate, or cross-module load errors.
 
 ---
 

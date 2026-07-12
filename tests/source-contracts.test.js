@@ -8,6 +8,15 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const read = relativePath => fs.readFileSync(path.join(root, relativePath), 'utf8');
 const background = read('background.js');
+const backgroundModulePaths = [
+  'background/context.js',
+  'background/tool-definitions.js',
+  'background/providers.js',
+  'background/tools-read.js',
+  'background/tools-metadata.js',
+  'background/tools-programs.js',
+];
+const worker = [background, ...backgroundModulePaths.map(read)].join('\n');
 const panel = read('sidepanel/panel.js');
 const panelHtml = read('sidepanel/panel.html');
 const manifest = JSON.parse(read('manifest.json'));
@@ -15,7 +24,7 @@ const packageJson = JSON.parse(read('package.json'));
 const toolCatalog = require('../shared/tool-catalog.js');
 
 test('callable tool schemas are unique and all have shared presentation metadata', () => {
-  const names = [...background.matchAll(/function:\s*\{\s*name:\s*'([^']+)'/g)].map(match => match[1]);
+  const names = [...worker.matchAll(/function:\s*\{\s*name:\s*'([^']+)'/g)].map(match => match[1]);
   assert.equal(names.length, 32, 'Unexpected callable tool count');
   assert.equal(new Set(names).size, names.length, 'Duplicate callable tool schema');
 
@@ -24,17 +33,17 @@ test('callable tool schemas are unique and all have shared presentation metadata
 });
 
 test('background top-level function declarations cannot silently override each other', () => {
-  const names = [...background.matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm)]
+  const names = [...worker.matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm)]
     .map(match => match[1]);
   const duplicates = names.filter((name, index) => names.indexOf(name) !== index);
   assert.deepEqual([...new Set(duplicates)], []);
-  const unused = names.filter(name => (background.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length === 1);
+  const unused = names.filter(name => (worker.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length === 1);
   assert.deepEqual(unused, [], 'Unused top-level background functions are dead code');
 });
 
 test('simple JavaScript declarations are not left unread', () => {
   for (const [file, source] of [
-    ['background.js', background],
+    ['background worker', worker],
     ['content.js', read('content.js')],
     ['sidepanel/panel.js', panel],
   ]) {
@@ -48,8 +57,8 @@ test('simple JavaScript declarations are not left unread', () => {
 });
 
 test('removed Inspect scaffolding and obsolete tool-result message cannot return', () => {
-  assert.equal(/inspectSnapshot|inspectCapture|inspectMode/.test(background), false);
-  assert.equal(background.includes("type: 'AI_TOOL_RESULT'"), false);
+  assert.equal(/inspectSnapshot|inspectCapture|inspectMode/.test(worker), false);
+  assert.equal(worker.includes("type: 'AI_TOOL_RESULT'"), false);
 });
 
 test('the side panel centralizes shared tool metadata and runtime messages', () => {
@@ -60,9 +69,23 @@ test('the side panel centralizes shared tool metadata and runtime messages', () 
 });
 
 test('only the current tab in the last-focused window can drive global context', () => {
-  assert.match(background, /lastFocusedWindow:\s*true/);
-  assert.match(background, /await isCurrentActiveTab\(tabId\)/);
-  assert.match(background, /pageContextSyncQueue\.then/);
+  assert.match(worker, /lastFocusedWindow:\s*true/);
+  assert.match(worker, /await isCurrentActiveTab\(tabId\)/);
+  assert.match(worker, /pageContextSyncQueue\.then/);
+});
+
+test('background worker stays within coarse module boundaries', () => {
+  const imports = [...background.matchAll(/importScripts\(([^)]+)\)/g)]
+    .flatMap(call => [...call[1].matchAll(/['"]([^'"]+)['"]/g)].map(match => match[1]));
+  assert.deepEqual(imports, [
+    'background/core.js',
+    'shared/tool-catalog.js',
+    ...backgroundModulePaths,
+  ]);
+  assert.ok(background.split('\n').length < 5000, 'background.js orchestration shell grew too large');
+  for (const modulePath of backgroundModulePaths) {
+    assert.ok(read(modulePath).split('\n').length < 8000, modulePath + ' grew beyond a coarse module');
+  }
 });
 
 test('conversation reset identity is captured before asynchronous turn work', () => {

@@ -6,15 +6,20 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
-const javascriptFiles = [
-  'background/core.js',
-  'shared/tool-catalog.js',
+const backgroundSource = fs.readFileSync(path.join(root, 'background.js'), 'utf8');
+const importedScripts = [...backgroundSource.matchAll(/importScripts\(([^)]+)\)/g)]
+  .flatMap(call => [...call[1].matchAll(/['"]([^'"]+)['"]/g)].map(match => match[1]));
+assert.ok(importedScripts.length > 0, 'background.js must load its coarse-grained modules');
+
+const javascriptFiles = [...new Set([
   'background.js',
+  ...importedScripts,
   'content.js',
   'sidepanel/panel.js',
-];
+])];
 
 for (const relativePath of javascriptFiles) {
+  assert.ok(fs.existsSync(path.join(root, relativePath)), 'Missing JavaScript entry: ' + relativePath);
   const result = spawnSync(process.execPath, ['--check', relativePath], {
     cwd: root,
     encoding: 'utf8',
@@ -32,13 +37,6 @@ assert.ok(
   fs.existsSync(path.join(root, manifest.background.service_worker)),
   'Manifest service worker does not exist'
 );
-
-const backgroundSource = fs.readFileSync(path.join(root, 'background.js'), 'utf8');
-const importCall = backgroundSource.match(/importScripts\(([^)]+)\)/);
-assert.ok(importCall, 'background.js must load its coarse-grained helper modules');
-for (const match of importCall[1].matchAll(/['"]([^'"]+)['"]/g)) {
-  assert.ok(fs.existsSync(path.join(root, match[1])), 'Missing background import: ' + match[1]);
-}
 
 const panelPath = path.join(root, manifest.side_panel.default_path);
 const panelHtml = fs.readFileSync(panelPath, 'utf8');
