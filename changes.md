@@ -2347,3 +2347,24 @@ answer. `node --check background.js` passes.
 Valid programs are unchanged (0 false skips). Programs with a bad rule now import
 (minus that rule) instead of failing wholesale. Deterministic retry loops are
 mechanically bounded across all tools, not just create_program.
+
+---
+
+## 40. New Design — modular refactor of the background worker (6 modules) + two fixes
+
+**Files:** `background.js` (now a loader), new `src/{core,registry,providers,tools-metadata,tools-programs,agent}.js`, new `scripts/verify.js`, `package.json`, `ARCHITECTURE.md`.
+**Full detail:** see `CHANGES_modular_refactor.md`.
+
+**Type of change:** Structural refactor (behaviour-preserving) + one deliberate bug fix + dead-code removal + tooling.
+
+**What changed:**
+
+1. **Split `background.js` (26,168 lines) into six focused modules** loaded in order via `importScripts()`. `background.js` is now a 40-line loader. The modules share one classic-worker global scope, so no `import`/`export` wiring and no build step. The concatenation of `src/*.js` in load order is **byte-for-byte identical** to the prior `background.js` — behaviour is unchanged by construction. Module map is in `ARCHITECTURE.md`.
+
+2. **Fixed the duplicate `normalizeText()`** that hoisting made silently collide. The lowercase-only and the aggressive (strip-non-alphanumerics) variants are now `lowercaseText` and `normalizeSearchTokens`, both in `core.js`. This **restores** the `'sub-'` / `'sub-org'` triggers in `userExplicitlyWantsDescendants()` (e.g. "all sub-counties"), which the aggressive normalizer had been quietly disabling by turning hyphens into spaces. Other callers were repointed with behaviour preserved.
+
+3. **Removed the dead `lineListingAssets.routerSource`** fetch/field (the router source was fetched on every load and never read). `LINE_LISTING_ROUTER_PATH` and the live embedded routing are unchanged; no model-facing text changed.
+
+4. **Added `scripts/verify.js`** (`npm run verify`), a dependency-free check that `node --check`s every file, loads the six modules under a `chrome` shim, and asserts the safety-critical gates (write-auth, UID entropy, patient-data privacy path gate, the two normalizers, strict query encoding). Added a minimal `package.json` (no dependencies, no build) and `ARCHITECTURE.md`.
+
+**Scope of impact:** No tool schema, prompt, DHIS2 request shape, or safety gate changed — except the intended `sub-` descendant-trigger restoration. The safety review's heavier recommendations (single tool registry, typed state stores, `Dhis2Client`, `panel.js` split, TypeScript) were deliberately deferred and are listed in `ARCHITECTURE.md`.
