@@ -985,8 +985,24 @@ function buildInspectSnapshot() {
   } catch {}
 })();
 
-function normalizeText(v) {
+// Lowercase only — preserves punctuation and hyphens. Use for substring checks
+// that must match literals like "sub-" (see userExplicitlyWantsDescendants).
+// NB: the file historically declared a SECOND, aggressive `normalizeText` far
+// below; function-hoisting made that one silently win everywhere and quietly
+// broke the "sub-" trigger. The two behaviours are now distinct and explicit:
+// lowercaseText (here) and normalizeSearchTokens (below).
+function lowercaseText(v) {
   return String(v || '').toLowerCase();
+}
+
+// Lowercase + collapse every non-alphanumeric run to a single space + trim.
+// For tokenized keyword search only — do NOT use where hyphens/punctuation
+// carry meaning (that was the bug that killed the "sub-" descendant trigger).
+function normalizeSearchTokens(input) {
+  return String(input || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
 }
 
 function isLikelyDhisUid(v) {
@@ -1125,7 +1141,7 @@ function extractMapIdFromText(text) {
 // stored by the extension.
 
 function userExplicitlyWantsDescendants(userText) {
-  const t = normalizeText(userText);
+  const t = lowercaseText(userText);
   if (!t) return false;
   return [
     'all facilities',
@@ -2902,7 +2918,7 @@ async function enrichAnalyticsPathWithVisualizationContext(path, vizId) {
 }
 
 function isVisualizationValueQuestion(text) {
-  const t = normalizeText(text);
+  const t = normalizeSearchTokens(text);
   if (!t) return false;
   const keys = [
     'value', 'values', 'how much', 'number', 'count', 'total',

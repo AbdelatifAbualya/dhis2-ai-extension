@@ -1339,15 +1339,9 @@ const TEXT_STOPWORDS = new Set([
   'known', 'family', 'pregnancy', 'pregnancies', 'medical',
 ]);
 
-function normalizeText(input) {
-  return String(input || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
+// Text normalizers (lowercaseText / normalizeSearchTokens) live in core.js.
 function tokenize(input) {
-  return normalizeText(input)
+  return normalizeSearchTokens(input)
     .split(/\s+/)
     .filter(Boolean)
     .filter(w => w.length >= 3 && !TEXT_STOPWORDS.has(w));
