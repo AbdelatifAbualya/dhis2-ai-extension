@@ -159,7 +159,6 @@ let conversationEpoch = 0;
 let lineListingAssets = {
   loaded: false,
   systemPromptMd: '',
-  routerSource: '',
   toolJson: null,
 };
 
@@ -3501,15 +3500,18 @@ const LINE_LISTING_KEYWORD_ROUTES = Object.freeze({
 async function ensureLineListingAssetsLoaded() {
   if (lineListingAssets.loaded && lineListingAssets.toolJson) return true;
   try {
-    const [jsonResp, mdResp, routerResp] = await Promise.all([
+    // NOTE: line-listing/dhis2_extension_router.js is NOT fetched or executed —
+    // its text was previously read into lineListingAssets.routerSource and never
+    // used. Routing is done by the embedded LINE_LISTING_KEYWORD_ROUTES +
+    // routeLineListingBlocks() below. The external router file is retained only
+    // as a reference artifact whose PATH is still surfaced to the model.
+    const [jsonResp, mdResp] = await Promise.all([
       fetch(chrome.runtime.getURL(LINE_LISTING_JSON_PATH)),
       fetch(chrome.runtime.getURL(LINE_LISTING_SYSTEM_PROMPT_PATH)),
-      fetch(chrome.runtime.getURL(LINE_LISTING_ROUTER_PATH)),
     ]);
     if (!jsonResp.ok) throw new Error(`Could not load ${LINE_LISTING_JSON_PATH}`);
     lineListingAssets.toolJson = await jsonResp.json();
     lineListingAssets.systemPromptMd = mdResp.ok ? await mdResp.text() : '';
-    lineListingAssets.routerSource = routerResp.ok ? await routerResp.text() : '';
     lineListingAssets.loaded = true;
     return true;
   } catch (e) {
