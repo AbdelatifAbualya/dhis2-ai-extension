@@ -213,12 +213,12 @@ Examples:
     type: 'function',
     function: {
       name: 'get_program_info',
-      description: `Get information about the CURRENT program. Use when asked about program structure, rules, indicators, stages, data elements.
-The program metadata is already in your context — use this tool only when you need ADDITIONAL detail not shown in context, like:
+      description: `Get information about a program's structure, rules, indicators, stages, or data elements.
+Defaults to the CURRENT program in context — but pass program_id (or program_name) to inspect ANY program, e.g. when you are on the Dashboard / Data Visualizer app (no program in context) and need a program's stages or tracked-entity attributes to build a program indicator. Use when you need detail beyond what is already in context, like:
 - Full list of program rules with conditions and actions
 - Complete option set details
 - Program indicators with expressions
-- Stage sections layout`,
+- Stage sections layout / stage data elements & attributes (to reference in a PI expression)`,
       parameters: {
         type: 'object',
         properties: {
@@ -226,6 +226,14 @@ The program metadata is already in your context — use this tool only when you 
             type: 'string',
             enum: ['rules', 'rules_for_stage', 'indicators', 'stage_details', 'option_set'],
             description: 'What to fetch. rules=all program rules, rules_for_stage=rules targeting a specific stage, indicators=program indicators with expressions, stage_details=all stages summary (no target_id) or full stage detail with data elements (with target_id), option_set=options for a specific option set.'
+          },
+          program_id: {
+            type: 'string',
+            description: 'Target program UID. Overrides the page-context program. Use this when the program you need is NOT the one open on the page (e.g. building a dashboard chart). Reuse a UID from a prior tool result — never invent one.'
+          },
+          program_name: {
+            type: 'string',
+            description: 'Target program display name, resolved to a UID server-side. Use when you know the name but not the UID and no program is in context. program_id takes precedence if both are given.'
           },
           target_id: {
             type: 'string',
@@ -2000,7 +2008,7 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
       name: 'manage_dashboards',
       description: `Build and inspect DHIS2 **analytics dashboards and visualizations** — the charts, pivot tables and single-value tiles shown in the Dashboard app, and the dashboards that arrange them. Use this tool for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata visualizations or dashboards bodies via dhis2_query (a raw POST that only sets columns/rows/filters silently imports an EMPTY, un-renderable chart — DHIS2 stores the layout as columnDimensions/rowDimensions/filterDimensions and the data as dataDimensionItems / relativePeriods / organisationUnits; this tool assembles that exact structure for you).
 Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
-- create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (indicator / dataElement / programIndicator UIDs — their types are auto-resolved AND verified to exist), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed.
+- create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (aggregate indicator / AGGREGATE-domain dataElement / programIndicator UIDs — types are auto-resolved AND verified), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed. ⚠ data_items must be AGGREGATE dimensions: a TRACKER data element or a tracked-entity attribute CANNOT be plotted directly (the tile renders an error) — first create a PROGRAM INDICATOR (manage_program_indicators) that aggregates it, then plot that program indicator's UID. The tool refuses a raw tracker data element with this guidance.
 - create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
 - add_items: add chart(s)/map(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
 - remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
@@ -3250,6 +3258,20 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     // Maps commonly ride onto dashboards ("…and a map of X by district"), so the
     // map authoring tool travels with dashboard intent too.
     selected.add('manage_maps');
+    // A chart/dashboard plots INDICATORS. "Replace this tile with one showing
+    // <a metric that doesn't exist yet>" is a routine dashboard request, and the
+    // model must be able to CREATE the data item the new chart needs — otherwise
+    // it has manage_dashboards but no way to build the metric and loops (the
+    // "percentage of males vs females enrolled" disaster, 2026-07-13, where a
+    // typo'd "incdicator" also defeated every indicator keyword). Surface BOTH
+    // indicator managers (the model picks the right one from their descriptions:
+    // tracker/enrollment metrics → manage_program_indicators, aggregate ratios →
+    // manage_indicators) plus get_program_info to inspect the program's stages/
+    // attributes the program-indicator expression references. These are slim
+    // MANUAL_TOOLS summaries on the wire, so the token cost is negligible.
+    selected.add('manage_program_indicators');
+    selected.add('manage_indicators');
+    selected.add('get_program_info');
     // Dashboard/visualization SHARING and DELETION live in manage_metadata
     // (manage_dashboards only CREATES and READS). The canonical multi-step
     // dashboard goal ends in a "share it" / "make it public" step, so the

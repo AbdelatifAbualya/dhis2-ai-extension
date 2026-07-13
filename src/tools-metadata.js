@@ -740,14 +740,31 @@ async function executeTool(name, args) {
 
   // ── get_program_info ──
   if (name === 'get_program_info') {
-    if (!programId) return { _error: 'No program in context.' };
+    // Target program: an explicit program_id / program_name overrides the page
+    // context so this tool works from ANY page (e.g. the Dashboard app, which
+    // has no program in context) instead of dead-ending on "No program in
+    // context" even when the model already knows the program UID (2026-07-13).
+    let effProgramId = programId;
+    let effProgramName = dhis2.programMetadata?.displayName || null;
+    if (args.program_id || args.program_name) {
+      const resolved = await resolveProgramForRecentChanges(args, programId);
+      if (resolved?._error) return resolved;
+      effProgramId = resolved.id;
+      effProgramName = resolved.displayName || effProgramName;
+    }
+    if (!effProgramId) {
+      return { _error: 'No program in context. Pass program_id or program_name to target a specific program.' };
+    }
+    // Stage-name guards below validate against dhis2.programMetadata, which is
+    // loaded for the PAGE program only — skip them when targeting another one.
+    const usingContextProgram = effProgramId === programId;
 
     if (args.info_type === 'rules' || args.info_type === 'rules_for_stage') {
       let fields = 'id,displayName,description,condition';
       if (args.include_actions) {
         fields += ',programRuleActions[id,programRuleActionType,content,data,dataElement[id,displayName],trackedEntityAttribute[id,displayName],programStage[id,displayName]]';
       }
-      let filter = `filter=program.id:eq:${programId}`;
+      let filter = `filter=program.id:eq:${effProgramId}`;
       if (args.info_type === 'rules_for_stage' && args.target_id) {
         // Get rules that reference this stage (via programStage field or via actions)
         filter += `&filter=programStage.id:eq:${args.target_id}`;
@@ -757,7 +774,7 @@ async function executeTool(name, args) {
       const rules = result.programRules || [];
       return {
         total_rules: rules.length,
-        program: { id: programId, name: dhis2.programMetadata?.displayName },
+        program: { id: effProgramId, name: effProgramName },
         stage_filter: args.target_id || null,
         rules: rules.slice(0, 100).map(r => ({
           id: r.id,
@@ -779,12 +796,12 @@ async function executeTool(name, args) {
 
     if (args.info_type === 'indicators') {
       const result = await safeDhis2Fetch(
-        `programIndicators?filter=program.id:eq:${programId}&fields=id,displayName,description,expression,filter,displayInForm&paging=false`
+        `programIndicators?filter=program.id:eq:${effProgramId}&fields=id,displayName,description,expression,filter,displayInForm&paging=false`
       );
       if (result._error) return result;
       return {
         total_indicators: result.programIndicators?.length || 0,
-        program: { id: programId, name: dhis2.programMetadata?.displayName },
+        program: { id: effProgramId, name: effProgramName },
         indicators: result.programIndicators?.map(pi => ({
           id: pi.id, name: pi.displayName, description: pi.description,
           expression: pi.expression, filter: pi.filter
@@ -794,8 +811,9 @@ async function executeTool(name, args) {
 
     if (args.info_type === 'stage_details') {
       if (args.target_id) {
-        // Guard: reject program ID used as stage ID
-        if (args.target_id === programId) {
+        // Guard: reject the PROGRAM ID used as a stage ID. Only meaningful for
+        // the page-context program (whose metadata + stage-in-context we know).
+        if (usingContextProgram && args.target_id === effProgramId) {
           const stageList = (dhis2.programMetadata?.programStages || [])
             .map(s => `${s.displayName} (${s.id})`).join(', ');
           const ctxStage = dhis2.pageContext?.stageId;
@@ -806,8 +824,10 @@ async function executeTool(name, args) {
                 : `Available stages: ${stageList || 'none loaded'}. Use a stage ID as target_id.`),
           };
         }
-        // Guard: validate target_id is a known stage in this program (if metadata loaded)
-        const knownStages = dhis2.programMetadata?.programStages;
+        // Guard: validate target_id is a known stage in this program (only when
+        // operating on the page-context program — dhis2.programMetadata holds
+        // ITS stages, not those of a program targeted via program_id).
+        const knownStages = usingContextProgram ? dhis2.programMetadata?.programStages : null;
         if (knownStages?.length && !knownStages.some(s => s.id === args.target_id)) {
           const ctxStage = dhis2.pageContext?.stageId;
           const stageList = knownStages.map(s => `${s.displayName} (${s.id})`).join(', ');
@@ -832,11 +852,11 @@ async function executeTool(name, args) {
       }
       // No target_id: list all stages for this program
       const result = await safeDhis2Fetch(
-        `programStages?filter=program.id:eq:${programId}&fields=id,displayName,description,sortOrder,repeatable,formType,programStageSections[id,displayName]&paging=false&order=sortOrder:asc`
+        `programStages?filter=program.id:eq:${effProgramId}&fields=id,displayName,description,sortOrder,repeatable,formType,programStageSections[id,displayName]&paging=false&order=sortOrder:asc`
       );
       if (result._error) return result;
       return {
-        program: { id: programId, name: dhis2.programMetadata?.displayName },
+        program: { id: effProgramId, name: effProgramName },
         total_stages: result.programStages?.length || 0,
         stages: result.programStages || [],
         _note: 'Use target_id with stage_details to get full data elements for a specific stage.',
@@ -3916,14 +3936,27 @@ async function resolveDataItemTypes(uids) {
   const inFilter = `id:in:[${list.join(',')}]`;
   const [indResp, deResp, piResp] = await Promise.all([
     safeDhis2Fetch(`indicators.json?filter=${inFilter}&fields=id&paging=false`),
-    safeDhis2Fetch(`dataElements.json?filter=${inFilter}&fields=id&paging=false`),
+    // domainType matters: a TRACKER-domain data element is NOT a valid aggregate
+    // dx item — plotting one directly produces a visualization that errors at
+    // render time (the 2026-07-13 "3 of 5 tiles broken" report). Fetch it so we
+    // can reject those with an actionable message instead of saving a dud.
+    safeDhis2Fetch(`dataElements.json?filter=${inFilter}&fields=id,displayName,domainType&paging=false`),
     safeDhis2Fetch(`programIndicators.json?filter=${inFilter}&fields=id&paging=false`),
   ]);
+  const trackerNames = {}; // id → displayName for tracker DEs (invalid as aggregate dx)
   for (const o of (indResp?.indicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'INDICATOR';
-  for (const o of (deResp?.dataElements || [])) if (!typeMap[o.id]) typeMap[o.id] = 'DATA_ELEMENT';
+  for (const o of (deResp?.dataElements || [])) {
+    if (typeMap[o.id]) continue;
+    if (o.domainType === 'TRACKER') {
+      typeMap[o.id] = 'TRACKER_DATA_ELEMENT';
+      trackerNames[o.id] = o.displayName || o.id;
+    } else {
+      typeMap[o.id] = 'DATA_ELEMENT';
+    }
+  }
   for (const o of (piResp?.programIndicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'PROGRAM_INDICATOR';
   const unresolved = list.filter(u => !typeMap[u]);
-  return { typeMap, unresolved };
+  return { typeMap, unresolved, trackerNames };
 }
 
 // Build a complete, render-correct visualization object from a friendly spec.
@@ -3953,6 +3986,18 @@ function buildVisualizationObject(spec, typeMap) {
     seenDx.add(u);
     const t = typeMap[u];
     if (!t) return { _error: `Could not resolve data item "${u}" to a known type. Verify the UID with search_metadata.` };
+    if (t === 'TRACKER_DATA_ELEMENT') {
+      // A tracker data element cannot be plotted directly: the aggregate
+      // analytics engine only serves AGGREGATE-domain data, so a tile built on
+      // one renders an error (the exact defect behind the "3 of 5 tiles broken"
+      // report). Refuse at build time and point the model at the right pattern —
+      // it now has manage_program_indicators available on dashboard turns.
+      return {
+        _error: `Data item "${u}" is a TRACKER data element and cannot be plotted directly on a visualization — a tile built on it renders an error in DHIS2 (aggregate analytics only serves AGGREGATE-domain data).`,
+        _hint: `Create a PROGRAM INDICATOR that aggregates this data element, then plot THAT: manage_program_indicators(action="create", ...) with an expression/filter referencing #{stageId.${u}} (e.g. a count or percentage of events/enrollments matching a value), then pass the new program indicator's UID as the data_item. Do not pass raw tracker data element or tracked-entity-attribute UIDs as visualization data_items.`,
+        _tracker_data_element: u,
+      };
+    }
     const key = VIZ_DDI_KEY[t];
     if (!key) return { _error: `Data item "${u}" has unsupported type ${t} for a visualization.` };
     dataDimensionItems.push({ dataDimensionItemType: t, [key]: { id: u } });
@@ -4149,6 +4194,14 @@ async function executeManageMaps(args) {
     if (!itemId) return { _error: 'data_item (one indicator / data element / program indicator UID) is required.' };
     const { typeMap, unresolved } = await resolveDataItemTypes([itemId]);
     if (unresolved.length) return { _error: `Data item not found: ${unresolved.join(', ')}. Verify the UID with search_metadata / a prior tool result.`, _scope: 'unresolved_data_item' };
+    if (typeMap[itemId] === 'TRACKER_DATA_ELEMENT') {
+      return {
+        _error: `Data item "${itemId}" is a TRACKER data element and cannot shade a thematic map directly — aggregate analytics only serves AGGREGATE-domain data.`,
+        _hint: `Create a program indicator that aggregates it (manage_program_indicators action="create") and pass that program indicator's UID as data_item.`,
+        _tracker_data_element: itemId,
+        _scope: 'tracker_data_element_not_aggregatable',
+      };
+    }
     // Auto-attach program for a program-indicator layer.
     if (typeMap[itemId] === 'PROGRAM_INDICATOR' && !spec.program_id) {
       const pid = await resolveProgramForProgramIndicator(itemId);

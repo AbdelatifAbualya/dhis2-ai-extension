@@ -161,6 +161,71 @@ if (loaded) {
   // line-listing router returns a block-id array
   const route = need('routeLineListingBlocks');
   if (route) truthy("routeLineListingBlocks('show me a line list') is an array", Array.isArray(route('show me a line list')));
+
+  // no-progress guard: identical EXECUTED calls are refused once the model is
+  // clearly looping — the defect that let manage_dashboards(list) run 45× and
+  // burn the whole iteration budget (2026-07-13). Guards run over a fresh
+  // per-turn state (executedCallSigs is created lazily on first note).
+  const noteExec = need('noteExecutedCall');
+  const noProg = need('noProgressStopOrNull');
+  const preflight = need('preflightCheckCall');
+  if (noteExec && noProg && preflight) {
+    const loopArgs = { action: 'list' };
+    eq('noProgressStopOrNull before any run => null', noProg('manage_dashboards', loopArgs), null);
+    eq('1st identical execution count', noteExec('manage_dashboards', loopArgs), 1);
+    eq('2nd identical execution count', noteExec('manage_dashboards', loopArgs), 2);
+    eq('noProgress after 2 runs (still under limit) => null', noProg('manage_dashboards', loopArgs), null);
+    eq('3rd identical execution count', noteExec('manage_dashboards', loopArgs), 3);
+    const stop = noProg('manage_dashboards', loopArgs);
+    eq('noProgress after 3 identical runs → blocked scope', stop && stop._scope, 'no_progress_repeat');
+    // key ordering must not matter (stable signature)
+    truthy('preflightCheckCall refuses the looping call (any key order)',
+      preflight('manage_dashboards', { action: 'list' }) &&
+      preflight('manage_dashboards', { action: 'list' })._scope === 'no_progress_repeat');
+    // a DIFFERENT call is unaffected — no false positive on genuine progress
+    eq('different args are NOT blocked', noProg('manage_dashboards', { action: 'get', id: 'abc' }), null);
+    eq('a different tool is NOT blocked', noProg('search_metadata', { object_type: 'programs' }), null);
+  }
+
+  // Fix A — a dashboard-app request to "create an indicator" for a tracker
+  // enrollment metric must surface manage_program_indicators (the AGGREGATE
+  // manage_indicators tool cannot count enrollments by a tracked-entity attr).
+  const getTools = need('getContextualTools');
+  if (getTools) {
+    // The EXACT message from the 2026-07-13 report, typos and all ("incdicator",
+    // "dahboard", "visulization") — those typos defeated every indicator/
+    // dashboard keyword, so the fix must not depend on spelling. On the
+    // Dashboard app the chart-metric tools must be present regardless.
+    const req = 'remove this visulization Monthly Screening Trends by Method from the dahboard and replace it with a visulization that show percentge of male vs females that are enrolled in the program, note that you likely need to create an incdicator for this to work';
+    let names = [];
+    try { names = getTools({ appType: 'Dashboard' }, req, false, null).map((t) => t.function.name); }
+    catch (e) { bad(`getContextualTools threw: ${e && e.message}`); }
+    truthy('Dashboard app surfaces manage_program_indicators (typo-proof)', names.includes('manage_program_indicators'));
+    truthy('Dashboard app surfaces manage_indicators', names.includes('manage_indicators'));
+    truthy('Dashboard app surfaces get_program_info', names.includes('get_program_info'));
+    truthy('Dashboard app still surfaces manage_dashboards', names.includes('manage_dashboards'));
+
+    // Fix D — get_program_info must accept program_id / program_name so it works
+    // from a page with no program in context (it dead-ended on "No program in
+    // context" in the 2026-07-13 report even though the model knew the UID).
+    const defs = getTools({ appType: 'Dashboard' }, req, false, null);
+    const gpi = defs.find((t) => t.function.name === 'get_program_info');
+    const props = (gpi && gpi.function.parameters && gpi.function.parameters.properties) || {};
+    truthy('get_program_info schema exposes program_id', !!props.program_id);
+    truthy('get_program_info schema exposes program_name', !!props.program_name);
+  }
+
+  // Broken-tile fix — a TRACKER-domain data element is not a valid aggregate dx
+  // item; buildVisualizationObject must refuse it (the 3-of-5-tiles-broken
+  // report) with a program-indicator pointer, while still building normal PIs.
+  const buildViz = need('buildVisualizationObject');
+  if (buildViz) {
+    const base = { name: 'T', vis_type: 'PIE', periods: ['LAST_12_MONTHS'], org_units: ['USER_ORGUNIT'] };
+    const trk = buildViz({ ...base, data_items: ['NfmqhsFpwnv'] }, { NfmqhsFpwnv: 'TRACKER_DATA_ELEMENT' });
+    truthy('tracker data element is REFUSED as a viz data_item', trk && !!trk._error && trk._tracker_data_element === 'NfmqhsFpwnv');
+    const pi = buildViz({ ...base, data_items: ['G2ON5cPuXxf'] }, { G2ON5cPuXxf: 'PROGRAM_INDICATOR' });
+    truthy('program indicator still builds a valid visualization', pi && !pi._error && !!pi.viz);
+  }
 }
 
 console.log('');

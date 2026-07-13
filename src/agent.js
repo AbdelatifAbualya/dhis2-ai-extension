@@ -212,6 +212,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   dhis2.failedCallSigs = new Map();
   dhis2.toolErrorFamilies = new Map();
   dhis2.toolSuccessCount = 0;
+  dhis2.executedCallSigs = new Map(); // no-progress guard: identical EXECUTED calls this turn
   console.log(`[AgenticLoop] writeAuth = ${dhis2.writeAuth.scope} (${dhis2.writeAuth.reason})`);
 
   const ctx = dhis2.pageContext || {};
@@ -639,34 +640,60 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     const msg = result.choices[0].message;
     messages.push(msg);
 
-    // Filter out hallucinated / invalid tool calls before processing
-    // Check both TOOL_ROUTER (exists at all) and contextualToolNames (was provided to the model)
-    const validToolCalls = (msg.tool_calls || []).filter(tc => {
-      const name = tc.function?.name;
-      if (!name || !TOOL_ROUTER[name]) {
-        console.warn(`[AgenticLoop] Skipping hallucinated tool call: "${name}" (not in TOOL_ROUTER)`);
-        return false;
-      }
-      if (!contextualToolNames.has(name)) {
-        console.warn(`[AgenticLoop] Skipping out-of-context tool call: "${name}" (not in contextual tools for this request)`);
-        return false;
-      }
-      return true;
-    });
-    // Also patch the message we pushed to history so only valid calls remain
-    if (msg.tool_calls && validToolCalls.length !== msg.tool_calls.length) {
-      msg.tool_calls = validToolCalls.length > 0 ? validToolCalls : undefined;
-      // Re-update the message already pushed into the messages array
-      messages[messages.length - 1] = msg;
-    }
+    // EVERY tool_call the model emits gets a tool result — even ones we cannot
+    // run. Hallucinated (unknown name) or out-of-context (real tool, not enabled
+    // this turn) calls were previously dropped SILENTLY with no result, so a
+    // temperature-0 model received zero feedback and re-emitted the exact same
+    // doomed call every iteration until the 50-step budget ran out (the
+    // manage_dashboards(list) loop reported 2026-07-13). We now answer each
+    // invalid call with an explanatory result so the model adapts, and we keep
+    // it in msg.tool_calls so every provider — including Anthropic, which
+    // requires one tool_result per tool_use — sees a matched pair.
+    const allToolCalls = msg.tool_calls || [];
 
-    if (validToolCalls.length > 0) {
-      for (const tc of validToolCalls) {
+    if (allToolCalls.length > 0) {
+      for (const tc of allToolCalls) {
+        const toolName = tc.function?.name;
         let args;
         try {
           const rawArgs = tc.function.arguments;
           args = typeof rawArgs === 'object' && rawArgs !== null ? rawArgs : JSON.parse(rawArgs);
         } catch { args = {}; }
+
+        // ── Unknown tool (hallucinated name) — answer, do not execute ──
+        if (!toolName || !TOOL_ROUTER[toolName]) {
+          console.warn(`[AgenticLoop] Hallucinated tool call: "${toolName}" (not in TOOL_ROUTER)`);
+          const feedback = {
+            _error: `Tool "${toolName || '(unnamed)'}" does not exist and was NOT executed.`,
+            _hint: `Use only the tools available for this request: ${[...contextualToolNames].join(', ')}. If none of them fits, answer the user directly in plain text.`,
+            _scope: 'unknown_tool',
+          };
+          broadcast({ type: 'AI_TOOL_CALL', tool: toolName || '(unknown)', args });
+          broadcast({ type: 'AI_TOOL_DONE', tool: toolName || '(unknown)', success: false, summary: feedback._error, details: { scope: 'unknown_tool' } });
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
+          lastToolName = toolName || null;
+          continue;
+        }
+
+        // ── Real tool, but not enabled for this request — answer, do not run ──
+        // The contextual set is sometimes a deliberate safety boundary (e.g. the
+        // read-only save-failure diagnostic mode strips every destructive tool),
+        // so we must NOT execute an unselected tool. Return actionable feedback
+        // instead of silently dropping the call, so the model switches to an
+        // available tool or tells the user — never loops on a vanished call.
+        if (!contextualToolNames.has(toolName)) {
+          console.warn(`[AgenticLoop] Out-of-context tool call: "${toolName}" (not enabled for this request)`);
+          const feedback = {
+            _error: `${toolName} is not enabled for this request and was NOT executed.`,
+            _hint: `Tools available this turn: ${[...contextualToolNames].join(', ')}. Pick the closest available one for the goal — e.g. tracker/enrollment PROGRAM indicators are created with manage_program_indicators, aggregate indicators with manage_indicators — or, if nothing here can do it, tell the user plainly what is missing. Do NOT re-issue ${toolName}; it will keep being refused.`,
+            _scope: 'tool_not_enabled',
+          };
+          broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args });
+          broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: feedback._error, details: { scope: 'tool_not_enabled' } });
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
+          lastToolName = toolName;
+          continue;
+        }
 
         broadcast({ type: 'AI_TOOL_CALL', tool: tc.function.name, args });
 
@@ -716,7 +743,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             // and must answer or switch tools — breaking the loop for real.
             const isLoopBlock = preflightStop._scope === 'repeated_identical_failure'
               || preflightStop._scope === 'same_error_family_limit'
-              || preflightStop._scope === 'http_error_limit_reached';
+              || preflightStop._scope === 'http_error_limit_reached'
+              || preflightStop._scope === 'no_progress_repeat';
             if (isLoopBlock) {
               const n = (toolBlockCounts.get(tc.function.name) || 0) + 1;
               toolBlockCounts.set(tc.function.name, n);
@@ -737,6 +765,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             } catch (toolErr) {
               toolResult = { _error: `Tool failed: ${toolErr.message}` };
             }
+            // Record this dispatch so the no-progress guard can refuse a model
+            // that keeps re-issuing the SAME call and getting the same result.
+            noteExecutedCall(tc.function.name, args);
             // ── Post-flight: harvest UIDs from the result so subsequent calls
             //    can reference them, and bump the HTTP-error counter on 4xx/5xx. ──
             recordKnownIdsFromResult(toolResult);

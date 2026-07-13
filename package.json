@@ -5,7 +5,8 @@
   "description": "DHIS2 AI Assistant — Chrome MV3 extension. No build step: the background service worker loads focused ES-free modules under src/ via importScripts(). See ARCHITECTURE.md.",
   "scripts": {
     "verify": "node scripts/verify.js",
-    "check": "node scripts/verify.js"
+    "check": "node scripts/verify.js",
+    "live": "node scripts/live-harness.js"
   },
   "engines": {
     "node": ">=18"

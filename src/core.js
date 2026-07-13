@@ -703,6 +703,47 @@ function repeatedFailureStopOrNull(toolName, args) {
   return null;
 }
 
+// ── No-progress guard (repeated identical SUCCESSFUL calls) ─────────────────
+// Every guard above only reacts to FAILURES. A call that keeps SUCCEEDING with
+// the same useless result made no progress yet slipped past all of them — the
+// model re-listed a dashboard 45× while narrating an action it never issued,
+// running out the whole iteration budget (2026-07-13). This counts identical
+// (tool, args) EXECUTIONS this turn and refuses further repeats once the model
+// is clearly looping. NO_PROGRESS_REPEAT_LIMIT is generous (a legit turn may
+// re-read the same list twice — e.g. before and after a write) so it never
+// bites a real build; a 3rd+ byte-identical execution is a loop.
+const NO_PROGRESS_REPEAT_LIMIT = 3;
+
+// Record a dispatched tool call (called AFTER it executes, on success OR error).
+// Returns the running count of identical (tool, args) executions this turn.
+// Fires on success too — that is the whole point; the failure guards already
+// cover the error case.
+function noteExecutedCall(toolName, args) {
+  if (!(dhis2.executedCallSigs instanceof Map)) dhis2.executedCallSigs = new Map();
+  const sig = failedCallSignature(toolName, args);
+  const count = (dhis2.executedCallSigs.get(sig) || 0) + 1;
+  dhis2.executedCallSigs.set(sig, count);
+  return count;
+}
+
+// Pre-flight refusal for a call that already executed with byte-identical args
+// NO_PROGRESS_REPEAT_LIMIT times this turn. Applies to every tool (including
+// read-only discovery tools — those are exactly what a no-progress loop spins
+// on). Fed into the agentic loop's circuit breaker via _scope so a model that
+// keeps re-emitting it has the tool physically removed, guaranteeing the loop
+// terminates instead of exhausting the budget.
+function noProgressStopOrNull(toolName, args) {
+  if (!(dhis2.executedCallSigs instanceof Map) || !dhis2.executedCallSigs.size) return null;
+  const count = dhis2.executedCallSigs.get(failedCallSignature(toolName, args)) || 0;
+  if (count < NO_PROGRESS_REPEAT_LIMIT) return null;
+  return {
+    _error: `BLOCKED: ${toolName}${args?.action ? `(action=${args.action})` : ''} has already run ${count} times this turn with identical arguments and returned the same result each time — re-running it makes no progress.`,
+    _hint: `You are looping on a call that changes nothing. STOP re-checking and do ONE of: (a) issue the NEXT concrete action with DIFFERENT arguments or a DIFFERENT tool, or (b) give the user your final answer now — what you have done so far (names + IDs), what still needs doing, and any tool you are missing to finish. Do NOT call ${toolName} with these arguments again.`,
+    _scope: 'no_progress_repeat',
+    _identical_executions: count,
+  };
+}
+
 // Pre-flight check called before EVERY tool dispatch. Returns null when the
 // call is safe to proceed; else returns a structured refusal.
 function preflightCheckCall(toolName, args) {
@@ -715,6 +756,9 @@ function preflightCheckCall(toolName, args) {
   // counter above never sees them.
   const repeatStop = repeatedFailureStopOrNull(toolName, args);
   if (repeatStop) return repeatStop;
+  // Refuse a call that keeps SUCCEEDING with no progress (identical repeats).
+  const noProgress = noProgressStopOrNull(toolName, args);
+  if (noProgress) return noProgress;
   // Skip UID validation when the seed set is empty (very first iteration with
   // no context) OR for read-only discovery tools whose job is to populate IDs.
   const DISCOVERY_TOOLS = new Set([

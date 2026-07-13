@@ -2393,3 +2393,87 @@ mechanically bounded across all tools, not just create_program.
 **Scope of impact:** Only the create_program / manage_program_rules build paths and the write-auth classifier changed. No other tool altered. The action-type guard and HIDEOPTION resolution make every rule-building path more robust (they can no longer emit an un-deserializable enum or an unbound HIDEOPTION). Not addressed (model behaviour, not a tool bug): the session's guessed icon-key 404s — the circuit breaker correctly stopped those; a create_program-side icon-keyword resolver is a noted follow-up.
 
 **Verification:** Live playground reproduce-then-fix for each error; full TB program imports with 0 API errors; server read-back confirms 10/10 rules (incl. bound HIDEOPTION + translated completion), 3/3 indicators, 5/5 sections; playground left clean; `npm run verify` green.
+
+---
+
+## 42. Dashboard "replace a tile with a new (program-indicator) chart" — infinite-loop disaster fixed
+
+**Reported:** 2026-07-13, `localhost:8081`. Asked to remove a dashboard tile and replace it with a
+chart of "% male vs female enrolled in the program (you likely need to create an indicator)", the
+model called the dashboard tool's `list` action ~45 times in a row — each succeeding — narrating
+"I'll create the program indicators and update the dashboard" without ever issuing a create, until
+it exhausted the 50-iteration budget. Full detail: `CHANGES_dashboard_indicator_loop_fix.md`.
+
+**Root cause (four compounding defects):**
+1. `manage_program_indicators` was never surfaced on the Dashboard app, so the model had no tool to
+   create the enrollment-by-sex program indicator it needed (`create_metadata` can't add a PI to an
+   existing program). The user's typos — "incdicator", "dahboard" — also defeated every keyword
+   regex, so even aggregate `manage_indicators` was withheld.
+2. An out-of-context tool call was dropped **silently** — no tool result, no feedback — so a temp-0
+   model re-emitted the same invisible call forever.
+3. The circuit breaker only fired on **failed** calls; the repeated `manage_dashboards(list)` calls
+   all **succeeded**, so nothing stopped them.
+4. `get_program_info` had no `program_id`/`program_name` param and dead-ended on "No program in
+   context" on the Dashboard app.
+
+**Fixes**
+- **A — `src/registry.js`:** a dashboard/data-viz turn now also surfaces `manage_program_indicators`,
+  `manage_indicators`, and `get_program_info` (the tools that create/inspect the metrics a chart
+  plots). Typo-proof: keyed off the app, not the spelling of "indicator".
+- **B — `src/agent.js`:** every `tool_call` now receives a `role:"tool"` result. Unknown tools
+  (`_scope:'unknown_tool'`) and real-but-not-enabled tools (`_scope:'tool_not_enabled'`) return
+  actionable feedback instead of vanishing. Not executed (respects deliberate safety boundaries like
+  read-only diagnostic mode); keeps one result per call (Anthropic-safe).
+- **C — `src/core.js` + `src/agent.js`:** new no-progress guard (`noteExecutedCall` /
+  `noProgressStopOrNull`, wired into `preflightCheckCall`) counts identical **executed** calls and,
+  after 3 identical no-progress runs, refuses further repeats and feeds the mechanical circuit
+  breaker (`no_progress_repeat` scope) — disabling the tool so the loop cannot continue.
+- **D — `src/registry.js` + `src/tools-metadata.js`:** `get_program_info` accepts `program_id` /
+  `program_name` (resolved server-side) and works from any page.
+
+**Verification:** `npm run verify` green with new assertions (no-progress guard behaviour; typo'd
+report message surfaces the indicator tools; `get_program_info` schema exposes `program_id`/
+`program_name`). Fresh-state loop simulation: the exact disaster now terminates at **iteration 7/50**
+(3 executions → blocked → tool disabled at iter 6). Live `localhost:8081` check: program/attribute/
+dashboard items match the report and DHIS2 validated the required PI pieces (`V{enrollment_count}`,
+`A{WCffUc0Cp2j} == 'MALE'`), confirming the task is now completable end-to-end.
+
+**Also fixed from the same report — 3 of 5 dashboard tiles rendered errors.** Root cause:
+`create_visualization` typed every data element as the aggregate `DATA_ELEMENT` dimension without
+checking `domainType`, so 3 tiles plotting **TRACKER**-domain data elements (Screening Method Used,
+Screening Assessment Result, Treatment Intervention Type) were saved but error at render time.
+Fix (`src/tools-metadata.js`): `resolveDataItemTypes` now reads `domainType` and marks tracker DEs
+as `TRACKER_DATA_ELEMENT`; `buildVisualizationObject` and the map `create` path refuse them with a
+"create a program indicator, then plot that" pointer. Confirmed live on `localhost:8081` that the
+three broken UIDs are all `domainType: TRACKER`.
+
+---
+
+## 43. Enhancement workflow: modular-repo skill + live-DHIS2 tool harness
+
+**Files:** `.claude/skills/dhis2-chatbot-performance-enhancement/SKILL.md` (rewritten),
+`scripts/live-harness.js` (new), `package.json` (added `live` script), `scripts/verify.js`
+(regression assertions added in #42).
+
+The performance-enhancement skill still described the pre-refactor monolith (`background.js` TOOLS
+array / dispatch). Rewrote it for the modular `src/*.js` layout and pointed it at the **New Design**
+repo, and hardened the mandate to match the user's requirement: only ship improvements (tools /
+security / design); never regress anything else; and before keeping ANY change, pass BOTH
+`npm run verify` AND a **complex** live-DHIS2 task driven through the real `executeTool` with
+**zero errors and zero failed API calls**, cleaning up every test object. Push to the New Design
+repo only after a complete pass, on `enhance-performance`, never straight to `main`.
+
+Added `scripts/live-harness.js`: loads the six modules in one VM scope (as the worker does) with a
+basic-auth `fetch` shim, so `executeTool(name, args)` runs against a real instance (writes fall
+back from `fetchViaTab` to a direct authenticated fetch; `dhis2.writeAuth='broad'`). It records
+every HTTP call + status and exposes `summarize()` to tally failures. `npm run live` is a
+connectivity smoke test; scenario scripts require it as a library. This is the concrete tool the
+skill's Tier-2 protocol points at — it is intentionally NOT part of `npm run verify` (which stays
+dependency- and network-free).
+
+**Verification of the #42 fixes with this harness (localhost:8081, program mqAdJnBK2Ve):** a
+complex flow — read program structure via `get_program_info(program_id)`; create male/female
+enrollment program indicators (server-validated); build a PIE from them; confirm a TRACKER data
+element is refused with no write; create a dashboard; `add_items`; `remove_item`; then delete
+everything and confirm the instance is left as found — passed **11/11 steps with 0 failed API
+calls** across 62 calls.
