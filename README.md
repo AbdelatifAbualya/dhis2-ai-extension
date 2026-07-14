@@ -79,7 +79,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 ```
 ┌──────────────────────┐    ┌────────────────────────────┐    ┌──────────────────────┐
 │   Content Script      │   │  Background Service Worker  │   │    Side Panel         │
-│   (content.js)        │──▶│  (background.js, ~18k LOC)  │──▶│  (sidepanel/)         │
+│   (content.js)        │──▶│  (background.js, 6 modules)│──▶│  (sidepanel/)         │
 │                       │   │                             │   │                       │
 │ • URL change monitor  │   │ • DHIS2 detection & session │   │ • Chat interface      │
 │ • hashchange/popstate │   │ • Page-context extraction   │   │ • Streaming display   │
@@ -207,8 +207,17 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
 ```
 dhis2-AI/
-├── manifest.json              MV3 config (v2.7.0)
-├── background.js              Service worker — all AI + API logic (~18.2k LOC)
+├── manifest.json              MV3 config (v2.8.13)
+├── background.js              Service worker entry — thin importScripts() loader
+├── src/                       Background worker modules (loaded, in order, by background.js)
+│   ├── core.js                config · state · safety gates · DHIS2 transport · backups · context
+│   ├── registry.js            tool schemas · KB · manuals · tool selection · system prompt
+│   ├── providers.js           LLM streaming · image · web search · patient-data privacy gate
+│   ├── tools-metadata.js      executeTool dispatcher + standard metadata tools
+│   ├── tools-programs.js      program-authoring tools · plugins · standalone
+│   └── agent.js               agentic loop · feedback · keepalive · message router
+├── scripts/
+│   └── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
 │   ├── panel.html             Side panel UI
@@ -229,11 +238,14 @@ dhis2-AI/
 
 ## Development
 
-No build step — pure HTML / CSS / JS.
+No build step — pure HTML / CSS / JS. The background worker is split into
+`src/*.js` modules loaded via `importScripts()`; see `ARCHITECTURE.md`.
 
 1. Edit source files.
-2. `chrome://extensions/` → click the refresh button on the extension card.
-3. Reload the DHIS2 tab.
+2. `npm run verify` — syntax-checks every module, loads them under a `chrome`
+   shim, and asserts the safety gates (no dependencies to install).
+3. `chrome://extensions/` → click the refresh button on the extension card.
+4. Reload the DHIS2 tab.
 
 Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district). Every feature in this README has been verified against that instance.
 

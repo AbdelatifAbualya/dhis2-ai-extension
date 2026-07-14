@@ -2347,3 +2347,174 @@ answer. `node --check background.js` passes.
 Valid programs are unchanged (0 false skips). Programs with a bad rule now import
 (minus that rule) instead of failing wholesale. Deterministic retry loops are
 mechanically bounded across all tools, not just create_program.
+
+---
+
+## 40. New Design — modular refactor of the background worker (6 modules) + two fixes
+
+**Files:** `background.js` (now a loader), new `src/{core,registry,providers,tools-metadata,tools-programs,agent}.js`, new `scripts/verify.js`, `package.json`, `ARCHITECTURE.md`.
+**Full detail:** see `CHANGES_modular_refactor.md`.
+
+**Type of change:** Structural refactor (behaviour-preserving) + one deliberate bug fix + dead-code removal + tooling.
+
+**What changed:**
+
+1. **Split `background.js` (26,168 lines) into six focused modules** loaded in order via `importScripts()`. `background.js` is now a 40-line loader. The modules share one classic-worker global scope, so no `import`/`export` wiring and no build step. The concatenation of `src/*.js` in load order is **byte-for-byte identical** to the prior `background.js` — behaviour is unchanged by construction. Module map is in `ARCHITECTURE.md`.
+
+2. **Fixed the duplicate `normalizeText()`** that hoisting made silently collide. The lowercase-only and the aggressive (strip-non-alphanumerics) variants are now `lowercaseText` and `normalizeSearchTokens`, both in `core.js`. This **restores** the `'sub-'` / `'sub-org'` triggers in `userExplicitlyWantsDescendants()` (e.g. "all sub-counties"), which the aggressive normalizer had been quietly disabling by turning hyphens into spaces. Other callers were repointed with behaviour preserved.
+
+3. **Removed the dead `lineListingAssets.routerSource`** fetch/field (the router source was fetched on every load and never read). `LINE_LISTING_ROUTER_PATH` and the live embedded routing are unchanged; no model-facing text changed.
+
+4. **Added `scripts/verify.js`** (`npm run verify`), a dependency-free check that `node --check`s every file, loads the six modules under a `chrome` shim, and asserts the safety-critical gates (write-auth, UID entropy, patient-data privacy path gate, the two normalizers, strict query encoding). Added a minimal `package.json` (no dependencies, no build) and `ARCHITECTURE.md`.
+
+**Scope of impact:** No tool schema, prompt, DHIS2 request shape, or safety gate changed — except the intended `sub-` descendant-trigger restoration. The safety review's heavier recommendations (single tool registry, typed state stores, `Dhis2Client`, `panel.js` split, TypeScript) were deliberately deferred and are listed in `ARCHITECTURE.md`.
+
+---
+
+## 41. create_program correctness — zero-error TB tracker program (COMPLETEENROLLMENT, HIDEOPTION, stage sections, "continue" auth)
+
+**Files:** `src/tools-programs.js`, `src/registry.js`, `src/core.js`.
+**Full detail + playground evidence:** `CHANGES_create_program_correctness.md`.
+
+**Type of change:** Correctness fixes to the create_program flow, proven on the live 2.43 playground.
+
+**Context:** A real session creating the "Tuberculosis Case Surveillance and Treatment" tracker program hit a cascade of failed API calls (a 500/409 on an invalid rule action, repeated "Option cannot be null", missing visual sections). Each root cause was reproduced and fixed via a Node harness running the REAL `executeTool` against `https://play.im.dhis2.org/stable-2-43-0-1`; the full program now imports with **32 API calls, 0 errors** (10 rules, 3 indicators, 5 sections), and all test metadata was cleaned up.
+
+**What changed:**
+
+1. **Invalid program-rule action types can no longer 409 the whole atomic import.** `createFullProgram` now normalizes every action `type` through the new `normalizeRuleActionType()` (`VALID_PR_ACTION_TYPES` whitelist + `PR_ACTION_TYPE_ALIASES`): valid types pass; model-invented `COMPLETEENROLLMENT`/`CLOSEENROLLMENT`/… are **translated to a `SHOWWARNING` completion prompt** (DHIS2 has no complete-enrollment action); anything else is dropped. Adjustments are surfaced in a new `rule_action_fixes` result field. Previously `programRuleActionType: act.type` was passed through unchecked → Jackson enum-deserialization 500/409 that killed the entire import.
+
+2. **HIDEOPTION resolves and binds the option UID.** The action loop resolves the target option from the option set built for `data_element_name` in this same call (exact name → code → forgiving match) and sets `programRuleAction.option`. Unresolvable → the rule is skipped cleanly. `src/registry.js` adds `option_name`/`option_code` to the rule-action schema. Fixes the repeated "Option cannot be null" validation failures.
+
+3. **create_program builds visual stage sections.** Stages accept `sections: [{name, data_elements:[…]}]`; sections are emitted as a **top-level `programStageSections` collection** (stage references by id — nesting them fails with "Invalid reference (ProgramStageSection)"). `src/registry.js` adds `sections` to the stage schema. Previously sections could not be created at all.
+
+4. **"continue" now authorizes writes.** Added `continue` to `WRITE_AUTH_BROAD_RE` and the bare-affirmation regex in `classifyWriteAuthorization()` (next to `proceed`), so the assistant's own suggested word ("Reply 'continue' and I will create…") no longer gets refused. Negation guard still neutralises "don't continue".
+
+**Scope of impact:** Only the create_program / manage_program_rules build paths and the write-auth classifier changed. No other tool altered. The action-type guard and HIDEOPTION resolution make every rule-building path more robust (they can no longer emit an un-deserializable enum or an unbound HIDEOPTION). Not addressed (model behaviour, not a tool bug): the session's guessed icon-key 404s — the circuit breaker correctly stopped those; a create_program-side icon-keyword resolver is a noted follow-up.
+
+**Verification:** Live playground reproduce-then-fix for each error; full TB program imports with 0 API errors; server read-back confirms 10/10 rules (incl. bound HIDEOPTION + translated completion), 3/3 indicators, 5/5 sections; playground left clean; `npm run verify` green.
+
+---
+
+## 42. Dashboard "replace a tile with a new (program-indicator) chart" — infinite-loop disaster fixed
+
+**Reported:** 2026-07-13, `localhost:8081`. Asked to remove a dashboard tile and replace it with a
+chart of "% male vs female enrolled in the program (you likely need to create an indicator)", the
+model called the dashboard tool's `list` action ~45 times in a row — each succeeding — narrating
+"I'll create the program indicators and update the dashboard" without ever issuing a create, until
+it exhausted the 50-iteration budget. Full detail: `CHANGES_dashboard_indicator_loop_fix.md`.
+
+**Root cause (four compounding defects):**
+1. `manage_program_indicators` was never surfaced on the Dashboard app, so the model had no tool to
+   create the enrollment-by-sex program indicator it needed (`create_metadata` can't add a PI to an
+   existing program). The user's typos — "incdicator", "dahboard" — also defeated every keyword
+   regex, so even aggregate `manage_indicators` was withheld.
+2. An out-of-context tool call was dropped **silently** — no tool result, no feedback — so a temp-0
+   model re-emitted the same invisible call forever.
+3. The circuit breaker only fired on **failed** calls; the repeated `manage_dashboards(list)` calls
+   all **succeeded**, so nothing stopped them.
+4. `get_program_info` had no `program_id`/`program_name` param and dead-ended on "No program in
+   context" on the Dashboard app.
+
+**Fixes**
+- **A — `src/registry.js`:** a dashboard/data-viz turn now also surfaces `manage_program_indicators`,
+  `manage_indicators`, and `get_program_info` (the tools that create/inspect the metrics a chart
+  plots). Typo-proof: keyed off the app, not the spelling of "indicator".
+- **B — `src/agent.js`:** every `tool_call` now receives a `role:"tool"` result. Unknown tools
+  (`_scope:'unknown_tool'`) and real-but-not-enabled tools (`_scope:'tool_not_enabled'`) return
+  actionable feedback instead of vanishing. Not executed (respects deliberate safety boundaries like
+  read-only diagnostic mode); keeps one result per call (Anthropic-safe).
+- **C — `src/core.js` + `src/agent.js`:** new no-progress guard (`noteExecutedCall` /
+  `noProgressStopOrNull`, wired into `preflightCheckCall`) counts identical **executed** calls and,
+  after 3 identical no-progress runs, refuses further repeats and feeds the mechanical circuit
+  breaker (`no_progress_repeat` scope) — disabling the tool so the loop cannot continue.
+- **D — `src/registry.js` + `src/tools-metadata.js`:** `get_program_info` accepts `program_id` /
+  `program_name` (resolved server-side) and works from any page.
+
+**Verification:** `npm run verify` green with new assertions (no-progress guard behaviour; typo'd
+report message surfaces the indicator tools; `get_program_info` schema exposes `program_id`/
+`program_name`). Fresh-state loop simulation: the exact disaster now terminates at **iteration 7/50**
+(3 executions → blocked → tool disabled at iter 6). Live `localhost:8081` check: program/attribute/
+dashboard items match the report and DHIS2 validated the required PI pieces (`V{enrollment_count}`,
+`A{WCffUc0Cp2j} == 'MALE'`), confirming the task is now completable end-to-end.
+
+**Also fixed from the same report — 3 of 5 dashboard tiles rendered errors.** Root cause:
+`create_visualization` typed every data element as the aggregate `DATA_ELEMENT` dimension without
+checking `domainType`, so 3 tiles plotting **TRACKER**-domain data elements (Screening Method Used,
+Screening Assessment Result, Treatment Intervention Type) were saved but error at render time.
+Fix (`src/tools-metadata.js`): `resolveDataItemTypes` now reads `domainType` and marks tracker DEs
+as `TRACKER_DATA_ELEMENT`; `buildVisualizationObject` and the map `create` path refuse them with a
+"create a program indicator, then plot that" pointer. Confirmed live on `localhost:8081` that the
+three broken UIDs are all `domainType: TRACKER`.
+
+---
+
+## 43. Enhancement workflow: modular-repo skill + live-DHIS2 tool harness
+
+**Files:** `.claude/skills/dhis2-chatbot-performance-enhancement/SKILL.md` (rewritten),
+`scripts/live-harness.js` (new), `package.json` (added `live` script), `scripts/verify.js`
+(regression assertions added in #42).
+
+The performance-enhancement skill still described the pre-refactor monolith (`background.js` TOOLS
+array / dispatch). Rewrote it for the modular `src/*.js` layout and pointed it at the **New Design**
+repo, and hardened the mandate to match the user's requirement: only ship improvements (tools /
+security / design); never regress anything else; and before keeping ANY change, pass BOTH
+`npm run verify` AND a **complex** live-DHIS2 task driven through the real `executeTool` with
+**zero errors and zero failed API calls**, cleaning up every test object. Push to the New Design
+repo only after a complete pass, on `enhance-performance`, never straight to `main`.
+
+Added `scripts/live-harness.js`: loads the six modules in one VM scope (as the worker does) with a
+basic-auth `fetch` shim, so `executeTool(name, args)` runs against a real instance (writes fall
+back from `fetchViaTab` to a direct authenticated fetch; `dhis2.writeAuth='broad'`). It records
+every HTTP call + status and exposes `summarize()` to tally failures. `npm run live` is a
+connectivity smoke test; scenario scripts require it as a library. This is the concrete tool the
+skill's Tier-2 protocol points at — it is intentionally NOT part of `npm run verify` (which stays
+dependency- and network-free).
+
+**Verification of the #42 fixes with this harness (localhost:8081, program mqAdJnBK2Ve):** a
+complex flow — read program structure via `get_program_info(program_id)`; create male/female
+enrollment program indicators (server-validated); build a PIE from them; confirm a TRACKER data
+element is refused with no write; create a dashboard; `add_items`; `remove_item`; then delete
+everything and confirm the instance is left as found — passed **11/11 steps with 0 failed API
+calls** across 62 calls.
+
+---
+
+## 44. Complex-program robustness — weak-model recovery so an average LLM finishes with 0 failed API calls
+
+**Files:** `src/tools-programs.js`, `src/core.js`, `src/agent.js`, `src/providers.js`.
+Full detail in **`CHANGES_complex_program_robustness.md`**.
+
+Root-caused from a real dead-loop: a very large prompt (the "Diabetes Care & Complications
+Tracker" — 6 attributes, 4 stages, 46 DEs, ~20 option sets, 30 rules) on a custom
+OpenAI-compatible provider (MiniMax). First `create_program` → `Validation failed with 304
+error(s): … Missing required property `name``; then empty `create_metadata` calls (`Missing
+required parameter: action`); the circuit breaker **disabled the tool**; the model then spun on
+30+ `check_existing` reads and emitted a garbled tool call with leaked `]<]minimax[>[` tokens.
+
+**Harness proof it was the model, not the tool:** the *correct* full payload imports via the real
+`executeTool` with **67 API calls, 0 failed, 242 objects** in one atomic call. The guardrails were
+turning a recoverable model glitch into an unrecoverable loop. Four fixes:
+
+1. **`create_program` pre-validation** (`validateAndHealProgramInput`, `tools-programs.js`) — a
+   zero-API-call pass BEFORE the import: auto-names unnamed rules / inline option sets, collects
+   un-inferable gaps (DE/attr missing name or `value_type`, option set with no options) into one
+   precise error, and flags a mostly-empty payload as *truncated → resend*. Turns a 304 atomic
+   avalanche (3 failed calls + a 409) into one cheap, precise, non-disabling error.
+2. **Malformed/empty/truncated calls never disable the tool** (`isIncompleteCallError` +
+   non-disabling `incomplete_call_repeat` scope in `core.js`; circuit-breaker exclusion in
+   `agent.js`) — the identical/family repeat is still refused, but with "resend the complete call"
+   framing that does NOT count toward removing the tool. Genuinely doomed operations still disable.
+3. **No-progress discovery-streak guard** (`isDiscoveryCall` / `discoveryStreakStopOrNull` in
+   `core.js`; `consecutiveDiscoveryCalls` in `agent.js`) — closes the blind spot where 30+
+   read-only calls with DIFFERENT args made no progress; after 12 consecutive reads with no write
+   it points the model at the create call and resets on the next successful write.
+4. **Recover corrupted streamed tool-call JSON** (`repairToolCallArguments` in `core.js`; used in
+   `providers.js`; honest resend in `agent.js`) — replaces the silent `arguments = '{}'` fallback
+   that was the root trigger. Strips leaked `]<]word[>[` tokens, balances truncated braces/strings,
+   re-parses; unrecoverable → non-disabling "resend / split into smaller calls".
+
+**Verified:** full 30-rule program imports with 0 failed calls; empty-name payload fails with 0
+failed calls (was 3+409); heal path creates the auto-named rule (server read-back); the exact
+`]<]minimax[>[` corruption is repaired and imports; integrated cascade simulation recovers (tool
+never disabled, streak guard fires). `npm run verify` green; instance left exactly as found.
