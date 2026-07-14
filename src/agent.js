@@ -213,6 +213,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   dhis2.toolErrorFamilies = new Map();
   dhis2.toolSuccessCount = 0;
   dhis2.executedCallSigs = new Map(); // no-progress guard: identical EXECUTED calls this turn
+  dhis2.consecutiveDiscoveryCalls = 0; // no-progress guard: read-only calls since the last write
+  dhis2.corruptedCallCount = 0; // truncated/corrupted tool-call arguments seen this turn
   console.log(`[AgenticLoop] writeAuth = ${dhis2.writeAuth.scope} (${dhis2.writeAuth.reason})`);
 
   const ctx = dhis2.pageContext || {};
@@ -655,10 +657,25 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       for (const tc of allToolCalls) {
         const toolName = tc.function?.name;
         let args;
+        // Provider may have flagged the streamed arguments as unrecoverable
+        // (truncated/corrupted tool-call JSON). Track it so we can return an
+        // honest "resend" instead of executing the empty {} fallback.
+        let argsCorrupted = tc._argsCorrupted || null;
         try {
           const rawArgs = tc.function.arguments;
-          args = typeof rawArgs === 'object' && rawArgs !== null ? rawArgs : JSON.parse(rawArgs);
-        } catch { args = {}; }
+          if (typeof rawArgs === 'object' && rawArgs !== null) {
+            args = rawArgs;
+          } else {
+            const trimmed = String(rawArgs == null ? '' : rawArgs).trim();
+            args = trimmed ? JSON.parse(trimmed) : {};
+          }
+        } catch {
+          // Non-empty arguments that don't parse = corruption, even if the
+          // provider layer didn't flag it (covers non-streaming/other adapters).
+          args = {};
+          const rawLen = String(tc.function?.arguments == null ? '' : tc.function.arguments).trim().length;
+          if (rawLen > 0) argsCorrupted = argsCorrupted || { rawLength: rawLen, sample: String(tc.function.arguments).slice(0, 120) };
+        }
 
         // ── Unknown tool (hallucinated name) — answer, do not execute ──
         if (!toolName || !TOOL_ROUTER[toolName]) {
@@ -690,6 +707,31 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           };
           broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args });
           broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: feedback._error, details: { scope: 'tool_not_enabled' } });
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
+          lastToolName = toolName;
+          continue;
+        }
+
+        // ── Corrupted / truncated tool-call arguments — resend, do not execute ──
+        // The tool name streamed fine but its arguments did not arrive intact
+        // (weak/custom provider truncating or leaking tokens on a large payload).
+        // Executing with the empty {} fallback produces a misleading "Missing
+        // required parameter" and trips the loop guards; instead return an
+        // honest, NON-disabling "resend the complete call" and, once it recurs,
+        // steer the model to split the work into smaller calls.
+        if (argsCorrupted) {
+          dhis2.corruptedCallCount = (dhis2.corruptedCallCount || 0) + 1;
+          const persistent = dhis2.corruptedCallCount >= 3;
+          const feedback = {
+            _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON). NOTHING was executed.`,
+            _hint: persistent
+              ? `This is the ${dhis2.corruptedCallCount}rd time your arguments arrived corrupted — the payload is too large to stream in one tool call reliably. STOP sending it whole. Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably.`
+              : `This is a transport/serialisation glitch, not a flaw in your plan. Re-send the SAME ${toolName} call with the COMPLETE arguments. If it keeps truncating, split a very large program into smaller calls (create the shell + first stage, then add_stage / add_program_rules for the rest). This does NOT count against you and the tool stays available.`,
+            _scope: 'incomplete_call',
+            _no_disable: true,
+          };
+          broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args: {} });
+          broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: `${toolName}: tool-call arguments were truncated/corrupted — asked model to resend`, details: { scope: 'incomplete_call' } });
           messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
           lastToolName = toolName;
           continue;
@@ -741,10 +783,19 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             // the turn AND inject a hard directive. A deterministic model that
             // keeps re-emitting the blocked call is then physically unable to,
             // and must answer or switch tools — breaking the loop for real.
-            const isLoopBlock = preflightStop._scope === 'repeated_identical_failure'
+            // Incomplete/malformed calls (empty args, "missing required
+            // parameter", truncated create_program payloads) are refused with a
+            // "resend the complete call" hint but must NEVER disable the tool —
+            // a well-formed retry is exactly what should happen next. They carry
+            // _no_disable / an incomplete_call scope, so they are excluded here.
+            const isNonDisabling = preflightStop._no_disable === true
+              || preflightStop._scope === 'incomplete_call'
+              || preflightStop._scope === 'incomplete_call_repeat';
+            const isLoopBlock = !isNonDisabling && (
+              preflightStop._scope === 'repeated_identical_failure'
               || preflightStop._scope === 'same_error_family_limit'
               || preflightStop._scope === 'http_error_limit_reached'
-              || preflightStop._scope === 'no_progress_repeat';
+              || preflightStop._scope === 'no_progress_repeat');
             if (isLoopBlock) {
               const n = (toolBlockCounts.get(tc.function.name) || 0) + 1;
               toolBlockCounts.set(tc.function.name, n);
@@ -768,6 +819,17 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             // Record this dispatch so the no-progress guard can refuse a model
             // that keeps re-issuing the SAME call and getting the same result.
             noteExecutedCall(tc.function.name, args);
+            // Discovery-streak guard: count consecutive read-only calls, and
+            // reset the moment a WRITE succeeds — a long run of reads with no
+            // write is the "research forever, never act" loop.
+            {
+              const toolFailed = toolResult && (toolResult._error || toolResult.success === false);
+              if (isDiscoveryCall(tc.function.name, args)) {
+                dhis2.consecutiveDiscoveryCalls = (dhis2.consecutiveDiscoveryCalls || 0) + 1;
+              } else if (!toolFailed) {
+                dhis2.consecutiveDiscoveryCalls = 0; // a successful non-discovery call = real progress
+              }
+            }
             // ── Post-flight: harvest UIDs from the result so subsequent calls
             //    can reference them, and bump the HTTP-error counter on 4xx/5xx. ──
             recordKnownIdsFromResult(toolResult);

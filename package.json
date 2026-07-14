@@ -1,6 +1,6 @@
 {
   "name": "dhis2-ai-assistant",
-  "version": "2.8.13",
+  "version": "2.8.14",
   "private": true,
   "description": "DHIS2 AI Assistant — Chrome MV3 extension. No build step: the background service worker loads focused ES-free modules under src/ via importScripts(). See ARCHITECTURE.md.",
   "scripts": {

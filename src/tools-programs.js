@@ -1048,8 +1048,123 @@ async function postMetadataPayload(payload, dryRunOnly) {
   return { success: true, phase: 'import', stats: importStats, ...recoveryInfo() };
 }
 
+// ── create_program input pre-validation (client-side, ZERO API calls) ────────
+// The atomic /metadata import rejects the WHOLE program if any object is missing
+// a required `name`/`value_type`, coming back as "Validation failed with N
+// error(s): TrackedEntityAttribute: Missing required property `name`; …" — and
+// NOTHING is created. Weak models routinely emit such payloads (empty
+// placeholders, or a truncated giant call), and the raw 304 avalanche burned the
+// HTTP-error budget (an empty `name` even 500s the dedup `ilike:` probe) and fed
+// the circuit breaker until the tool was disabled and the turn dead-looped
+// (real 2026-07-14 session). This pass runs BEFORE any network call and:
+//   • auto-heals cosmetic gaps — a rule with no name gets a generated one, an
+//     inline option set with no name inherits its field's name;
+//   • collects the gaps DHIS2 would reject and cannot be safely inferred (a
+//     data element / attribute with no name, a new one with no value_type, an
+//     option set with no options) into ONE precise, cheap error;
+//   • flags a payload that is mostly-empty as truncated, steering the model to
+//     re-send the COMPLETE call rather than guess at 150 nameless objects.
+// The returned error carries `_scope:'incomplete_call'` + `_no_disable:true` so
+// the agent loop treats it as "your input was incomplete, resend it" — it never
+// counts toward disabling create_metadata (a well-formed retry must stay open).
+function validateAndHealProgramInput(args) {
+  const nonEmpty = (s) => typeof s === 'string' && s.trim().length > 0;
+  const issues = [];               // hard, un-inferable gaps → block (cheaply)
+  const heals = [];                // cosmetic gaps auto-filled → note only
+  let nameRequiredTotal = 0;       // denominator for the truncation heuristic
+  let nameMissingCount = 0;
+
+  const attrs = Array.isArray(args.program_attributes) ? args.program_attributes : [];
+  attrs.forEach((a, i) => {
+    if (!a || typeof a !== 'object') { issues.push(`program_attributes[${i}] is not an object`); return; }
+    if (nonEmpty(a.id)) return;    // reusing an existing TEA by UID — name/type not required
+    nameRequiredTotal++;
+    if (!nonEmpty(a.name)) { nameMissingCount++; issues.push(`program_attributes[${i}] is missing a name`); return; }
+    if (!nonEmpty(a.value_type)) issues.push(`attribute "${a.name}" is missing value_type (e.g. TEXT, NUMBER, DATE, BOOLEAN)`);
+    if (a.option_set && typeof a.option_set === 'object') {
+      if (!nonEmpty(a.option_set.name)) { a.option_set.name = a.name; heals.push(`named the option set for attribute "${a.name}"`); }
+      if (!Array.isArray(a.option_set.options) || !a.option_set.options.filter(nonEmpty).length) issues.push(`option set for attribute "${a.name}" has no options`);
+    }
+  });
+
+  const stages = Array.isArray(args.stages) ? args.stages : [];
+  stages.forEach((s, si) => {
+    if (!s || typeof s !== 'object') { issues.push(`stages[${si}] is not an object`); return; }
+    nameRequiredTotal++;
+    const sName = nonEmpty(s.name) ? s.name : `stages[${si}]`;
+    if (!nonEmpty(s.name)) { nameMissingCount++; issues.push(`stages[${si}] is missing a name`); }
+    const des = Array.isArray(s.data_elements) ? s.data_elements : [];
+    des.forEach((d, di) => {
+      if (!d || typeof d !== 'object') { issues.push(`stage "${sName}" data_elements[${di}] is not an object`); return; }
+      nameRequiredTotal++;
+      if (!nonEmpty(d.name)) { nameMissingCount++; issues.push(`stage "${sName}" data_elements[${di}] is missing a name`); return; }
+      if (!nonEmpty(d.value_type)) issues.push(`data element "${d.name}" (stage "${sName}") is missing value_type (e.g. TEXT, NUMBER, DATE, BOOLEAN)`);
+      if (d.option_set && typeof d.option_set === 'object') {
+        if (!nonEmpty(d.option_set.name)) { d.option_set.name = d.name; heals.push(`named the option set for data element "${d.name}"`); }
+        if (!Array.isArray(d.option_set.options) || !d.option_set.options.filter(nonEmpty).length) issues.push(`option set for data element "${d.name}" has no options`);
+      }
+    });
+  });
+
+  // Rules: a missing name is cosmetic (a rule's identity is its condition +
+  // actions) — generate one so it never bounces the import. A rule with no
+  // condition or no actions is left for the existing skip-and-report path.
+  const rules = Array.isArray(args.program_rules) ? args.program_rules : [];
+  const usedRuleNames = new Set(rules.filter(r => r && nonEmpty(r.name)).map(r => r.name.trim().toLowerCase()));
+  const rulePrefix = (nonEmpty(args.program_short_name) ? args.program_short_name.trim() : (args.program_name || 'Program').trim());
+  rules.forEach((r, i) => {
+    if (!r || typeof r !== 'object') return;
+    if (nonEmpty(r.name)) return;
+    let base = '';
+    const act = Array.isArray(r.actions) && r.actions[0] ? r.actions[0] : null;
+    const target = act && (act.data_element_name || act.tracked_entity_attribute_name || act.program_stage_name);
+    if (act && nonEmpty(act.type)) base = `${rulePrefix} ${act.type}${nonEmpty(target) ? ' ' + target : ''}`;
+    let candidate = nonEmpty(base) ? base : `${rulePrefix} rule ${i + 1}`;
+    let n = candidate;
+    let k = 2;
+    while (usedRuleNames.has(n.trim().toLowerCase())) { n = `${candidate} ${k++}`; }
+    r.name = n.substring(0, 230);
+    usedRuleNames.add(r.name.trim().toLowerCase());
+    heals.push(`auto-named an unnamed program rule → "${r.name}"`);
+  });
+
+  if (!issues.length) return { heals };
+
+  // Mostly-empty payload → almost always a truncated/garbled giant call. Say so
+  // plainly instead of dumping 150 near-identical "missing name" lines.
+  const truncated = nameRequiredTotal >= 4 && (nameMissingCount / nameRequiredTotal) >= 0.25 || nameMissingCount >= 8;
+  const shown = issues.slice(0, 12);
+  const more = issues.length - shown.length;
+  const error = truncated
+    ? `create_program input looks incomplete/truncated — ${nameMissingCount} of ${nameRequiredTotal} objects that need a name are missing one (e.g. ${shown.slice(0, 3).join('; ')}${issues.length > 3 ? '; …' : ''}). NOTHING was created.`
+    : `create_program input is missing ${issues.length} required field(s): ${shown.join('; ')}${more > 0 ? `; …and ${more} more` : ''}. NOTHING was created.`;
+  return {
+    heals,
+    error: {
+      success: false,
+      nothing_created: true,
+      phase: 'input_validation',
+      _error: error,
+      _hint: truncated
+        ? 'Your create_program arguments arrived incomplete — likely the tool-call JSON was truncated. Re-send the COMPLETE create_program call with every attribute/stage/data element carrying its name and value_type. This is a client-side check: NO API call was made, nothing was created, and this does NOT count against the tool — a well-formed retry is expected.'
+        : 'Add the missing name/value_type/options field(s) listed above (each object needs a non-empty name; every NEW data element/attribute needs a value_type; every inline option set needs options), then re-issue the WHOLE create_program call. This was caught client-side with NO API call — nothing was created and the tool remains fully available for your corrected retry.',
+      _scope: 'incomplete_call',
+      _no_disable: true,
+    },
+  };
+}
+
 async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   if (!args.program_name) return { _error: 'Missing program_name for create_program' };
+
+  // Pre-validate + heal the payload BEFORE any network call: turns the atomic
+  // "Missing required property `name`" 304 avalanche into one cheap, precise,
+  // non-disabling error (see validateAndHealProgramInput).
+  {
+    const pre = validateAndHealProgramInput(args);
+    if (pre.error) return pre.error;
+    if (pre.heals && pre.heals.length) args._input_heals = pre.heals;
+  }
 
   // Default program_type to WITH_REGISTRATION (tracker) if not specified
   const programType = args.program_type || 'WITH_REGISTRATION';
@@ -2191,6 +2306,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   return {
     ...result,
     ...skipInfo,
+    ...(args._input_heals && args._input_heals.length ? { _input_heals: args._input_heals } : {}),
     program_id: programUid,
     stage_ids,
     data_element_ids: { ...deUidMap },

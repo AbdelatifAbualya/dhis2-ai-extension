@@ -2477,3 +2477,44 @@ enrollment program indicators (server-validated); build a PIE from them; confirm
 element is refused with no write; create a dashboard; `add_items`; `remove_item`; then delete
 everything and confirm the instance is left as found — passed **11/11 steps with 0 failed API
 calls** across 62 calls.
+
+---
+
+## 44. Complex-program robustness — weak-model recovery so an average LLM finishes with 0 failed API calls
+
+**Files:** `src/tools-programs.js`, `src/core.js`, `src/agent.js`, `src/providers.js`.
+Full detail in **`CHANGES_complex_program_robustness.md`**.
+
+Root-caused from a real dead-loop: a very large prompt (the "Diabetes Care & Complications
+Tracker" — 6 attributes, 4 stages, 46 DEs, ~20 option sets, 30 rules) on a custom
+OpenAI-compatible provider (MiniMax). First `create_program` → `Validation failed with 304
+error(s): … Missing required property `name``; then empty `create_metadata` calls (`Missing
+required parameter: action`); the circuit breaker **disabled the tool**; the model then spun on
+30+ `check_existing` reads and emitted a garbled tool call with leaked `]<]minimax[>[` tokens.
+
+**Harness proof it was the model, not the tool:** the *correct* full payload imports via the real
+`executeTool` with **67 API calls, 0 failed, 242 objects** in one atomic call. The guardrails were
+turning a recoverable model glitch into an unrecoverable loop. Four fixes:
+
+1. **`create_program` pre-validation** (`validateAndHealProgramInput`, `tools-programs.js`) — a
+   zero-API-call pass BEFORE the import: auto-names unnamed rules / inline option sets, collects
+   un-inferable gaps (DE/attr missing name or `value_type`, option set with no options) into one
+   precise error, and flags a mostly-empty payload as *truncated → resend*. Turns a 304 atomic
+   avalanche (3 failed calls + a 409) into one cheap, precise, non-disabling error.
+2. **Malformed/empty/truncated calls never disable the tool** (`isIncompleteCallError` +
+   non-disabling `incomplete_call_repeat` scope in `core.js`; circuit-breaker exclusion in
+   `agent.js`) — the identical/family repeat is still refused, but with "resend the complete call"
+   framing that does NOT count toward removing the tool. Genuinely doomed operations still disable.
+3. **No-progress discovery-streak guard** (`isDiscoveryCall` / `discoveryStreakStopOrNull` in
+   `core.js`; `consecutiveDiscoveryCalls` in `agent.js`) — closes the blind spot where 30+
+   read-only calls with DIFFERENT args made no progress; after 12 consecutive reads with no write
+   it points the model at the create call and resets on the next successful write.
+4. **Recover corrupted streamed tool-call JSON** (`repairToolCallArguments` in `core.js`; used in
+   `providers.js`; honest resend in `agent.js`) — replaces the silent `arguments = '{}'` fallback
+   that was the root trigger. Strips leaked `]<]word[>[` tokens, balances truncated braces/strings,
+   re-parses; unrecoverable → non-disabling "resend / split into smaller calls".
+
+**Verified:** full 30-rule program imports with 0 failed calls; empty-name payload fails with 0
+failed calls (was 3+409); heal path creates the auto-named rule (server read-back); the exact
+`]<]minimax[>[` corruption is repaired and imports; integrated cascade simulation recovers (tool
+never disabled, streak guard fires). `npm run verify` green; instance left exactly as found.

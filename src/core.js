@@ -618,6 +618,58 @@ function isTransientToolError(text) {
     .test(String(text || ''));
 }
 
+// "Incomplete call" = the model failed to SERIALIZE its arguments (empty args, a
+// dispatcher's "Missing required parameter", or a truncated/empty-placeholder
+// create_program payload flagged by validateAndHealProgramInput). Unlike a
+// doomed OPERATION (a rejected expression, a bad UID), the fix is always "resend
+// the COMPLETE call" — so these must NEVER disable the tool: a well-formed retry
+// is exactly what should happen. We still refuse an identical empty REPEAT (no
+// spam), but with recovery framing and a non-disabling scope. Detected by an
+// explicit flag/scope from the tool, or by the error text as a fallback.
+function isIncompleteCallError(resultOrText) {
+  if (resultOrText && typeof resultOrText === 'object') {
+    if (resultOrText._no_disable === true) return true;
+    if (resultOrText._scope === 'incomplete_call' || resultOrText._scope === 'incomplete_call_repeat') return true;
+    resultOrText = toolFailureText(resultOrText);
+  }
+  return /missing required parameter|missing program_name|input looks incomplete|input is missing \d+ required field|incomplete\/truncated|arguments? (?:were|was|arrived) (?:empty|incomplete|truncated)|did not arrive intact|missing required property/i
+    .test(String(resultOrText || ''));
+}
+
+// Recover a streamed tool-call `arguments` JSON string that did not parse — the
+// common failure on weaker / custom OpenAI-compatible models (e.g. MiniMax)
+// under a large payload: the stream truncates mid-object, or leaks provider
+// separator tokens like `]<]minimax[>[` into the buffer. Returns
+// { ok:true, text } with a parseable JSON string when recovered, else
+// { ok:false }. Never throws. Pure — safe to unit test.
+function repairToolCallArguments(raw) {
+  const s0 = String(raw == null ? '' : raw);
+  const tryParse = (t) => { try { JSON.parse(t); return true; } catch { return false; } };
+  if (tryParse(s0)) return { ok: true, text: s0 };
+  // Strip leaked provider separator tokens ( ]<]word[>[ ) and stray control chars.
+  let s = s0.replace(/\]?<\]\w+\[>\[?/g, '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  if (tryParse(s)) return { ok: true, text: s };
+  // Isolate the outermost object/array of a stream truncated before it closed.
+  const start = s.search(/[{[]/);
+  if (start === -1) return { ok: false };
+  s = s.slice(start).replace(/,\s*$/, '').replace(/:\s*$/, '').replace(/,\s*([}\]])/g, '$1');
+  // Balance braces/brackets that are open outside of a string literal.
+  let inStr = false, esc = false;
+  const stack = [];
+  for (const ch of s) {
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (inStr) s += '"';               // close an unterminated string
+  s = s.replace(/,\s*$/, '');
+  while (stack.length) s += (stack.pop() === '{' ? '}' : ']');
+  return tryParse(s) ? { ok: true, text: s } : { ok: false };
+}
+
 // Collapse an error message into a "family" key: same message modulo UIDs,
 // numbers and whitespace. Lets us catch "same error, slightly different args".
 function toolErrorFamily(text) {
@@ -671,6 +723,19 @@ function repeatedFailureStopOrNull(toolName, args) {
       const limit = prev.transient ? IDENTICAL_TRANSIENT_LIMIT : IDENTICAL_FAILURE_LIMIT;
       if (prev.count >= limit) {
         prev.blockedAttempts = (prev.blockedAttempts || 0) + 1;
+        // Incomplete/malformed call: refuse the identical empty repeat, but with
+        // recovery framing and a NON-disabling scope — the model must be free to
+        // send a well-formed call next (see isIncompleteCallError).
+        if (isIncompleteCallError(prev.error)) {
+          return {
+            _error: `Your last ${toolName} call was refused because it repeated an INCOMPLETE call: "${prev.error}". `,
+            _hint: `This is not a doomed operation — it means the arguments did not arrive intact (empty or truncated tool-call JSON). Re-send the COMPLETE ${toolName} call with EVERY required field populated. Do NOT send the same empty/partial arguments again. The tool stays fully available; a well-formed call will run normally.`,
+            _scope: 'incomplete_call_repeat',
+            _no_disable: true,
+            _previous_error: prev.error,
+            _identical_failures: prev.count,
+          };
+        }
         return {
           _error: `BLOCKED: this exact ${toolName} call already failed ${prev.count} time(s) this turn with: "${prev.error}". Identical retries are refused — the same input produces the same error.`,
           _hint: prev.blockedAttempts >= 2
@@ -691,6 +756,19 @@ function repeatedFailureStopOrNull(toolName, args) {
       if (k.startsWith(prefix) && n > worst) { worst = n; worstFamily = k.slice(prefix.length); }
     }
     if (worst >= SAME_ERROR_FAMILY_LIMIT) {
+      // A run of incomplete/malformed calls (empty args, "missing required
+      // parameter", truncated payloads) must not disable the tool — steer the
+      // model to send ONE complete call, keeping the tool available.
+      if (isIncompleteCallError(worstFamily)) {
+        return {
+          _error: `${toolName}${args?.action ? `(action=${args.action})` : ''} has been called ${worst} times this turn with INCOMPLETE arguments ("${worstFamily}").`,
+          _hint: `The arguments keep arriving empty or truncated. Send ONE complete ${toolName} call with every required field populated — or, if you cannot, give the user a final answer describing what you were trying to create and ask them to retry. The tool remains available for a well-formed call.`,
+          _scope: 'incomplete_call_repeat',
+          _no_disable: true,
+          _family_error: worstFamily,
+          _family_failures: worst,
+        };
+      }
       return {
         _error: `STOP: ${toolName}${args?.action ? `(action=${args.action})` : ''} has failed ${worst} times this turn with the same class of error ("${worstFamily}"). Further calls to this operation are blocked for this turn.`,
         _hint: `This error is not going away by resending variations of the same attempt. Give the user your final answer NOW: (1) list everything successfully created this turn (names + IDs), (2) quote the exact server error for what failed, (3) recommend one concrete next step (e.g. show the corrected expression you would try and ask the user to confirm, or suggest skipping the failing objects). Do NOT call ${toolName} again this turn.`,
@@ -744,6 +822,48 @@ function noProgressStopOrNull(toolName, args) {
   };
 }
 
+// ── Discovery-streak guard (read-only calls with no intervening write) ───────
+// noProgressStopOrNull only catches BYTE-IDENTICAL repeats. A model can instead
+// spin on read-only calls with DIFFERENT args — 30+ check_existing / search /
+// discover_icons calls, each narrating "now I'll build the payload" but never
+// writing (real 2026-07-14 session; the program was never created). Every
+// existing guard missed it: the args differ (no-progress guard), the calls
+// SUCCEED (failure guards), and they are HTTP 200 (http-error guard). This
+// counts consecutive discovery calls and, once the model has clearly gathered
+// enough without acting, refuses further discovery and points it at the write.
+// The counter (dhis2.consecutiveDiscoveryCalls) is reset by the agent loop on
+// any successful non-discovery (write/action) call and at the start of a turn.
+const DISCOVERY_STREAK_LIMIT = 12;
+const DISCOVERY_ONLY_TOOLS = new Set([
+  'architect_metadata',            // lookup_schema/check_existing/verify/browse_docs/inspect — all read-only
+  'search_metadata', 'count_records', 'get_program_info',
+  'get_program_recent_changes', 'get_event_analytics',
+]);
+const DISCOVERY_ACTIONS = {
+  manage_metadata: new Set(['discover_icons', 'check_references']),
+  manage_program_rules: new Set(['list', 'get']),
+  manage_program_indicators: new Set(['list', 'get']),
+  manage_program_notifications: new Set(['list', 'get']),
+  manage_backups: new Set(['list', 'get']),
+};
+function isDiscoveryCall(toolName, args) {
+  if (DISCOVERY_ONLY_TOOLS.has(toolName)) return true;
+  if (toolName === 'dhis2_query') return String(args?.method || 'GET').toUpperCase() === 'GET';
+  const acts = DISCOVERY_ACTIONS[toolName];
+  return !!(acts && args && acts.has(args.action));
+}
+function discoveryStreakStopOrNull(toolName, args) {
+  if (!isDiscoveryCall(toolName, args)) return null;
+  const streak = dhis2.consecutiveDiscoveryCalls || 0;
+  if (streak < DISCOVERY_STREAK_LIMIT) return null;
+  return {
+    _error: `STOP researching: ${streak} read-only/discovery calls in a row this turn with NOTHING created or changed. You already have enough information to act.`,
+    _hint: `Issue the actual write the task needs NOW. To build a program, send ONE create_metadata(action=create_program) call with ALL components — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
+    _scope: 'no_progress_repeat',   // feeds the circuit breaker: if the model ignores this and keeps spinning, the discovery tool is disabled and the loop ends
+    _discovery_streak: streak,
+  };
+}
+
 // Pre-flight check called before EVERY tool dispatch. Returns null when the
 // call is safe to proceed; else returns a structured refusal.
 function preflightCheckCall(toolName, args) {
@@ -759,6 +879,9 @@ function preflightCheckCall(toolName, args) {
   // Refuse a call that keeps SUCCEEDING with no progress (identical repeats).
   const noProgress = noProgressStopOrNull(toolName, args);
   if (noProgress) return noProgress;
+  // Refuse an endless run of read-only discovery calls that never writes.
+  const discoveryStop = discoveryStreakStopOrNull(toolName, args);
+  if (discoveryStop) return discoveryStop;
   // Skip UID validation when the seed set is empty (very first iteration with
   // no context) OR for read-only discovery tools whose job is to populate IDs.
   const DISCOVERY_TOOLS = new Set([

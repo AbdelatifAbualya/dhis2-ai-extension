@@ -398,10 +398,28 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
     content: fullContent || null,
   };
   if (hasToolCalls) {
-    // Ensure each tool call has valid JSON arguments (guard against hallucinated junk)
+    // Ensure each tool call has valid JSON arguments. A streamed argument buffer
+    // that does not parse is the #1 way a weak/custom provider (e.g. MiniMax)
+    // breaks a large call: the stream truncates mid-object or leaks separator
+    // tokens like `]<]minimax[>[`. The old code silently replaced it with `{}` —
+    // which the model never intended and which surfaces downstream as a
+    // misleading "Missing required parameter" that then trips the loop guards.
+    // Instead: try to REPAIR it (balance braces, strip leaked tokens); if that
+    // fails, FLAG it so the agent loop returns an honest "arguments were
+    // truncated — resend" (non-disabling) rather than executing an empty call.
     const tcList = Object.values(toolCallMap).map(tc => {
-      try { JSON.parse(tc.function.arguments); } catch {
-        tc.function.arguments = '{}';
+      let ok = false;
+      try { JSON.parse(tc.function.arguments); ok = true; } catch { ok = false; }
+      if (!ok) {
+        const rep = repairToolCallArguments(tc.function.arguments);
+        if (rep.ok) {
+          console.warn(`[providers] Recovered malformed tool-call arguments for ${tc.function?.name} (${String(tc.function.arguments || '').length} chars streamed)`);
+          tc.function.arguments = rep.text;
+        } else {
+          console.warn(`[providers] Unrecoverable tool-call arguments for ${tc.function?.name} (${String(tc.function.arguments || '').length} chars) — flagging as corrupted`);
+          tc._argsCorrupted = { rawLength: String(tc.function.arguments || '').length, sample: String(tc.function.arguments || '').slice(0, 120) };
+          tc.function.arguments = '{}';
+        }
       }
       return tc;
     });
