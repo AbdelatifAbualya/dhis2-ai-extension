@@ -541,6 +541,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     manage_program_rules: 'Processing program rules',
     manage_program_indicators: 'Processing program indicators',
     manage_metadata: 'Processing metadata changes',
+    manage_line_lists: 'Working on line lists',
   };
   const thinkingLabels = [
     'Analyzing your question',

@@ -3473,13 +3473,21 @@ async function checkMetadataReferences(objectType, objectId) {
     if (!indResp._error && indResp.indicators?.length) {
       refs.indicators_using_legendset = indResp.indicators.map(x => ({ id: x.id, name: x.name }));
     }
-    const visResp = await safeDhis2Fetch(`visualizations?filter=legendSet.id:eq:${id}&fields=id,name&paging=false`);
+    // The visualization schema's property is `legend` (LegendDefinitions) —
+    // `legendSet.id` is not a valid filter path on 2.40+ and returns HTTP 400.
+    const visResp = await safeDhis2Fetch(`visualizations?filter=legend.set.id:eq:${id}&fields=id,name&paging=false`);
     if (!visResp._error && visResp.visualizations?.length) {
       refs.visualizations_using_legendset = visResp.visualizations.map(x => ({ id: x.id, name: x.name }));
     }
     const mapResp = await safeDhis2Fetch(`maps?filter=mapViews.legendSet.id:eq:${id}&fields=id,name&paging=false`);
     if (!mapResp._error && mapResp.maps?.length) {
       refs.maps_using_legendset = mapResp.maps.map(x => ({ id: x.id, name: x.name }));
+    }
+    // Saved line lists (eventVisualizations) reference legend sets too — a
+    // FIXED-strategy line list breaks if its legend set disappears.
+    const evResp = await safeDhis2Fetch(`eventVisualizations?filter=legend.set.id:eq:${id}&fields=id,name&paging=false`);
+    if (!evResp._error && evResp.eventVisualizations?.length) {
+      refs.line_lists_using_legendset = evResp.eventVisualizations.map(x => ({ id: x.id, name: x.name }));
     }
   }
 

@@ -2518,3 +2518,32 @@ turning a recoverable model glitch into an unrecoverable loop. Four fixes:
 failed calls (was 3+409); heal path creates the auto-named rule (server read-back); the exact
 `]<]minimax[>[` corruption is repaired and imports; integrated cascade simulation recovers (tool
 never disabled, streak guard fires). `npm run verify` green; instance left exactly as found.
+
+---
+
+## 20. v2.8.15 — `manage_line_lists`: Line Listing authoring + EVENT_VISUALIZATION dashboard tiles
+
+**Files:** `src/tools-linelists.js` (NEW, the tool), `src/registry.js` (schema, router, manual
+gate, `KB_LINE_LISTS_DETAILS`, `wantsLineListIntent` selection), `src/tools-metadata.js`
+(dispatch; `manage_dashboards` accepts `{type:"EVENT_VISUALIZATION", event_visualization_id}`
+items in create_dashboard/add_items), `src/tools-programs.js` (legend-set reference check fixed:
+`visualizations?filter=legend.set.id:…` — the old `legendSet.id` path 400s on 2.40+; line lists
+now checked too), `background.js` (7th module), `src/agent.js` (progress label),
+`scripts/scenario-line-lists.js` (NEW deep test). Details: `CHANGES_line_listing_tool.md`.
+
+The tool authors the saved line lists of the Line Listing app (`/api/eventVisualizations`,
+type LINE_LIST): EVENT / ENROLLMENT (cross-stage + repeated-event columns) / TRACKED_ENTITY
+output, dimensions by UID or exact name with auto stage/option-code resolution, per-valueType
+filter validation, legend wiring, sorting, and a pre-save analytics probe that proves the layout
+runs (row_count + headers ONLY — never row-level values). Refuses the traps that silently break
+line lists: division PIs (per-row zero denominator 409s the whole table), PI analyticsType ≠
+output type, aggregationType NONE (invalid SQL), COUNT+d2:count (constant 1 per row — warns with
+the exact SUM fix), repetition on non-repeatable stages, missing time/org-unit dimensions,
+invented UIDs/option values, duplicate names.
+
+**Verified live on DHIS2 2.42.5.1:** full senior-implementor TB package (2 row-safe PIs →
+legend set → 3 line lists incl. repeated adherence columns [1,2,-1,0] and FIXED FILL legend →
+dashboard with 3 EVENT_VISUALIZATION tiles → validate/update/delete-guard → cleanup) — final
+scenario run **104 API calls, 0 failed, 38/38 assertions**; 8 negative paths refuse with zero
+failing HTTP. Rendering verified visually in the Line Listing + Dashboard apps. `npm run verify`
+green. Version 2.8.14 → 2.8.15.

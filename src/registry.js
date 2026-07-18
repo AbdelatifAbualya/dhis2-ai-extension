@@ -2010,7 +2010,7 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
 Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
 - create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (aggregate indicator / AGGREGATE-domain dataElement / programIndicator UIDs — types are auto-resolved AND verified), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed. ⚠ data_items must be AGGREGATE dimensions: a TRACKER data element or a tracked-entity attribute CANNOT be plotted directly (the tile renders an error) — first create a PROGRAM INDICATOR (manage_program_indicators) that aggregates it, then plot that program indicator's UID. The tool refuses a raw tracker data element with this guidance.
 - create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
-- add_items: add chart(s)/map(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
+- add_items: add chart(s)/map(s)/line-list(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, { type:"EVENT_VISUALIZATION", event_visualization_id } to embed a saved line list from manage_line_lists, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
 - remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
 - list / get: list dashboards (optional name filter) / read one dashboard with its items (each item's id, type, and referenced visualization/map).
 Every mutating action is backed up first (undo via manage_backups). For sharing use manage_metadata(action=update_sharing). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
@@ -2062,9 +2062,10 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
             items: {
               type: 'object',
               properties: {
-                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map.' },
+                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'EVENT_VISUALIZATION', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map, EVENT_VISUALIZATION to embed a saved line list (create with manage_line_lists).' },
                 visualization_id: { type: 'string', description: 'UID of an EXISTING visualization to embed (type VISUALIZATION).' },
                 map_id: { type: 'string', description: 'UID of an EXISTING map to embed (type MAP).' },
+                event_visualization_id: { type: 'string', description: 'UID of an EXISTING saved line list / event visualization to embed (type EVENT_VISUALIZATION). line_list_id is accepted as an alias.' },
                 text: { type: 'string', description: 'Tile text (type TEXT).' },
                 new_visualization: {
                   type: 'object',
@@ -2116,6 +2117,72 @@ To place a new map on a dashboard, pass its map_id to manage_dashboards(action="
           limit: { type: 'integer', description: 'For list: max maps to return (1–200, default 50).' },
           program_id: { type: 'string', description: 'For create (optional): owning program UID for a program-indicator/event layer. Auto-derived from a program indicator when omitted.' },
           skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_line_lists',
+      description: `Author and manage DHIS2 **line lists** — the saved row-per-record tables of the Line Listing app (stored as /api/eventVisualizations with type LINE_LIST). Use this tool for ALL saved-line-list CREATION/UPDATE — NEVER hand-assemble eventVisualizations bodies via dhis2_query (the persisted layout is columns/filters axes + derived dataElementDimensions/attributeDimensions/programIndicatorDimensions/simpleDimensions/repetitions, and a malformed body saves an object the app cannot open). This tool resolves every dimension against the program's REAL metadata, validates filters/repetitions/legends mechanically, and PROVES the layout runs (the same analytics query the app issues) BEFORE saving — a bad spec creates nothing.
+Actions: list / get / create / update / delete / validate.
+- create: one saved line list. Supply name, output_type (EVENT = one row per event of ONE stage; ENROLLMENT = one row per enrollment with cross-stage + repeated-event columns; TRACKED_ENTITY = one row per person), program_id (or exact program_name), program_stage_id for EVENT on multi-stage tracker programs, columns[] and optional filters[] (see column spec below), optional sorting[], legend, completed_only, data_check.
+- update: change an existing list by line_list_id — pass columns/filters to REBUILD the layout (same spec as create), or just name/description/sorting/legend to touch own fields. Auto-backup first.
+- validate: re-run an existing saved list's analytics query → row_count + headers (use after data/analytics changes or to diagnose "the line list shows an error").
+- get / list: readable breakdown (decoded filters, stages, repetitions, legend) / recent line lists.
+- delete: remove a saved line list (refuses while a dashboard still shows it; auto-backup first).
+COLUMN/FILTER SPEC — each entry is a string or object:
+- Org units: { dimension:"ou", org_units:["USER_ORGUNIT" | "LEVEL-4" | "<ouUid>" | "OU_GROUP-<uid>", …] } (required somewhere: every line list needs an org-unit boundary).
+- Time: { dimension:"event_date"|"enrollment_date"|"incident_date"|"scheduled_date"|"last_updated", periods:["LAST_12_MONTHS","2026Q1","202605", …] } (EVENT/ENROLLMENT lists need one; time dims differ per output_type).
+- Data element / attribute / program indicator: pass the UID or EXACT display name — the type and (for DEs) the stage are auto-resolved; add program_stage_id only when a DE lives in several stages. Optional filter: {operator:"IN"|"EQ"|"NE"|"GT"|"GE"|"LT"|"LE"|"LIKE", value | values:[…]} — option-set values are auto-mapped NAME→CODE, booleans to 1/0.
+- Repeated events (ENROLLMENT output + repeatable stage only): add repeated_events:{ most_recent:2, oldest:2 } (or repetition_indexes:[1,2,-1,0]; 1=first, 0=latest, -1=second-latest) to a DE column to show one column per event occurrence.
+- Statuses: { dimension:"event_status"|"program_status", statuses:["ACTIVE","COMPLETED",…] }.
+⚠ Program-indicator columns are evaluated PER ROW: a rate/percentage PI with a division 409s the whole table when any row's denominator is 0 — the tool refuses those and tells you to build a count/flag PI with manage_program_indicators instead. PI analyticsType must match output_type (EVENT↔EVENT, ENROLLMENT↔ENROLLMENT), and count-style PIs need aggregation_type SUM (COUNT renders a constant 1 per row; NONE breaks the query and is refused).
+Legend: legend:{ legend_set_id | legend_set_name, style:"FILL"|"TEXT", strategy:"FIXED"|"BY_DATA_ITEM", show_key } — create the set first with manage_legend_sets.
+Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVENT_VISUALIZATION", event_visualization_id }]. For UI navigation help in the Line Listing app use line_listing_guide; for ad-hoc event/enrollment COUNTS use get_event_analytics — this tool SAVES reusable line lists.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete', 'validate'],
+            description: 'list=recent saved line lists (filters: name_filter, program_id); get=readable breakdown of one; create=new saved line list (validated + probed BEFORE saving); update=rebuild layout or touch own fields (auto-backup); delete=remove (refuses while on a dashboard; auto-backup); validate=re-run its analytics query → row_count/headers.'
+          },
+          line_list_id: { type: 'string', description: 'eventVisualization UID (required for get / update / delete / validate).' },
+          name: { type: 'string', description: 'For create (required) / update: the saved line list title.' },
+          description: { type: 'string', description: 'Optional description shown in the app\'s file details.' },
+          output_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT', 'TRACKED_ENTITY'], description: 'EVENT = one row per event of ONE stage (default). ENROLLMENT = one row per enrollment; columns may come from any stage and repeatable-stage columns can show several event occurrences. TRACKED_ENTITY = one row per person (attributes + org unit only).' },
+          program_id: { type: 'string', description: 'The program UID the line list is built on (required for create unless program_name resolves uniquely).' },
+          program_name: { type: 'string', description: 'Exact program name — resolved to program_id when unique.' },
+          program_stage_id: { type: 'string', description: 'For EVENT output on a multi-stage tracker program: the stage whose events become rows. Stage NAME also accepted. Auto-resolved when the program has one stage.' },
+          columns: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                dimension: { type: 'string', description: '"ou" | a time keyword (event_date, enrollment_date, incident_date, scheduled_date, last_updated) | "event_status"/"program_status" | a DE/attribute/program-indicator UID or EXACT display name.' },
+                org_units: { type: 'array', items: { type: 'string' }, description: 'For dimension "ou": UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, LEVEL-<n>, OU_GROUP-<uid>.' },
+                periods: { type: 'array', items: { type: 'string' }, description: 'For a time dimension: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) and/or fixed ISO periods (202605, 2026Q1, 2026).' },
+                statuses: { type: 'array', items: { type: 'string' }, description: 'For event_status (ACTIVE, COMPLETED, SCHEDULE, OVERDUE, SKIPPED) or program_status (ACTIVE, COMPLETED, CANCELLED).' },
+                program_stage_id: { type: 'string', description: 'Stage UID or name — only needed when the data element appears in several stages.' },
+                filter: { description: 'Condition on this dimension: { operator, value | values:[…] } or a raw "OP:value" string. Option-set values auto-map name→code; booleans → true/false.', type: 'object', properties: { operator: { type: 'string' }, value: {}, values: { type: 'array' } } },
+                repeated_events: { type: 'object', properties: { most_recent: { type: 'integer' }, oldest: { type: 'integer' } }, description: 'ENROLLMENT output + repeatable stage only: how many latest/earliest event occurrences of this DE to show as separate columns. Or pass repetition_indexes:[1,2,-1,0].' },
+                repetition_indexes: { type: 'array', items: { type: 'integer' }, description: 'Explicit occurrence indexes: 1=first, 2=second, …; 0=latest, -1=second-latest.' },
+                allow_risky_program_indicator: { type: 'boolean', description: 'Override the division-PI refusal for THIS column — only when certain the per-row denominator can never be 0.' }
+              }
+            },
+            description: 'The table columns, in order. Strings allowed as shorthand for { dimension:"…" }. Must include an org-unit dimension and (for EVENT/ENROLLMENT) a time dimension somewhere in columns+filters.'
+          },
+          filters: { type: 'array', items: { type: 'object', properties: { dimension: { type: 'string' }, org_units: { type: 'array' }, periods: { type: 'array' }, statuses: { type: 'array' }, program_stage_id: { type: 'string' }, filter: { type: 'object' } } }, description: 'Same spec as columns, but the dimension constrains the rows WITHOUT showing as a column.' },
+          sorting: { type: 'array', items: { type: 'object', properties: { dimension: { type: 'string' }, direction: { type: 'string', enum: ['ASC', 'DESC'] } } }, description: 'Sort order; each dimension must be one of the columns (name, UID or time keyword accepted).' },
+          legend: { type: 'object', properties: { legend_set_id: { type: 'string' }, legend_set_name: { type: 'string' }, style: { type: 'string', enum: ['FILL', 'TEXT'] }, strategy: { type: 'string', enum: ['FIXED', 'BY_DATA_ITEM'] }, show_key: { type: 'boolean' } }, description: 'Colour numeric cells: FIXED = one legend set for the whole list (pass legend_set_id/name); BY_DATA_ITEM = each item\'s own legend set. style FILL = cell background.' },
+          completed_only: { type: 'boolean', description: 'Only completed events/enrollments.' },
+          data_check: { type: 'string', enum: ['warn_empty', 'require_rows', 'skip'], description: 'create/update probe policy. warn_empty (default): refuse to save if the query FAILS, warn if it returns 0 rows. require_rows: also refuse on 0 rows. skip: no probe (offline analytics).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive name filter.' },
+          limit: { type: 'integer', description: 'For list: max results (1–200, default 50).' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
         },
         required: ['action']
       }
@@ -2188,6 +2255,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_legend_sets: true,
   manage_dashboards: true,
   manage_maps: true,
+  manage_line_lists: true,
   manage_backups: true,
 });
 
@@ -2238,6 +2306,7 @@ const MANUAL_TOOLS = new Set([
   'manage_legend_sets',
   'manage_dashboards',
   'manage_maps',
+  'manage_line_lists',
   'manage_custom_translations',
   'manage_growth_chart_plugin',
 ]);
@@ -2263,6 +2332,7 @@ const TOOL_SUMMARIES = {
   manage_legend_sets: 'Standalone legend-set lifecycle (reusable colour bands for traffic-light / heat-map rendering): list, get, create (explicit legends or auto_bands red→amber→green), add_legends, remove_legends, update (own fields), delete. Attach to an aggregate indicator via manage_indicators(legend_set_id) — never via raw PATCH. NEVER hand-write legendSets bodies via dhis2_query.',
   manage_dashboards: 'Build/inspect analytics dashboards and saved visualizations (charts, pivots, single-value tiles): list, get, create_visualization, create_dashboard (atomic, with inline new visualizations), add_items (the ONLY safe way to add to an EXISTING dashboard — a raw PUT wipes its tiles), remove_item, update, delete. NEVER hand-assemble visualizations/dashboards bodies via dhis2_query (they import as EMPTY charts). render_chart = inline chat preview; this tool SAVES to DHIS2.',
   manage_maps: 'Create/inspect/delete thematic maps (choropleth / bubble): list, get, create (one data_item UID + org_unit_level/org_units + period, optional legend_set_id), delete. NEVER hand-assemble /api/maps bodies via dhis2_query. Place a map on a dashboard via manage_dashboards(action=add_items, items=[{type:"MAP", map_id}]).',
+  manage_line_lists: 'Author SAVED line lists — the row-per-record tables of the Line Listing app (eventVisualizations type LINE_LIST): list, get, create (EVENT / ENROLLMENT with cross-stage + repeated-event columns / TRACKED_ENTITY; dimensions by UID or exact name, auto stage/option-code resolution, filters, sorting, legend; the layout is PROVEN against analytics BEFORE saving), update, delete, validate (re-run its query → row_count). NEVER hand-assemble eventVisualizations bodies via dhis2_query (the app cannot open them). Dashboard placement: manage_dashboards items [{type:"EVENT_VISUALIZATION", event_visualization_id}]. line_listing_guide = app UI help; THIS tool saves the actual line lists.',
 };
 
 // ── Deep how-to KB text that used to live in buildSystemPrompt ──
@@ -2647,7 +2717,7 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 ### Rules
 - data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped. NEVER invent visualization, map or data-item UIDs.
 - add_items reads the full dashboard, appends below the current tiles, and writes the COMPLETE item set back, snapshotting to backups first. NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} — a dashboard PUT is a whole-object REPLACE that permanently wipes every existing tile (now blocked in code).
-- Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.
+- Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"EVENT_VISUALIZATION", event_visualization_id } (a saved line list from manage_line_lists) | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.
 - To delete a whole dashboard use action="delete" (snapshots first). Sharing/deletion of standalone visualizations/maps → manage_metadata.
 
 ### Examples
@@ -2690,6 +2760,30 @@ configure makes the plugin FUNCTION but does not place the widget. Relay the too
 // Per-tool manual extras: the deep KB text appended to the tool's original
 // description when its manual is delivered. Shared grammar blocks appear in
 // every manual that needs them.
+// ── Line-list KB — deep how-to for manage_line_lists (delivered in its manual) ──
+const KB_LINE_LISTS_DETAILS = `## DHIS2 Line Lists (manage_line_lists)
+A **line list** is a saved row-per-record table (one row per event / enrollment / person) opened in the Line Listing app and embeddable on dashboards. It is stored as an \`eventVisualization\` with \`type: LINE_LIST\` — a DIFFERENT object from the aggregate \`visualizations\` that manage_dashboards creates. Aggregated charts/pivots → manage_dashboards; row-level tables → THIS tool.
+
+**Choosing output_type (the single most important decision):**
+- \`EVENT\` — one row per event of ONE program stage. Needs \`program_stage_id\` on multi-stage tracker programs. Columns: that stage's DEs + program attributes + EVENT-analytics PIs.
+- \`ENROLLMENT\` — one row per enrollment. Columns may come from ANY stage (auto-qualified), attributes, ENROLLMENT-analytics PIs, and repeatable-stage DEs can repeat: \`repeated_events:{ most_recent:2, oldest:2 }\` renders "Adherence [1] [2] [-1] [0]"-style columns. Use for treatment-monitoring / cohort registers.
+- \`TRACKED_ENTITY\` — one row per person (attributes + org unit; the program still anchors the dimensions).
+
+**A senior implementor's workflow for a monitoring register:**
+1. get_program_info → real stage/DE/attribute names + UIDs.
+2. Row-level metrics DON'T exist as columns? Create ENROLLMENT-analytics PIs with manage_program_indicators — per-row-safe patterns: \`d2:count(#{stage.de})\` (visits recorded), \`d2:countIfValue(#{stage.de}, 'CODE')\` (e.g. poor-adherence months), \`d2:daysBetween(V{enrollment_date}, V{event_date})\`, \`d2:condition("…", 1, 0)\` flags. ⚠ NEVER put a rate/percentage PI (any division) in a line list — per-row zero denominators 409 the WHOLE table. The tool refuses them; that refusal is final unless the user insists (allow_risky_program_indicator). ⚠ **aggregation_type matters per row** (verified live on 2.42): give count-style PIs \`aggregation_type:"SUM"\` — with COUNT the line-list cell shows a constant 1 for every row (COUNT counts the one enrollment row, not the events), and with NONE the whole query fails with an SQL error (the tool refuses NONE PIs as columns and warns on COUNT+d2:count).
+3. Colour-coding: manage_legend_sets(action=create) → pass legend:{ legend_set_id, strategy:"FIXED", style:"FILL" }. FILL = cell background (scorecard look). Legends colour NUMERIC columns (PIs, numeric DEs).
+4. create with data_check="require_rows" when the user expects data — an empty register usually means wrong period/org units or analytics tables not yet run (the result tells you which).
+5. Dashboard: manage_dashboards(action="create_dashboard"|"add_items") with items [{ type:"EVENT_VISUALIZATION", event_visualization_id:"<line_list_id>" }].
+
+**Filters** (on columns or the filters axis): option-set dims take option CODES (names auto-map; \`{operator:"IN", values:["CODE_A","CODE_B"]}\`), booleans take true/false, numerics EQ/NE/GT/GE/LT/LE, text LIKE/EQ. Multiple conditions on one dimension: \`{conditions:[{operator:"GE", value:5},{operator:"LT", value:10}]}\`.
+**Periods**: relative keywords (LAST_12_MONTHS, THIS_QUARTER, LAST_4_QUARTERS, THIS_YEAR, …) mix freely with fixed ISO (202605, 2026Q1, 2026). Time dimensions differ per output_type: EVENT has event_date/enrollment_date/incident_date/scheduled_date/last_updated; ENROLLMENT has enrollment_date/incident_date/last_updated.
+**Org units**: USER_ORGUNIT (+_CHILDREN/_GRANDCHILDREN), LEVEL-<n>, OU_GROUP-<uid>, explicit UIDs — combinable (e.g. LEVEL-4 under a parent UID).
+**Sorting**: only by columns of the list; pass the column's name/UID + ASC/DESC.
+
+**Diagnosing "the line list shows an error / is empty"** → action=validate on the saved list: it re-runs the app's exact query and returns row_count or the offending dimension. Division-PI columns and analytics-tables-not-run are the two most common causes.
+**Zero-invention rule**: every dimension resolves against the program's real metadata at call time; a typo'd name returns the valid candidates instead of saving a broken list. Never invent UIDs; never POST/PUT eventVisualizations via dhis2_query.`;
+
 const MANUAL_EXTRAS = {
   create_metadata: [KB_CREATE_PROGRAM_DETAILS, KB_VALUE_TYPE_MAPPING, KB_PROGRAM_RULE_SYNTAX, KB_PI_GRAMMAR].join('\n\n'),
   manage_metadata: [KB_METADATA_DELETE_FLOW, KB_METADATA_TEA_OU, KB_METADATA_ICON_FLOW, KB_METADATA_SHARING].join('\n\n'),
@@ -2704,6 +2798,7 @@ const MANUAL_EXTRAS = {
   manage_option_sets: KB_OPTION_SETS_DETAILS,
   manage_legend_sets: KB_LEGEND_SETS_DETAILS,
   manage_dashboards: KB_DASHBOARDS_DETAILS,
+  manage_line_lists: KB_LINE_LISTS_DETAILS,
   manage_custom_translations: KB_TRANSLATIONS_DETAILS,
   manage_growth_chart_plugin: KB_GROWTH_CHART_DETAILS,
   // manage_maps: full description already covers usage; no extra KB.
@@ -3036,6 +3131,21 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
       && (/\b(create|build|make|save|design|set\s*up|setup|add|new|choropleth|bubble|thematic|shade[ds]?|colou?r[- ]?cod)\b/.test(combinedText)))
     || /\bchoropleth\b/.test(combinedText)
     || /\bthematic\s+maps?\b/.test(combinedText);
+  // ── Line-list authoring intent ──
+  // Saved row-per-record tables (Line Listing app / eventVisualizations of
+  // type LINE_LIST). Fires on explicit "line list(ing)" wording, on classic
+  // implementor phrasings ("case register", "patient listing", "listing of
+  // enrollments"), or on an authoring verb + row-level-table noun. Reads like
+  // "how do I use the Line Listing app" also match — the tool's list/get/
+  // validate actions are read-only and line_listing_guide travels alongside
+  // when the user is IN the app.
+  const wantsLineListIntent =
+    /\bline[-\s]?list(?:s|ing|ings)?\b/.test(combinedText)
+    || /\bevent\s*visuali[sz]ations?\b/.test(combinedText)
+    || /\b(case|patient|client|person|tei|entity|enrollment|event|cohort|treatment|defaulter|follow[-\s]?up)\s+(register|registry|listing)\b/.test(combinedText)
+    || (/\b(register|listing|row[-\s]?level|record[-\s]?level)\b/.test(combinedText)
+        && /\b(tracker|program|stage|enrollment|event|patient|case|cohort)\b/.test(combinedText)
+        && /\b(create|build|make|design|set\s*up|save|generate|author|update|list)\b/.test(combinedText));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -3125,6 +3235,24 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('line_listing_guide');
     selected.add('detect_enrollment_abnormalities');
     selected.add('resolve_option_codes');
+  }
+
+  // ── Line-list authoring — saved Line Listing tables ──
+  // Surfaced on explicit line-list intent, or whenever the user is IN the
+  // Line Listing app (where "save this as…", "make me a register of…" are the
+  // obvious next steps). Companions: get_program_info + search_metadata for
+  // dimension resolution, manage_program_indicators for the row-level metric
+  // columns, manage_legend_sets for colour-coding, manage_dashboards for
+  // placement — the canonical register workflow chains all four.
+  if (wantsLineListIntent || isLineListing) {
+    selected.add('manage_line_lists');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
+    if (wantsLineListIntent) {
+      selected.add('manage_program_indicators');
+      selected.add('manage_legend_sets');
+      selected.add('manage_dashboards');
+    }
   }
 
   // ── Tracker / program context ──
@@ -3330,7 +3458,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     'manage_program_notifications', 'create_metadata', 'manage_datasets',
     'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
     'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
-    'manage_dashboards', 'manage_maps',
+    'manage_dashboards', 'manage_maps', 'manage_line_lists',
   ]);
   let hasWriteTool = false;
   for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
@@ -3372,6 +3500,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.delete('manage_legend_sets');
     selected.delete('manage_dashboards');
     selected.delete('manage_maps');
+    selected.delete('manage_line_lists');
     // Keep architect_metadata (read-only research) and manage_backups (list/get
     // are read-only — the executor itself gates restore/delete/purge_old).
   }

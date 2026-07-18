@@ -26,6 +26,8 @@
                             custom forms)
      src/tools-programs.js  program-authoring tools (metadata/programs, rules,
                             indicators, notifications) · plugins · standalone
+     src/tools-linelists.js line-listing authoring (eventVisualizations of type
+                            LINE_LIST: resolve/validate/probe/CRUD)
      src/agent.js           agentic loop · feedback · keepalive · message router
                             and every chrome.* event listener
    ══════════════════════════════════════════════════════════════════════════════ */
@@ -36,5 +38,6 @@ importScripts(
   'src/providers.js',
   'src/tools-metadata.js',
   'src/tools-programs.js',
+  'src/tools-linelists.js',
   'src/agent.js',
 );

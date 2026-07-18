@@ -1995,6 +1995,11 @@ async function executeTool(name, args) {
     return await executeManageMaps(args);
   }
 
+  // ── manage_line_lists ──
+  if (name === 'manage_line_lists') {
+    return await executeManageLineLists(args);
+  }
+
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
@@ -4373,7 +4378,7 @@ async function executeManageDashboards(args) {
     const dashboardItems = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
       const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
       const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
       let x, y;
@@ -4392,10 +4397,14 @@ async function executeManageDashboards(args) {
       } else if (itType === 'MAP') {
         if (!it.map_id) return { _error: `Item ${i + 1} is a MAP but has no map_id.` };
         di.map = { id: it.map_id };
+      } else if (itType === 'EVENT_VISUALIZATION') {
+        const evId = it.event_visualization_id || it.line_list_id;
+        if (!evId) return { _error: `Item ${i + 1} is an EVENT_VISUALIZATION (line list) but has no event_visualization_id / line_list_id.` };
+        di.eventVisualization = { id: evId };
       } else if (itType === 'TEXT') {
         di.text = String(it.text || '');
       } else {
-        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT.` };
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list) or TEXT.` };
       }
       dashboardItems.push(di);
     }
@@ -4417,6 +4426,13 @@ async function executeManageDashboards(args) {
       const foundM = new Set((mr?.maps || []).map(o => o.id));
       const missingM = refMapIds.filter(id => !foundM.has(id));
       if (missingM.length) return { _error: `These referenced map UIDs do not exist: ${missingM.join(', ')}.` };
+    }
+    const refEvIds = [...new Set(dashboardItems.filter(di => di.type === 'EVENT_VISUALIZATION').map(di => di.eventVisualization.id))];
+    if (refEvIds.length) {
+      const er = await safeDhis2Fetch(`eventVisualizations.json?filter=id:in:[${refEvIds.join(',')}]&fields=id&paging=false`);
+      const foundE = new Set((er?.eventVisualizations || []).map(o => o.id));
+      const missingE = refEvIds.filter(id => !foundE.has(id));
+      if (missingE.length) return { _error: `These referenced line-list (eventVisualization) UIDs do not exist: ${missingE.join(', ')}.`, _hint: 'Create them first with manage_line_lists, or fix the UIDs via manage_line_lists(action="list").' };
     }
 
     const dashId = generateDhis2Uid();
@@ -4506,7 +4522,7 @@ async function executeManageDashboards(args) {
     const summary = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
       const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
       const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
       let x, y;
@@ -4538,11 +4554,19 @@ async function executeManageDashboards(args) {
         if (mr?._error) return { _error: `Item ${i + 1}: could not verify map ${mapId}: ${mr._error}` };
         di.map = { id: mapId };
         summary.push({ item_id: di.id, type: 'MAP', object_id: mapId, object_name: mr.displayName || null });
+      } else if (itType === 'EVENT_VISUALIZATION') {
+        const evId = it.event_visualization_id || it.line_list_id || it.id;
+        if (!evId) return { _error: `Item ${i + 1} is an EVENT_VISUALIZATION (line list) but has no event_visualization_id / line_list_id.` };
+        const er = await safeDhis2Fetch(`eventVisualizations/${evId}?fields=id,displayName,type`);
+        if (er?._status === 404) return { _error: `Item ${i + 1}: line list (eventVisualization) "${evId}" does not exist (404). Not adding a broken tile.`, _hint: 'Create it first with manage_line_lists, or confirm the UID via manage_line_lists(action="list").' };
+        if (er?._error) return { _error: `Item ${i + 1}: could not verify line list ${evId}: ${er._error}` };
+        di.eventVisualization = { id: evId };
+        summary.push({ item_id: di.id, type: 'EVENT_VISUALIZATION', object_id: evId, object_name: er.displayName || null });
       } else if (itType === 'TEXT') {
         di.text = String(it.text || '');
         summary.push({ item_id: di.id, type: 'TEXT' });
       } else {
-        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT (or new_visualization).` };
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list) or TEXT (or new_visualization).` };
       }
       newItems.push(di);
     }
