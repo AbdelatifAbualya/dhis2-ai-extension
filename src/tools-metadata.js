@@ -4141,7 +4141,12 @@ async function resolveDataItemTypes(uids) {
 function buildVisualizationObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'visualization spec object is required.' };
   const type = String(spec.vis_type || spec.type || 'COLUMN').toUpperCase();
-  if (!VIZ_TYPES.has(type)) return { _error: `Unsupported vis_type "${type}". One of: ${[...VIZ_TYPES].join(', ')}.` };
+  if (!VIZ_TYPES.has(type)) {
+    const hint = /^MAP$/i.test(type)
+      ? 'A MAP is NOT a visualization type. Create the thematic map first with manage_maps(action="create", data_item=<programIndicator/indicator UID>, org_unit_level=2, legend_set_id=…), then add it as a dashboard tile with { type:"MAP", map_id:<the returned map_id> } — do NOT put it in a new_visualization.'
+      : `Pick a chart/table/tile type from: ${[...VIZ_TYPES].join(', ')}.`;
+    return { _error: `Unsupported vis_type "${type}". One of: ${[...VIZ_TYPES].join(', ')}.`, _hint: hint };
+  }
   const name = String(spec.name || '').trim();
   if (!name) return { _error: 'visualization name is required.' };
 

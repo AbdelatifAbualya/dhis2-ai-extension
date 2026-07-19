@@ -2621,3 +2621,62 @@ asked about.
 **Verified:** `npm run verify` green, including new tests proving generic/wrong-type
 searches don't arm the guard, a lookalike write is blocked, a matching-name write passes
 and disarms, and a later variant-spelling match disarms. Version 2.8.16 → 2.8.17.
+
+## 23. v2.8.18 — Batch program-indicator create + single-PI percentage: the 47-PI analytics disaster fixed
+
+**Files:** `src/tools-programs.js` (`manage_program_indicators` create now accepts
+`indicators:[…]`; NEW `_prepareProgramIndicatorObject` extracted from
+`_buildAndPostProgramIndicator` + NEW `_buildAndPostProgramIndicatorsBatch`),
+`src/registry.js` (tool schema gains the `indicators` array; description + create
+action-enum steer to batch; `KB_PI_GRAMMAR` gains the single-PI percentage pattern +
+"batch every multi-indicator build" section; a new tracker-analytics worked chain),
+`src/tools-metadata.js` (`buildVisualizationObject` now returns a map-specific `_hint`
+when refused a `vis_type:"MAP"`), `scripts/verify.js` (regression assertions),
+`scripts/scenario-pregnancy-analytics.js` (NEW Tier-2 live scenario).
+Details: `CHANGES_batch_program_indicators.md`.
+
+**The disaster this fixes (observed live):** asked to build the analytical package for
+the Integrated Pregnancy, Delivery and Postnatal Care Tracker — ~12 metrics with
+numerator/denominator/percentage indicators, legends, tables, charts, maps and a
+dashboard — the model created **47 program indicators, one per tool call**, exhausted the
+50-iteration agentic-loop budget on PI creation alone, and **never produced a single
+percentage, legend, visualization, map or the dashboard.** Root causes: (1)
+`manage_program_indicators` create only accepted ONE `indicator` per call, so a big build
+could never fit the budget; (2) nothing taught the model that a coverage **percentage is
+ONE program indicator**, so it split every metric into separate numerator + denominator +
+percentage objects.
+
+**The fix:**
+- **Batch create.** `manage_program_indicators(action="create", program_id, indicators:[…])`
+  validates every indicator (lint + `/expression|filter/description` + structure grounding)
+  with bounded concurrency, sharing ONE program-structure + category-combo fetch across the
+  whole batch, then commits the valid ones in a SINGLE `/metadata` import. Invalid entries
+  are **skipped** (never disable the tool) and returned under `failed[]`; valid ones are
+  saved and their UIDs returned as a flat `program_indicator_ids` list to chain into
+  visualization/map/dashboard `data_items`. shortName + name collisions are auto-resolved
+  against the server AND intra-batch. The single-`indicator` path is unchanged (delegates to
+  the same new `_prepareProgramIndicatorObject`).
+- **Single-PI percentage pattern (KB).** A coverage/rate metric is ONE program indicator:
+  `analytics_type=ENROLLMENT`, `filter` = the denominator population, `expression =
+  d2:condition("<numerator condition>", 100, 0)`, `aggregation_type=AVERAGE`, `decimals=1`.
+  The mean of the 0/100 flag over the denominator IS the percentage; it contains no division
+  so it never 409s on a zero denominator (unlike a numerator/denominator ratio). Separate
+  count PIs only when a table/breakdown explicitly needs them as columns. Verified live on
+  2.42 (`/expression/description` + `/filter/description` accept it).
+- **Map-tile refusal hint.** Refusing `vis_type:"MAP"` now tells the model to create the map
+  with `manage_maps` and add it as `{ type:"MAP", map_id }` — one-step recovery.
+
+**Verified — Tier 1:** `npm run verify` green, with new assertions that the schema exposes
+`indicators[]`, the description teaches batch + the AVERAGE percentage pattern, and a
+`vis_type:"MAP"` is refused with a `manage_maps` hint.
+**Tier 2 (deterministic, `scripts/scenario-pregnancy-analytics.js`):** batch-created 16 PIs
+(8 AVERAGE percentages + 8 counts) in ONE call, plus a legend, 2 maps and a dashboard with
+9 inline visualizations + map tiles + text headers, verified all persisted, then deleted
+everything — **60 build API calls, 0 failed, 0 leftovers.**
+**Tier 2 (real LLM — Kimi K2P7-code via Fireworks, live localhost:8081):** the exact
+disaster prompt now completes end-to-end — **78 program indicators created in 2 batched
+calls** (16 single-PI AVERAGE percentages + 62 requested supporting/breakdown counts), 4
+legend sets, 4 district maps, and the full "Maternal and Newborn Continuum Dashboard" (35
+tiles: 7 text sections, 24 charts, 4 maps, 0 dangling references), with sharing — **120
+DHIS2 API calls, 0 failed.** All test objects were cleaned up; the instance was left exactly
+as found. Version 2.8.17 → 2.8.18.

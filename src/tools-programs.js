@@ -7846,7 +7846,13 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     const _gate = requireWriteAuth('manage_program_indicators', 'create');
     if (_gate) return _gate;
     if (!programId) return { _error: 'program_id required for create' };
-    if (!args.indicator) return { _error: 'indicator object required for create' };
+    // BATCH create: indicators:[…] validates & commits MANY PIs in ONE metadata
+    // import — the only way a big analytical build (15-40 PIs) fits the loop budget.
+    if (Array.isArray(args.indicators)) {
+      if (!args.indicators.length) return { _error: 'indicators array is empty — pass at least one indicator object, or use the single `indicator` field.' };
+      return await _buildAndPostProgramIndicatorsBatch(programId, args.indicators, args.dry_run_only);
+    }
+    if (!args.indicator) return { _error: 'indicator object (or indicators array for a batch) required for create' };
     if (!args.indicator.name) return { _error: 'indicator.name is required' };
     return await _buildAndPostProgramIndicator(programId, null, args.indicator, args.dry_run_only);
   }
@@ -7936,9 +7942,17 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
 
 // Build and POST a program indicator object.
 // indicator_id=null → create new; indicator_id=string → update existing.
-async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, dryRun) {
-  // Resolve default categoryCombo once
-  const catComboId = indicator._catComboId
+// Build + fully validate ONE program-indicator object WITHOUT posting it.
+// Extracted from _buildAndPostProgramIndicator so batch create can validate many
+// indicators and then commit them in a SINGLE metadata import. Returns
+// { pi, precedenceAdvisories } on success, or an { _error, _hint, … } object shaped
+// exactly like the create-time refusals. opts.catComboId / opts.progStagesById let
+// the batch driver resolve the default category combo and the program's stage→DE
+// structure ONCE and share them across the whole batch instead of refetching per
+// indicator (47 identical program fetches → 1 on the pregnancy analytics build).
+async function _prepareProgramIndicatorObject(programId, indicatorId, indicator, opts = {}) {
+  // Resolve default categoryCombo once (batch driver shares one across all PIs)
+  const catComboId = indicator._catComboId || opts.catComboId
     || (await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1'))?.categoryCombos?.[0]?.id
     || 'bjDvmb4bfuf';
 
@@ -8013,9 +8027,14 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
       for (const m of String(text || '').matchAll(refRe)) refs.push({ stage: m[1], de: m[2], token: m[0] });
     }
     if (refs.length) {
-      const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName]]]`);
-      if (!progResp?._error && Array.isArray(progResp?.programStages)) {
-        const stageById = new Map(progResp.programStages.map(st => [st.id, st]));
+      let stageById = opts.progStagesById || null;
+      if (!stageById) {
+        const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName]]]`);
+        if (!progResp?._error && Array.isArray(progResp?.programStages)) {
+          stageById = new Map(progResp.programStages.map(st => [st.id, st]));
+        }
+      }
+      if (stageById) {
         const problems = [];
         for (const r of [...new Map(refs.map(x => [x.token, x])).values()]) {
           const st = stageById.get(r.stage);
@@ -8028,7 +8047,7 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
           }
         }
         if (problems.length) {
-          const stageList = progResp.programStages.map(st => `${st.displayName} (${st.id})`).join(', ');
+          const stageList = [...stageById.values()].map(st => `${st.displayName} (${st.id})`).join(', ');
           return {
             _error: `Program indicator ${indicatorId ? 'update' : 'create'} blocked: expression/filter references do not match the program structure — ${problems.join('; ')}.`,
             _hint: `Use the program's REAL stage ids: ${stageList}. Fetch a stage's data elements with get_program_info(info_type="stage_details", target_id=<stageId>) and rebuild the #{stageUid.deUid} references. Nothing was saved.`,
@@ -8072,6 +8091,17 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
     piMixedPrecedenceAdvisory('expression', pi.expression),
     piMixedPrecedenceAdvisory('filter', pi.filter),
   ].filter(Boolean);
+
+  return { pi, precedenceAdvisories };
+}
+
+// Commit ONE program indicator (create or update). Validates via
+// _prepareProgramIndicatorObject, then disambiguates shortName/name and POSTs it.
+async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, dryRun) {
+  const prepared = await _prepareProgramIndicatorObject(programId, indicatorId, indicator);
+  if (prepared._error) return prepared;
+  const { pi, precedenceAdvisories } = prepared;
+  const uid = pi.id;
 
   if (dryRun) {
     return { success: true, phase: 'dry_run', message: 'Dry run only. No changes committed.', would_save: pi, ...(precedenceAdvisories.length ? { precedence_advisories: precedenceAdvisories } : {}) };
@@ -8125,6 +8155,141 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   // never yield a chainable-but-nonexistent UID.
   if (result && result.success) out.program_indicator_id = uid;
   return out;
+}
+
+// Batch create: validate MANY program indicators, then commit the valid ones in a
+// SINGLE /metadata import. This is what makes big analytical builds fit the agentic
+// loop budget — the pregnancy analytics prompt needs ~15-40 PIs; one-per-call burned
+// all 50 loop iterations on PI creation alone and never reached the charts/dashboard.
+// Invalid indicators are SKIPPED (never disable the tool) and reported under failed[]
+// so the model can fix just those, not re-run the whole batch. Program structure +
+// default category combo are fetched ONCE and shared across the batch.
+async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun) {
+  const catComboId = (await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1'))?.categoryCombos?.[0]?.id || 'bjDvmb4bfuf';
+  let progStagesById = null;
+  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName]]]`);
+  if (!progResp?._error && Array.isArray(progResp?.programStages)) {
+    progStagesById = new Map(progResp.programStages.map(st => [st.id, st]));
+  }
+  const opts = { catComboId, progStagesById };
+
+  // Validate/build every indicator with bounded concurrency (a 40-PI batch would
+  // otherwise fire 80 description POSTs at once). Preserve input order for reporting.
+  const prepared = new Array(indicators.length);
+  const CONC = 6;
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= indicators.length) return;
+      const ind = indicators[idx];
+      if (!ind || !ind.name || !String(ind.name).trim()) {
+        prepared[idx] = { _error: 'indicator.name is required' };
+        continue;
+      }
+      prepared[idx] = await _prepareProgramIndicatorObject(programId, null, ind, opts);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONC, indicators.length) }, worker));
+
+  const validPis = [];
+  const validAdvisories = [];
+  const failed = [];
+  for (let i = 0; i < indicators.length; i++) {
+    const p = prepared[i];
+    if (p && p._error) {
+      failed.push({ index: i, name: indicators[i]?.name || null, _error: p._error, _hint: p._hint, expression: p.expression, filter: p.filter });
+    } else if (p && p.pi) {
+      validPis.push(p.pi);
+      if (p.precedenceAdvisories?.length) validAdvisories.push(...p.precedenceAdvisories);
+    }
+  }
+
+  if (dryRun) {
+    return {
+      success: failed.length === 0,
+      phase: 'dry_run',
+      message: `Dry run only. ${validPis.length} indicator(s) would be created, ${failed.length} rejected. Nothing committed.`,
+      would_create: validPis.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
+      ...(failed.length ? { failed } : {}),
+      ...(validAdvisories.length ? { precedence_advisories: validAdvisories } : {}),
+    };
+  }
+
+  if (!validPis.length) {
+    return {
+      _error: `All ${indicators.length} program indicator(s) failed validation — nothing was created.`,
+      failed,
+      _hint: 'Fix each _error above and retry. Common causes: an unsupported d2:* function, a #{stage.de} reference not on that stage, or a division/percentage expression the parser rejects (use d2:condition("<numerator condition>", 100, 0) with aggregation_type "AVERAGE" for a coverage %).',
+    };
+  }
+
+  // shortName uniqueness: server (batched probes) THEN intra-batch (the server probe
+  // early-returns when there are no server collisions, so two identical shortNames
+  // minted in THIS call could still slip through).
+  await disambiguateShortNamesAgainstServer(validPis, 'programIndicators', 'programIndicators');
+  {
+    const seenSn = new Set();
+    for (const p of validPis) {
+      if (!p.shortName) continue;
+      if (seenSn.has(p.shortName)) {
+        const base = p.shortName.slice(0, 45).replace(/\s+$/, '');
+        let sn, g = 0;
+        do { sn = `${base} ${generateDhis2Uid().slice(-4)}`; g++; } while (seenSn.has(sn) && g < 5);
+        p.shortName = sn;
+      }
+      seenSn.add(p.shortName);
+    }
+  }
+
+  // NAME is globally unique on programIndicators. One batched probe per 50 names,
+  // then rename any that already exist on the server OR collide within this batch.
+  const nameTaken = new Set();
+  for (let i = 0; i < validPis.length; i += 50) {
+    const chunk = validPis.slice(i, i + 50);
+    const filter = chunk.map(p => encodeURIComponent(p.name)).join(',');
+    const resp = await safeDhis2Fetch(`programIndicators?filter=name:in:[${filter}]&fields=id,name&paging=false`);
+    for (const ex of (resp?.programIndicators || [])) {
+      if (!chunk.some(p => p.id === ex.id) && ex.name) nameTaken.add(ex.name);
+    }
+  }
+  const seenNames = new Set();
+  const renamed = [];
+  for (const p of validPis) {
+    if (nameTaken.has(p.name) || seenNames.has(p.name)) {
+      const base = String(p.name).substring(0, 225);
+      let candidate, g = 0;
+      do { candidate = `${base} ${generateDhis2Uid().slice(-4)}`; g++; }
+      while ((nameTaken.has(candidate) || seenNames.has(candidate)) && g < 5);
+      renamed.push({ from: p.name, to: candidate });
+      p.name = candidate;
+    }
+    seenNames.add(p.name);
+  }
+
+  const result = await postMetadataPayload({ programIndicators: validPis }, false);
+  if (!result || !result.success) {
+    return {
+      _error: result?._error || 'Batch program-indicator import failed.',
+      phase: result?.phase,
+      errors: result?.errors,
+      attempted: validPis.map(p => ({ id: p.id, name: p.name })),
+      ...(failed.length ? { validation_rejected: failed } : {}),
+    };
+  }
+
+  return {
+    success: true,
+    action: 'create',
+    created_count: validPis.length,
+    created: validPis.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
+    // Flat UID list so the caller chains straight into visualization/map/dashboard data_items.
+    program_indicator_ids: validPis.map(p => p.id),
+    ...(failed.length ? { failed_count: failed.length, failed } : {}),
+    ...(renamed.length ? { name_auto_disambiguated: renamed } : {}),
+    ...(validAdvisories.length ? { precedence_advisories: validAdvisories } : {}),
+    summary: `Created ${validPis.length} program indicator(s) in one import${failed.length ? `; ${failed.length} rejected by validation (see failed[])` : ''}. Chain program_indicator_ids into visualizations/maps/dashboard data_items.`,
+  };
 }
 
 async function createStandaloneOptionSet(args) {

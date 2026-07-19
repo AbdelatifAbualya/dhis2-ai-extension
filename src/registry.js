@@ -1185,14 +1185,14 @@ Actions:
     type: 'function',
     function: {
       name: 'manage_program_indicators',
-      description: `CRUD + audit + cross-program discovery + OU ranking for DHIS2 program indicators. Actions: list/get/create/update/delete/audit/bulk_fix/bulk_fix_expressions/discover/rank_ou. expressions reference #{stageId.deId}, A{attrId}, V{event_count|tei_count}, d2:sum/countIfValue/etc. For "find/fix broken indicators" use action=audit (paginates + validates server-side via /expression/description) then bulk_fix or bulk_fix_expressions. For "complex/heavy/big/top/most program indicators" or "indicators with lots of data" ACROSS ALL programs use action=discover — NEVER guess a program ID. For "which OUs/districts/regions/facilities have the most data/events for these indicators" use action=rank_ou with indicator_ids from a prior discover result. NEVER PUT/PATCH programIndicators through dhis2_query. NEVER invent program UIDs — always reuse UIDs from prior tool results (discover/list/get/search_metadata). For metadata-count comparisons ("which program has the most indicators") use search_metadata(object_type="programs").`,
+      description: `CRUD + audit + cross-program discovery + OU ranking for DHIS2 program indicators. Actions: list/get/create/update/delete/audit/bulk_fix/bulk_fix_expressions/discover/rank_ou. **create accepts a BATCH: pass indicators:[…] to build MANY in ONE call/metadata import — always do this for analytics builds (a coverage dashboard needs 10-40 PIs and one-per-call runs out of loop budget before the charts exist).** A coverage/percentage metric is normally ONE program indicator — numerator condition in the expression via d2:condition("…",100,0) with aggregation_type AVERAGE, denominator population in the filter — NOT three separate numerator/denominator/percentage objects. expressions reference #{stageId.deId}, A{attrId}, V{enrollment_count|event_count|tei_count}, d2:count/countIfValue/condition/etc. For "find/fix broken indicators" use action=audit (paginates + validates server-side via /expression/description) then bulk_fix or bulk_fix_expressions. For "complex/heavy/big/top/most program indicators" or "indicators with lots of data" ACROSS ALL programs use action=discover — NEVER guess a program ID. For "which OUs/districts/regions/facilities have the most data/events for these indicators" use action=rank_ou with indicator_ids from a prior discover result. NEVER PUT/PATCH programIndicators through dhis2_query. NEVER invent program UIDs — always reuse UIDs from prior tool results (discover/list/get/search_metadata). For metadata-count comparisons ("which program has the most indicators") use search_metadata(object_type="programs").`,
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
             enum: ['list', 'get', 'create', 'update', 'delete', 'audit', 'bulk_fix', 'bulk_fix_expressions', 'discover', 'rank_ou'],
-            description: 'list=paginated indicator list (needs program_id); get=one indicator; create=new indicator; update=modify single existing; delete=remove; audit=check ALL indicators in a program for issues (references, boundaries, V{}/d2: names, braces, optional server validation); bulk_fix=swap a wrong stage ID across many indicators; bulk_fix_expressions=apply per-indicator expression/filter replacements in one batch; discover=cross-program scan ranking indicators by complexity (#{} refs, A{} refs, d2: funcs, operators, length) and/or per-program event volume — NO program_id required, returns top_n ranked; use for "complex/heavy/biggest/top/most complicated indicators" and "indicators with lots of data" questions. rank_ou=for "which OUs/districts/regions/facilities have the most data/events for these indicators" — pass indicator_ids (from a prior discover/list) OR programs; runs analytics/events/aggregate per distinct program with ou:{root};LEVEL-{N}, sums per-OU across programs, returns top_n OUs with per-program breakdown. Do NOT hand-build analytics URLs for this.'
+            description: 'list=paginated indicator list (needs program_id); get=one indicator; create=new indicator (single `indicator` OR a BATCH via `indicators:[…]` — prefer the batch for any multi-indicator build); update=modify single existing; delete=remove; audit=check ALL indicators in a program for issues (references, boundaries, V{}/d2: names, braces, optional server validation); bulk_fix=swap a wrong stage ID across many indicators; bulk_fix_expressions=apply per-indicator expression/filter replacements in one batch; discover=cross-program scan ranking indicators by complexity (#{} refs, A{} refs, d2: funcs, operators, length) and/or per-program event volume — NO program_id required, returns top_n ranked; use for "complex/heavy/biggest/top/most complicated indicators" and "indicators with lots of data" questions. rank_ou=for "which OUs/districts/regions/facilities have the most data/events for these indicators" — pass indicator_ids (from a prior discover/list) OR programs; runs analytics/events/aggregate per distinct program with ou:{root};LEVEL-{N}, sums per-OU across programs, returns top_n OUs with per-program breakdown. Do NOT hand-build analytics URLs for this.'
           },
           program_id: { type: 'string', description: 'Program ID (required for list, create, audit; ignored by discover)' },
           indicator_id: { type: 'string', description: 'Existing indicator ID (required for get, update, delete)' },
@@ -1219,17 +1219,35 @@ Actions:
           page: { type: 'integer', description: 'Page number for list action (default: 1, 50 per page). Check _has_more in response for more pages.' },
           indicator: {
             type: 'object',
-            description: 'Indicator definition (required for create; provide only changed fields for update)',
+            description: 'ONE indicator definition (create a single indicator, or provide only the changed fields for update). For creating MANY indicators at once, use `indicators` (array) instead — it commits them all in one metadata import.',
             properties: {
               name: { type: 'string' },
               short_name: { type: 'string', description: 'Max 50 chars. Auto-derived from name if omitted.' },
               description: { type: 'string' },
-              expression: { type: 'string', description: 'What to aggregate. Examples: "V{event_count}", "V{tei_count}", "d2:sum(#{stageId.deId})"' },
-              filter: { type: 'string', description: 'Condition restricting which events/enrollments count. Examples: "V{program_stage_id} == \'stageId\'", "#{stageId.deId} == \'value\'"' },
-              analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'], description: 'EVENT=aggregate over events, ENROLLMENT=aggregate over enrollments/TEIs' },
-              aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'], description: 'How to aggregate. Default: COUNT' },
-              decimals: { type: 'integer', description: 'Decimal places in output. Optional.' },
+              expression: { type: 'string', description: 'What to aggregate. Count of enrollments/women → "V{enrollment_count}" (ENROLLMENT) or "V{event_count}" (EVENT). Coverage/PERCENTAGE in ONE indicator → "d2:condition(\\"<numerator condition>\\", 100, 0)" with aggregation_type "AVERAGE" (mean of the 0/100 flag over the filtered population = the %). Also: "d2:sum(#{stageId.deId})", "d2:count(#{stageId.deId})".' },
+              filter: { type: 'string', description: 'Condition selecting which events/enrollments count. For a percentage indicator this is the DENOMINATOR population (e.g. "#{stageId.gestAge} < 999" = women with a valid gestational age). Examples: "#{stageId.deId} == \'value\'", "d2:count(#{stageId.contactNo}) >= 4".' },
+              analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'], description: 'EVENT=aggregate over events, ENROLLMENT=aggregate over enrollments/TEIs. Use ENROLLMENT for "per woman / per pregnancy" counts and coverage so a pregnancy is counted once, not once per visit.' },
+              aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'], description: 'How to aggregate across rows. COUNT/SUM for counts; AVERAGE for a d2:condition(...,100,0) percentage indicator. Default: COUNT.' },
+              decimals: { type: 'integer', description: 'Decimal places in output. Optional (e.g. 1 for a percentage).' },
               display_in_form: { type: 'boolean', description: 'Show this indicator in the right-side "Indicators" widget of Tracker Capture / Capture data entry (DHIS2 displayInForm). Set true when the user wants the indicator visible during data entry. Default false.' }
+            }
+          },
+          indicators: {
+            type: 'array',
+            description: 'BATCH create: an array of indicator objects (same shape as `indicator`) committed in ONE metadata import. USE THIS whenever you need more than one program indicator — a coverage/analytics build needs many, and one-per-call exhausts the loop budget before the charts/dashboard are built. Invalid entries are skipped and returned under failed[]; valid ones are created and their UIDs returned in program_indicator_ids for chaining into visualizations/maps/dashboard data_items. shortName and name collisions (server + intra-batch) are auto-resolved. A percentage metric is normally ONE indicator (numerator condition in the expression, denominator population in the filter) — do NOT emit separate numerator + denominator + percentage objects unless a table explicitly needs those counts as columns.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                short_name: { type: 'string' },
+                description: { type: 'string' },
+                expression: { type: 'string' },
+                filter: { type: 'string' },
+                analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'] },
+                aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'] },
+                decimals: { type: 'integer' },
+                display_in_form: { type: 'boolean' }
+              }
             }
           },
           dry_run_only: { type: 'boolean', description: 'Validate without committing. Default: false.' },
@@ -2432,6 +2450,16 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
 - \`analyticsType\`: \`EVENT\` (one row per event) or \`ENROLLMENT\` (one row per enrollment, latest event values per stage).
 - \`aggregationType\`: \`COUNT\` for count-of-rows, \`SUM\`/\`AVERAGE\`/\`MIN\`/\`MAX\` for numeric aggregations.
 - "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{tei_count}\`. \`V{enrollment_count}\` is also valid; \`V{event_count}\` is for EVENT-type PIs.
+
+**PERCENTAGE / COVERAGE = ONE program indicator (NOT three).** A metric like "% of pregnant women whose first ANC was before 12 weeks" is **a SINGLE program indicator**, not a numerator PI + a denominator PI + a percentage object. Build it as:
+- \`analytics_type: "ENROLLMENT"\` (count each woman/pregnancy once, not once per visit),
+- \`filter\`: the **DENOMINATOR** population — who is eligible (e.g. \`#{FIPs4MVhcok.gestAge} < 999\` = women with a valid gestational age),
+- \`expression\`: \`d2:condition("<NUMERATOR condition>", 100, 0)\` — 100 when the woman meets the numerator, else 0 (e.g. \`d2:condition("#{FIPs4MVhcok.gestAge} < 12", 100, 0)\`),
+- \`aggregation_type: "AVERAGE"\` — the mean of a 0/100 flag over the denominator population **is** the percentage,
+- \`decimals: 1\`. Verified live on 2.42/2.43 — the description endpoints accept it and it plots directly on line charts/maps/single-value cards.
+This is the pattern to use whenever the user asks for "the percentage/rate/coverage of …". It contains **no division**, so unlike a numerator/denominator ratio it never 409s on a zero denominator. Do NOT reflexively create separate numerator + denominator count PIs — create them **only** when the user explicitly wants those counts as their own tiles or as separate columns of a table (e.g. "a table showing numerator, denominator, percentage"). In that case: one COUNT PI for the numerator, one COUNT PI for the denominator, and the single AVERAGE percentage PI above — all in ONE batch.
+
+**BATCH every multi-indicator build.** \`manage_program_indicators(action="create", program_id, indicators:[ {…}, {…}, … ])\` validates and commits them all in a SINGLE metadata import and returns \`program_indicator_ids\` (a flat UID list) to chain into visualizations/maps/dashboard \`data_items\`. A coverage dashboard needs 10-40 indicators; creating them one-per-call exhausts the agentic-loop budget before any chart or dashboard is built (the pregnancy-analytics failure). Plan the full indicator set, then create it in one (or a few) batched calls. Invalid entries are skipped and returned under \`failed[]\` — fix just those and re-batch the remainder; the valid ones are already saved.
 
 **Indicators widget during data entry:** when the user wants an indicator visible in the right-side "Indicators" widget of Tracker Capture / Capture (e.g. live gestational age, risk flags), pass \`display_in_form: true\` in the indicator object (create or update). Per-event calculations (EVENT analytics) read most naturally there.
 
@@ -4014,6 +4042,16 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
 3. manage_indicators(action="create", indicator:{ name:"ANC 1st visit coverage", numerator:"#{anc1Uid}", denominator:"#{expectedUid}", indicator_type:"Per cent", legend_set_id:<legend_set_id> }) → the indicator is created AND the legend attached in ONE call; keep \`indicator_id\`.
 4. manage_dashboards(action="create_dashboard", dashboard:{ name:"ANC Coverage" }, items:[ { new_visualization:{ name:"ANC coverage by month", vis_type:"COLUMN", data_items:[<indicator_id>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } } ]) → keep \`dashboard_id\`.
 5. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------").
+
+### Worked chain — "build the analytical package (program indicators + charts + maps + dashboard) for a TRACKER program"
+This is the shape of a big coverage/monitoring build. Do it in a HANDFUL of batched calls, never dozens of single ones.
+1. get_program_info(program_id=<the tracker>) → the REAL stage UIDs + data element UIDs. Every #{stage.de} you write must come from here.
+2. PLAN the indicator set. Each "% / rate / coverage" metric = **ONE** program indicator: analytics_type ENROLLMENT, filter = the denominator population, expression = \`d2:condition("<numerator condition>", 100, 0)\`, aggregation_type AVERAGE, decimals 1 (see the manage_program_indicators manual). Add a COUNT/SUM program indicator ONLY for a headline number (e.g. "active pregnancies") or when a table/breakdown explicitly needs the raw numerator, denominator, or category counts as their own columns. Do NOT split every percentage into numerator + denominator + percentage objects.
+3. manage_program_indicators(action="create", program_id, indicators:[ …all of them… ]) — ONE batched call. Keep the returned \`program_indicator_ids\`. (Re-batch only the entries returned under failed[], if any.)
+4. manage_legend_sets(action="create", …) for the map/RAG colour bands → keep each \`legend_set_id\`.
+5. manage_maps(action="create", data_item:<a program_indicator_id>, org_unit_level:2, legend_set_id:<…>) for EACH thematic map → keep each \`map_id\`. (Maps are created one per call; there is no inline-map on a dashboard.)
+6. manage_dashboards(action="create_dashboard", dashboard:{ name }, items:[ …]) — build the WHOLE dashboard in ONE call: each chart/pivot/single-value tile as an inline \`new_visualization\` (data_items = the program_indicator_ids), each map as \`{ type:"MAP", map_id }\`, section headers as \`{ type:"TEXT", text:"## ANC coverage" }\`. Keep \`dashboard_id\`.
+7. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, …) LAST.
 
 ### Worked chain — "create an option set for RDT results, a data element that uses it, and add it to the monthly malaria dataset"
 1. manage_option_sets(action="create", option_set:{ name:"Malaria RDT Result", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INV",name:"Invalid"}] }) → keep the returned \`option_set_id\`.

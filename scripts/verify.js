@@ -213,6 +213,29 @@ if (loaded) {
     const props = (gpi && gpi.function.parameters && gpi.function.parameters.properties) || {};
     truthy('get_program_info schema exposes program_id', !!props.program_id);
     truthy('get_program_info schema exposes program_name', !!props.program_name);
+
+    // Batch program-indicator create (v2.8.18) — the schema must expose an
+    // `indicators` array so a big analytics build commits many PIs in ONE call
+    // instead of one-per-loop-iteration (the 47-PI pregnancy disaster). The tool
+    // description must steer toward the batch + single-PI percentage pattern.
+    const mpi = defs.find((t) => t.function.name === 'manage_program_indicators');
+    const mpiProps = (mpi && mpi.function.parameters && mpi.function.parameters.properties) || {};
+    truthy('manage_program_indicators schema exposes indicators[] (batch)', !!(mpiProps.indicators && mpiProps.indicators.type === 'array'));
+    truthy('manage_program_indicators still exposes single indicator', !!mpiProps.indicator);
+    truthy('manage_program_indicators description teaches batch', /BATCH/.test(mpi.function.description || ''));
+    truthy('manage_program_indicators description teaches single-PI % (AVERAGE)', /AVERAGE/.test(mpi.function.description || '') && /d2:condition/.test(mpi.function.description || ''));
+
+    // A MAP is refused as a visualization type, and the refusal must point at
+    // manage_maps + the { type:"MAP", map_id } dashboard tile (2026-07-19: kimi
+    // tried to inline a map as new_visualization and needed the recovery hint).
+    const buildViz = fn('buildVisualizationObject');
+    if (buildViz) {
+      const mapRefusal = buildViz({ name: 'X', vis_type: 'MAP', data_items: ['abcdef12345'], periods: ['LAST_12_MONTHS'], org_units: ['USER_ORGUNIT'] }, {});
+      truthy('vis_type MAP is refused', !!(mapRefusal && mapRefusal._error));
+      truthy('vis_type MAP refusal hints manage_maps', !!(mapRefusal && /manage_maps/.test(mapRefusal._hint || '')));
+    } else {
+      bad('buildVisualizationObject — missing (cannot verify MAP refusal hint)');
+    }
   }
 
   // Named-program substitution guard — a user-named program that searches
