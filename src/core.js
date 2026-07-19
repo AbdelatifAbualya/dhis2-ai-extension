@@ -640,15 +640,20 @@ function isIncompleteCallError(resultOrText) {
 // common failure on weaker / custom OpenAI-compatible models (e.g. MiniMax)
 // under a large payload: the stream truncates mid-object, or leaks provider
 // separator tokens like `]<]minimax[>[` into the buffer. Returns
-// { ok:true, text } with a parseable JSON string when recovered, else
-// { ok:false }. Never throws. Pure — safe to unit test.
+// { ok:true, text, lossy } with a parseable JSON string when recovered, else
+// { ok:false }. `lossy:false` means the payload is intact after stripping leaked
+// tokens — safe to execute. `lossy:true` means braces had to be balanced /
+// strings closed, i.e. THE TAIL OF THE PAYLOAD WAS LOST: executing it would
+// silently run a partial call (e.g. a create_program missing its last stages
+// and rules that then "succeeds"), so callers must treat it as corrupted and
+// ask the model to resend/split instead. Never throws. Pure — safe to unit test.
 function repairToolCallArguments(raw) {
   const s0 = String(raw == null ? '' : raw);
   const tryParse = (t) => { try { JSON.parse(t); return true; } catch { return false; } };
-  if (tryParse(s0)) return { ok: true, text: s0 };
+  if (tryParse(s0)) return { ok: true, text: s0, lossy: false };
   // Strip leaked provider separator tokens ( ]<]word[>[ ) and stray control chars.
   let s = s0.replace(/\]?<\]\w+\[>\[?/g, '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
-  if (tryParse(s)) return { ok: true, text: s };
+  if (tryParse(s)) return { ok: true, text: s, lossy: false };
   // Isolate the outermost object/array of a stream truncated before it closed.
   const start = s.search(/[{[]/);
   if (start === -1) return { ok: false };
@@ -667,7 +672,72 @@ function repairToolCallArguments(raw) {
   if (inStr) s += '"';               // close an unterminated string
   s = s.replace(/,\s*$/, '');
   while (stack.length) s += (stack.pop() === '{' ? '}' : ']');
-  return tryParse(s) ? { ok: true, text: s } : { ok: false };
+  return tryParse(s) ? { ok: true, text: s, lossy: true } : { ok: false };
+}
+
+// ── Tool-call argument shape healing ─────────────────────────────────────────
+// Grammar-constrained providers can mangle NESTED structures in tool-call
+// arguments: given an item schema of bare `{type:'object'}`, Fireworks'
+// constrained decoder (observed live with MiniMax-M3, 2026-07-18) emits each
+// item as `{"$text": "<the intended object serialized as a JSON string>"}` —
+// and some models stringify nested objects/arrays outright ("body": "{…}").
+// Executing those shapes fails validation with misleading "missing required
+// field" errors even though the model's INTENT was complete and correct.
+// Heal generically (any tool, any provider):
+//   • an object whose ONLY key is $text (string) → parse the string as JSON
+//     when possible (else use the raw string);
+//   • an array item / object value that is a string LOOKING like a JSON
+//     object/array and parsing cleanly → parsed value.
+// Plain strings that don't parse as JSON containers are never touched.
+// Returns { value, healed }. Pure — safe to unit test.
+function healToolArgumentShape(value, depth = 0) {
+  if (depth > 12) return { value, healed: false };
+  const tryParseContainer = (s) => {
+    const t = String(s).trim();
+    if (!t.startsWith('{') && !t.startsWith('[')) return undefined;
+    try {
+      const p = JSON.parse(t);
+      return (p && typeof p === 'object') ? p : undefined;
+    } catch { return undefined; }
+  };
+  if (Array.isArray(value)) {
+    let healed = false;
+    const out = value.map(item => {
+      if (typeof item === 'string') {
+        const parsed = tryParseContainer(item);
+        if (parsed !== undefined) {
+          healed = true;
+          const inner = healToolArgumentShape(parsed, depth + 1);
+          return inner.value;
+        }
+        return item;
+      }
+      const r = healToolArgumentShape(item, depth + 1);
+      if (r.healed) healed = true;
+      return r.value;
+    });
+    return { value: out, healed };
+  }
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.length === 1 && keys[0] === '$text' && typeof value.$text === 'string') {
+      const parsed = tryParseContainer(value.$text);
+      if (parsed !== undefined) {
+        const inner = healToolArgumentShape(parsed, depth + 1);
+        return { value: inner.value, healed: true };
+      }
+      return { value: value.$text, healed: true };
+    }
+    let healed = false;
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      const r = healToolArgumentShape(v, depth + 1);
+      if (r.healed) healed = true;
+      out[k] = r.value;
+    }
+    return { value: out, healed };
+  }
+  return { value, healed: false };
 }
 
 // Collapse an error message into a "family" key: same message modulo UIDs,
@@ -727,6 +797,22 @@ function repeatedFailureStopOrNull(toolName, args) {
         // recovery framing and a NON-disabling scope — the model must be free to
         // send a well-formed call next (see isIncompleteCallError).
         if (isIncompleteCallError(prev.error)) {
+          // The non-disabling refusal exists so a CORRECTED retry stays open —
+          // but a model that re-sends the byte-identical empty/partial call
+          // forever must not burn the whole iteration budget on it (observed
+          // live 2026-07-18: 22 identical `rules:[{}]` repeats). After 3
+          // blocked identical repeats, escalate to the disabling scope so the
+          // circuit breaker ends the loop; a retry with DIFFERENT (fixed)
+          // arguments is a different signature and is never affected.
+          if ((prev.blockedAttempts || 0) >= 3) {
+            return {
+              _error: `BLOCKED: ${toolName} has now sent the SAME incomplete arguments ${prev.count + prev.blockedAttempts} times ("${prev.error}"). Re-sending them again will never work.`,
+              _hint: `STOP repeating this exact call. Either send the tool call with COMPLETE, fully-populated arguments (every required field), or give the user your final answer now: what was created (names + IDs), what remains, and what blocked you.`,
+              _scope: 'no_progress_repeat',
+              _previous_error: prev.error,
+              _identical_failures: prev.count,
+            };
+          }
           return {
             _error: `Your last ${toolName} call was refused because it repeated an INCOMPLETE call: "${prev.error}". `,
             _hint: `This is not a doomed operation — it means the arguments did not arrive intact (empty or truncated tool-call JSON). Re-send the COMPLETE ${toolName} call with EVERY required field populated. Do NOT send the same empty/partial arguments again. The tool stays fully available; a well-formed call will run normally.`,
@@ -858,7 +944,7 @@ function discoveryStreakStopOrNull(toolName, args) {
   if (streak < DISCOVERY_STREAK_LIMIT) return null;
   return {
     _error: `STOP researching: ${streak} read-only/discovery calls in a row this turn with NOTHING created or changed. You already have enough information to act.`,
-    _hint: `Issue the actual write the task needs NOW. To build a program, send ONE create_metadata(action=create_program) call with ALL components — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
+    _hint: `Issue the actual write the task needs NOW. To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
     _scope: 'no_progress_repeat',   // feeds the circuit breaker: if the model ignores this and keeps spinning, the discovery tool is disabled and the loop ends
     _discovery_streak: streak,
   };

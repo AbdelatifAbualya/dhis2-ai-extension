@@ -1,5 +1,42 @@
 // ── Fireworks AI ─────────────────────────────────────────────────────────────
 
+// Outbound wire sanitizer — runs on EVERY provider request. The agent loop
+// annotates in-memory messages with internal underscore-prefixed markers
+// (e.g. tool_calls[i]._argsCorrupted set when streamed arguments arrive
+// truncated). Strict OpenAI-compatible providers hard-reject unknown fields:
+// Moonshot/Kimi returns 400 "Extra inputs are not permitted,
+// field: 'messages[N].tool_calls[0]._argsCorrupted'", which killed the whole
+// turn. Strip every `_`-prefixed key from messages and their tool_calls before
+// sending — but ONLY those, because some providers require their own extra
+// fields echoed back (Google Gemini's tool_call `thought_signature`).
+function sanitizeWireMessages(messages, isGoogle) {
+  return messages.map(m => {
+    let changed = false;
+    const out = {};
+    for (const k of Object.keys(m)) {
+      if (k.startsWith('_')) { changed = true; continue; }
+      out[k] = m[k];
+    }
+    if (Array.isArray(out.tool_calls)) {
+      const cleaned = out.tool_calls.map(tc => {
+        if (!tc || typeof tc !== 'object') return tc;
+        const keys = Object.keys(tc);
+        if (!keys.some(k => k.startsWith('_'))) return tc;
+        changed = true;
+        const c = {};
+        for (const k of keys) { if (!k.startsWith('_')) c[k] = tc[k]; }
+        return c;
+      });
+      if (changed) out.tool_calls = cleaned;
+    }
+    // Google rejects content:null on assistant messages with tool_calls
+    if (isGoogle && out.role === 'assistant' && out.content === null && out.tool_calls) {
+      return { ...out, content: '' };
+    }
+    return changed ? out : m;
+  });
+}
+
 async function callFireworks(messages, useTools = true, tools = TOOLS) {
   const stored = await chrome.storage.local.get(['fireworksApiKey', 'providerConfig']);
   const key = sanitizeHeaderValue(stored.fireworksApiKey);
@@ -14,12 +51,7 @@ async function callFireworks(messages, useTools = true, tools = TOOLS) {
   const url = getChatCompletionsUrl(cfg.apiBaseUrl);
   const isGoogle = cfg.providerType === 'google' || (cfg.apiBaseUrl || '').includes('googleapis.com');
 
-  const sanitizedMessages = isGoogle ? messages.map(m => {
-    if (m.role === 'assistant' && m.content === null && m.tool_calls) {
-      return { ...m, content: '' };
-    }
-    return m;
-  }) : messages;
+  const sanitizedMessages = sanitizeWireMessages(messages, isGoogle);
 
   const body = {
     model: cfg.modelId,
@@ -133,14 +165,9 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
   const url = getChatCompletionsUrl(cfg.apiBaseUrl);
   const isGoogle = cfg.providerType === 'google' || (cfg.apiBaseUrl || '').includes('googleapis.com');
 
-  // Sanitize messages for provider compatibility
-  const sanitizedMessages = isGoogle ? messages.map(m => {
-    // Google rejects content:null on assistant messages with tool_calls
-    if (m.role === 'assistant' && m.content === null && m.tool_calls) {
-      return { ...m, content: '' };
-    }
-    return m;
-  }) : messages;
+  // Sanitize messages for provider compatibility (strip internal `_` markers
+  // that strict providers 400 on; fix Google's content:null rejection)
+  const sanitizedMessages = sanitizeWireMessages(messages, isGoogle);
 
   const body = {
     model: cfg.modelId,
@@ -389,8 +416,10 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
     }
   }
 
-  // Safety: strip any residual think tags from final content
-  fullContent = fullContent.replace(/<think>[\s\S]*?<\/think>\s*/g, '').replace(/<\/?think>/g, '').trimStart();
+  // Safety: strip any residual think tags AND leaked provider separator
+  // tokens (]<]word[>[ — observed live from MiniMax mid-CONTENT, not just in
+  // tool-call args) from the final content.
+  fullContent = fullContent.replace(/<think>[\s\S]*?<\/think>\s*/g, '').replace(/<\/?think>/g, '').replace(/\]?<\]\w+\[>\[?/g, '').trimStart();
 
   // Build the message object matching non-streaming format
   const message = {
@@ -412,12 +441,25 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
       try { JSON.parse(tc.function.arguments); ok = true; } catch { ok = false; }
       if (!ok) {
         const rep = repairToolCallArguments(tc.function.arguments);
-        if (rep.ok) {
+        if (rep.ok && !rep.lossy) {
+          // Payload intact after stripping leaked separator tokens — safe to run.
           console.warn(`[providers] Recovered malformed tool-call arguments for ${tc.function?.name} (${String(tc.function.arguments || '').length} chars streamed)`);
           tc.function.arguments = rep.text;
         } else {
-          console.warn(`[providers] Unrecoverable tool-call arguments for ${tc.function?.name} (${String(tc.function.arguments || '').length} chars) — flagging as corrupted`);
-          tc._argsCorrupted = { rawLength: String(tc.function.arguments || '').length, sample: String(tc.function.arguments || '').slice(0, 120) };
+          // Unrecoverable OR only recoverable by dropping the truncated tail
+          // (lossy). NEVER execute a lossy repair: brace-balancing a truncated
+          // create_program "succeeds" while silently missing its last stages
+          // and rules. Flag it so the agent loop asks for a resend/split.
+          // finishReason distinguishes a deterministic max_tokens cut
+          // ('length' — resending the same call WILL truncate again; split now)
+          // from a transient transport glitch (resend may work).
+          console.warn(`[providers] ${rep.ok ? 'Truncated (lossy-repair refused)' : 'Unrecoverable'} tool-call arguments for ${tc.function?.name} (${String(tc.function.arguments || '').length} chars, finish_reason=${finishReason}) — flagging as corrupted`);
+          tc._argsCorrupted = {
+            rawLength: String(tc.function.arguments || '').length,
+            sample: String(tc.function.arguments || '').slice(0, 120),
+            finishReason: finishReason || null,
+            truncatedTail: !!rep.ok,
+          };
           tc.function.arguments = '{}';
         }
       }

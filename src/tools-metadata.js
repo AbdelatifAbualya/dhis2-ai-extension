@@ -845,6 +845,21 @@ async function executeTool(name, args) {
           }
           return result;
         }
+        // Ground the stage id against the target program BEFORE fetching:
+        // stale/hallucinated stage ids from long conversations otherwise
+        // produce a raw 404 (observed live 2026-07-19). The membership probe
+        // always succeeds and its result doubles as the correction hint.
+        const memberProbe = await safeDhis2Fetch(
+          `programStages?filter=program.id:eq:${effProgramId}&fields=id,displayName&paging=false`
+        );
+        const members = memberProbe?.programStages || [];
+        if (!memberProbe?._error && members.length && !members.some(st => st.id === args.target_id)) {
+          return {
+            _error: `"${args.target_id}" is not a stage of program ${effProgramId}.`,
+            _hint: `Use one of this program's real stage ids: ${members.map(st => `${st.displayName} (${st.id})`).join(', ')}.`,
+            valid_stages: members,
+          };
+        }
         const result = await safeDhis2Fetch(
           `programStages/${args.target_id}?fields=id,displayName,description,executionDateLabel,formType,sortOrder,programStageSections[id,displayName,sortOrder,dataElements[id]],programStageDataElements[compulsory,displayInReports,dataElement[id,displayName,displayFormName,valueType,description,optionSetValue,optionSet[id,displayName,options[id,displayName,code]]]]`
         );
@@ -3004,10 +3019,55 @@ async function createIndicator(args) {
   const itype = await resolveIndicatorType(ind.indicator_type);
   if (itype._error) return itype;
 
+  // Heal common reference mistakes BEFORE validation (all advisory-reported):
+  //   • #{<uid>} where the uid is a PROGRAM INDICATOR → I{<uid>} (aggregate
+  //     indicator grammar references PIs with I{}, not #{});
+  //   • I{<name>} / #{<name>} where a NAME was passed instead of a UID →
+  //     resolved against programIndicators / indicators / aggregate DEs by
+  //     exact name (unique match only).
+  // Observed live 2026-07-19: a weak model burned 4 validation failures and a
+  // circuit-breaker disable on exactly these shapes.
+  const expressionRewrites = [];
+  {
+    const healExpr = async (label, expr) => {
+      let out = String(expr);
+      const uidTokens = [...out.matchAll(/#\{([A-Za-z][A-Za-z0-9]{10})\}/g)].map(m => m[1]);
+      if (uidTokens.length) {
+        const piResp = await safeDhis2Fetch(`programIndicators?filter=id:in:[${[...new Set(uidTokens)].join(',')}]&fields=id&paging=false`);
+        for (const pi of (piResp?.programIndicators || [])) {
+          out = out.split(`#{${pi.id}}`).join(`I{${pi.id}}`);
+          expressionRewrites.push({ where: label, from: `#{${pi.id}}`, to: `I{${pi.id}}`, reason: 'program indicators are referenced with I{} in indicator expressions' });
+        }
+      }
+      const nameTokens = [...out.matchAll(/(I|#)\{([^}]+)\}/g)]
+        .filter(m => !/^[A-Za-z][A-Za-z0-9]{10}$/.test(m[2]) && !/^[A-Za-z][A-Za-z0-9]{10}\.[A-Za-z][A-Za-z0-9]{10}$/.test(m[2]));
+      for (const m of nameTokens) {
+        const raw = m[2].trim();
+        const [piR, indR, deR] = await Promise.all([
+          safeDhis2Fetch(`programIndicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+          safeDhis2Fetch(`indicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+          safeDhis2Fetch(`dataElements?filter=name:eq:${encodeURIComponent(raw)}&filter=domainType:eq:AGGREGATE&fields=id&pageSize=2`),
+        ]);
+        const pi = (piR?.programIndicators || []); const indL = (indR?.indicators || []); const de = (deR?.dataElements || []);
+        let to = null;
+        if (pi.length === 1) to = `I{${pi[0].id}}`;
+        else if (indL.length === 1) to = `N{${indL[0].id}}`;
+        else if (de.length === 1) to = `#{${de[0].id}}`;
+        if (to) {
+          out = out.split(m[0]).join(to);
+          expressionRewrites.push({ where: label, from: m[0], to, reason: 'resolved object name to its UID reference' });
+        }
+      }
+      return out;
+    };
+    ind.numerator = await healExpr('numerator', ind.numerator);
+    ind.denominator = await healExpr('denominator', ind.denominator);
+  }
+
   // Server-validate BOTH expressions before building the payload — a broken
   // reference is caught here with the parser's exact error, not silently saved.
   const numChk = await describeValidationExpression(ind.numerator);
-  if (!numChk.ok) return { _error: `numerator rejected by DHIS2: ${numChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} / R{dsUid.REPORTING_RATE} / I{programIndicatorUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+  if (!numChk.ok) return { _error: `numerator rejected by DHIS2: ${numChk.error}`, _hint: `Reference grammar for AGGREGATE indicators: program indicator = I{<piUid>}, other indicator = N{<indicatorUid>}, aggregate data element = #{<deUid>} (optionally #{de.coc}), reporting rate = R{dsUid.REPORTING_RATE}, constant = C{uid}. Program-rule/PI functions (d2:*) and V{} variables are NOT valid here. The numerator after auto-healing was: ${ind.numerator}. Confirm each UID exists (search_metadata) and retry.`, ...(expressionRewrites.length ? { expression_rewrites: expressionRewrites } : {}) };
   const denChk = await describeValidationExpression(ind.denominator);
   if (!denChk.ok) return { _error: `denominator rejected by DHIS2: ${denChk.error}`, _hint: 'Confirm each reference exists (use search_metadata) and the syntax is well-formed. For a plain count/sum use denominator "1".' };
 
@@ -3058,6 +3118,7 @@ async function createIndicator(args) {
   return {
     success: true,
     action: 'create',
+    ...(expressionRewrites.length ? { expression_rewrites: expressionRewrites } : {}),
     indicator_id: id,
     indicator: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, numerator: indObj.numerator, denominator: indObj.denominator, annualized: indObj.annualized, legendSetIds: legendRefs.ids.length ? legendRefs.ids : undefined },
     // Confirm the attached legend set(s) so a multi-step caller can report the
@@ -3797,6 +3858,27 @@ async function createLegendSet(args) {
   }
   if (!ls.name || !String(ls.name).trim()) return { _error: 'legend_set.name is required.' };
 
+  // Never-recreate: a same-name legend set is REUSED, not 409'd. Weak models
+  // routinely re-issue a create for a set they already made earlier in the
+  // turn (observed live 2026-07-19) — the duplicate 409 then burned a failed
+  // API call and a retry loop. Returning the existing set is always safe: the
+  // caller wanted a set with this name to exist, and its actual bands are
+  // included so the model can add/adjust if they differ.
+  {
+    const probe = await safeDhis2Fetch(`legendSets?filter=name:eq:${encodeURIComponent(String(ls.name).trim())}&fields=id,name,legends[id,name,startValue,endValue,color]&pageSize=2`);
+    const existing = probe?.legendSets?.[0];
+    if (existing) {
+      return {
+        success: true,
+        action: 'create',
+        _idempotent_reuse: true,
+        legend_set_id: existing.id,
+        legend_set: existing,
+        message: `Legend set "${existing.name}" already exists (${existing.id}) — reusing it instead of creating a duplicate. Its current bands are listed; use add_legends/update if they need adjusting.`,
+      };
+    }
+  }
+
   let legends;
   if (args.auto_bands && typeof args.auto_bands === 'object') {
     const gen = buildLegendAutoBands(args.auto_bands);
@@ -3960,8 +4042,37 @@ async function resolveDataItemTypes(uids) {
     }
   }
   for (const o of (piResp?.programIndicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'PROGRAM_INDICATOR';
-  const unresolved = list.filter(u => !typeMap[u]);
-  return { typeMap, unresolved, trackerNames };
+  let unresolved = list.filter(u => !typeMap[u]);
+
+  // Name → UID aliasing: models routinely pass an object's NAME as a data
+  // item (observed live 2026-07-19: data_items:["Early ANC initiation
+  // (before 12 weeks)"] → hard failure + circuit breaker). Anything that is
+  // not UID-shaped is resolved by exact name against indicators / program
+  // indicators / aggregate DEs; a UNIQUE match substitutes the UID IN PLACE
+  // in the caller's array (both create_visualization and dashboard items pass
+  // spec.data_items by reference) and is reported in `aliases`.
+  const aliases = [];
+  const nameItems = unresolved.filter(u => !/^[A-Za-z][A-Za-z0-9]{10}$/.test(u));
+  for (const raw of nameItems) {
+    const [indR, piR, deR] = await Promise.all([
+      safeDhis2Fetch(`indicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+      safeDhis2Fetch(`programIndicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+      safeDhis2Fetch(`dataElements?filter=name:eq:${encodeURIComponent(raw)}&filter=domainType:eq:AGGREGATE&fields=id&pageSize=2`),
+    ]);
+    let id = null, type = null;
+    if ((indR?.indicators || []).length === 1) { id = indR.indicators[0].id; type = 'INDICATOR'; }
+    else if ((piR?.programIndicators || []).length === 1) { id = piR.programIndicators[0].id; type = 'PROGRAM_INDICATOR'; }
+    else if ((deR?.dataElements || []).length === 1) { id = deR.dataElements[0].id; type = 'DATA_ELEMENT'; }
+    if (id) {
+      typeMap[id] = type;
+      aliases.push({ name: raw, id, type });
+      if (Array.isArray(uids)) {
+        for (let i = 0; i < uids.length; i++) if (String(uids[i]).trim() === raw) uids[i] = id;
+      }
+    }
+  }
+  if (aliases.length) unresolved = unresolved.filter(u => !aliases.some(a => a.name === u));
+  return { typeMap, unresolved, trackerNames, aliases };
 }
 
 // Build a complete, render-correct visualization object from a friendly spec.
@@ -5646,7 +5757,26 @@ function resolveRuleTokenBindings(rule, deNames, teaNames, existingVarNames = ne
     if (preferred.length === 1) return preferred[0];
     if (preferred.length > 1) return null;
     const other = prefix(kinds[1][0], kinds[1][1]);
-    return other.length === 1 ? other[0] : null;
+    if (other.length === 1) return other[0];
+    // Underscore-insensitive last resort: weak models emit near-miss tokens
+    // ("haemoglobin_in_g_d_l" for "haemoglobin_in_g_dl"). Only an UNAMBIGUOUS
+    // squash-equality/prefix match resolves.
+    const squash = (x) => String(x).replace(/_/g, '');
+    const sq = squash(token);
+    const sqMatch = (names, kind) => {
+      const eq = [], pref2 = [];
+      for (const n of names) {
+        const sn = squash(sanitizeVariableName(n));
+        if (sn === sq) eq.push({ kind, name: n });
+        else if (sn.startsWith(sq) || sq.startsWith(sn)) pref2.push({ kind, name: n });
+      }
+      return eq.length ? eq : pref2;
+    };
+    const sq1 = sqMatch(kinds[0][0], kinds[0][1]);
+    if (sq1.length === 1) return sq1[0];
+    if (sq1.length > 1) return null;
+    const sq2 = sqMatch(kinds[1][0], kinds[1][1]);
+    return sq2.length === 1 ? sq2[0] : null;
   };
   for (const [re, teaOnly] of [[/#\{([^}]+)\}/g, false], [/A\{([^}]+)\}/g, true]]) {
     for (const m of text.matchAll(re)) {
@@ -6012,6 +6142,42 @@ function inferValueType(rawName, fallback = 'TEXT') {
   if (/\bpercent(age)?\b|\(\s*%\s*\)|\s%$/.test(name)) return 'PERCENTAGE';
   if (/\(\s*(cm|kg|mm|g|ml|mg|cm3|m|kg\/m2|mmhg|bpm|°c|c)\s*\)|\b(in|in cm|in kg|in mm|in g|in ml)\b/.test(name)) return 'NUMBER';
   return fallback;
+}
+
+// ── Reuse-compatibility gate for existing DEs / TEAs ─────────────────────────
+// Reusing an existing object by name is the never-recreate doctrine — but a
+// same-name object whose definition CONTRADICTS the request silently breaks the
+// program (live 2026-07-18: existing DE "Mode of delivery" was bound to a
+// 2-option Vaginal/Cesarean set while the program needed 5 modes; blind reuse
+// dropped 3 options and made every caesarean rule dead). Reuse is allowed when:
+//   • the requested value type is in the same FAMILY as the existing one
+//     (numeric/date/boolean/text buckets — INTEGER_POSITIVE reuses a NUMBER
+//     field fine; a DATE can never reuse a TEXT), and
+//   • when the request carries an inline option_set, the existing object's
+//     option set already contains every requested option (case-insensitive).
+// Anything else returns a reason string and the caller creates a coexisting
+// "<name> (<program short name>)" object instead.
+function valueTypeFamily(vt) {
+  const v = String(vt || '').toUpperCase();
+  if (/^(NUMBER|INTEGER|INTEGER_POSITIVE|INTEGER_NEGATIVE|INTEGER_ZERO_OR_POSITIVE|PERCENTAGE|UNIT_INTERVAL)$/.test(v)) return 'numeric';
+  if (/^(DATE|DATETIME|AGE)$/.test(v)) return 'date';
+  if (/^(BOOLEAN|TRUE_ONLY)$/.test(v)) return 'boolean';
+  if (/^(TEXT|LONG_TEXT|MULTI_TEXT|PHONE_NUMBER|EMAIL|URL|USERNAME)$/.test(v)) return 'text';
+  return v; // ORGANISATION_UNIT, COORDINATE, FILE_RESOURCE, IMAGE… must match exactly
+}
+function reuseIncompatibilityReason(reqDef, existing) {
+  if (!reqDef) return null;
+  const reqVt = reqDef.value_type || reqDef.valueType;
+  if (reqVt && existing.valueType && valueTypeFamily(reqVt) !== valueTypeFamily(existing.valueType)) {
+    return `existing value type ${existing.valueType} is incompatible with requested ${reqVt}`;
+  }
+  const reqOpts = reqDef.option_set && Array.isArray(reqDef.option_set.options) ? reqDef.option_set.options : null;
+  if (reqOpts && reqOpts.length) {
+    const have = new Set((existing.optionSet?.options || []).map(o => String((o && (o.name ?? o)) || '').toLowerCase()));
+    const missing = reqOpts.map(o => (typeof o === 'string' ? o : o?.name)).filter(n => n && !have.has(String(n).toLowerCase()));
+    if (missing.length) return `existing option set is missing requested option(s): ${missing.join(', ')}`;
+  }
+  return null;
 }
 
 function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames = null, opts = {}) {

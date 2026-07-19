@@ -2547,3 +2547,35 @@ dashboard with 3 EVENT_VISUALIZATION tiles → validate/update/delete-guard → 
 scenario run **104 API calls, 0 failed, 38/38 assertions**; 8 negative paths refuse with zero
 failing HTTP. Rendering verified visually in the Line Listing + Dashboard apps. `npm run verify`
 green. Version 2.8.14 → 2.8.15.
+
+---
+
+## 21. v2.8.16 — Weak-LLM reliability: zero failed turns / zero failed API calls on giant builds
+
+**Files:** `src/providers.js` (wire-message sanitizer, lossy-repair refusal, content
+separator-token strip), `src/core.js` (`healToolArgumentShape`, lossy flag on
+`repairToolCallArguments`, incomplete-repeat escalation, split-doctrine hints),
+`src/agent.js` (finish_reason plumbing, `$text`-shape healing, leaked-XML-tool-call
+recovery, `_argsCorrupted` consumption), `src/registry.js` (schema skeleton for
+constrained decoders, `rules` batch param, DISPLAYKEYVALUEPAIR/location docs,
+SHOWWARNINGINFORMATION removal, incremental-build doctrine, TEA unique/generated/
+pattern/description, program description/style), `src/tools-programs.js` (add_stage
+parity: name reuse + ci pass + sections + stage-name probe; reuse-compatibility gate
+for DEs/TEAs/option sets; TET auto-create; PI `#{stage.de}` grounding; `or`/`and`
+keyword lint fix; unknown-d2-function counting recipe; precedence advisories;
+failed-import phantom-id guard; action-type normalization in every rule path),
+`src/tools-metadata.js` (legend-set idempotent reuse, aggregate-indicator expression
+healing `#{piUid}`→`I{uid}` + name resolution, data_items name aliasing,
+stage_details membership grounding), `src/tools-linelists.js` (analytics-freshness
+gate for pre-save probes), `scripts/llm-harness.js` + `scripts/llm-run.js` (NEW:
+real runAgenticLoop driven by a real env-configured LLM), `scripts/
+scenario-pregnancy-p1.js` + `scripts/verify-pregnancy-p1.js` +
+`scripts/verify-pregnancy-llm.js` + `scripts/cleanup-pregnancy.js` (NEW deep tests).
+Details: `CHANGES_weak_llm_reliability.md`.
+
+**Verified live on DHIS2 2.42.5.1 with real weak LLMs (MiniMax-M3, Kimi-K2.6 via
+Fireworks) driving the REAL agentic loop end-to-end:** the full 3-prompt maternal-
+continuum acceptance (5-stage/100-DE/126-rule tracker → 52 PIs + 11 indicators + 26
+visualizations + 4 maps + 35-tile dashboard → 10 line lists + case-management
+dashboard) completes with **zero failed API calls**; scripted tool-level scenario:
+387 calls, 0 failed, every prompt detail verified. Version 2.8.15 → 2.8.16.

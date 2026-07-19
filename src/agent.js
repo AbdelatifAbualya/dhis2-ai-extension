@@ -552,7 +552,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     'Cross-referencing data',
   ];
   let lastToolName = null;
-  let emptyResponseCount = 0; // Guard against infinite think-only loops
+  let emptyResponseCount = 0;
+  let leakedToolCallCount = 0; // tool calls emitted as plain text instead of native calls // Guard against infinite think-only loops
   let providerStallRetries = 0; // Transparent retries for mid-stream stalls (nothing shown to the user yet)
 
   // ── Mechanical circuit breaker for deterministic retry loops ────────────────
@@ -641,6 +642,11 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     }
 
     const msg = result.choices[0].message;
+    // 'length' = the response was cut off by the max output token limit. The
+    // empty-response and corrupted-arguments paths below use this to give the
+    // model DETERMINISTIC-failure guidance (a same-size retry will be cut at
+    // the same point) instead of generic "try again" nudges.
+    const finishReason = result.choices[0].finish_reason || null;
     messages.push(msg);
 
     // EVERY tool_call the model emits gets a tool result — even ones we cannot
@@ -660,8 +666,13 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         let args;
         // Provider may have flagged the streamed arguments as unrecoverable
         // (truncated/corrupted tool-call JSON). Track it so we can return an
-        // honest "resend" instead of executing the empty {} fallback.
+        // honest "resend" instead of executing the empty {} fallback. Consume
+        // the marker immediately: this msg object lives on in `messages` and
+        // conversationHistory, and any internal field left on a tool_call is
+        // rejected by strict providers (Moonshot/Kimi 400 "Extra inputs are
+        // not permitted") on the very next request — killing the whole turn.
         let argsCorrupted = tc._argsCorrupted || null;
+        if (argsCorrupted) delete tc._argsCorrupted;
         try {
           const rawArgs = tc.function.arguments;
           if (typeof rawArgs === 'object' && rawArgs !== null) {
@@ -676,6 +687,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           args = {};
           const rawLen = String(tc.function?.arguments == null ? '' : tc.function.arguments).trim().length;
           if (rawLen > 0) argsCorrupted = argsCorrupted || { rawLength: rawLen, sample: String(tc.function.arguments).slice(0, 120) };
+        }
+        // Heal provider-mangled nested shapes ($text-wrapped / stringified
+        // objects from grammar-constrained decoders) before validation sees
+        // them — the model's intent is complete; only the encoding is off.
+        if (args && typeof args === 'object') {
+          const healedShape = healToolArgumentShape(args);
+          if (healedShape.healed) {
+            console.warn(`[AgenticLoop] Healed provider-mangled argument shapes for ${toolName} ($text/stringified nesting)`);
+            args = healedShape.value;
+          }
         }
 
         // ── Unknown tool (hallucinated name) — answer, do not execute ──
@@ -722,11 +743,20 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         // steer the model to split the work into smaller calls.
         if (argsCorrupted) {
           dhis2.corruptedCallCount = (dhis2.corruptedCallCount || 0) + 1;
-          const persistent = dhis2.corruptedCallCount >= 3;
+          // A max_tokens cut ('length') is DETERMINISTIC: at the same
+          // temperature the same whole-payload retry truncates at the same
+          // point every time — so steer to smaller calls IMMEDIATELY instead
+          // of burning 3 doomed resends. Transport glitches (no 'length')
+          // still get one "resend the same call" pass before split advice.
+          const hitTokenLimit = argsCorrupted.finishReason === 'length';
+          const persistent = hitTokenLimit || dhis2.corruptedCallCount >= 3;
+          const splitHint = `Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.`;
           const feedback = {
-            _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON). NOTHING was executed.`,
+            _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was ${hitTokenLimit ? `cut off by the response token limit after ${argsCorrupted.rawLength} characters` : `truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON)`}. NOTHING was executed.`,
             _hint: persistent
-              ? `This is the ${dhis2.corruptedCallCount}rd time your arguments arrived corrupted — the payload is too large to stream in one tool call reliably. STOP sending it whole. Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably.`
+              ? (hitTokenLimit
+                ? `Your tool call hit the maximum response length before the arguments finished streaming. Re-sending the SAME whole payload WILL be cut off again at the same point — do NOT resend it whole. ${splitHint}`
+                : `Your arguments have now arrived corrupted ${dhis2.corruptedCallCount} times — the payload is too large to stream in one tool call reliably. STOP sending it whole. ${splitHint}`)
               : `This is a transport/serialisation glitch, not a flaw in your plan. Re-send the SAME ${toolName} call with the COMPLETE arguments. If it keeps truncating, split a very large program into smaller calls (create the shell + first stage, then add_stage / add_program_rules for the rest). This does NOT count against you and the tool stays available.`,
             _scope: 'incomplete_call',
             _no_disable: true,
@@ -1036,13 +1066,52 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       // Final text response (already streamed to UI if streaming was active)
       const text = msg.content || '';
 
+      // A model under stress can emit its tool call as PLAIN TEXT (XML-ish
+      // <tool_call>/<invoke> markup, sometimes with leaked provider separator
+      // tokens) instead of using the native tool-calling interface. Treating
+      // that as the final answer silently ABANDONS the task mid-flight
+      // (observed live 2026-07-19: MiniMax ended a dashboard build with an
+      // unexecuted <invoke name="search_metadata"> in its reply). Detect it,
+      // tell the model nothing was executed, and demand a native call.
+      if (/<tool_call>|<invoke\s+name=|<function_call[\s>]|<tool\s+name=/i.test(text)) {
+        leakedToolCallCount++;
+        if (leakedToolCallCount <= 3) {
+          console.warn(`[AgenticLoop] Tool call emitted as plain text (${leakedToolCallCount}/3) — asking for a native call`);
+          messages.push({
+            role: 'system',
+            content: 'Your last message contained a tool call written as plain text/XML — it was NOT executed; nothing happened. Re-issue it now using the NATIVE tool-calling interface (a real tool call, not markup in your reply). If you are actually finished with the task, reply with a plain-text summary that contains no tool-call markup.',
+          });
+          continue;
+        }
+      }
+
       // If content is empty (e.g., think block stripped) and nothing streamed,
       // nudge the model to produce a real response or tool call.
       if (!text.trim() && !streamStartBroadcast) {
         emptyResponseCount++;
+        // Reasoning models (GLM, DeepSeek-R1 style) can burn the ENTIRE output
+        // token budget on internal reasoning when facing a huge task — the
+        // visible response is empty with finish_reason='length'. That failure
+        // is deterministic: an identical retry reasons identically and dies
+        // identically (observed live: GLM planning a 5-stage/100-DE program in
+        // one atomic call → 3 empty responses → turn abandoned). The cure is
+        // to SHRINK THE TASK the model is reasoning about, so nudge it to take
+        // one small concrete step now and build the rest incrementally.
+        if (finishReason === 'length') {
+          console.warn(`[AgenticLoop] Empty response cut by token limit (finish_reason=length), nudge ${emptyResponseCount}/3`);
+          if (emptyResponseCount < 3) {
+            messages.push({
+              role: 'system',
+              content: 'Your last response hit the maximum output length before any visible answer or tool call was produced — the entire budget went to internal reasoning. Repeating the same approach will fail the same way. Do NOT plan the whole task; take the SMALLEST next concrete step immediately: emit ONE tool call now (for a large program: create_metadata(action=create_program) with the shell + attributes + first stage only, then add_stage / add_program_rules in later steps). Output the tool call directly with no deliberation.',
+            });
+            continue;
+          }
+        }
         if (emptyResponseCount >= 3) {
           // Too many empty responses — bail out with a helpful message
-          const fallback = 'I was unable to produce a response. Please try rephrasing your question.';
+          const fallback = finishReason === 'length'
+            ? 'The model kept exhausting its output token budget on internal reasoning before producing a response (3 attempts). This usually happens when a smaller/reasoning model plans a very large task in one step. Try: (1) raise "Max tokens" in the extension settings, (2) split the request into smaller steps (e.g. "create the program with its first stage", then add the remaining stages one by one), or (3) switch to a stronger model for this task. Any work already completed above has been saved.'
+            : 'I was unable to produce a response. Please try rephrasing your question.';
           broadcast({ type: 'AI_STREAM_START' });
           broadcast({ type: 'AI_STREAM_END', text: fallback });
           // Persist the full action trail for this turn (tool calls + results),

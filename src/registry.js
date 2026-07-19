@@ -747,6 +747,9 @@ If user enabled web browsing from UI, this tool should usually be called before 
           },
           program_name: { type: 'string', description: 'Program display name (for create_program)' },
           program_short_name: { type: 'string', description: 'Short name (max 50 chars, auto-derived if omitted)' },
+          program_description: { type: 'string', description: 'Program description shown in Maintenance/Capture (for create_program).' },
+          program_color: { type: 'string', description: 'Program style color hex, e.g. "#E91E63" (for create_program).' },
+          program_icon: { type: 'string', description: 'Program style icon key — MUST be a real DHIS2 icon key; verify with manage_metadata(action=discover_icons, search="…") first (for create_program).' },
           program_type: {
             type: 'string',
             enum: ['WITH_REGISTRATION', 'WITHOUT_REGISTRATION'],
@@ -772,7 +775,11 @@ If user enabled web browsing from UI, this tool should usually be called before 
                 },
                 mandatory: { type: 'boolean' },
                 searchable: { type: 'boolean' },
-                display_in_list: { type: 'boolean' }
+                display_in_list: { type: 'boolean' },
+                description: { type: 'string', description: 'Attribute description (shown in Maintenance).' },
+                unique: { type: 'boolean', description: 'Value must be unique across the instance (IDs, registration numbers).' },
+                generated: { type: 'boolean', description: 'Auto-generated identifier (implies unique). Capture generates the value from the TextPattern.' },
+                pattern: { type: 'string', description: 'TextPattern for generated attributes, e.g. "RANDOM(########)" or \'"PW-"+SEQUENTIAL(######)\'. Default RANDOM(########).' }
               },
               required: ['name']
             },
@@ -856,13 +863,14 @@ If user enabled web browsing from UI, this tool should usually be called before 
                   items: {
                     type: 'object',
                     properties: {
-                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, HIDEOPTION. HIDEOPTION hides ONE option of an option-set field — pass data_element_name + option_name (never leave the option unbound). There is NO complete/close-enrollment action; a completion request becomes a SHOWWARNING prompt. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages). NO SHOW action exists: "show X when C" = ONE HIDEFIELD rule with the NEGATED condition (fields re-appear automatically) — show/hide pairs and HIDEFIELD+SETMANDATORYFIELD on the same field are refused.' },
+                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, HIDEOPTION, DISPLAYTEXT (static banner), DISPLAYKEYVALUEPAIR (live label+value in the Feedback widget: content=label, data=expression). HIDEOPTION hides ONE option of an option-set field — pass data_element_name + option_name (never leave the option unbound). There is NO complete/close-enrollment action; a completion request becomes a SHOWWARNING prompt. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages). NO SHOW action exists: "show X when C" = ONE HIDEFIELD rule with the NEGATED condition (fields re-appear automatically) — show/hide pairs and HIDEFIELD+SETMANDATORYFIELD on the same field are refused.' },
                       data_element_name: { type: 'string', description: 'Target DE name (resolved to ID automatically)' },
                       tracked_entity_attribute_name: { type: 'string', description: 'Target TEA name for HIDEFIELD on a tracked entity attribute (resolved to ID automatically)' },
                       program_stage_name: { type: 'string', description: 'Target stage NAME (for HIDEPROGRAMSTAGE/CREATEEVENT). In create_program ALWAYS use this — stage IDs are generated during the call and cannot be known in advance; the tool resolves the name to the new stage UID.' },
                       program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE on an EXISTING program, e.g. add_program_rules). During create_program use program_stage_name instead.' },
                       content: { type: 'string', description: 'Static message text for SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/DISPLAYTEXT. Variables in content are shown literally — use the data field for dynamic refs.' },
                       data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: target value. SHOWWARNING/SHOWERROR/etc: dynamic content appended after the static content prefix (e.g. data="#{my_de}" or data="d2:concatenate(\\"X=\\", #{a})").' },
+                      location: { type: 'string', description: 'For DISPLAYTEXT/DISPLAYKEYVALUEPAIR: which widget shows it — "feedback" (default) or "indicators". DISPLAYKEYVALUEPAIR shows content as the key and the evaluated data expression as the value — the right choice for "display X in the Feedback widget".' },
                       exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE).' },
                       option_name: { type: 'string', description: "For HIDEOPTION: exact display name of the option to hide (an option of data_element_name's option set created in THIS call)." },
                       option_code: { type: 'string', description: 'For HIDEOPTION: the option CODE to hide (alternative to option_name).' }
@@ -917,9 +925,21 @@ If user enabled web browsing from UI, this tool should usually be called before 
                   },
                   required: ['name', 'value_type']
                 }
+              },
+              sections: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    data_elements: { type: 'array', items: { type: 'string' }, description: "Names of this stage's data elements to place in this section." }
+                  },
+                  required: ['name', 'data_elements']
+                },
+                description: 'Optional visual sections grouping this stage\'s data elements (same shape as create_program stages[].sections).'
               }
             },
-            description: 'Single stage object (for add_stage)'
+            description: 'Single stage object (for add_stage). Existing data elements and option sets are REUSED by exact name — safe to repeat DEs already used in earlier stages (blood pressure, referral fields, …).'
           },
           data_elements: {
             type: 'array',
@@ -1130,8 +1150,8 @@ Actions:
                 items: {
                   type: 'object',
                   properties: {
-                    type: { type: 'string', enum: ['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE', 'SHOWWARNINGINFORMATION', 'HIDEFIELD', 'HIDEPROGRAMSTAGE', 'HIDESECTION', 'HIDEALLFIELDS', 'ASSIGN', 'SETMANDATORYFIELD', 'DISPLAYTEXT', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP', 'CREATEEVENT', 'SENDMESSAGE'], description: 'Action type. HIDEPROGRAMSTAGE hides an entire stage tab (needs program_stage_id). HIDESECTION hides a section within a stage (needs program_stage_section_id). HIDEALLFIELDS = chatbot-internal sugar: pass exclude_data_element_ids: [<trigger DE id>] and the tool auto-expands into HIDEFIELD per DE in the trigger\'s stage + HIDEPROGRAMSTAGE for every other stage. SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/SHOWWARNINGINFORMATION concatenate static content + evaluated data — put #{var}/A{attr} in data, not content. NO SHOW action exists: "show X when C" = ONE hide rule with the NEGATED condition (targets re-appear automatically when it turns false) — show/hide twin rules and HIDEFIELD+SETMANDATORYFIELD on the same field are refused at lint.' },
-                    content: { type: 'string', description: 'Static message text shown by SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/SHOWWARNINGINFORMATION/DISPLAYTEXT. Variables placed here are shown LITERALLY — put dynamic refs in `data` instead.' },
+                    type: { type: 'string', enum: ['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE', 'HIDEFIELD', 'HIDEPROGRAMSTAGE', 'HIDESECTION', 'HIDEALLFIELDS', 'ASSIGN', 'SETMANDATORYFIELD', 'DISPLAYTEXT', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP', 'CREATEEVENT', 'SENDMESSAGE'], description: 'Action type. HIDEPROGRAMSTAGE hides an entire stage tab (needs program_stage_id). HIDESECTION hides a section within a stage (needs program_stage_section_id). HIDEALLFIELDS = chatbot-internal sugar: pass exclude_data_element_ids: [<trigger DE id>] and the tool auto-expands into HIDEFIELD per DE in the trigger\'s stage + HIDEPROGRAMSTAGE for every other stage. SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE concatenate static content + evaluated data — put #{var}/A{attr} in data, not content. NO SHOW action exists: "show X when C" = ONE hide rule with the NEGATED condition (targets re-appear automatically when it turns false) — show/hide twin rules and HIDEFIELD+SETMANDATORYFIELD on the same field are refused at lint.' },
+                    content: { type: 'string', description: 'Static message text shown by SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/DISPLAYTEXT. Variables placed here are shown LITERALLY — put dynamic refs in `data` instead.' },
                     data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: assigned to the target DE/TEA. SHOWWARNING/SHOWERROR/etc: appended after content (e.g. data="#{maternal_risk_factors}" or data="d2:concatenate(\\"prefix \\", #{a}, \\", \\", #{b})"). The tool auto-moves trailing #{var}/A{attr} from content into data when content has variable refs and data is empty.' },
                     exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE referenced in the condition).' },
                     data_element_id: { type: 'string', description: 'Target data element ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD' },
@@ -2223,6 +2243,23 @@ Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrateg
   }
 ];
 
+// `rules` (batch create) shares the exact schema of `rule` — attached
+// programmatically so the wire schema and the dispatcher (args.rules) can
+// never drift apart. Without this declaration, grammar-constrained providers
+// could not emit rule fields at all (observed live 2026-07-18: 22 consecutive
+// `rules:[{}]` calls from a constrained decoder that had no spec for `rules`).
+{
+  const _mpr = TOOLS.find(t => t.function.name === 'manage_program_rules');
+  if (_mpr && _mpr.function.parameters?.properties?.rule) {
+    _mpr.function.parameters.properties.rules = {
+      type: 'array',
+      description: 'Batch form of `rule` for action=create: an array of rule objects (same fields as `rule`). Prefer ≤15 rules per call so the payload streams reliably.',
+      items: _mpr.function.parameters.properties.rule,
+    };
+  }
+}
+
+
 const TOOL_ROUTER = Object.freeze({
   dhis2_query: true,
   count_records: true,
@@ -2316,7 +2353,7 @@ const MANUAL_TOOLS = new Set([
 // "never do this via dhis2_query" routing rules); HOW to call it lives in the
 // manual.
 const TOOL_SUMMARIES = {
-  create_metadata: 'Create DHIS2 metadata: programs (with stages, data elements, inline option sets, program rules, program indicators — ALL in ONE atomic create_program call), standalone option sets, standalone data elements (+ category combos for disaggregation), or add stages/DEs/rules to an existing program. Handles the full dependency chain and name→ID resolution, and REUSES existing TEAs/DEs/option sets by exact name (never pre-create them, never recreate an attribute that already exists); never create a program\'s components with separate calls.',
+  create_metadata: 'Create DHIS2 metadata: programs (with stages, data elements, inline option sets, program rules, program indicators — ALL in ONE atomic create_program call for small/medium programs; VERY LARGE programs (>2 stages / >40 DEs / >20 rules) are built incrementally: create_program with shell + first stage, then add_stage and add_program_rules in batches so each call fits the output limit), standalone option sets, standalone data elements (+ category combos for disaggregation), or add stages/DEs/rules to an existing program. Handles the full dependency chain and name→ID resolution, and REUSES existing TEAs/DEs/option sets by exact name (never pre-create them, never recreate an attribute that already exists); never pre-create a program\'s DEs/option sets with separate standalone calls.',
   manage_metadata: 'Metadata lifecycle manager: remove DEs from a stage, delete objects with reference checking, check_references, update a program\'s org-unit assignment, update sharing/access, add TEAs to an existing program, set icon/color (discover_icons FIRST, then update_style), convert value types (e.g. to MULTI_TEXT multi-select, cascaded). Use INSTEAD of dhis2_query for all of these — raw sharing/style/TEA/delete writes fail on DHIS2.',
   manage_program_rules: 'CRUD + audit for program rules, rule variables and rule actions on a program. Actions: list, get, create, update, delete, list_variables, audit, bulk_fix_conditions. For "broken / non-working rules" ALWAYS audit first, then bulk_fix_conditions. NEVER PUT/PATCH programRules via dhis2_query (409/415).',
   manage_program_indicators: 'CRUD + audit + cross-program discovery + OU ranking for tracker/event PROGRAM indicators. Actions: list, get, create, update, delete, audit, bulk_fix, bulk_fix_expressions, discover (cross-program "complex/top/heavy indicators", no program_id needed), rank_ou ("which OUs/districts have the most data/events"). NEVER PUT/PATCH programIndicators via dhis2_query; never invent UIDs.',
@@ -2344,12 +2381,13 @@ const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
 - ⚠ **\`A{attr_name}\` IS the correct, canonical way to reference a tracked-entity-attribute program rule variable** in BOTH conditions and ASSIGN/expression \`data\` — this matches DHIS2's own demo rules, e.g. \`d2:yearsBetween(A{born}, V{current_date})\` and \`A{Sex} == 'MALE'\`. \`#{...}\` is for DATA-ELEMENT-sourced variables only. **Do NOT "fix" a working \`A{tea}\` reference into \`#{tea}\`** — for a TEA variable that is a regression, not a fix, and it is NEVER the cause of a rule "not firing". Auto-calc-from-attribute patterns like \`ASSIGN d2:monthsBetween(A{dob}, V{current_date}) → "Age in months"\` are correct as written.
 - 🔎 **When a user says an auto-assign / calculation rule "isn't working", DIAGNOSE from real metadata — never guess a syntax cause.** First \`manage_program_rules(action=get)\` + \`action=list_variables\` and read the ACTUAL condition, the PRV source types, and the target DE's valueType. If the expression already matches a known-good pattern (A{tea} for attributes, V{current_date}, a valid d2: function, ASSIGN target DE that can hold the result), the rule is correct — say so. The real reasons an ASSIGN value looks "missing" are runtime/UX, not syntax: (a) the assigned value only appears once you open the stage event that contains the target DE and the source attribute already has a value; (b) the target field is read-only/auto-filled by design; (c) the target DE valueType cannot hold the computed value (e.g. a number assigned to a TEXT field). Explain the real cause and verify; do NOT invent "the reference doesn't resolve at runtime" without evidence.
 - HIDEFIELD on TEA: use \`tracked_entity_attribute_name\`; on DE: use \`data_element_name\`
-- Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, WARNINGONCOMPLETE, ERRORONCOMPLETE, SHOWWARNINGINFORMATION
+- Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, DISPLAYKEYVALUEPAIR, WARNINGONCOMPLETE, ERRORONCOMPLETE (⚠ SHOWWARNINGINFORMATION is NOT accepted by the server enum — it is auto-aliased to SHOWWARNING)
 - Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
 - ⛔ **There is NO "show field" action — visibility is ONE hide rule, never a show/hide pair.** Fields, sections and stages are visible by default; a HIDE action hides while its condition is TRUE and the engine re-shows AUTOMATICALLY the moment it turns false. Therefore "show X only when Y is Yes" = EXACTLY ONE rule: \`{ name: "Hide X when Y is not Yes", condition: "!d2:hasValue(#{y}) || #{y} != true", actions: [{ type: "HIDEFIELD", data_element_name: "X" }] }\`. NEVER ALSO create a second "Show X when Y is Yes" rule — a complementary twin hides the target in EVERY case (permanently hidden). NEVER put a HIDE action under the positive/"show" condition. NEVER combine HIDEFIELD and SETMANDATORYFIELD on the same field in one rule (hidden-AND-mandatory renders the field broken/un-selectable in Capture — this is exactly what breaks multi-select option sets). If X must be required when visible, that is a SEPARATE rule: \`{ name: "Require X when Y is Yes", condition: "#{y} == true", actions: [{ type: "SETMANDATORYFIELD", data_element_name: "X" }] }\`. The tool hard-refuses all three broken shapes (phase "lint") — emit the one-rule pattern from the start.
 - 🔎 **"Field shows but can't be used / options not selectable / field never appears" → run \`action=audit\` FIRST.** Its \`cross_rule_issues\` detects hide+mandate contradictions and complementary show/hide twins on existing programs. NEVER blame "a DHIS2 rendering issue" without audit evidence — these symptoms are almost always contradictory program rules.
-- **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE / SHOWWARNINGINFORMATION** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
+- **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
 - **DISPLAYTEXT** (instructions banner) takes \`content\` only — keep it static.
+- **DISPLAYKEYVALUEPAIR** shows a live value in the Feedback (default) or Indicators widget: \`content\` = the static label/key, \`data\` = the evaluated expression (e.g. \`{ type: "DISPLAYKEYVALUEPAIR", content: "BMI", data: "#{weight_kg} / ((#{height_cm}/100) * (#{height_cm}/100))" }\`). This is THE action for "display X in the Feedback widget" requests; add \`location: "indicators"\` to target the Indicators widget instead.
 - **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
 - **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
 - **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
@@ -2467,7 +2505,14 @@ create_metadata(action="create_data_elements",
 ### Adding to existing programs
 - DEs to an existing stage: create_metadata(action=add_data_elements_to_stage, stage_id=<id>, data_element_ids=[<id>]) — use \`data_elements:[{name, value_type, …}]\` instead to create NEW DEs onto the stage.
 - A new stage: create_metadata(action=add_stage, program_id=<id>, stage={ name, repeatable, data_elements:[…] }).
-- More rules: create_metadata(action=add_program_rules, program_id=<id>, program_rules=[…]).`;
+- More rules: create_metadata(action=add_program_rules, program_id=<id>, program_rules=[…]).
+
+### ⚠ VERY LARGE programs — split the build so each tool call fits your output budget
+A tool call's arguments must fully fit inside ONE model response. A whole 4–5 stage program with 80–100 data elements, dozens of option sets, and 40+ rules in a single create_program call easily exceeds a typical max-output limit — the streamed JSON gets cut off mid-payload, NOTHING is created, and you are asked to resend. Do not gamble on it: **when a program has more than ~2 stages or ~40 total data elements or ~20 rules, build incrementally from the start:**
+1. \`create_metadata(action=create_program)\` — program shell, ALL program_attributes, and ONLY the first stage with its data_elements/sections. Include NO program_rules yet.
+2. \`create_metadata(action=add_stage, program_id=<id from step 1>, stage={…})\` — one call per remaining stage.
+3. \`create_metadata(action=add_program_rules, program_id=<id>, program_rules=[10–15 rules])\` — repeat until all rules are added. Rules are the wordiest part; never send more than ~15 per call.
+Each call is atomic, reuses existing metadata by name exactly like the one-call form, and the earlier calls' results give you the real stage/DE ids for later ones. A small/medium program (1–2 stages, ≤40 DEs, ≤20 rules) should still use the classic ONE create_program call.`;
 
 const KB_METADATA_DELETE_FLOW = `### Removing / deleting metadata
 ⚠️ **NEVER** use dhis2_query with DELETE method for metadata objects. manage_metadata checks references and verifies deletion.
@@ -2832,6 +2877,29 @@ function slimSchema(parameters) {
   return out;
 }
 
+// Bare type/enum/structure skeleton of a schema subtree — property names and
+// types WITHOUT descriptions. Nested objects MUST keep their property lists on
+// the wire: providers with grammar-constrained tool-call decoding (observed
+// live 2026-07-18 on Fireworks/MiniMax-M3) cannot emit fields they have no
+// spec for — given `items: {type:'object'}` the constrainer wrapped each item
+// as `{"$text": "<the object as a JSON string>"}`, which reached the tool as
+// objects with no usable fields and dead-looped create_program. The skeleton
+// costs a few hundred tokens and makes every constrained decoder emit real
+// objects. (agent.js also heals $text-style wrapping as a safety net.)
+function schemaSkeleton(def) {
+  if (!def || typeof def !== 'object') return {};
+  const out = {};
+  if (def.type) out.type = def.type;
+  if (Array.isArray(def.enum)) out.enum = [...def.enum];
+  if (def.type === 'array' && def.items && typeof def.items === 'object') out.items = schemaSkeleton(def.items);
+  if (def.properties) {
+    out.properties = {};
+    for (const [k, v] of Object.entries(def.properties)) out.properties[k] = schemaSkeleton(v);
+    if (Array.isArray(def.required) && def.required.length) out.required = [...def.required];
+  }
+  return out;
+}
+
 function slimSchemaProp(def) {
   if (!def || typeof def !== 'object') return def;
   const out = {};
@@ -2841,7 +2909,7 @@ function slimSchemaProp(def) {
   let desc = def.description ? slimDescriptionText(def.description) : '';
   if (def.type === 'array' && def.items && typeof def.items === 'object') {
     if (def.items.properties) {
-      out.items = { type: 'object' };
+      out.items = schemaSkeleton(def.items);
       desc += (desc ? ' ' : '') + 'Item fields: ' + Object.keys(def.items.properties).join(', ') + ' — full spec in the manual.';
     } else {
       out.items = {};
@@ -2849,6 +2917,7 @@ function slimSchemaProp(def) {
       if (Array.isArray(def.items.enum)) out.items.enum = [...def.items.enum];
     }
   } else if (def.properties) {
+    out.properties = schemaSkeleton(def).properties;
     desc += (desc ? ' ' : '') + 'Object fields: ' + Object.keys(def.properties).join(', ') + ' — full spec in the manual.';
   } else if (def.additionalProperties) {
     out.additionalProperties = def.additionalProperties;

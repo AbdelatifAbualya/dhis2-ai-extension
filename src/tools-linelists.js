@@ -473,6 +473,39 @@ function lineListBuildProbePath(outputType, programId, tetId, dims, allDims) {
   return { path: `analytics/trackedEntities/query/${tetId}?${parts.join('&')}`, hasTime };
 }
 
+
+// ── Analytics-freshness gate for live probes ─────────────────────────────────
+// The pre-save probe PROVES a list renders — but on an instance whose
+// analytics tables were last generated BEFORE the program was created, every
+// analytics query 409s with "referenced table does not exist" (E7144) no
+// matter how correct the list is. Probing anyway burns a failed API call and
+// misleads the model into "fixing" a list that isn't broken (observed live
+// 2026-07-19). Check system/info.lastAnalyticsTableSuccess against the
+// program's created timestamp; when stale, callers skip the probe and save
+// with an explicit warning instead. Result is cached per program for the turn.
+const _analyticsFreshCache = new Map();
+async function lineListAnalyticsFresh(programId) {
+  if (!programId) return { fresh: true }; // TRACKED_ENTITY lists have no program
+  if (_analyticsFreshCache.has(programId)) return _analyticsFreshCache.get(programId);
+  let out = { fresh: true };
+  try {
+    const [info, prog] = await Promise.all([
+      safeDhis2Fetch('system/info'),
+      safeDhis2Fetch(`programs/${programId}?fields=id,created`),
+    ]);
+    const last = info?.lastAnalyticsTableSuccess ? Date.parse(info.lastAnalyticsTableSuccess) : null;
+    const created = prog?.created ? Date.parse(prog.created) : null;
+    if (created && (!last || last < created)) {
+      out = {
+        fresh: false,
+        warning: `Live data-check skipped: analytics tables were last generated ${info?.lastAnalyticsTableSuccess || 'never'}, BEFORE this program was created — every analytics query for it fails with "referenced table does not exist" until the Analytics Tables job runs (Data Administration → Analytics Tables, or POST /api/resourceTables/analytics). The line list definition was structurally validated and saved; data will appear after analytics runs.`,
+      };
+    }
+  } catch { /* on any doubt, probe as usual */ }
+  _analyticsFreshCache.set(programId, out);
+  return out;
+}
+
 async function lineListRunProbe(probePath) {
   const resp = await safeDhis2Fetch(probePath);
   if (resp?._error) {
@@ -806,6 +839,12 @@ async function executeManageLineLists(args) {
     const { columns, filters, summary } = lineListDimsFromSaved(resp);
     const allDims = [...columns, ...filters];
     const probe = lineListBuildProbePath(resp.outputType, resp.program?.id, resp.trackedEntityType?.id, columns, allDims);
+    if (resp.program?.id) {
+      const freshness = await lineListAnalyticsFresh(resp.program.id);
+      if (!freshness.fresh) {
+        return { success: true, line_list_id: llId, name: summary.name, validated: 'structure_only', _warning: freshness.warning, line_list: summary };
+      }
+    }
     const probeRes = await lineListRunProbe(probe.path);
     if (!probeRes.ok) {
       return {
@@ -848,7 +887,12 @@ async function executeManageLineLists(args) {
     // Pre-flight probe: prove the layout runs BEFORE saving anything.
     const dataCheck = String(args.data_check || 'warn_empty');
     let probeRes = null;
+    let staleAnalyticsWarning = null;
     if (dataCheck !== 'skip') {
+      const freshness = await lineListAnalyticsFresh(args.program_id);
+      if (!freshness.fresh) {
+        staleAnalyticsWarning = freshness.warning;
+      } else {
       probeRes = await lineListRunProbe(built.probe.path);
       if (!probeRes.ok) {
         return {
@@ -865,6 +909,7 @@ async function executeManageLineLists(args) {
           _hint: 'Widen the periods/org units/filters, run analytics tables, or retry with data_check="warn_empty" to save it anyway.',
         };
       }
+      }
     }
 
     const postResp = await safeDhis2Fetch('eventVisualizations', { method: 'POST', body: built.payload });
@@ -874,6 +919,7 @@ async function executeManageLineLists(args) {
     if (typeof dhis2 !== 'undefined' && dhis2.knownIds) dhis2.knownIds.add(newId);
 
     const warnings = [...built.warnings];
+    if (staleAnalyticsWarning) warnings.push(staleAnalyticsWarning);
     if (probeRes && probeRes.row_count === 0) {
       warnings.push('The saved list currently shows 0 rows. If data was entered recently, analytics tables may need a run (Data Administration → Analytics tables).');
     }
@@ -970,6 +1016,10 @@ async function executeManageLineLists(args) {
 
     let probeRes = null;
     if (probePath && String(args.data_check || 'warn_empty') !== 'skip') {
+      const freshness = existing.program?.id ? await lineListAnalyticsFresh(existing.program.id) : { fresh: true };
+      if (!freshness.fresh) {
+        return { success: true, action: 'update', line_list_id: llId, _warning: freshness.warning, backup: backup.block };
+      }
       probeRes = await lineListRunProbe(probePath);
       if (!probeRes.ok) {
         return {
