@@ -1,5 +1,17 @@
 // ── Tool Execution ───────────────────────────────────────────────────────────
 
+// Program-bound write actions covered by the named-program substitution guard
+// (core.js). Only actions that take an explicit program UID and CREATE/MODIFY
+// content on that program are listed — reads and non-program writes pass free.
+const PROGRAM_BOUND_WRITE_ACTIONS = {
+  manage_line_lists: ['create', 'update'],
+  manage_program_rules: ['create', 'update', 'bulk_fix_conditions'],
+  manage_program_indicators: ['create', 'update', 'bulk_fix', 'bulk_fix_expressions'],
+  manage_program_notifications: ['create', 'create_and_link'],
+  create_metadata: ['add_stage', 'add_data_elements_to_stage', 'add_program_rules'],
+  manage_metadata: ['add_program_attributes'],
+};
+
 async function executeTool(name, args) {
   if (!TOOL_ROUTER[name]) {
     return { _error: `Unknown tool: ${name}` };
@@ -10,6 +22,22 @@ async function executeTool(name, args) {
   // prompt content. De-identified aggregates and metadata pass straight through.
   const _privacyBlock = enforcePatientDataPrivacyGate(name, args);
   if (_privacyBlock) return _privacyBlock;
+
+  // Named-program substitution gate: after a name-filtered program search
+  // returned 0 matches this turn, program-bound writes against a DIFFERENT
+  // program are refused so the model cannot silently build the user's request
+  // on a lookalike program (see core.js for the live incident this prevents).
+  if ((dhis2.missingNamedTargets || []).length) {
+    const _gatedActions = PROGRAM_BOUND_WRITE_ACTIONS[name];
+    if (_gatedActions && _gatedActions.includes(String(args?.action || ''))) {
+      // For add_program_attributes the program UID rides in object_id; every
+      // other gated tool carries it in program_id/program.
+      const _progUid = args.program_id || args.program
+        || (name === 'manage_metadata' ? args.object_id : null);
+      const _subStop = await namedProgramSubstitutionStop(name, args.action, _progUid);
+      if (_subStop) return _subStop;
+    }
+  }
 
   const ctx = dhis2.pageContext || {};
   const programId = ctx.programId;
@@ -414,6 +442,24 @@ async function executeTool(name, args) {
     // the user — can see how to restore.
     if (opts._backup_block && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult)) {
       writeResult.backup = opts._backup_block;
+    }
+    // Named-target substitution guard bookkeeping (core.js) for RAW program
+    // searches — the model sometimes searches via dhis2_query instead of
+    // search_metadata, and the guard must arm/disarm identically on that path.
+    if (method === 'GET' && writeResult && typeof writeResult === 'object' && !writeResult._error
+        && /^(?:\/?api\/(?:\d+\/)?)?programs(?:\.json)?\?/i.test(safePath)
+        && Array.isArray(writeResult.programs)) {
+      if (writeResult.programs.length) {
+        clearNamedTargetsFoundIn(writeResult.programs.map(o => o.displayName || o.name));
+      } else {
+        const nf = safePath.match(/filter=(?:displayName|name)(?::|%3A)i?like(?::|%3A)([^&]+)/i);
+        let q = null;
+        try { q = nf ? decodeURIComponent(nf[1].replace(/\+/g, ' ')) : null; } catch { q = nf ? nf[1] : null; }
+        if (q) {
+          noteMissingNamedTarget('programs', q);
+          writeResult._hint = `No programs match "${q}" on this instance. If the user asked for this program BY NAME, it does NOT exist — STOP, tell the user, list the closest existing program names, and ask whether to create it, use a specific existing program, or stop. NEVER silently substitute a similar program and build the user's request on it.`;
+        }
+      }
     }
     return writeResult;
   }
@@ -996,6 +1042,20 @@ async function executeTool(name, args) {
         return 2;
       };
       resp[type] = resp[type].slice().sort((a, b) => rank(a) - rank(b));
+    }
+    // Named-target substitution guard bookkeeping (core.js): a specific
+    // name-filtered program search with 0 hits ARMS the guard; any result set
+    // containing a matching program name DISARMS it. The empty-result hint
+    // applies to every object type — a user-named object that does not exist
+    // is a stop-and-ask, never a "pick the closest match".
+    if (resp && !resp._error && Array.isArray(resp[type])) {
+      if (type === 'programs' && resp[type].length) {
+        clearNamedTargetsFoundIn(resp[type].map(o => o.displayName));
+      }
+      if (nameFilter && resp[type].length === 0) {
+        noteMissingNamedTarget(type, nameFilter);
+        resp._hint = `No ${type} match "${nameFilter}" on this instance. If the user asked for this object BY NAME, it does NOT exist — STOP, tell the user, list the closest existing names, and ask how to proceed. NEVER silently substitute a similar object and build the user's request on it. (Only if the user explicitly asked you to CREATE this object is an empty result here expected — then proceed with creation.)`;
+      }
     }
     return resp;
   }

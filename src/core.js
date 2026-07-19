@@ -343,6 +343,88 @@ function destructive404StopOrNull(toolName, action) {
   };
 }
 
+// ── Named-target substitution guard ─────────────────────────────────────────
+// Stops the "closest match" disaster: the user names a specific program
+// ("Using the Integrated Pregnancy, Delivery and Postnatal Care Tracker,
+// create these line lists…"), the search for that name returns ZERO matches,
+// and instead of stopping to ask, the model silently picks a lookalike program
+// and builds the entire request on it — observed live 2026-07-19: 9 line lists
+// + a dashboard were created against "Maternal and Child Health (MCH) Program"
+// when the named program did not exist at all. Mechanics:
+//   • A name-filtered program search returning 0 rows ARMS a missing named
+//     target for this turn — only when the query is specific enough to be a
+//     user-named object (≥2 words, or one word of ≥10 chars), so generic
+//     probes like "ANC" or "Maternal" never arm the guard.
+//   • Any later result containing a program whose name matches an armed query
+//     DISARMS it (the object existed under a variant spelling after all).
+//   • While armed, program-bound WRITES targeting a program whose name does
+//     NOT match the missing name are refused with a stop-and-ask message.
+//     Writes against a matching program pass (and disarm) — so the legitimate
+//     "program X doesn't exist yet → user asked me to create it → build on
+//     the new program" flow is never blocked.
+// State is strictly per-turn (reset in the agentic loop): the refusal forces
+// exactly one stop-and-ask, and whatever the user decides next turn proceeds.
+
+function _namedTargetNorm(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function noteMissingNamedTarget(objectType, nameFilter) {
+  if (String(objectType) !== 'programs') return;
+  const norm = _namedTargetNorm(nameFilter);
+  if (!norm) return;
+  const specific = norm.includes(' ') || norm.length >= 10;
+  if (!specific) return;
+  dhis2.missingNamedTargets = dhis2.missingNamedTargets || [];
+  if (dhis2.missingNamedTargets.some(t => t.norm === norm)) return;
+  if (dhis2.missingNamedTargets.length >= 5) return;
+  dhis2.missingNamedTargets.push({ name: String(nameFilter), norm });
+  console.log(`[NamedTarget] armed — program search "${nameFilter}" returned 0 matches this turn`);
+}
+
+function clearNamedTargetsFoundIn(displayNames) {
+  const armed = dhis2.missingNamedTargets;
+  if (!armed || !armed.length || !displayNames) return;
+  const norms = (Array.isArray(displayNames) ? displayNames : [displayNames])
+    .map(_namedTargetNorm).filter(Boolean);
+  if (!norms.length) return;
+  dhis2.missingNamedTargets = armed.filter(t => {
+    const found = norms.some(n => n.includes(t.norm));
+    if (found) console.log(`[NamedTarget] disarmed — an existing program name matches "${t.name}"`);
+    return !found;
+  });
+}
+
+async function namedProgramSubstitutionStop(toolName, action, programUid) {
+  const armed = dhis2.missingNamedTargets;
+  if (!armed || !armed.length) return null;
+  if (typeof programUid !== 'string' || !/^[A-Za-z][A-Za-z0-9]{10}$/.test(programUid)) return null;
+  dhis2._namedTargetProgramNames = dhis2._namedTargetProgramNames || new Map();
+  let progName = dhis2._namedTargetProgramNames.get(programUid);
+  if (progName === undefined) {
+    const resp = await safeDhis2Fetch(`programs/${programUid}?fields=id,displayName`);
+    progName = (resp && !resp._error && resp.displayName) ? String(resp.displayName) : null;
+    dhis2._namedTargetProgramNames.set(programUid, progName);
+  }
+  // Name resolution failed (404/network) — let the tool's own handling report it.
+  if (progName === null) return null;
+  const progNorm = _namedTargetNorm(progName);
+  const matches = armed.some(t =>
+    progNorm.includes(t.norm) || (progNorm.length >= 8 && t.norm.includes(progNorm)));
+  if (matches) {
+    clearNamedTargetsFoundIn([progName]);
+    return null;
+  }
+  const missing = armed.map(t => `"${t.name}"`).join(', ');
+  return {
+    _error: `STOP — silent program substitution blocked. Earlier this turn your search for a program named ${missing} returned ZERO matches, and this ${toolName}(action=${action}) call targets a DIFFERENT program: "${progName}" (${programUid}). The user asked for the named program; building their request on a lookalike without their consent is forbidden. NOTE: ${toolName} itself IS available and working — this is a substitution gate, not a missing tool.`,
+    _hint: `End your turn NOW with a short message to the user: (1) the program ${missing} does NOT exist on this DHIS2 instance, (2) list the closest existing program names you saw, (3) ask whether to (a) create the missing program first, (b) build on one specific existing program instead, or (c) stop. Do NOT retry this write, do NOT route it through dhis2_query, and do NOT pick a substitute program yourself. When the user answers next turn, proceed exactly as they direct.`,
+    _scope: 'named_program_substitution_blocked',
+    _missing_named_programs: armed.map(t => t.name),
+    _attempted_program: { id: programUid, name: progName },
+  };
+}
+
 // ── Per-turn known-IDs registry & verify-before-call gate ───────────────────
 // EVERY API call must derive from verified data. The chatbot must never
 // construct a path/UID from a guess. dhis2.knownIds is seeded each turn from

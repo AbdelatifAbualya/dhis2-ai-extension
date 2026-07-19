@@ -2579,3 +2579,45 @@ continuum acceptance (5-stage/100-DE/126-rule tracker → 52 PIs + 11 indicators
 visualizations + 4 maps + 35-tile dashboard → 10 line lists + case-management
 dashboard) completes with **zero failed API calls**; scripted tool-level scenario:
 387 calls, 0 failed, every prompt detail verified. Version 2.8.15 → 2.8.16.
+
+---
+
+## 22. v2.8.17 — Named-program substitution guard: a missing named program is a STOP, not a silent lookalike
+
+**Files:** `src/core.js` (NEW named-target guard: `noteMissingNamedTarget`,
+`clearNamedTargetsFoundIn`, `namedProgramSubstitutionStop`, `_namedTargetNorm`),
+`src/tools-metadata.js` (dispatcher gate before every program-bound write;
+`search_metadata` + raw `dhis2_query` GET arm/disarm bookkeeping + empty-result
+hint), `src/agent.js` (per-turn state reset), `src/registry.js` (system-prompt
+rule 10.9.3 — Named-target fidelity), `scripts/verify.js` (regression tests +
+async-aware verdict). Details: `CHANGES_named_program_substitution_guard.md`.
+
+**The disaster this fixes (observed live 2026-07-19):** the user asked, *"Using the
+Integrated Pregnancy, Delivery and Postnatal Care Tracker, create and save the
+following complex line-listing tables…"* That program did not exist on the instance.
+The model searched, got zero matches, then **silently picked a lookalike** — the
+"Maternal and Child Health (MCH) Program" — and built **9 line lists + a dashboard +
+6 legend sets** on the wrong program, burying the missing-program fact at the bottom
+of a long summary. The user's whole request was executed against data they never
+asked about.
+
+**The fix (mechanical, not just prompt):**
+- A **specific** name-filtered program search returning **0 rows** arms a "missing
+  named target" for the turn. "Specific" = ≥2 words or one word ≥10 chars, so generic
+  probes ("ANC", "Maternal") never arm it. Works on both `search_metadata` and raw
+  `dhis2_query` program searches.
+- Any later result containing a program whose name matches an armed query **disarms**
+  it (the object existed under a variant spelling).
+- While armed, the tool dispatcher **refuses** program-bound writes
+  (`manage_line_lists` create/update, `manage_program_rules`, `manage_program_indicators`,
+  `manage_program_notifications`, `create_metadata` add_stage/add_DEs/add_rules) whose
+  target program name does **not** match the missing name — with a stop-and-ask message.
+  A write on a program whose name **does** match passes and disarms, so the legitimate
+  "the named program doesn't exist → user asked me to create it → build on the new one"
+  flow is never blocked.
+- State is strictly per-turn: the refusal forces exactly one stop-and-ask; whatever the
+  user decides next turn proceeds normally.
+
+**Verified:** `npm run verify` green, including new tests proving generic/wrong-type
+searches don't arm the guard, a lookalike write is blocked, a matching-name write passes
+and disarms, and a later variant-spelling match disarms. Version 2.8.16 → 2.8.17.

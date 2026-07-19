@@ -215,6 +215,59 @@ if (loaded) {
     truthy('get_program_info schema exposes program_name', !!props.program_name);
   }
 
+  // Named-program substitution guard — a user-named program that searches
+  // proved absent must BLOCK program-bound writes against a lookalike program
+  // (the 2026-07-19 incident: line lists silently built on the MCH program
+  // when "Integrated Pregnancy, Delivery and Postnatal Care Tracker" did not
+  // exist). Async check runs against a pre-seeded name cache — no network.
+  // The `dhis2` state object lives in the bundle's lexical scope (a top-level
+  // `let`), so it is NOT reachable as a context property — the guard is
+  // therefore exercised purely through its own functions, which read/write
+  // that state. safeDhis2Fetch is stubbed so program-name resolution needs no
+  // network; overriding the context property redirects the internal call.
+  const noteMissing = need('noteMissingNamedTarget');
+  const clearFound = need('clearNamedTargetsFoundIn');
+  const subStop = need('namedProgramSubstitutionStop');
+  if (noteMissing && clearFound && subStop) {
+    const NAMES = {
+      hwuYFxYpWyK: 'Maternal and Child Health (MCH) Program',
+      aBcDeFgHiJ2: 'Integrated Pregnancy, Delivery and Postnatal Care Tracker',
+    };
+    ctx.safeDhis2Fetch = async (p) => {
+      const m = String(p).match(/programs\/([A-Za-z][A-Za-z0-9]{10})/);
+      const id = m && m[1];
+      return id && NAMES[id] ? { id, displayName: NAMES[id] } : { _error: 'not found' };
+    };
+    (async () => {
+      // Generic / wrong-type searches must NOT arm the guard: a lookalike write
+      // stays allowed (subStop returns null when nothing is armed).
+      noteMissing('programs', 'ANC');                     // 1 word, <10 chars
+      noteMissing('dataElements', 'Integrated Pregnancy'); // wrong object type
+      eq('generic/wrong-type searches leave lookalike writes allowed',
+        await subStop('manage_line_lists', 'create', 'hwuYFxYpWyK'), null);
+
+      // A specific failed program search arms the guard → lookalike write blocked.
+      noteMissing('programs', 'Integrated Pregnancy');
+      const blocked = await subStop('manage_line_lists', 'create', 'hwuYFxYpWyK');
+      truthy('write on a lookalike program is BLOCKED',
+        blocked && blocked._scope === 'named_program_substitution_blocked');
+
+      // A write on a program whose name matches the missing one passes AND
+      // disarms — so the "create the missing program, then build on it" flow
+      // is never blocked. Prove disarm: the lookalike write is allowed after.
+      eq('write on a program matching the missing name passes',
+        await subStop('manage_line_lists', 'create', 'aBcDeFgHiJ2'), null);
+      eq('matching write disarmed the guard (lookalike now allowed)',
+        await subStop('manage_line_lists', 'create', 'hwuYFxYpWyK'), null);
+
+      // Finding the program later under a variant spelling also disarms it.
+      noteMissing('programs', 'Integrated Pregnancy');
+      clearFound(['Integrated Pregnancy, Delivery and Postnatal Care Tracker']);
+      eq('a found program name containing the query disarms the guard',
+        await subStop('manage_line_lists', 'create', 'hwuYFxYpWyK'), null);
+    })().catch((e) => bad(`namedProgramSubstitutionStop threw: ${e && e.message}`));
+  }
+
   // Broken-tile fix — a TRACKER-domain data element is not a valid aggregate dx
   // item; buildVisualizationObject must refuse it (the 3-of-5-tiles-broken
   // report) with a program-indicator pointer, while still building normal PIs.
@@ -228,6 +281,10 @@ if (loaded) {
   }
 }
 
-console.log('');
-if (failures) { console.error(`\x1b[31mFAILED\x1b[0m — ${failures} check(s) failed\n`); process.exit(1); }
-console.log('\x1b[32mAll checks passed.\x1b[0m\n');
+// setImmediate: a few checks are async (promise-returning safety gates); they
+// resolve on the microtask queue, so the verdict must run after it drains.
+setImmediate(() => {
+  console.log('');
+  if (failures) { console.error(`\x1b[31mFAILED\x1b[0m — ${failures} check(s) failed\n`); process.exit(1); }
+  console.log('\x1b[32mAll checks passed.\x1b[0m\n');
+});

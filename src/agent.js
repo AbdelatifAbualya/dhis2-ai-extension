@@ -215,6 +215,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   dhis2.executedCallSigs = new Map(); // no-progress guard: identical EXECUTED calls this turn
   dhis2.consecutiveDiscoveryCalls = 0; // no-progress guard: read-only calls since the last write
   dhis2.corruptedCallCount = 0; // truncated/corrupted tool-call arguments seen this turn
+  dhis2.missingNamedTargets = []; // named-program substitution guard (core.js) — user-named programs that searches proved absent this turn
+  dhis2._namedTargetProgramNames = new Map(); // per-turn programId → displayName cache for that guard
   console.log(`[AgenticLoop] writeAuth = ${dhis2.writeAuth.scope} (${dhis2.writeAuth.reason})`);
 
   const ctx = dhis2.pageContext || {};
