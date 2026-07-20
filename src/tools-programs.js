@@ -2755,9 +2755,14 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
     return { _error: 'Provide data_element_ids (existing DE IDs) or data_elements (new DE definitions) for add_data_elements_to_stage' };
   }
 
-  // 1. Fetch the full current stage — we need name + program for a valid PUT
+  // 1. Fetch the full current stage — we need name + program for a valid PUT.
+  // CRITICAL: also fetch formType + programStageSections. A programStages PUT
+  // REPLACES the whole object, so omitting these two fields makes DHIS2 delete
+  // every section and revert the form to DEFAULT — the exact data-loss bug this
+  // tool used to cause. We read them here so we can send them back untouched
+  // (and route the new DE into the right section below).
   const stageResp = await safeDhis2Fetch(
-    `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,programStageDataElements[id,dataElement[id],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
+    `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
   );
   if (stageResp._error) return { _error: `Could not load stage ${args.stage_id}: ${stageResp._error}` };
   if (!stageResp.name) return { _error: `Stage ${args.stage_id} is missing required 'name' field` };
@@ -2767,6 +2772,50 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
   const existingIds = new Set(existing.map(psde => psde.dataElement?.id).filter(Boolean));
   const maxSortOrder = existing.reduce((m, e) => Math.max(m, e.sortOrder || 0), 0);
   let sortCounter = maxSortOrder;
+
+  // ── Section awareness ──────────────────────────────────────────────────────
+  // A stage renders as a sectioned form when it has programStageSections. When
+  // it does, a newly-added DE that is NOT placed in a section is invisible on
+  // the form. So if the stage is sectioned and the caller asks to add something,
+  // we must resolve WHICH section the new field(s) belong to before touching the
+  // server — and refuse (rather than orphan the field or wipe sections) when the
+  // target is ambiguous.
+  const sections = stageResp.programStageSections || [];
+  const hasSections = sections.length > 0;
+  const sectionList = sections.map(s => ({ id: s.id, name: s.name, data_element_count: (s.dataElements || []).length }));
+
+  // Will this call actually add anything new? (existing IDs already in the stage
+  // are skipped; new DE definitions are assumed to add.)
+  const willAddExistingIds = hasExistingIds && args.data_element_ids.some(id => !existingIds.has(id));
+  const willAddSomething = hasNewDEs || willAddExistingIds;
+
+  let targetSection = null;
+  if (hasSections && willAddSomething) {
+    if (args.section_id) {
+      targetSection = sections.find(s => s.id === args.section_id) || null;
+      if (!targetSection) {
+        return { _error: `Section id "${args.section_id}" is not a section of stage "${stageResp.name}".`, available_sections: sectionList };
+      }
+    } else if (args.section_name) {
+      const want = String(args.section_name).trim().toLowerCase();
+      targetSection = sections.find(s => (s.name || '').trim().toLowerCase() === want)
+        || sections.find(s => (s.name || '').trim().toLowerCase().includes(want)) || null;
+      if (!targetSection) {
+        return { _error: `No section matching "${args.section_name}" in stage "${stageResp.name}".`, available_sections: sectionList };
+      }
+    } else if (sections.length === 1) {
+      targetSection = sections[0]; // unambiguous — the stage has exactly one section
+    } else {
+      // Ambiguous: multiple sections, none specified. STOP — do not orphan the
+      // field or drop sections. Let the model ask the user which section.
+      return {
+        _error: `Stage "${stageResp.name}" uses a SECTION form with ${sections.length} sections. Tell me which section the new data element(s) should go into so they show up on the form.`,
+        _requires_user_confirmation: true,
+        available_sections: sectionList,
+        _hint: 'Re-call add_data_elements_to_stage with section_name (or section_id). All existing sections are preserved either way; this only decides where the NEW field appears.',
+      };
+    }
+  }
 
   // Preserve the existing elements as-is in the PUT body
   const updatedPsdes = existing.map(psde => ({
@@ -2783,6 +2832,7 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
   }));
 
   const addedElements = [];
+  const addedDeIds = []; // DE ids actually appended to the stage (for section routing)
 
   // 2. Create new DEs if requested, then queue them for the stage
   if (hasNewDEs) {
@@ -2834,6 +2884,7 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
           skipAnalytics: false,
         });
         addedElements.push({ id: deId, name: de.name });
+        addedDeIds.push(deId);
       }
     }
   }
@@ -2855,6 +2906,7 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
           skipAnalytics: false,
         });
         addedElements.push({ id: deId });
+        addedDeIds.push(deId);
       } else {
         addedElements.push({ id: deId, note: 'already_in_stage' });
       }
@@ -2866,13 +2918,36 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
       success: true, phase: 'dry_run',
       message: 'Dry run: no changes made.',
       stage_id: args.stage_id, stage_name: stageResp.name,
+      form_type: stageResp.formType || 'DEFAULT',
       would_add: addedElements.filter(e => !e.note),
+      ...(hasSections ? { would_place_in_section: targetSection ? { id: targetSection.id, name: targetSection.name } : null } : {}),
     };
   }
 
-  // 4. PUT the complete stage back with name + program + full programStageDataElements
-  // DHIS2 PUT on programStages requires 'name' and 'program' — sending only
-  // programStageDataElements causes 409 "Missing required property name".
+  // 3b. Snapshot the stage (and the target section, if any) BEFORE we mutate it.
+  // A full-object PUT on a program stage is inherently destructive to its
+  // sections, so a restorable backup is mandatory here — same guarantee the
+  // remove_from_stage path already gives.
+  const backupTargets = [{ object_type: 'programStages', object_id: args.stage_id, role: 'primary' }];
+  if (targetSection) backupTargets.push({ object_type: 'programStageSections', object_id: targetSection.id, role: 'section' });
+  const backup = await ensureBackupOrBail(
+    {
+      operation: 'add_data_elements_to_stage',
+      tool: 'create_metadata',
+      action: 'add_data_elements_to_stage',
+      reason: `Adding ${addedDeIds.length} data element(s) to stage ${stageResp.name}${targetSection ? ` (section "${targetSection.name}")` : ''}`,
+    },
+    backupTargets,
+    args
+  );
+  if (!backup.ok) return backup.error;
+
+  // 4. PUT the complete stage back. DHIS2 PUT on programStages REPLACES the
+  // whole object, so we MUST echo back formType AND the existing section
+  // references (as id-refs) — otherwise DHIS2 deletes every section and reverts
+  // the form to DEFAULT. Sending id-refs preserves each section object and its
+  // own dataElements untouched; the target section's membership is updated in a
+  // dedicated PUT below (step 5).
   const stageUpdate = {
     name: stageResp.name,
     program: { id: stageResp.program.id },
@@ -2880,12 +2955,14 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
     repeatable: stageResp.repeatable || false,
     programStageDataElements: updatedPsdes,
   };
+  if (stageResp.formType) stageUpdate.formType = stageResp.formType;
+  if (hasSections) stageUpdate.programStageSections = sections.map(s => ({ id: s.id }));
 
   const putResp = await safeDhis2Fetch(`programStages/${args.stage_id}`, {
     method: 'PUT',
     body: stageUpdate,
   });
-  if (putResp._error) return { _error: `Failed to update stage: ${putResp._error}` };
+  if (putResp._error) return { _error: `Failed to update stage: ${putResp._error}`, backup: backup.block };
 
   // Surface any DHIS2 import-level errors from the PUT response
   const putStatus = putResp?.status || putResp?.response?.status;
@@ -2897,13 +2974,48 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
         for (const er of (or.errorReports || [])) errors.push(er.message);
       }
     }
-    return { _error: `Stage update failed: ${putResp?.message || 'Unknown error'}`, errors };
+    return { _error: `Stage update failed: ${putResp?.message || 'Unknown error'}`, errors, backup: backup.block };
+  }
+
+  // 5. Place the newly-added DE(s) into the target section so they render on the
+  // sectioned form. The DE is already a programStageDataElement of the stage
+  // (step 4), which is a precondition for section membership. We fetch the full
+  // section via :owner and PUT it back with the new ids appended, so no section
+  // property is lost.
+  let sectionUpdate = null;
+  if (targetSection && addedDeIds.length) {
+    const secFull = await safeDhis2Fetch(`programStageSections/${targetSection.id}?fields=:owner`);
+    if (secFull?._error) {
+      sectionUpdate = { section_id: targetSection.id, placed: false, warning: `Could not load section to add the field: ${secFull._error}. The data element is on the stage but not yet in a section.` };
+    } else {
+      const secDeIds = new Set((secFull.dataElements || []).map(d => d.id));
+      const mergedDes = [...(secFull.dataElements || [])];
+      for (const id of addedDeIds) if (!secDeIds.has(id)) mergedDes.push({ id });
+      secFull.dataElements = mergedDes;
+      if (!secFull.programStage) secFull.programStage = { id: args.stage_id };
+      const secPut = await safeDhis2Fetch(`programStageSections/${targetSection.id}`, { method: 'PUT', body: secFull });
+      if (secPut?._error || (secPut?.status || secPut?.response?.status) === 'ERROR') {
+        const errs = [];
+        for (const tr of (secPut?.response?.typeReports || [])) {
+          for (const or of (tr.objectReports || [])) {
+            for (const er of (or.errorReports || [])) errs.push(er.message);
+          }
+        }
+        sectionUpdate = { section_id: targetSection.id, section_name: targetSection.name, placed: false, warning: `Field added to the stage but placing it in section "${targetSection.name}" failed: ${secPut?._error || errs.join('; ') || 'unknown error'}. Restore from backup if needed.` };
+      } else {
+        sectionUpdate = { section_id: targetSection.id, section_name: targetSection.name, placed: true };
+      }
+    }
   }
 
   return {
     success: true,
     stage_id: args.stage_id,
     stage_name: stageResp.name,
+    form_type: stageResp.formType || 'DEFAULT',
+    sections_preserved: hasSections ? sections.length : 0,
+    ...(sectionUpdate ? { section_placement: sectionUpdate } : {}),
+    backup: backup.block,
     added_elements: addedElements,
     total_elements: updatedPsdes.length,
   };
@@ -2920,12 +3032,17 @@ async function executeManageMetadata(args) {
     if (!args.stage_id) return { _error: 'stage_id required for remove_from_stage' };
     if (!args.data_element_ids?.length) return { _error: 'data_element_ids (array of DE UIDs) required for remove_from_stage' };
 
-    // Fetch the full current stage — we need name + program for a valid PUT
+    // Fetch the full current stage — we need name + program for a valid PUT.
+    // Also fetch formType + programStageSections: a programStages PUT REPLACES
+    // the object, so omitting them would delete every section and revert the
+    // form to DEFAULT (same data-loss bug the add path had).
     const stageResp = await safeDhis2Fetch(
-      `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,programStageDataElements[id,dataElement[id,name],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
+      `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id,name],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
     );
     if (stageResp._error) return { _error: `Could not load stage ${args.stage_id}: ${stageResp._error}` };
     if (!stageResp.name || !stageResp.program?.id) return { _error: `Stage ${args.stage_id} is missing required 'name' or program reference` };
+    const rmSections = stageResp.programStageSections || [];
+    const rmHasSections = rmSections.length > 0;
 
     const removeSet = new Set(args.data_element_ids);
     const existing = stageResp.programStageDataElements || [];
@@ -2959,15 +3076,32 @@ async function executeManageMetadata(args) {
       };
     }
 
-    // Snapshot the stage BEFORE we mutate it.
+    // Which sections reference a DE we're about to remove? They must be updated
+    // too, else they'd point at a DE that is no longer a stage PSDE.
+    const rmSectionsToFix = rmSections.filter(s => (s.dataElements || []).some(d => removeSet.has(d.id)));
+
+    // Snapshot the stage AND every affected section BEFORE we mutate them.
+    const rmBackupTargets = [{ object_type: 'programStages', object_id: args.stage_id, role: 'primary' }];
+    for (const s of rmSectionsToFix) rmBackupTargets.push({ object_type: 'programStageSections', object_id: s.id, role: 'section' });
     const backup = await ensureBackupOrBail(
       { operation: 'remove_from_stage', tool: 'manage_metadata', action: 'remove_from_stage', reason: `Removing ${removed.length} data element(s) from stage ${stageResp.name}` },
-      [{ object_type: 'programStages', object_id: args.stage_id, role: 'primary' }],
+      rmBackupTargets,
       args
     );
     if (!backup.ok) return backup.error;
 
-    // PUT the complete stage back without the removed elements
+    // Remove the DE(s) from their sections FIRST — a section may not reference a
+    // DE that is no longer a stage PSDE, so this must precede the stage PUT.
+    for (const s of rmSectionsToFix) {
+      const secFull = await safeDhis2Fetch(`programStageSections/${s.id}?fields=:owner`);
+      if (secFull?._error) continue;
+      secFull.dataElements = (secFull.dataElements || []).filter(d => !removeSet.has(d.id));
+      if (!secFull.programStage) secFull.programStage = { id: args.stage_id };
+      await safeDhis2Fetch(`programStageSections/${s.id}`, { method: 'PUT', body: secFull });
+    }
+
+    // PUT the complete stage back without the removed elements, echoing formType
+    // and the surviving section references so DHIS2 keeps the sectioned form.
     const stageUpdate = {
       name: stageResp.name,
       program: { id: stageResp.program.id },
@@ -2975,6 +3109,8 @@ async function executeManageMetadata(args) {
       repeatable: stageResp.repeatable || false,
       programStageDataElements: kept,
     };
+    if (stageResp.formType) stageUpdate.formType = stageResp.formType;
+    if (rmHasSections) stageUpdate.programStageSections = rmSections.map(s => ({ id: s.id }));
 
     const putResp = await safeDhis2Fetch(`programStages/${args.stage_id}`, {
       method: 'PUT',
@@ -2999,6 +3135,8 @@ async function executeManageMetadata(args) {
       action: 'remove_from_stage',
       stage_id: args.stage_id,
       stage_name: stageResp.name,
+      form_type: stageResp.formType || 'DEFAULT',
+      sections_preserved: rmHasSections ? rmSections.length : 0,
       removed_elements: removed,
       remaining_elements: kept.length,
       backup: backup.block,

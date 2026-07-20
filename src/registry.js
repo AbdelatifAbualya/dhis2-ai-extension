@@ -1014,7 +1014,9 @@ If user enabled web browsing from UI, this tool should usually be called before 
             type: 'array',
             items: { type: 'string' },
             description: 'IDs of EXISTING data elements to add to the stage (for add_data_elements_to_stage). Use when the data element already exists in DHIS2.'
-          }
+          },
+          section_name: { type: 'string', description: 'For add_data_elements_to_stage: name of the existing section the new data element(s) should appear under. REQUIRED when the stage uses a SECTION form and has more than one section — otherwise the tool stops and lists the sections. Omit for non-sectioned (DEFAULT) stages, or when the stage has exactly one section.' },
+          section_id: { type: 'string', description: 'For add_data_elements_to_stage: id of the target section (alternative to section_name). All OTHER sections are always preserved regardless.' }
         },
         required: ['action']
       }
@@ -2531,7 +2533,7 @@ create_metadata(action="create_data_elements",
 \`use_category_combo: true\` binds that DE to the inline/named combo; \`use_default_combo: true\` keeps it on the system default. DEs with neither flag inherit from the call's category_combo (or default if none). Attach an option set either inline (\`option_set\` — creates a new set) or by reference (\`option_set_id\` / \`option_set_name\` — reuses an existing set; the DE valueType auto-aligns). Mix freely in one call.
 
 ### Adding to existing programs
-- DEs to an existing stage: create_metadata(action=add_data_elements_to_stage, stage_id=<id>, data_element_ids=[<id>]) — use \`data_elements:[{name, value_type, …}]\` instead to create NEW DEs onto the stage.
+- DEs to an existing stage: create_metadata(action=add_data_elements_to_stage, stage_id=<id>, data_element_ids=[<id>]) — use \`data_elements:[{name, value_type, …}]\` instead to create NEW DEs onto the stage. This action ALWAYS backs the stage up first and preserves the stage's existing sections + form type. If the stage uses a SECTION form with multiple sections, ALSO pass \`section_name\` (the section the new field belongs under) — without it the tool stops and lists the sections rather than guessing. Never revert a sectioned stage to a default form to add a field.
 - A new stage: create_metadata(action=add_stage, program_id=<id>, stage={ name, repeatable, data_elements:[…] }).
 - More rules: create_metadata(action=add_program_rules, program_id=<id>, program_rules=[…]).
 

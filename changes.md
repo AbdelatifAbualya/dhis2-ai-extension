@@ -2763,3 +2763,52 @@ removes the nudge that made the model discard the requirement.
 existing "Pregnant Woman" TET (P17V7707oMl) via PATCH (no enrollments, safe).
 
 **Verification:** `npm run verify` all pass.
+
+---
+
+## Section-safe stage edits: backup + preserve sections when adding/removing stage data elements (2026-07-20)
+
+**Files:** `src/tools-programs.js` (`addDataElementsToExistingStage` ~line 2750; `executeManageMetadata` → `remove_from_stage` ~line 3029), `src/registry.js` (`create_metadata` schema `section_name`/`section_id` ~line 1012; guidance in `KB_CREATE_PROGRAM_DETAILS` ~line 2536)
+
+**Type of change:** Bug fix (data-loss) + new params
+
+**Symptom reported:** asking the chatbot to add a data element to a stage very
+often flipped the stage's form from SECTION to DEFAULT and deleted every section.
+Re-adding the sections created them with NEW ids (originals were never backed up),
+breaking any program rules / layout that referenced the old section ids.
+
+**Root cause:** a `PUT /programStages/{id}` REPLACES the whole object. Both the add
+path and the `remove_from_stage` path sent only `name, program, sortOrder,
+repeatable, programStageDataElements` — omitting `formType` and
+`programStageSections`. DHIS2 therefore wiped all sections and reset the form to
+DEFAULT. The add path also created no backup at all.
+
+**Fix (add path — `addDataElementsToExistingStage`):**
+1. **Backup first.** Now calls `ensureBackupOrBail` before the PUT (snapshotting
+   the stage + the target section), matching the guarantee `remove_from_stage`
+   already had. Bypassable only with `skip_backup:true`.
+2. **Preserve the form.** Fetches `formType` + `programStageSections[...]` and
+   echoes `formType` and the section id-refs back in the PUT, so sections are
+   never deleted and the form stays SECTION.
+3. **Route the new field to the right section.** New `section_name` / `section_id`
+   params. On a sectioned stage the newly-added DE is PUT into the chosen section
+   (its other DEs preserved via a `:owner` fetch). Exactly one section → auto-used.
+   Multiple sections and none specified → the tool STOPS and returns the section
+   list (`_requires_user_confirmation`) instead of orphaning the field or wiping
+   sections. Non-sectioned (DEFAULT) stages behave as before.
+
+**Fix (`remove_from_stage`):** same section/`formType` preservation, plus it now
+strips the removed DE from any section that referenced it (a section may not point
+at a DE that is no longer a stage PSDE), and backs up every affected section too.
+
+**Model guidance:** `create_metadata`'s manual now states the action always backs
+up and preserves sections, and that a multi-section SECTION stage needs
+`section_name`. Response objects now report `form_type`, `sections_preserved`, and
+`section_placement`.
+
+**Verification:** `npm run verify` all pass; a dedicated harness
+(`test-add-de-sections.js`, sandboxed bundle + mocked `safeDhis2Fetch`/snapshot)
+asserts across 4 cases: sectioned add preserves both sections + formType + routes
+the DE into the named section + backs up first; ambiguous-section add makes ZERO
+writes; DEFAULT stage still backs up; `remove_from_stage` keeps the sectioned form
+and strips the DE from its section. 31/31 checks pass.
