@@ -1288,7 +1288,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       } else {
         return {
           _error: `TrackedEntityType "${tetName}" does not exist and could not be created: ${tetImport?._error || (tetImport?.errors || []).join('; ') || 'unknown import error'}`,
-          _hint: 'Fix the reported error, or pass an existing TrackedEntityType UID/name, or omit tracked_entity_type_id to use a Person type.',
+          _hint: 'Fix the reported error and retry with the SAME tracked_entity_type_id name. Only fall back to omitting it (defaults to Person) if the user did not request a specific tracked entity type — do not substitute Person for a named type.',
         };
       }
     }
@@ -1296,7 +1296,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       const available = allTets.map(t => `${t.displayName || t.name} (${t.id})`).join(', ') || '(none exist on this server)';
       return {
         _error: `Could not resolve a TrackedEntityType${rawTet ? ` for tracked_entity_type_id="${rawTet}"` : ''} on this server.`,
-        _hint: `Do NOT guess a UID. Available TrackedEntityTypes: ${available}. Pass tracked_entity_type_id as one of those UIDs (or its exact name), or omit it to use a Person type. If none exist, create one first.`,
+        _hint: `Do NOT guess a UID. If the program spec NAMES a tracked entity type (e.g. "Pregnant Woman"), retry with that exact NAME as tracked_entity_type_id — an existing one is reused, a missing one is CREATED. Only omit tracked_entity_type_id (which defaults to Person) when the user did NOT request a specific type — do not silently substitute Person for a named type. Available TrackedEntityTypes: ${available}.`,
         _available_tracked_entity_types: allTets.map(t => ({ id: t.id, name: t.displayName || t.name })),
       };
     }
@@ -1902,6 +1902,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const prvCreated = {}; // track created variables by name
   let ruleConditionAdvisories = [];
   let ruleConditionRewrites = [];
+  let ruleDeadLiterals = [];
   let ruleTokenRewrites = [];
   let ruleAutoGuards = [];
   // Rules that could not be built (unresolved variable/stage/section refs) are
@@ -2226,6 +2227,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       });
       ruleConditionAdvisories = mapped.advisories;
       ruleConditionRewrites = mapped.rewrites;
+      ruleDeadLiterals = mapped.deadLiterals || [];
     }
     ruleAutoGuards = autoGuardedConditions;
   }
@@ -2381,6 +2383,10 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     ...(ruleAutoGuards.length ? { auto_guarded_conditions: ruleAutoGuards } : {}),
     ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
     ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
+    ...(ruleDeadLiterals.length ? {
+      dead_option_literals: ruleDeadLiterals,
+      dead_option_literals_action: `${ruleDeadLiterals.length} rule/ASSIGN comparison(s) reference a value that is not an option (code or name) of the target option set — these WILL NEVER FIRE. Fix each listed literal to a valid option code via manage_program_rules (update the rule condition or ASSIGN data), or the corresponding program behaviour will silently not work.`,
+    } : {}),
     ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
     ...(skippedRules.length ? { skipped_rules: skippedRules } : {}),
     ...(ruleActionFixes.length ? { rule_action_fixes: ruleActionFixes } : {}),
@@ -4178,6 +4184,7 @@ async function addProgramRules(args) {
   // option-NAME literal to its code and flag literals that match neither.
   let ruleConditionAdvisories = [];
   let ruleConditionRewrites = [];
+  let ruleDeadLiterals = [];
   {
     const deIdToOsId = new Map();
     for (const [n, id] of Object.entries(deNameToId)) {
@@ -4236,6 +4243,7 @@ async function addProgramRules(args) {
       });
       ruleConditionAdvisories = mapped.advisories;
       ruleConditionRewrites = mapped.rewrites;
+      ruleDeadLiterals = mapped.deadLiterals || [];
     }
   }
 
@@ -4261,6 +4269,10 @@ async function addProgramRules(args) {
       ...(autoGuardedConditions.length ? { auto_guarded_conditions: autoGuardedConditions } : {}),
       ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
       ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
+      ...(ruleDeadLiterals.length ? {
+        dead_option_literals: ruleDeadLiterals,
+        dead_option_literals_action: `${ruleDeadLiterals.length} rule/ASSIGN comparison(s) reference a value that is not an option (code or name) of the target option set — these WILL NEVER FIRE. Fix each listed literal to a valid option code via manage_program_rules, or the corresponding program behaviour will silently not work.`,
+      } : {}),
       ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
     },
   };
@@ -5771,35 +5783,55 @@ function lintRuleVisibilitySemantics(newRules, existingRules = []) {
     }
   }
 
-  // 3. Complementary / duplicate hide pairs on the same target (batch-internal
-  // and new-vs-existing). Complementary pair ⇒ the target is hidden in EVERY
-  // case; duplicate ⇒ redundant twin rule.
-  const hideEntries = (list, isNew) => {
+  // 3. Complementary / duplicate action pairs (batch-internal and new-vs-existing).
+  //   - HIDE pairs: COMPLEMENTARY conditions ⇒ target hidden in EVERY case;
+  //     EQUIVALENT ⇒ redundant twin.
+  //   - Also catch EXACT-DUPLICATE rules for other deterministic actions:
+  //     SETMANDATORYFIELD on the same target, and UNTARGETED SHOWWARNING /
+  //     SHOWERROR / WARNING|ERRORONCOMPLETE. The same effect under an equivalent
+  //     condition is a redundant twin that fires twice in Capture (root cause of
+  //     "two identical BP warnings" / "referral set mandatory twice"). ASSIGN and
+  //     DISPLAY* are deliberately excluded: ASSIGN-same-target-different-value is
+  //     a CONFLICT not a duplicate, and DISPLAY feedback may legitimately repeat.
+  const UNTARGETED_DUP_TYPES = new Set(['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE']);
+  const TARGETED_DUP_TYPES = new Set([...PR_HIDE_ACTION_TYPES, 'SETMANDATORYFIELD']);
+  const dupEntries = (list, isNew) => {
     const out = [];
     for (const r of list) {
       for (const act of r.actions) {
-        if (PR_HIDE_ACTION_TYPES.has(act.type)) out.push({ rule: r, act, isNew });
+        const targeted = !!(act.keys && act.keys.size > 0);
+        if (targeted ? TARGETED_DUP_TYPES.has(act.type) : UNTARGETED_DUP_TYPES.has(act.type)) {
+          out.push({ rule: r, act, isNew, targeted });
+        }
       }
     }
     return out;
   };
-  const newHides = hideEntries(news, true);
-  const allHides = [...newHides, ...hideEntries(olds, false)];
+  const newDups = dupEntries(news, true);
+  const allDups = [...newDups, ...dupEntries(olds, false)];
   const flagged = new Set();
-  for (const a of newHides) {
-    for (const b of allHides) {
+  for (const a of newDups) {
+    for (const b of allDups) {
       if (a === b || a.rule === b.rule) continue;
-      if (a.act.type !== b.act.type || !_prKeysIntersect(a.act.keys, b.act.keys)) continue;
-      const pairKey = [a.rule.name, b.rule.name, a.act.label].sort().join('|');
+      if (a.act.type !== b.act.type) continue;
+      // Same target: both untargeted (identical effect) OR overlapping target keys.
+      const sameTarget = (a.targeted && b.targeted)
+        ? _prKeysIntersect(a.act.keys, b.act.keys)
+        : (!a.targeted && !b.targeted);
+      if (!sameTarget) continue;
+      const label = a.act.label || a.act.type;
+      const pairKey = [a.rule.name, b.rule.name, String(label)].sort().join('|');
       if (flagged.has(pairKey)) continue;
-      if (_prConditionsComplementary(a.rule.condition, b.rule.condition)) {
+      const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
+      if (PR_HIDE_ACTION_TYPES.has(a.act.type) && _prConditionsComplementary(a.rule.condition, b.rule.condition)) {
         flagged.add(pairKey);
-        const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
         errors.push(`Rule "${a.rule.name}" and ${bDesc} BOTH hide "${a.act.label}" under COMPLEMENTARY conditions ("${a.rule.condition}" vs "${b.rule.condition}") — together they hide it in every case, so the field/stage never appears. Keep ONLY the rule whose condition expresses when to HIDE and drop the other. ${PR_ONE_RULE_DOCTRINE}`);
       } else if (_prConditionsEquivalent(a.rule.condition, b.rule.condition)) {
         flagged.add(pairKey);
-        const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
-        errors.push(`Rule "${a.rule.name}" duplicates ${bDesc}: same ${a.act.type} target "${a.act.label}" under an equivalent condition. Do not create duplicate rules — keep one.`);
+        const tgtDesc = a.targeted
+          ? `same ${a.act.type} target "${a.act.label}"`
+          : `an equivalent ${a.act.type} (same effect) `;
+        errors.push(`Rule "${a.rule.name}" duplicates ${bDesc}: ${tgtDesc} under an equivalent condition — it fires redundantly (the user sees the effect twice). Do not create duplicate rules — keep ONE (merge the messages/targets if both were intended, or stage-scope them).`);
       }
     }
   }
@@ -5850,14 +5882,45 @@ function autoGuardNumericComparisons(condition) {
 function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKey, optionsByOsKey }) {
   const advisories = [];
   const rewrites = [];
+  // Literals that match NO option even after normalization. Their rule/ASSIGN can
+  // never fire, so callers surface these PROMINENTLY (dead_option_literals) instead
+  // of leaving a silently-inert rule in the program (root cause of "many program
+  // rules don't work" — the comparison value simply isn't in the option set).
+  const deadLiterals = [];
+  // Tolerant match key: case-fold + collapse every run of non-alphanumerics to a
+  // single space. Lets '1+' match an option coded/named '1 +', 'Severe headache /
+  // visual symptoms' match 'Severe headache/visual symptoms', and stray case or
+  // spacing resolve to the real code instead of shipping a dead comparison.
+  const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   const lookup = (osKey) => {
     const opts = optionsByOsKey.get(osKey);
     if (!opts || !opts.length) return null;
+    const byNameNorm = new Map();
+    const byCodeNorm = new Map();
+    for (const o of opts) {
+      if (!byNameNorm.has(norm(o.name))) byNameNorm.set(norm(o.name), String(o.code));
+      if (!byCodeNorm.has(norm(o.code))) byCodeNorm.set(norm(o.code), String(o.code));
+    }
     return {
       byCode: new Set(opts.map(o => String(o.code))),
       byName: new Map(opts.map(o => [String(o.name).toLowerCase(), String(o.code)])),
+      byNameNorm,
+      byCodeNorm,
       codes: opts.map(o => o.code).join(', '),
     };
+  };
+  // exact code → {code, exact:true}; exact/normalized name or normalized code →
+  // {code, normalized?}; no match at all → null.
+  const resolve = (os, lit) => {
+    if (os.byCode.has(lit)) return { code: lit, exact: true };
+    const exactName = os.byName.get(lit.toLowerCase());
+    if (exactName) return { code: exactName };
+    const n = norm(lit);
+    const nn = os.byNameNorm.get(n);
+    if (nn) return { code: nn, normalized: true };
+    const nc = os.byCodeNorm.get(n);
+    if (nc) return { code: nc, normalized: true };
+    return null;
   };
 
   for (const rule of (rules || [])) {
@@ -5875,14 +5938,15 @@ function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKe
         const lit = (lit1 !== undefined ? lit1 : lit2);
         const op = op1 || op2;
         if (lit === '') return full;         // empty-value check — leave alone
-        if (os.byCode.has(lit)) return full; // already a code — leave alone
-        const code = os.byName.get(lit.toLowerCase());
-        if (code) {
-          rewrites.push(`Rule "${rule.name}": '${lit}' → option code '${code}'`);
-          return op1 ? `${varToken} ${op} '${code}'` : `'${code}' ${op} ${varToken}`;
+        const r = resolve(os, lit);
+        if (!r) {
+          advisories.push(`Rule "${rule.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of its option set (codes: ${os.codes}). This comparison will never match — verify the value.`);
+          deadLiterals.push({ rule: rule.name, variable: vRaw, literal: lit, valid_codes: os.codes });
+          return full;
         }
-        advisories.push(`Rule "${rule.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of its option set (codes: ${os.codes}). This comparison will never match — verify the value.`);
-        return full;
+        if (r.exact) return full;            // already a code — leave alone
+        rewrites.push(`Rule "${rule.name}": '${lit}' → option code '${r.code}'${r.normalized ? ' (normalized match)' : ''}`);
+        return op1 ? `${varToken} ${op} '${r.code}'` : `'${r.code}' ${op} ${varToken}`;
       });
     }
     rule.condition = cond;
@@ -5898,17 +5962,19 @@ function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKe
     const literal = typeof pra.data === 'string' && pra.data.trim().match(/^'([^']*)'$/);
     if (!literal) continue; // dynamic expression — can't statically check
     const value = literal[1];
-    if (value === '' || os.byCode.has(value)) continue;
-    const code = os.byName.get(value.toLowerCase());
-    if (code) {
-      rewrites.push(`ASSIGN '${value}' → option code '${code}'`);
-      pra.data = `'${code}'`;
+    if (value === '') continue;
+    const r = resolve(os, value);
+    if (r && r.exact) continue;             // already a code — leave alone
+    if (r) {
+      rewrites.push(`ASSIGN '${value}' → option code '${r.code}'${r.normalized ? ' (normalized match)' : ''}`);
+      pra.data = `'${r.code}'`;
     } else {
       advisories.push(`ASSIGN uses '${value}', which is neither an option code nor an option name of the target's option set (codes: ${os.codes}). The assigned value will bounce on save — fix it.`);
+      deadLiterals.push({ assign: true, literal: value, valid_codes: os.codes });
     }
   }
 
-  return { advisories, rewrites };
+  return { advisories, rewrites, deadLiterals };
 }
 
 // PI grammar — d2 functions DHIS2 2.41 actually accepts inside a programIndicator

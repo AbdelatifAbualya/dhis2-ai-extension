@@ -2680,3 +2680,86 @@ legend sets, 4 district maps, and the full "Maternal and Newborn Continuum Dashb
 tiles: 7 text sections, 24 charts, 4 maps, 0 dangling references), with sharing — **120
 DHIS2 API calls, 0 failed.** All test objects were cleaned up; the instance was left exactly
 as found. Version 2.8.17 → 2.8.18.
+
+---
+
+## Dead option-literal hardening in program-rule generation (2026-07-20)
+
+**File:** `src/tools-programs.js`
+**Functions:** `rewriteOptionLiteralsGeneric` (~line 5850), `createProgram` result (~line 2385), `addProgramRules` result (~line 4271)
+
+**Type of change:** Modified + new result field
+
+**What & why:** Rule conditions / ASSIGN data that referenced an option value which
+was neither a code nor an exact option name were left as **dead comparisons** and
+only flagged via a soft advisory, so they shipped silently non-firing — the root
+cause of "many program rules are not working" on reuse-heavy builds. Added (1)
+normalized (case + punctuation/whitespace-insensitive) matching so wording and
+punctuation variants like `'1 +'`↔`'1+'` resolve to the real option code, and
+(2) a structured `dead_option_literals` + `dead_option_literals_action` result
+field on both `create_program` and `add_program_rules` so a genuinely-unmatchable
+literal is reported prominently and actionably instead of buried. Reuse superset
+guard and `useCodeForOptionSet=true` were already correct and are untouched.
+
+**Verification:** `npm run verify` all pass; standalone `test-rewrite.js` 10/10.
+See `CHANGES_dead_option_literals.md`.
+
+---
+
+## Generalize duplicate-rule lint beyond HIDE actions (2026-07-20)
+
+**File:** `src/tools-programs.js`
+**Function:** `lintRuleVisibilitySemantics` (step 3, ~line 5786)
+
+**Type of change:** Modified (broadened duplicate detection)
+
+**Symptom found during verification of the rebuilt maternal tracker:** the program
+shipped 3 EXACT-duplicate rule pairs that both fire at program scope —
+two "severe BP" SHOWWARNINGs, two "elevated BP" SHOWWARNINGs, and two
+SETMANDATORYFIELD-on-"Referral destination" rules. Root cause: the spec repeats
+BP/referral behaviour across stages; the LLM authored one rule per stage but did
+not stage-scope them, so they collapse into redundant twins. The existing dedup
+lint only inspected HIDE actions, so these were never caught.
+
+**Fix:** the equivalent-condition duplicate check now also covers
+`SETMANDATORYFIELD` (targeted, same DE/TEA) and UNTARGETED `SHOWWARNING` /
+`SHOWERROR` / `WARNINGONCOMPLETE` / `ERRORONCOMPLETE` (same effect under an
+equivalent condition = redundant twin). `ASSIGN` and `DISPLAY*` are deliberately
+excluded (ASSIGN-same-target-different-value is a conflict, not a duplicate;
+feedback DISPLAY may legitimately repeat). The HIDE complementary-pair logic is
+unchanged. Applies batch-internally and new-vs-existing, so a duplicate is caught
+whether both twins arrive together or one already exists on the program.
+
+**Verification:** `npm run verify` all pass; targeted test (`test-dedup.js`)
+against the actual rebuilt program flags exactly the 3 duplicate pairs and
+over-flags none of the legitimate same-condition/different-action rules
+(EDD-mandatory vs hide-LMP-date; GA-at-visit vs GA-at-delivery ASSIGNs).
+The 3 redundant rules were also removed from the live program on 8081.
+
+---
+
+## Stop substituting "Person" for a user-named tracked entity type (2026-07-20)
+
+**File:** `src/tools-programs.js` (TET resolution hints ~line 1291, 1299), `src/registry.js` (tracked_entity_type_id description ~line 758)
+
+**Type of change:** Modified (guidance/hints)
+
+**Symptom found during verification:** the spec said "Use Pregnant Woman as the
+tracked entity type", a "Pregnant Woman" TET existed on the instance, yet the
+rebuilt program used "person". The name-resolution code is correct (it reuses an
+existing type by exact/ci name and CREATES a missing named type), but when the
+model first passed a guessed UID it hit the unresolved-UID error whose hint
+offered "omit it to use a Person type" — so the model abandoned the user's named
+type and fell back to Person.
+
+**Fix:** the unresolved-TET hints and the `tracked_entity_type_id` schema
+description now explicitly instruct: if the user NAMES a tracked entity type, pass
+that exact NAME (reused if present, created if missing) and NEVER substitute
+"Person"; only omit it (defaulting to Person) when no specific type was requested.
+No behavioural code change — the resolver already handled names correctly; this
+removes the nudge that made the model discard the requirement.
+
+**Live fix:** the rebuilt program (DtrybmSigv0) was switched from "person" to the
+existing "Pregnant Woman" TET (P17V7707oMl) via PATCH (no enrollments, safe).
+
+**Verification:** `npm run verify` all pass.

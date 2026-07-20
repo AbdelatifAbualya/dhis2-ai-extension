@@ -755,7 +755,7 @@ If user enabled web browsing from UI, this tool should usually be called before 
             enum: ['WITH_REGISTRATION', 'WITHOUT_REGISTRATION'],
             description: 'WITH_REGISTRATION = Tracker, WITHOUT_REGISTRATION = Event'
           },
-          tracked_entity_type_id: { type: 'string', description: 'For WITH_REGISTRATION (tracker) programs: the TrackedEntityType to use. Prefer the real UID. If you only know the type\'s NAME (e.g. "Person"), pass the exact name string — the tool resolves it to its UID server-side; NEVER invent/guess a UID. If omitted entirely, auto-resolves to the TrackedEntityType named "Person". For a non-Person type (e.g. "Household", "Livestock"), first confirm it exists via architect_metadata(action="check_existing", object_type="trackedEntityTypes") if unsure of the exact name.' },
+          tracked_entity_type_id: { type: 'string', description: 'For WITH_REGISTRATION (tracker) programs: the TrackedEntityType to use. If the user NAMES a type (e.g. "Pregnant Woman", "Household"), pass that EXACT name string — an existing one is reused, a missing one is CREATED for you; NEVER substitute "Person" for a type the user named, and NEVER invent/guess a UID. Prefer a real UID only when you actually have one. If (and only if) the user did not request a specific type, omit this — it auto-resolves to the TrackedEntityType named "Person".' },
           program_attributes: {
             type: 'array',
             items: {
