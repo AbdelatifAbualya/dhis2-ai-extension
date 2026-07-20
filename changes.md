@@ -2812,3 +2812,49 @@ asserts across 4 cases: sectioned add preserves both sections + formType + route
 the DE into the named section + backs up first; ambiguous-section add makes ZERO
 writes; DEFAULT stage still backs up; `remove_from_stage` keeps the sectioned form
 and strips the DE from its section. 31/31 checks pass.
+
+---
+
+## Silence the CORS console error when switching to a not-signed-in DHIS2 instance (2026-07-20)
+
+**Files:** `src/core.js` (`dhis2Fetch` ~line 1709; `safeDhis2Fetch` direct fetch ~line 2346; DELETE-retry POST ~line 2394; new `DHIS2_NOT_SIGNED_IN_MSG` const), `src/tools-programs.js` (`validateProgramRuleCondition` ~line 4909; `validateProgramIndicatorExpression` ~line 7196)
+
+**Type of change:** Bug fix (noisy console error)
+
+**Symptom reported:** after switching from one DHIS2 instance to another, opening
+the extension logged a red error in the service-worker console (visible on the
+`chrome://extensions` page):
+
+```
+Access to fetch at 'http://hmis.moh.ps/tr-family-migration/dhis-web-login/'
+(redirected from '.../api/42/programs/vj5cpA2OOfZ?fields=...') from origin
+'chrome-extension://...' has been blocked by CORS policy: No
+'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+**Root cause:** the just-switched-to instance had no authenticated session yet, so
+DHIS2 answered the context-load GET (`programs/{id}?fields=...`) with a **302
+redirect to `/dhis-web-login/`**. The default `fetch()` follows redirects, so the
+browser chased the 302 into the cross-origin login page — which carries no
+`Access-Control-Allow-Origin` header — and logged a CORS error before our
+try/catch ever saw it. `initializeFromUrl`'s `/api/system/info` probe already
+guarded against this with `redirect: 'manual'`, but the two transport helpers
+(`dhis2Fetch`, `safeDhis2Fetch`) and the two PI/rule validation POSTs did not.
+
+**Fix:** every service-worker-context DHIS2 fetch now uses `redirect: 'manual'`.
+An unauthenticated 302 comes back as an *opaque redirect* (`resp.type ===
+'opaqueredirect'` / `status 0`) that we detect **before** the browser follows it,
+so no cross-origin login page is ever fetched and no CORS error is logged.
+Instead the call resolves cleanly:
+- `dhis2Fetch` throws `DHIS2_NOT_SIGNED_IN_MSG` (swallowed by `initializeFromUrl`'s
+  context-load `try/catch` → a quiet `console.warn`, not a red CORS error).
+- `safeDhis2Fetch` and the two validation POSTs return
+  `{ _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true }`, an
+  actionable "log in to this server in the tab, then try again" message.
+
+Writes routed through the active tab (`fetchViaTab`) were never affected — they run
+same-origin inside the DHIS2 page. Legitimate DHIS2 metadata GETs return 200
+directly and never 3xx, so `redirect: 'manual'` changes nothing for them.
+
+**Verification:** `npm run verify` — all checks pass. `node --check` clean on both
+edited files.

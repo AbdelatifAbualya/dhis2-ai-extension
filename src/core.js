@@ -1706,11 +1706,28 @@ async function clearConversationState() {
 
 // ── DHIS2 API Helpers ────────────────────────────────────────────────────────
 
+// Sentinel message for "the DHIS2 session on this instance isn't authenticated".
+// Thrown/returned instead of letting the browser follow the 302→/dhis-web-login/
+// into a CORS-blocked resource, which spams the service-worker console. Callers
+// that swallow context-load errors (initializeFromUrl) stay quiet; callers that
+// surface tool errors (safeDhis2Fetch) get a clear, actionable message.
+const DHIS2_NOT_SIGNED_IN_MSG =
+  'Not signed in to this DHIS2 instance. Log in to this server in the browser tab, then try again.';
+
 async function dhis2Fetch(url) {
+  // `redirect: 'manual'` so an unauthenticated 302 → /dhis-web-login/ surfaces as
+  // an opaque redirect we can detect, instead of the browser following it into a
+  // cross-origin login page that has no CORS headers (which logs a noisy
+  // "blocked by CORS policy" error). Happens right after switching instances
+  // when the session on the new server hasn't been established yet.
   const resp = await fetch(url, {
     credentials: 'include',
     headers: { Accept: 'application/json' },
+    redirect: 'manual',
   });
+  if (resp.type === 'opaqueredirect' || resp.status === 0) {
+    throw new Error(DHIS2_NOT_SIGNED_IN_MSG);
+  }
   if (!resp.ok) throw new Error(`DHIS2 ${resp.status}: ${resp.statusText}`);
   return resp.json();
 }
@@ -2340,10 +2357,18 @@ async function safeDhis2Fetch(path, options = {}) {
         method,
         credentials: 'include',
         headers,
+        // Catch an unauthenticated 302 → /dhis-web-login/ as an opaque redirect
+        // rather than following it into a CORS-blocked login page (noisy console
+        // error). Common right after switching to an instance you're not logged
+        // into. Turned into a clean auth error below.
+        redirect: 'manual',
       };
       if (bodyStr) fetchOpts.body = bodyStr;
 
       const resp = await fetch(fullUrl, fetchOpts);
+      if (resp.type === 'opaqueredirect' || resp.status === 0) {
+        return { _error: DHIS2_NOT_SIGNED_IN_MSG, _url: fullUrl, _status: 401, _not_signed_in: true };
+      }
       const text = await resp.text().catch(() => '');
       rawResp = { ok: resp.ok, status: resp.status, statusText: resp.statusText, text };
 
@@ -2391,7 +2416,7 @@ async function safeDhis2Fetch(path, options = {}) {
           try {
             let retryResp = await fetchViaTab(metaDeleteUrl, 'POST', postHeaders, deleteBody);
             if (!retryResp) {
-              const r = await fetch(metaDeleteUrl, { method: 'POST', credentials: 'include', headers: postHeaders, body: deleteBody });
+              const r = await fetch(metaDeleteUrl, { method: 'POST', credentials: 'include', headers: postHeaders, body: deleteBody, redirect: 'manual' });
               retryResp = { ok: r.ok, status: r.status, text: await r.text().catch(() => '') };
             }
             if (retryResp.text && retryResp.text.trim()) {

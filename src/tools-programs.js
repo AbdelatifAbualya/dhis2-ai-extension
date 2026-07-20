@@ -4915,7 +4915,11 @@ async function validateProgramRuleCondition(condition, programId) {
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: condition || '',
+      redirect: 'manual',
     });
+    if (resp.type === 'opaqueredirect' || resp.status === 0) {
+      return { _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true };
+    }
     const bodyText = await resp.text().catch(() => '');
     if (!resp.ok) {
       try {
@@ -7198,7 +7202,11 @@ async function validateProgramIndicatorExpression(kind, text, programId) {
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: text || '',
+      redirect: 'manual',
     });
+    if (resp.type === 'opaqueredirect' || resp.status === 0) {
+      return { _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true };
+    }
     const bodyText = await resp.text().catch(() => '');
     if (!resp.ok) {
       // Some DHIS2 versions return 409/400 with JSON { message }; surface that as the error.
