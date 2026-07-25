@@ -67,7 +67,11 @@ const evt = () => ({ addListener: noop, removeListener: noop, hasListener: () =>
 const store = () => ({ get: () => Promise.resolve({}), set: () => Promise.resolve(), remove: () => Promise.resolve() });
 const chrome = {
   runtime: { id: 'live-harness', onMessage: evt(), onInstalled: evt(), onStartup: evt(),
-             getURL: (p) => p, getPlatformInfo: (cb) => cb && cb({ os: 'linux' }) },
+             getURL: (p) => p, getPlatformInfo: (cb) => cb && cb({ os: 'linux' }),
+             // broadcast() calls this. Tools may emit progress events (e.g. the
+             // analytics-tables wait), and without it executeTool throws here
+             // while working fine in the real worker.
+             sendMessage: () => Promise.resolve() },
   storage: { local: store(), session: store(), onChanged: evt() },
   tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve([]) },
   action: { onClicked: evt() },

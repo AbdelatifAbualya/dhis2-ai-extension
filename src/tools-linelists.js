@@ -235,6 +235,39 @@ async function lineListNormalizeFilter(rawFilter, target, optionCache) {
 
 // ── Dimension spec resolution ────────────────────────────────────────────────
 // Turns one caller column/filter spec into a fully-resolved internal dimension.
+// Normalize a dimension name for near-matching: drop a trailing parenthetical
+// or bracketed qualifier (DHIS2 rename-on-collision adds these), strip
+// punctuation, collapse whitespace. "Final case classification (VPD CBS)" and
+// "Final case classification" both normalize to "final case classification".
+function lineListNormalizeDimName(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\s*[([][^)\]]*[)\]]\s*$/, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+// Candidate dimensions whose name is "the same modulo a qualifier" as the token.
+// Exact-normalized matches win outright; only when there are none do we fall
+// back to prefix matches (and only for tokens long enough to be meaningful, so
+// "date" can never sweep in every date field). Returns [] when nothing matches.
+function lineListNearestDimensions(dimToken, ctx) {
+  const want = lineListNormalizeDimName(dimToken);
+  if (!want) return [];
+  const pool = [
+    ...[...ctx.teas.values()].map(t => ({ kind: 'tea', id: t.id, name: t.name })),
+    ...[...ctx.des.values()].map(d => ({ kind: 'de', id: d.id, name: d.name })),
+    ...[...ctx.pis.values()].map(p => ({ kind: 'pi', id: p.id, name: p.name })),
+  ];
+  const exact = pool.filter(c => lineListNormalizeDimName(c.name) === want);
+  if (exact.length) return exact;
+  if (want.length < 8) return [];
+  return pool.filter(c => {
+    const got = lineListNormalizeDimName(c.name);
+    return got.startsWith(want + ' ') || want.startsWith(got + ' ');
+  });
+}
+
 async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis) {
   const raw = typeof spec === 'string' ? { dimension: spec } : (spec || {});
   const dimToken = String(raw.dimension || raw.id || raw.name || '').trim();
@@ -316,6 +349,27 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
     else if (deId) target = { kind: 'de', ...ctx.des.get(deId) };
     else if (deId === null) return { _error: `Data element name "${dimToken}" is ambiguous in this program (several DEs share it). Pass its UID instead.` };
     else if (piId) target = { kind: 'pi', ...ctx.pis.get(piId) };
+  }
+  // 4b. Near-name fallback. An exact-name lookup is brittle against DHIS2's own
+  // renames: create_program appends a qualifier when a name collides with an
+  // unrelated existing object ("Final case classification" →
+  // "Final case classification (VPD CBS)"), so the name the user and the model
+  // both use no longer matches the stored displayName. Retry with trailing
+  // parenthetical/bracketed qualifiers stripped and on a prefix basis; resolve
+  // only when exactly ONE candidate matches, otherwise report the candidates so
+  // the next call can be exact. Never guesses between ambiguous options.
+  if (!target) {
+    const near = lineListNearestDimensions(dimToken, ctx);
+    if (near.length === 1) {
+      const hit = near[0];
+      console.log(`[LineList] Resolved "${dimToken}" → "${hit.name}" (${hit.kind} ${hit.id}) by near-name match`);
+      target = { kind: hit.kind, ...(hit.kind === 'tea' ? ctx.teas.get(hit.id) : hit.kind === 'de' ? ctx.des.get(hit.id) : ctx.pis.get(hit.id)) };
+    } else if (near.length > 1) {
+      return {
+        _error: `"${dimToken}" matches ${near.length} dimensions of program "${ctx.program.name}": ${near.map(n => `"${n.name}" (${n.kind} ${n.id})`).join(', ')}.`,
+        _hint: 'Pass the exact display name or the UID of the one you want.',
+      };
+    }
   }
   if (!target) {
     const sample = [

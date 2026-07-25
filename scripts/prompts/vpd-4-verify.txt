@@ -1,0 +1,7 @@
+Now run the analytics tables so the new data is queryable, then verify that everything actually renders:
+
+1. Check each of the 5 program indicators returns a value (not an error and not empty).
+2. Check both line lists return rows.
+3. Check each of the three visualizations on the dashboard resolves to real data.
+
+Report a table of what works and what does not. If anything comes back empty or errors, tell me the exact cause.

@@ -1,0 +1,38 @@
+Build a new tracker program called "VPD Case-Based Surveillance" on this instance, modelled on the WHO/DHIS2 vaccine-preventable-disease case surveillance standard package. Create everything in one go.
+
+Enrollment (tracked entity type: person) must capture these attributes:
+- Epid Number (text, unique, searchable)
+- Clinical diagnosis (option set "VPD Clinical Diagnosis": Measles, Rubella, Acute Flaccid Paralysis, Neonatal Tetanus, Meningitis, Yellow Fever) — mandatory
+- Date of birth (date)
+- Age in years (integer)
+- Village or neighbourhood (text)
+
+Stage 1 "Case Investigation" (not repeatable) with these data elements:
+- Date of onset of rash or fever (date)
+- Fever present (yes/no)
+- Rash present (yes/no)
+- Vaccination status (option set "VPD Vaccination Status": Zero doses, One dose, Two or more doses, Unknown)
+- Date of last vaccination (date)
+- Date of case investigation (date)
+- Hospitalised (yes/no)
+- Patient outcome (option set "VPD Patient Outcome": Alive, Died, Unknown)
+
+Stage 2 "Laboratory Result" (repeatable) with these data elements:
+- Specimen ID (text)
+- Specimen type (option set "VPD Specimen Type": Serum, Throat swab, Urine, Stool, Cerebrospinal fluid)
+- Date specimen collected (date)
+- Date specimen received at laboratory (date)
+- IgM result (option set "VPD Lab Result": Positive, Negative, Indeterminate, Pending)
+- PCR result (reuse the same "VPD Lab Result" option set)
+
+Stage 3 "Final Classification" (not repeatable) with these data elements:
+- Final case classification (option set "VPD Final Classification": Laboratory confirmed, Epidemiologically linked, Clinically compatible, Discarded)
+- Date of final classification (date)
+
+And these program rules:
+1. "Hide lab stage for Neonatal Tetanus" — when the clinical diagnosis is Neonatal Tetanus, hide the Laboratory Result stage (neonatal tetanus needs no laboratory testing).
+2. "Warn on late specimen collection" — show a warning on Date specimen collected when the specimen was collected more than 28 days after the date of onset of rash or fever.
+3. "Warn when IgM positive but case discarded" — show a warning on Final case classification when the IgM result is Positive and the final case classification is Discarded.
+4. "Require date of last vaccination when vaccinated" — make Date of last vaccination mandatory when the vaccination status is One dose or Two or more doses.
+
+Assign the program to every organisation unit in the hierarchy and make it publicly readable and writable for data capture.

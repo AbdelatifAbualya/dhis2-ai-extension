@@ -2858,3 +2858,78 @@ directly and never 3xx, so `redirect: 'manual'` changes nothing for them.
 
 **Verification:** `npm run verify` — all checks pass. `node --check` clean on both
 edited files.
+
+---
+
+## Tool-router continuity, write discipline, dead-code removal, and API-shape healing (2026-07-25)
+
+Three user-reported failures, a dead-code sweep, and a long tail of API-shape defects
+found by driving MiniMax-M3 (Fireworks) through a complete DHIS2 build end-to-end.
+Full write-up with root causes, before/after tables and live evidence:
+**`CHANGES_router_and_write_discipline.md`**.
+
+**Files:** `src/core.js`, `src/registry.js`, `src/agent.js`, `src/tools-metadata.js`,
+`src/tools-programs.js`, `src/tools-linelists.js`, `scripts/verify.js`,
+`scripts/live-harness.js`, `scripts/seed-vpd-data.js` (new),
+`scripts/prompts/*.txt` (new), `ARCHITECTURE.md`, `README.md`.
+
+### What changed
+
+1. **Tool router lost the tool on follow-up turns.** `getContextualTools` matched only
+   the CURRENT message, so "now remove it and put it back" dropped the tool used a
+   moment earlier. The model then either called a lookalike tool (`manage_custom_forms`
+   for `manage_custom_translations`) or — worse, reproduced with a provider probe —
+   claimed success with no tool call at all. Fixed with per-conversation sticky tools
+   (`noteToolUsedThisThread` / `getThreadToolNames`) plus **late admission** of any tool
+   the router missed. The one real boundary — destructive tools during read-only
+   save-diagnosis — is preserved and now driven by the shared
+   `WRITE_CAPABLE_TOOL_NAMES` instead of a stale hand-copied list.
+
+2. **Bug reports authorised writes.** A write verb inside an inability clause
+   ("it's not allowing me to **add**", "I can't **add**", "unable to **update**") made
+   `classifyWriteAuthorization` return `broad` — so a symptom report licensed rewriting
+   sharing on 4 stages and 15 attributes on an unverified theory. An inability guard now
+   strips those clauses before looking for a surviving write verb; a complaint that also
+   carries an instruction still authorises. Backed by system-prompt rules 18 (prove the
+   cause before changing anything; never fix-and-see; never test config by writing
+   tracker data) and 19 (verify saved outputs with their own tools).
+
+3. **"Add all OUs + fix sharing" deleted the program from Capture.**
+   `update_program_org_units` accepted an empty `org_unit_ids` (un-assigning every OU)
+   and sent a PARTIAL program object — and DHIS2 `/metadata` defaults to REPLACE, so it
+   silently reset sharing. Now: full `?fields=:owner` round-trip, empty replace refused,
+   new `all_org_units:true`, sharing cascades program → stages (`cascade_to_stages`),
+   `add_stage` inherits the program's sharing, and `update_sharing` reports honestly when
+   the server drops data bits on a `dataShareable:false` class.
+
+4. **Dead code removed (~600 lines).** The orphaned inspect subsystem (`chrome.debugger`
+   was dropped for the Web Store, leaving the consumer half unreachable), the duplicate
+   `line-listing/dhis2_extension_router.js`, and `getDhis2MinorVersion()`. Also fixed a
+   latent UI bug: the save-error diagnostic broadcast `AI_TOOL_RESULT`, which the panel
+   does not handle, leaving its tool card spinning forever.
+
+5. **API-shape healing.** Twelve classes of guaranteed-failed call are now healed or
+   refused before sending — packed/duplicated/`dx:`-prefixed analytics dimensions,
+   singular `analytics/enrollment/`, invented analytics-run endpoints, GET on the
+   POST-only PI description validator, empty-expression 500s, a transient validator 500
+   aborting a whole indicator batch, a healthy analytics run misread as FAILED, and
+   `enrollments` (11 chars) being mistaken for a hallucinated UID. The analytics-run POST
+   now **waits** for the job and returns a definitive status instead of leaving the model
+   to invent a polling loop.
+
+6. **Program-rule and program-indicator correctness.** The option-literal rewrite now
+   scans `A{…}` as well as `#{…}` — an attribute compared to a display name previously
+   saved clean and never fired. And `A{Display Name}` inside a PROGRAM INDICATOR is now
+   rejected: DHIS2's validator returns OK for it, so the indicator saved and only
+   detonated at dashboard render time with HTTP 500 `ctx.uid0 is null`.
+
+7. **Tracker write path** hardened (legacy field renaming, incident-date default, nested
+   events inheriting their entity, empty/duplicate id handling, dangling-entity and
+   unique-attribute pre-checks). Confirmed against the pristine code to be a strict
+   improvement: CREATE went from failing to succeeding, UPDATE behaviour is unchanged.
+   ID minting is CREATE-only so an update can never be retargeted.
+
+**Verification:** `npm run verify` — 199 assertions, all passing. Live acceptance against
+DHIS2 2.42.5.1 driven by MiniMax-M3: program + indicators + dashboard build, analytics
+verification, and the sharing diagnose-then-fix scenario all complete with **0 failed API
+calls**; all 11 analytics outputs independently confirmed to return real data.

@@ -1361,6 +1361,18 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
             type: 'string',
             description: 'Public access string for update_sharing. Format: 8 chars, e.g. "rwrw----" (metadata+data rw), "rw------" (metadata only), "r-r-----" (read-only). Positions 1-2=metadata, 3-4=data.'
           },
+          all_org_units: {
+            type: 'boolean',
+            description: 'For update_program_org_units: assign the program to EVERY organisation unit on the instance. Use this for "add all OUs to this program" — do NOT fetch the hierarchy and pass it yourself, and NEVER pass an empty org_unit_ids array (that would un-assign the program from every OU).'
+          },
+          confirm_remove_all_org_units: {
+            type: 'boolean',
+            description: 'For update_program_org_units: required acknowledgement to replace the org-unit assignment with an EMPTY list (which removes the program from Capture/Tracker everywhere). Only set this when the user explicitly asked to un-assign the program from all org units.'
+          },
+          cascade_to_stages: {
+            type: 'boolean',
+            description: 'For update_sharing on object_type="programs": also apply the same access to every PROGRAM STAGE of that program. Default TRUE — sharing a program always implies sharing its stages, and stage DATA access is what actually allows event capture. Set false only for metadata-visibility-only changes.'
+          },
           user_group_accesses: {
             type: 'array',
             items: {
@@ -2348,6 +2360,19 @@ const TOOL_ROUTER = Object.freeze({
 // first-call manual gate. Read tools (dhis2_query, search_metadata, counts,
 // analytics, architect_metadata, …) and manage_backups (recovery path must be
 // zero-friction) keep their full definitions on the wire.
+// Tools that can MODIFY the server. Used to decide whether manage_backups
+// travels with the selection, and — the safety-critical use — which tools the
+// read-only save-diagnosis mode withholds. Shared with the agentic loop so a
+// withheld tool can never be late-admitted.
+const WRITE_CAPABLE_TOOL_NAMES = new Set([
+  'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
+  'manage_program_notifications', 'create_metadata', 'manage_datasets',
+  'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
+  'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
+  'manage_dashboards', 'manage_maps', 'manage_line_lists',
+  'manage_custom_translations', 'manage_growth_chart_plugin',
+]);
+
 const MANUAL_TOOLS = new Set([
   'create_metadata',
   'manage_metadata',
@@ -2594,6 +2619,13 @@ When a program/object doesn't appear in an app (Capture, Data Entry, etc.) or a 
 4. Also check \`sharing.userGroups\` — user groups can grant data access even if publicAccess doesn't
 5. OU assignment and sharing must both be correct for users to actually use a program in Capture.
 **Fix:** \`manage_metadata(action=update_sharing, object_type="programs", object_id="<id>", public_access="rwrw----")\` (+ user_group_accesses / user_accesses entries as needed)
+
+**Assigning org units.** \`update_program_org_units\` writes the WHOLE program object back (DHIS2 /metadata replaces, it does not patch), so the tool re-sends every property it read — never hand-build a partial program body for this, or you will silently reset the program's sharing and flags. For "add all OUs" pass \`all_org_units: true\`; to add some without disturbing the rest use \`merge_mode:"add"\`. An empty \`org_unit_ids\` with the default \`merge_mode:"replace"\` un-assigns the program from EVERY org unit and makes it vanish from Capture — the tool refuses that unless you pass \`confirm_remove_all_org_units:true\`.
+
+**A program's stages are shared WITH it.** A programStage carries its OWN sharing, and its DATA bits are what actually gate event capture — so a program shared \`"rwrw----"\` whose stages are still \`"rw------"\` looks correctly shared and still blocks enrollment/event entry. \`update_sharing\` on a program therefore cascades the same access to every stage automatically (\`cascade_to_stages\`, default true), and \`create_program\`/\`add_stage\` give new stages the program's sharing. Never share a program and leave its stages behind, and when data entry is blocked ALWAYS check the stages before looking anywhere else.
+
+**Only Program and ProgramStage are DATA-shareable.** DataElement, TrackedEntityAttribute, OptionSet, ProgramIndicator, Dashboard and Visualization have \`dataShareable:false\` in the DHIS2 schema: the server accepts a \`"rwrw----"\` PUT with HTTP 200 and silently stores \`"rw------"\`. \`update_sharing\` compares what you asked for against what was stored: the METADATA half still applies (so sharing a dashboard publicly works exactly as intended), and the reply carries \`_data_sharing_not_applicable\` explaining that the data bits were dropped because that class has no data sharing. Treat that note as DONE, not as a failure — do NOT retry it and do NOT repeat it across sibling objects. If you are chasing a DATA-access problem, it lives in the program, its stages, the tracked entity type, or the user's org units — never in these classes.
+
 ⚠️ **NEVER** use dhis2_query PUT/PATCH to modify sharing — it fails with 405/500. The DHIS2 sharing API is \`PUT /api/sharing?type={singularType}&id={id}\` — update_sharing handles this correctly.`;
 
 const KB_NOTIFICATIONS_DETAILS = `### DHIS2 schema reality (codified in the tool — don't relearn)
@@ -3044,23 +3076,9 @@ function stubToolContentForHistory(content) {
 // Keeping the tool list small prevents context-window overflow and helps
 // the model make better routing decisions.  Every extra tool is wasted
 // context tokens and an invitation for the LLM to pick the wrong one.
-function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
+function getContextualTools(ctx, userText, browseWeb) {
   const appType = (ctx?.appType || '');
-  const lowerText = String(userText || '').toLowerCase();
-  const inspectText = inspectSnapshot?.enabled
-    ? JSON.stringify({
-        insights: inspectSnapshot.insights,
-        sample: (inspectSnapshot.logs || []).slice(-20).map(l => ({
-          level: l.level,
-          source: l.source,
-          kind: l.kind,
-          text: l.text,
-          url: l.url,
-          status: l.status,
-        })),
-      }).toLowerCase()
-    : '';
-  const combinedText = `${lowerText}\n${inspectText}`;
+  const combinedText = String(userText || '').toLowerCase();
   const wantsProgramChangeHistory =
     /\b(recent changes|what changed|changes made|change history|history of changes|recent modifications|modified in the last|updated in the last|changes in the last)\b/.test(combinedText)
     && /\bprogram|stage|data element|metadata|family health file|this program\b/.test(combinedText);
@@ -3268,9 +3286,6 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     + '|(?:which|what|top)\\s+(?:ous?|org ?units?|districts?|regions?|facilities|facility|provinces?|countries|sites?|health ?facilities)'
     + '|(?:ous?|org ?units?|districts?|regions?|facilities|facility|provinces?|sites?)\\s+(?:with|having|that have|that has)\\s+(?:the most|most|a lot|lots|many|highest|largest))\\b'
   ).test(combinedText);
-  const hasInspectRuleErrors = !!inspectSnapshot?.insights?.rule_errors?.length;
-  const hasInspectNetworkErrors = !!inspectSnapshot?.insights?.network_errors?.length;
-
   // ── Save-failure diagnostic intent ──
   // Triggered by phrasings like "error saving enrollment", "can't save",
   // "failed to save", "409 conflict", or a 409 visible in inspect logs.
@@ -3279,10 +3294,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   // diagnose, but cannot "fix" until the user gives explicit authorization on
   // a later turn. This blocks the failure mode where the model edited program
   // rules in response to a save error that had nothing to do with rules.
-  const hasInspect409 = !!inspectSnapshot?.insights?.network_errors?.some(e => Number(e.status) === 409);
-  const wantsSaveErrorDiagnosis = SAVE_FAILURE_RE.test(combinedText) || hasInspect409;
-  const writeAuthScope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
-  const saveDiagnosisReadOnly = wantsSaveErrorDiagnosis && writeAuthScope === 'read_only';
+  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(userText);
 
   // ── Factual context flags — derived from URL/app state only, no NLU ──
   const hasProgram    = !!ctx?.programId;
@@ -3552,56 +3564,38 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   // manage_backups is included whenever the user mentions backup/restore/undo
   // OR whenever any other write-capable tool is in the selection — that way
   // the model can always tell the user "the backup key is X" after a write.
-  const writeCapableNames = new Set([
-    'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
-    'manage_program_notifications', 'create_metadata', 'manage_datasets',
-    'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
-    'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
-    'manage_dashboards', 'manage_maps', 'manage_line_lists',
-  ]);
   let hasWriteTool = false;
-  for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
+  for (const n of selected) { if (WRITE_CAPABLE_TOOL_NAMES.has(n)) { hasWriteTool = true; break; } }
   if (wantsBackupIntent || hasWriteTool) {
     selected.add('manage_backups');
-  }
-
-  if (inspectSnapshot?.enabled) {
-    selected.add('dhis2_query');
-    selected.add('search_metadata');
-    selected.add('get_program_info');
-    if (hasInspectRuleErrors) {
-      selected.add('manage_program_rules');
-      selected.add('manage_program_indicators');
-    }
-    if (hasInspectNetworkErrors || hasInspectRuleErrors) {
-      selected.add('resolve_option_codes');
-    }
   }
 
   // ── Web browsing ──
   if (browseWeb) selected.add('browse_web');
 
+  // ── Sticky tools: everything this CONVERSATION has already used ──
+  // A follow-up turn ("now remove it and put it back to how it was") names no
+  // feature, so the keyword rules above cannot re-select the tool that did the
+  // work. Keep it available. This is a relevance union only — the read-only
+  // save-diagnosis strip below still removes destructive tools, and every write
+  // still passes requireWriteAuth. browse_web is excluded: it is gated by an
+  // explicit UI toggle, not by intent.
+  for (const n of getThreadToolNames()) {
+    if (n !== 'browse_web') selected.add(n);
+  }
+
   // ── Save-failure diagnostic mode: strip destructive tools until the user
   //    explicitly authorizes a fix on a future turn. Read-only tools stay so
   //    the model can fully investigate. ──
   if (saveDiagnosisReadOnly) {
-    selected.delete('manage_program_rules');
-    selected.delete('manage_program_indicators');
-    selected.delete('manage_metadata');
-    selected.delete('manage_program_notifications');
-    selected.delete('create_metadata');
-    selected.delete('manage_datasets');
-    selected.delete('manage_custom_forms');
-    selected.delete('manage_validation_rules');
-    selected.delete('manage_org_units');
-    selected.delete('manage_indicators');
-    selected.delete('manage_option_sets');
-    selected.delete('manage_legend_sets');
-    selected.delete('manage_dashboards');
-    selected.delete('manage_maps');
-    selected.delete('manage_line_lists');
-    // Keep architect_metadata (read-only research) and manage_backups (list/get
-    // are read-only — the executor itself gates restore/delete/purge_old).
+    // Strip from the shared WRITE_CAPABLE_TOOL_NAMES set, never a hand-copied
+    // list: a duplicated list silently goes stale the moment a write tool is
+    // added (manage_custom_translations and manage_growth_chart_plugin were
+    // both missing from the old copy, so they survived the strip).
+    for (const n of WRITE_CAPABLE_TOOL_NAMES) selected.delete(n);
+    // Kept on purpose: architect_metadata (read-only research) and
+    // manage_backups (list/get are read-only — its executor gates
+    // restore/delete/purge_old behind write authorization itself).
   }
 
   return TOOLS.filter(t => selected.has(t.function.name));
@@ -3609,14 +3603,13 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
 
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false, inspectSnapshot = null) {
+async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false) {
   const ctx = dhis2.pageContext || {};
   const ou = dhis2.ouContext;
   const prog = dhis2.programMetadata;
 
   // Intent detection — used to conditionally include sections
-  const inspectIntentText = inspectSnapshot?.enabled ? JSON.stringify(inspectSnapshot.insights || {}).toLowerCase() : '';
-  const text = `${(userText || '').toLowerCase()}\n${inspectIntentText}`;
+  const text = (userText || '').toLowerCase();
   const isCreating  = /\b(create|build|design|new program|set up a program|make a program)\b/.test(text)
     || /\badd\b.{0,50}\b(data elements?|fields?|stages?|rules?|option sets?)\b/.test(text)
     || /\b(add|assign)\b.{1,80}\bto\b.{1,50}\bstage\b/.test(text);
@@ -3782,6 +3775,9 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 14.2. Never claim a tracker create/update/delete succeeded unless the tool result shows no validation errors and stats.created/stats.updated/stats.deleted is greater than 0.
 15. For sharing/access issues (program not appearing, "can't see", no data access): check the access field first, then use manage_metadata(action=update_sharing) to fix. NEVER use dhis2_query PUT/PATCH for sharing — it will fail.
 16. Two-tier tool docs: authoring/write tools carry a short routing description; their FULL usage manual is delivered automatically as the result of your FIRST call to them each turn (that first call does not execute — it is not an error). When you receive a manual, read it, then immediately re-issue the corrected tool call. Never tell the user about manuals or this mechanism.
+19. VERIFY SAVED OUTPUTS WITH THEIR OWN TOOLS, NOT HAND-WRITTEN ANALYTICS URLS. To check that a saved line list returns rows use manage_line_lists(action="validate", …); for a saved visualization use get_visualization_details(include_analytics_preview=true); for a program indicator use manage_program_indicators(action="get"/"audit") or read the values through an existing visualization. Hand-assembling /api/analytics URLs is the single biggest source of 409s: \`;\` separates ITEMS INSIDE one dimension while separate dimensions each need their own \`dimension=\` parameter, \`dx:\` exists only on the aggregate /analytics endpoint (the event/enrollment endpoints take a bare UID), and every query needs a data dimension, a period and an org unit. If you must query analytics directly, send ONE \`dimension=\` per dimension and always include dx, pe and ou.
+18. HARD RULE — PROVE THE CAUSE BEFORE YOU CHANGE ANYTHING. When the user reports that something is broken ("it won't let me enrol", "none of the stages appear"), you are DIAGNOSING, not repairing. A plausible-looking difference is a hypothesis, not a cause. Before ANY write you must be able to state: the symptom, the specific object and field you believe causes it, the tool result that PROVES that field is wrong, and why changing it fixes the symptom. If you cannot, keep reading — or tell the user what you found and ask. Specifically: (a) NEVER fix-and-see; (b) NEVER apply the same speculative change across a whole class of objects (all attributes, all stages, all elements) — verify ONE, confirm the symptom is gone, then extend; (c) if a write reports that nothing actually changed, treat that as disproof of your hypothesis and STOP, do not repeat it on sibling objects; (d) NEVER create, update or delete tracker DATA (enrollments, events, tracked entities) to "test" a configuration — that writes real patient records; verify with reads and tell the user to try the action instead. Changing things you have not proven wrong destroys the user's configuration and hides the real fault.
+17. HARD RULE — SEQUENCE DEPENDENT CALLS. Every tool call you put in ONE message runs against the state that existed BEFORE any of them ran, and you get all their results together afterwards. So a call may NEVER use a value that another call in the SAME message produces. If step B needs an ID that step A creates (e.g. add a line list / visualization / map to a dashboard, attach a legend set to an indicator you are creating), issue A ALONE, read the real UID from its result, then issue B in the NEXT step. NEVER bridge the gap with a placeholder like "__LINE_LIST_ID__", "<viz_id>" or "YOUR_ID_HERE" — such calls are refused before execution. Independent calls (nothing in common) may still be sent together.
 `;
 
   // ── Tracker Write Protocol — only when user wants to create/update/complete tracker data ──
@@ -3892,49 +3888,12 @@ Use importStrategy=CREATE_AND_UPDATE to create new records AND update existing o
 `;
   }
 
-  if (inspectSnapshot?.enabled) {
-    p += `
-## Inspect Mode
-Inspect mode is ENABLED. The user turned on page inspection before asking this question. You have captured browser console, runtime exception, and network error logs for the current active tab only.
-- Treat the [Inspect Logs] block in the user message as first-class diagnostic evidence.
-- First classify each important error: network/API status, JavaScript/runtime exception, DHIS2 program rule/program indicator expression error, permission/session issue, or harmless warning.
-- For DHIS2 program rule errors, the rule ID in the logs is a HYPOTHESIS, not a verified target. First call manage_program_rules(action="get", rule_id=...) — if it returns 404, the ID is stale or from a prior context. STOP and DO NOT proceed with any "fix"; do not invent "stale cache" explanations (DHIS2 has no such cache). Instead, call manage_program_rules(action=list, program_id=Current Program ID) to see the actual current rules, or ask the user which rule.
-- For DHIS2 program indicator expression errors, use manage_program_indicators(action="get" or action="audit") instead of guessing — and apply the same 404-means-stop rule.
-- If a log contains "Failed to coerce value 'null' to Boolean", explain that the condition is evaluating a null/empty value as a Boolean. Recommend wrapping that comparison in d2:hasValue(...) or rewriting the OR group so every nullable value is guarded.
-- If a log contains "Unknown function or constant", explain that the expression uses a function not supported by this DHIS2 expression engine/version or not valid in that expression type. Fetch the rule/indicator metadata before proposing an exact replacement.
-- For 404/409/500 API logs, inspect the endpoint, UID, program, TEI, enrollment, stage, and current context. Use dhis2_query only for safe GET context checks unless the user explicitly asks you to fix metadata.
-- Do not hide browser error details. Summarize the practical meaning and the next concrete fix steps.
-
-### Diagnose BEFORE destroying metadata
-- **Default to read-only.** Inspect mode gives you browser logs — those are symptoms, not proof of a specific metadata defect. Start by *explaining what the logs mean* and listing candidate causes, then ask the user before deleting or PATCH-ing anything.
-- **Benign patterns — DO NOT "fix":**
-  - \`staticContent/logo_banner\` 404 — DHIS2 returns 404 when no custom logo is uploaded; the app falls back to the default logo. This is not a bug. Never POST to staticContent (it's multipart-only and will return 500).
-  - \`dataStore/capture/*\` or \`dataStore/settings/*\` 404 — those keys are app-owned and get created lazily on first use; do NOT write defaults yourself.
-  - Vendor-prefix CSS rejections (\`-moz-\`, \`-ms-\`, \`-webkit-\`) in StyleSheet warnings — browser cosmetic, unrelated to app load.
-  - Favicon / manifest / service-worker 404s — cosmetic, not a cause of app failure.
-  - Mixed-content or extension-CSP warnings from the side panel or other extensions.
-- **Never bulk-delete from Inspect conclusions.** "Orphan program rule variables" reported by audit are a *code-quality* finding, not a guaranteed cause of Capture load failure. Deleting them without confirmation removes authoring work and is rarely the right fix. If you believe deletion is necessary, list the exact IDs you propose to delete and ask "do you want me to delete these N items?" — wait for explicit "yes" before any DELETE / importStrategy=DELETE call.
-- **Escalate to the user, not the DELETE endpoint.** If the Inspect logs show only harmless 404s / CSS warnings and no JS exception with a clear stack, say so: "The logs do not show a metadata defect. The app-load failure is likely <hypothesis>. Want me to gather more details (network waterfall, DHIS2 server logs, permissions) before making changes?"
-- Prefer \`manage_metadata(action=delete, ...)\` or \`manage_program_rules(action=delete, rule_id=...)\` for single-object deletes (they check references first) — not raw \`dhis2_query\` with \`importStrategy=DELETE\`. Bulk delete via dhis2_query now requires \`confirm_bulk_delete:true\` AND is still a last resort.
-
-### Verify before modify (mandatory)
-- Before ANY destructive call (update/delete/bulk_fix on rules, indicators, metadata), the chatbot's tool layer auto-verifies the target ID via GET. **A 404 from that lookup is a STOP — do not proceed, do not invent a "stale cached rule" explanation, do not retry with a different action that performs the same write.**
-- Inspect logs may carry rule IDs from previous app loads or unrelated programs. The DHIS2 rule engine evaluates against the live database; **there is no "stale rule cache"** that returns ghost objects. If a rule ID is in the logs but the live API says 404, the ID is wrong (or already deleted) — full stop.
-- After 2 consecutive 404s on destructive lookups in this turn, ALL further write attempts are hard-blocked. If you hit this, summarize the 404 history to the user and ask which ACTUAL current object should be acted on.
-
-### NEVER recommend cache-clearing as a DHIS2 fix
-- ❌ Do NOT recommend "Hard refresh", "Ctrl+Shift+R", "Cmd+Shift+R", "clear browser cache", "incognito mode", "App Management → resource cache", or "clear DHIS2 cache".
-- DHIS2 server-side errors (404/409/500 from /api/...) have nothing to do with browser cache. Recommending cache-clearing for these is hallucination and wastes the user's time. The only legitimate use of "hard refresh" is when the *Capture/Tracker app bundle itself* fails to load due to a stale service-worker — and even then, ask the user before recommending it.
-`;
-  }
-
   // ── Save / Load failure diagnosis (enrollment, event, TEI, dataset) ──
   // Triggered when the user reports a save/load failure or when inspect logs
   // show a 409 from the tracker API. This is the canonical KB the model must
   // consult BEFORE forming any hypothesis. It blocks the failure mode where
   // "error saving enrollment" was misdiagnosed as a program-rule issue.
-  const saveFailureMode = SAVE_FAILURE_RE.test(text)
-    || (inspectSnapshot?.enabled && /\b409\b|enroll/i.test(JSON.stringify(inspectSnapshot.insights || {})));
+  const saveFailureMode = SAVE_FAILURE_RE.test(text);
   if (saveFailureMode) {
     p += `
 ## Save / Load failure diagnosis — investigate AUTOMATICALLY
@@ -4399,7 +4358,6 @@ For "can't see / not appearing / no access" issues: (1) for programs in Capture/
   if (hasVizCtx)  p += `| Explain this chart/table | get_visualization_details |\n`;
   if (hasMapCtx)  p += `| Explain this map | get_map_details |\n`;
   if (browseWeb)  p += `| External / web search | browse_web |\n`;
-  if (inspectSnapshot?.enabled) p += `| Explain captured page errors | inspect logs + DHIS2 tools |\n`;
   if (wantsChart) p += `| Render a chart | render_chart |\n`;
   if (isCreating) p += `| Create program (ONE call, all components) | create_metadata(action=create_program) |\n| Design/verify metadata | architect_metadata |\n`;
   if (isCreating || wantsSharingAccess) p += `| Update program OU assignment | manage_metadata(action=update_program_org_units) |\n`;
@@ -4498,7 +4456,7 @@ The user's image has been analyzed; the description is under [Attached Image Ana
 - Routed block IDs: ${llBlockIds.join(', ')}
 - Use ONLY these blocks for Line Listing UI guidance in this turn.
 - Primary source: ${LINE_LISTING_JSON_PATH}
-- Extra references loaded: ${LINE_LISTING_SYSTEM_PROMPT_PATH}, ${LINE_LISTING_ROUTER_PATH}
+- Extra references loaded: ${LINE_LISTING_SYSTEM_PROMPT_PATH}
 
 ### Line Listing Guidance Rules
 ${compactRules.map(r => `- ${r}`).join('\n')}

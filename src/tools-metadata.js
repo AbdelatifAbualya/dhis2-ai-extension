@@ -3,6 +3,13 @@
 // Program-bound write actions covered by the named-program substitution guard
 // (core.js). Only actions that take an explicit program UID and CREATE/MODIFY
 // content on that program are listed — reads and non-program writes pass free.
+// Analytics-table generation is asynchronous. dhis2_query awaits it (see the
+// resourceTables/analytics branch) so the model gets one definitive answer
+// instead of inventing a polling loop. The cap keeps a very large instance from
+// blocking the whole turn — past it we report "still running, do not poll".
+const ANALYTICS_JOB_MAX_WAIT_MS = 180_000;
+const ANALYTICS_JOB_POLL_MS = 5_000;
+
 const PROGRAM_BOUND_WRITE_ACTIONS = {
   manage_line_lists: ['create', 'update'],
   manage_program_rules: ['create', 'update', 'bulk_fix_conditions'],
@@ -61,8 +68,17 @@ async function executeTool(name, args) {
     // write authorization the same way as the dedicated manage_* tools, so the
     // model cannot route around the gates by sending a raw API call.
     if (method !== 'GET') {
-      const _gate = requireWriteAuth('dhis2_query', method, { path: args.path });
-      if (_gate) return _gate;
+      // Running the analytics/resource tables is MAINTENANCE, not a write: it
+      // creates no metadata and changes no user data, it only rebuilds derived
+      // tables from what already exists. Gating it behind write authorization
+      // blocked the routine "run analytics so the dashboard populates" step on
+      // an otherwise read-only turn, with nothing destructive at stake.
+      const _isAnalyticsRun = /^(?:resourceTables(?:\/analytics)?|jobConfigurations\/analytics|maintenance\/analyticsTables?)(\b|\?|$)/i
+        .test(String(args.path || '').replace(/^\//, '').replace(/^api\/\d+\//, ''));
+      if (!_isAnalyticsRun) {
+        const _gate = requireWriteAuth('dhis2_query', method, { path: args.path });
+        if (_gate) return _gate;
+      }
     }
     const opts = {};
     if (method !== 'GET') opts.method = method;
@@ -149,6 +165,126 @@ async function executeTool(name, args) {
           opts._backup_block = bulkBackup.block;
         }
       }
+    }
+
+    // ── PI expression/filter validator: heal GET → the POST it must be ──
+    // /programIndicators/{expression|filter}/description is POST-only with the
+    // expression as a text/plain BODY. A GET (the intuitive shape, and what the
+    // model reaches for) returns HTTP 405 — three of them in a row tripped the
+    // HTTP-error breaker and killed a working turn (live 2026-07-25). The
+    // intent is unambiguous, so run the correct request instead of failing.
+    if (/^programIndicators\/(expression|filter)\/description(\b|\?|$)/.test(safePath)) {
+      const kind = /^programIndicators\/filter\//.test(safePath) ? 'filter' : 'expression';
+      const qs = new URLSearchParams((safePath.split('?')[1] || ''));
+      // The expression may arrive as a query param (the GET shape) or as the body.
+      const expr = (typeof args.body === 'string' ? args.body : null)
+        || qs.get('expression') || qs.get('filter')
+        || (args.body && typeof args.body === 'object' ? String(args.body.expression || args.body.filter || '') : '');
+      const pid = qs.get('programId') || args.program_id || ctx.programId || dhis2.programMetadata?.id || '';
+      if (!expr) {
+        return {
+          _error: 'The program-indicator description endpoint needs the expression itself. Nothing was sent.',
+          _hint: 'Prefer manage_program_indicators(action="create", dry_run=true) — it validates expression AND filter against the program and explains any rejection. If you call this endpoint directly, put the expression in "body".',
+        };
+      }
+      const out = await validateProgramIndicatorExpression(kind, expr, pid);
+      return {
+        ...out,
+        _validated: { kind, expression: expr, program_id: pid || null },
+        _hint: out && out._error
+          ? `The ${kind} was REJECTED. Fix it against the supported PI grammar before saving; do not retry the same text.`
+          : `The ${kind} is valid. Note: this endpoint is POST-only — a GET returns HTTP 405, so use manage_program_indicators(dry_run=true) rather than hand-calling it.`,
+      };
+    }
+
+    // ── Analytics-tables run: ONE call that waits for the job to finish ──
+    // Analytics generation is asynchronous, and every analytics-dependent step
+    // of a build (line lists, dashboards, PI values) is blocked until it ends —
+    // so the model has to know when that is. With a bare fire-and-forget POST it
+    // improvised a polling loop over jobConfigurations/{taskId} (live
+    // 2026-07-25), which made no progress, tripped the no-progress guard twice
+    // and got dhis2_query disabled mid-task. Awaiting the job here turns that
+    // whole failure mode into a single definitive answer.
+    // `resourceTables/analytics` is the ONLY endpoint that starts this job.
+    // jobConfigurations/analytics is the intuitive guess and returns 405
+    // (verified 2.42.5.1, 2026-07-25), so accept it and route to the real one —
+    // query params such as ?lastYears=5 are preserved.
+    // POST /api/resourceTables/analytics is the ONLY endpoint that starts an
+    // analytics run. Models invent endless variants — jobConfigurations/analytics,
+    // maintenance/analyticsTables, resourceTables/analyticsProgramDataElementGroupJob,
+    // maintenance/analyticsTablesProgramDataIndex — every one a 404 (all observed
+    // live 2026-07-25). Enumerating spellings is a losing game, so treat ANY POST
+    // whose path mentions "analytic" and is not a genuine analytics WRITE
+    // endpoint as a mis-spelling of the real one.
+    const analyticsRunMatch =
+      /^(?:resourceTables|jobConfigurations)\/analytics/i.test(safePath)
+      || /^maintenance\/analytic/i.test(safePath)
+      || (/analytic/i.test(safePath.split('?')[0]) && !/^analytics(\/|\?|$)/i.test(safePath));
+    if (method === 'POST' && analyticsRunMatch) {
+      // Keep only the parameters the real endpoint understands (lastYears,
+      // skipResourceTables, skipOutliers); everything else was invented for a
+      // fictional endpoint and would be ignored or rejected.
+      const keepParams = new URLSearchParams();
+      for (const [k, v] of new URLSearchParams(safePath.split('?')[1] || '')) {
+        if (/^(lastYears|skipResourceTables|skipOutliers|skipTableTypes|skipPrograms)$/i.test(k)) keepParams.append(k, v);
+      }
+      const qs = keepParams.toString();
+      const analyticsPath = `resourceTables/analytics${qs ? `?${qs}` : ''}`;
+      if (analyticsPath !== safePath) {
+        console.log(`[dhis2_query] Healed analytics-run endpoint ${safePath} → ${analyticsPath}`);
+      }
+      const started = await safeDhis2Fetch(analyticsPath, { method: 'POST' });
+      if (started?._error) return started;
+      const jobId = started?.response?.id || null;
+      if (!jobId) {
+        return { ...started, _hint: 'Analytics generation was started but the server returned no job id, so it could not be awaited. Do NOT poll for status — continue with the rest of the task and tell the user analytics is running.' };
+      }
+      const t0 = Date.now();
+      let status = 'RUNNING';
+      let message = null;
+      let failed = null;
+      // Bounded wait. Small instances finish in well under a minute; a big one
+      // can run for many minutes, and blocking the whole turn on it is worse
+      // than reporting "still running", so we cap the wait and hand back a
+      // definitive do-not-poll instruction either way.
+      while (Date.now() - t0 < ANALYTICS_JOB_MAX_WAIT_MS) {
+        await new Promise(r => setTimeout(r, ANALYTICS_JOB_POLL_MS));
+        const notes = await safeDhis2Fetch(`system/tasks/ANALYTICS_TABLE/${jobId}`);
+        if (notes?._error) break;                       // transport problem — stop waiting, report RUNNING
+        if (!Array.isArray(notes) || !notes.length) continue; // queued, not started yet
+        // `completed` is checked FIRST and wins. DHIS2 emits ERROR-level
+        // notifications for non-fatal conditions during a perfectly successful
+        // run (e.g. "skipped stage. 0 successful and 1 failed items"), so
+        // treating any ERROR entry as fatal reported a healthy analytics run as
+        // FAILED and sent the model hunting for a job-status endpoint that does
+        // not exist — three 404/400s (live 2026-07-25).
+        const done = notes.find(n => n && n.completed === true);
+        if (done) { status = 'COMPLETED'; message = done.message || null; break; }
+        // Only a HARD failure ends the wait: the run says so explicitly.
+        const err = notes.find(n => n && String(n.level).toUpperCase() === 'ERROR'
+          && /process failed|aborted|could not|exception|fatal/i.test(String(n.message || '')));
+        if (err) { failed = err.message || 'Analytics generation reported an error.'; break; }
+        broadcast({ type: 'AI_THINKING', iteration: 0, label: `Generating analytics tables… (${Math.round((Date.now() - t0) / 1000)}s)` });
+      }
+      const waited = Math.round((Date.now() - t0) / 1000);
+      if (failed) {
+        return {
+          _error: `Analytics table generation FAILED after ${waited}s: ${failed}`,
+          _hint: 'Analytics data will not be available. Report this to the user; do not retry blindly — the same job will fail the same way. The rest of the metadata you created is unaffected.',
+          job_id: jobId, status: 'FAILED', waited_seconds: waited,
+        };
+      }
+      return {
+        success: true,
+        job_id: jobId,
+        status,
+        message: message || started?.message || null,
+        waited_seconds: waited,
+        _apiPath: `/api/${dhis2.apiVersion}/resourceTables/analytics`,
+        _hint: status === 'COMPLETED'
+          ? `Analytics tables finished in ${waited}s and this call already waited for them — analytics queries for the new metadata now work. Do NOT check the job status again; move on to the next step.`
+          : `Analytics generation is STILL RUNNING after ${waited}s (large instances take several minutes). This call already waited — do NOT poll the job status, and do NOT call resourceTables/analytics again; repeated status checks make no progress and will be blocked. Continue with the remaining steps (definitions save fine without analytics) and tell the user that data values will appear once the run completes.`,
+      };
     }
 
     const trackerWriteResult = await executeTrackerWrite(safePath, method, args.body, ctx);
@@ -396,6 +532,32 @@ async function executeTool(name, args) {
     if (method === 'GET') {
       const invalidProg = await validateAnalyticsProgramId(safePath);
       if (invalidProg) return invalidProg;
+      // `dimension=dx:<uid>` on an event/enrollment analytics endpoint is a
+      // guaranteed 409 whose message names an internal SQL column. Heal it to
+      // the bare-UID form the endpoint actually takes.
+      // analytics/event|enrollment → the plural resource DHIS2 actually serves.
+      const pluralHeal = healAnalyticsResourcePlural(safePath);
+      if (pluralHeal.healed) {
+        console.log(`[dhis2_query] Healed analytics resource name → ${pluralHeal.path}`);
+        safePath = pluralHeal.path;
+      }
+      // Multiple dimensions packed into one dimension= parameter.
+      const packHeal = healPackedAnalyticsDimensions(safePath);
+      if (packHeal.healed) {
+        console.log(`[dhis2_query] Split packed analytics dimensions → ${packHeal.path}`);
+        safePath = packHeal.path;
+      }
+      const dxHeal = healEventAnalyticsDxDimension(safePath);
+      if (dxHeal.healed) {
+        console.log(`[dhis2_query] Healed dx: dimension for an event/enrollment analytics query → ${dxHeal.path}`);
+        safePath = dxHeal.path;
+      }
+      // Two data items asked for as two dx dimensions → 409. Merge them.
+      const dupHeal = healDuplicateDxDimension(safePath);
+      if (dupHeal.healed) {
+        console.log(`[dhis2_query] Merged repeated dx dimensions → ${dupHeal.path}`);
+        safePath = dupHeal.path;
+      }
     }
 
     // ── Auto-snapshot before any item-level metadata mutation routed through
@@ -1144,7 +1306,6 @@ async function executeTool(name, args) {
       source: {
         json: LINE_LISTING_JSON_PATH,
         system_prompt: LINE_LISTING_SYSTEM_PROMPT_PATH,
-        router: LINE_LISTING_ROUTER_PATH,
       },
       usage: {
         mode: 'route-first',
@@ -3994,13 +4155,6 @@ async function createLegendSet(args) {
 // All shared helpers (generateDhis2Uid, postMetadataPayload, safeDhis2Fetch,
 // requireWriteAuth) are reused with their existing signatures — no shared
 // code's behaviour changes.
-
-// DHIS2 minor version as a number (e.g. 42), or null if unknown. dhis2.apiVersion
-// is set to info.version.split('.')[1] on connect, so it is already the minor.
-function getDhis2MinorVersion() {
-  const v = parseInt(dhis2.apiVersion, 10);
-  return Number.isFinite(v) ? v : null;
-}
 
 // Locate an existing analytics favorite (chart / pivot) regardless of DHIS2
 // version. 2.34+ unifies them under `visualizations`; older servers split them

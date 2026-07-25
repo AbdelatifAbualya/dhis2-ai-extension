@@ -56,7 +56,7 @@ know a moved declaration has no load-time dependents.
 
 | Module | ~lines | Contents |
 | --- | --- | --- |
-| `src/core.js` | 3.5k | `DEFAULT_PROVIDER_CONFIG` & provider URL helpers; the `dhis2` state object and conversation globals; the **write-authorization** gate (`classifyWriteAuthorization`, `requireWriteAuth`); UID recognition/harvesting; repeated-failure & HTTP circuit breakers; inspect capture; text/URL/UID utils (`lowercaseText`, `normalizeSearchTokens`, `extractContext`…); connection & state persistence; the DHIS2 transport choke point (`safeDhis2Fetch`, `dhis2Fetch`, `fetchViaTab`); backups (`snapshotBeforeWrite`, `restoreFromBackup`); tracker-write & analytics helpers; `initializeFromUrl`; line-listing routing. |
+| `src/core.js` | 3.6k | `DEFAULT_PROVIDER_CONFIG` & provider URL helpers; the `dhis2` state object and conversation globals; the **write-authorization** gate (`classifyWriteAuthorization`, `requireWriteAuth`); UID recognition/harvesting; repeated-failure & HTTP circuit breakers; inspect capture; text/URL/UID utils (`lowercaseText`, `normalizeSearchTokens`, `extractContext`…); connection & state persistence; the DHIS2 transport choke point (`safeDhis2Fetch`, `dhis2Fetch`, `fetchViaTab`); backups (`snapshotBeforeWrite`, `restoreFromBackup`); tracker-write & analytics helpers; `initializeFromUrl`; line-listing routing. |
 | `src/registry.js` | 4.2k | The `TOOLS` schema array (what the model sees); the knowledge-base `KB_*` strings and per-tool manuals; the parallel tool lists (`TOOL_ROUTER`, `MANUAL_TOOLS`, `TOOL_SUMMARIES`, `MANUAL_EXTRAS`); `getContextualTools` (deterministic tool selection) and `buildSystemPrompt`. |
 | `src/providers.js` | 2.0k | LLM streaming for every provider (`callProviderStreaming`, OpenAI-compatible + Anthropic adapters, stall guard); `analyzeImage`; `tavilySearch`; read/analytics tool helpers (recent-changes, enrollment abnormalities); the **patient-data privacy gate** (`pathReadsPatientData`, `enforcePatientDataPrivacyGate`, `PATIENT_DATA_TOOL_NAMES`). |
 | `src/tools-metadata.js` | 6.8k | `executeTool` (the dispatcher) plus the standard-metadata tool implementations: validation rules, org units, indicators, option sets, legend sets, visualizations, maps, dashboards, datasets, backups, generic create-metadata, custom forms. |
@@ -131,10 +131,6 @@ pass prioritised a safe, behaviour-preserving refactor:
   / conversation / per-turn stores with explicit lifetimes.
 - **A single `Dhis2Client`** injected into tools so no handler can bypass the
   transport/backup/privacy pipeline with a raw `fetch`.
-- **De-duplicate the line-listing router** — `line-listing/dhis2_extension_router.js`
-  is a reference artifact; the live routing is `LINE_LISTING_KEYWORD_ROUTES` +
-  `routeLineListingBlocks` in `core.js`. (The dead `routerSource` fetch was
-  already removed.)
 - **Split `sidepanel/panel.js`** (2.6k lines) into controllers with a typed
   message contract.
 - **TypeScript + a bundler** — only worth it if the team wants types; it adds a

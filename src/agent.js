@@ -188,16 +188,16 @@ function summarizeSaveErrorDiagnosis(diag) {
 
 // ── Agentic Loop ─────────────────────────────────────────────────────────────
 
-async function runAgenticLoop(userText, imageBase64, browseWeb = false, inspectMode = false) {
+async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
   acquireKeepalive();
   try {
-    return await _runAgenticLoopInner(userText, imageBase64, browseWeb, inspectMode);
+    return await _runAgenticLoopInner(userText, imageBase64, browseWeb);
   } finally {
     releaseKeepalive();
   }
 }
 
-async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, inspectMode = false) {
+async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   lastUserText = userText || '';
 
   // ── Per-turn write-authorization gate ──
@@ -215,27 +215,27 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   dhis2.executedCallSigs = new Map(); // no-progress guard: identical EXECUTED calls this turn
   dhis2.consecutiveDiscoveryCalls = 0; // no-progress guard: read-only calls since the last write
   dhis2.corruptedCallCount = 0; // truncated/corrupted tool-call arguments seen this turn
+  dhis2.placeholderBlocks = new Map(); // per-tool count of unresolved-placeholder refusals this turn
   dhis2.missingNamedTargets = []; // named-program substitution guard (core.js) — user-named programs that searches proved absent this turn
   dhis2._namedTargetProgramNames = new Map(); // per-turn programId → displayName cache for that guard
   console.log(`[AgenticLoop] writeAuth = ${dhis2.writeAuth.scope} (${dhis2.writeAuth.reason})`);
 
   const ctx = dhis2.pageContext || {};
-  const inspectSnapshot = inspectMode ? buildInspectSnapshot() : null;
 
   // Seed the known-IDs registry from every verified source available BEFORE
-  // any tool call: user text, page context, inspect logs, already-loaded
-  // program/OU/viz/map metadata. The registry grows as tools return data.
-  seedKnownIds(userText, ctx, inspectSnapshot);
+  // any tool call: user text, page context, already-loaded program/OU/viz/map
+  // metadata. The registry grows as tools return data.
+  seedKnownIds(userText, ctx);
   seedKnownIcons();
   seedRecentCreations();
   console.log(`[AgenticLoop] knownIds seeded with ${dhis2.knownIds.size} UID(s); knownIcons + recentCreations reset`);
-  const routingText = inspectSnapshot?.enabled
-    ? `${userText || ''}\n\n[Inspect diagnostics]\n${JSON.stringify(inspectSnapshot.insights || {})}`
-    : userText;
-
   // ── Dynamic tool selection — send only tools relevant to this request ──
-  const contextualTools = getContextualTools(ctx, routingText, browseWeb, inspectSnapshot);
+  const contextualTools = getContextualTools(ctx, userText, browseWeb);
   const contextualToolNames = new Set(contextualTools.map(t => t.function.name));
+  // The ONE case where an unselected tool must stay unavailable: the user
+  // reported a save failure and has not authorized a fix, so destructive tools
+  // are withheld for the whole turn (see the late-admission branch below).
+  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(userText);
   console.log(`[AgenticLoop] Using ${contextualTools.length}/${TOOLS.length} tools:`,
     [...contextualToolNames].join(', '));
 
@@ -246,7 +246,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   const wireTools = toWireTools(contextualTools);
   const deliveredManuals = new Set();
 
-  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb, inspectSnapshot);
+  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb);
 
   // If image is attached, analyze with a vision model first, then include description
   let userContent;
@@ -271,25 +271,6 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     userContent = browseWeb
       ? `${userText}\n\n[Web Browsing Enabled]\nUse browse_web tool if external/current web info is needed.`
       : userText;
-  }
-
-  if (inspectSnapshot?.enabled) {
-    const inspectBlock =
-      `\n\n[Inspect Logs]\n` +
-      `Captured ${inspectSnapshot.captured} console/runtime/network entries for the active tab since ${inspectSnapshot.startedAt}.\n` +
-      `Active tab URL: ${inspectSnapshot.url || 'unknown'}\n` +
-      `${JSON.stringify({
-        counts: inspectSnapshot.counts,
-        insights: inspectSnapshot.insights,
-        logs: inspectSnapshot.logs,
-      })}`;
-    if (typeof userContent === 'string') {
-      userContent += inspectBlock;
-      historyText += `\n\n[Inspect Logs attached: ${inspectSnapshot.captured} entries]`;
-    } else if (Array.isArray(userContent) && userContent[0]?.type === 'text') {
-      userContent[0].text += inspectBlock;
-      historyText += `\n\n[Inspect Logs attached: ${inspectSnapshot.captured} entries]`;
-    }
   }
 
   if (browseWeb) {
@@ -481,10 +462,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   // any existing enrollments for the TEI in context. Inject the bundle as a
   // system message so the model can identify the likely cause WITHOUT asking
   // the user for the error code — the chatbot has tools, it should use them.
-  const saveDiagText = (userText || '').toLowerCase();
-  const saveDiagInspect = inspectSnapshot?.enabled ? JSON.stringify(inspectSnapshot.insights || {}).toLowerCase() : '';
-  const saveDiagDetected = SAVE_FAILURE_RE.test(saveDiagText + '\n' + saveDiagInspect)
-    || (inspectSnapshot?.enabled && /\b409\b/.test(saveDiagInspect));
+  const saveDiagDetected = SAVE_FAILURE_RE.test((userText || '').toLowerCase());
   if (saveDiagDetected && ctx.programId) {
     broadcast({ type: 'AI_THINKING', iteration: 0, label: 'Diagnosing save error' });
     try {
@@ -499,9 +477,13 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           args: { program_id: ctx.programId, tei_id: ctx.teiId || null },
           summary: summary.headline,
         });
+        // AI_TOOL_DONE (not AI_TOOL_RESULT): the side panel only closes a tool
+        // card on AI_TOOL_DONE, so the old event left this card spinning
+        // "running" for the rest of the turn.
         broadcast({
-          type: 'AI_TOOL_RESULT',
+          type: 'AI_TOOL_DONE',
           tool: 'diagnose_save_error',
+          success: true,
           summary: summary.headline,
           apiPath: `programs/${ctx.programId}?fields=...`,
         });
@@ -716,24 +698,45 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           continue;
         }
 
-        // ── Real tool, but not enabled for this request — answer, do not run ──
-        // The contextual set is sometimes a deliberate safety boundary (e.g. the
-        // read-only save-failure diagnostic mode strips every destructive tool),
-        // so we must NOT execute an unselected tool. Return actionable feedback
-        // instead of silently dropping the call, so the model switches to an
-        // available tool or tells the user — never loops on a vanished call.
+        // ── Real tool the keyword router did not select for this request ──
+        // getContextualTools is a RELEVANCE filter (it keeps the wire schema
+        // small), not a permission system — with exactly one exception: the
+        // read-only save-failure diagnostic mode deliberately withholds every
+        // destructive tool until the user authorizes a fix. So:
+        //   • a withheld WRITE tool in diagnosis mode → refuse, as before;
+        //   • anything else → ADMIT it for the rest of the turn and run it.
+        // Refusing a merely-unselected tool was its own failure mode: the model
+        // knows the right tool (it used it last turn), gets told "not enabled",
+        // and has no legal way to finish the task — so it thrashes through
+        // wrong tools until the circuit breaker ends the turn. The router
+        // guessing wrong must degrade to "one extra round trip", never to
+        // "the task is impossible".
         if (!contextualToolNames.has(toolName)) {
-          console.warn(`[AgenticLoop] Out-of-context tool call: "${toolName}" (not enabled for this request)`);
-          const feedback = {
-            _error: `${toolName} is not enabled for this request and was NOT executed.`,
-            _hint: `Tools available this turn: ${[...contextualToolNames].join(', ')}. Pick the closest available one for the goal — e.g. tracker/enrollment PROGRAM indicators are created with manage_program_indicators, aggregate indicators with manage_indicators — or, if nothing here can do it, tell the user plainly what is missing. Do NOT re-issue ${toolName}; it will keep being refused.`,
-            _scope: 'tool_not_enabled',
-          };
-          broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args });
-          broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: feedback._error, details: { scope: 'tool_not_enabled' } });
-          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
-          lastToolName = toolName;
-          continue;
+          const withheldForSafety = saveDiagnosisReadOnly && WRITE_CAPABLE_TOOL_NAMES.has(toolName);
+          if (withheldForSafety) {
+            console.warn(`[AgenticLoop] Withheld tool call: "${toolName}" (read-only save-diagnosis mode)`);
+            const feedback = {
+              _error: `${toolName} is a destructive tool and is withheld while diagnosing a save failure. It was NOT executed.`,
+              _hint: `The user reported a save/load error and has not authorized any change. Finish the DIAGNOSIS with the read-only tools available this turn (${[...contextualToolNames].join(', ')}), tell the user the cause you found, and ask them to confirm the fix. If they reply "yes" / "fix it" on the next turn, ${toolName} becomes available again.`,
+              _scope: 'tool_withheld_diagnostic_mode',
+            };
+            broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args });
+            broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: feedback._error, details: { scope: 'tool_withheld_diagnostic_mode' } });
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
+            lastToolName = toolName;
+            continue;
+          }
+          const admitted = TOOLS.find(t => t.function.name === toolName);
+          if (admitted) {
+            console.log(`[AgenticLoop] Late-admitting "${toolName}" — the router did not select it, but the model needs it`);
+            contextualToolNames.add(toolName);
+            // Put it on the wire too, so a grammar-constrained decoder can name
+            // it again next iteration instead of snapping to a lookalike.
+            wireTools.push(...toWireTools([admitted]));
+            noteToolUsedThisThread(toolName);
+            // Falls through and executes normally — including the manual gate,
+            // which still delivers the full usage manual before the first run.
+          }
         }
 
         // ── Corrupted / truncated tool-call arguments — resend, do not execute ──
@@ -852,6 +855,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             // Record this dispatch so the no-progress guard can refuse a model
             // that keeps re-issuing the SAME call and getting the same result.
             noteExecutedCall(tc.function.name, args);
+            // Remember the tool for the rest of the CONVERSATION, so a
+            // follow-up turn that names no feature ("now put it back the way it
+            // was") still has it on the wire. See noteToolUsedThisThread.
+            noteToolUsedThisThread(tc.function.name);
             // Discovery-streak guard: count consecutive read-only calls, and
             // reset the moment a WRITE succeeds — a long run of reads with no
             // write is the "research forever, never act" loop.
@@ -1507,7 +1514,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }
           }
         } catch {}
-        return runAgenticLoop(msg.payload.text, msg.payload.imageBase64, !!msg.payload.browseWeb, !!msg.payload.inspect);
+        return runAgenticLoop(msg.payload.text, msg.payload.imageBase64, !!msg.payload.browseWeb);
       })()
         .then(r => {
           // If response was already streamed, only send AI_RESPONSE for non-text cleanup (charts, state reset)

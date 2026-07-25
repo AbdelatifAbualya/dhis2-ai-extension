@@ -2477,7 +2477,13 @@ async function addStageToProgram(args, defaultCatComboId) {
 
   // Get existing program to determine sort order (name is used to disambiguate
   // a globally-colliding stage name, mirroring create_program).
-  const progResp = await safeDhis2Fetch(`programs/${args.program_id}?fields=id,name,shortName,programStages[id,sortOrder]`);
+  // `sharing` is fetched so the new stage can INHERIT the program's access (see
+  // where stageObj is built): a stage created without it silently gets DHIS2's
+  // default rw------ (metadata only, NO data access), which blocks event entry
+  // on that stage while the program itself looks correctly shared. That is the
+  // "I can't add a new enrollment / none of the stages appear" failure reported
+  // live 2026-07-25 — three of four stages had been added with add_stage.
+  const progResp = await safeDhis2Fetch(`programs/${args.program_id}?fields=id,name,shortName,sharing,programStages[id,sortOrder]`);
   if (progResp._error) return { _error: `Could not load program ${args.program_id}: ${progResp._error}` };
   const existingStageCount = progResp?.programStages?.length || 0;
 
@@ -2719,6 +2725,16 @@ async function addStageToProgram(args, defaultCatComboId) {
   };
   if (psSections.length) {
     stageObj.programStageSections = psSections.map(s => ({ id: s.id }));
+  }
+  // Inherit the PROGRAM's sharing. A programStage is data-shareable, and its
+  // data bits are what actually gate event capture — so a stage that does not
+  // carry the program's access is invisible/unusable for data entry even
+  // though the program is shared correctly. Sharing a program always implies
+  // sharing its stages; an explicit `stage.sharing` still wins.
+  const inheritedStageSharing = stage.sharing || progResp.sharing || null;
+  if (inheritedStageSharing && inheritedStageSharing.public) {
+    stageObj.sharing = inheritedStageSharing;
+    stageObj.publicAccess = normalizeAccessString(inheritedStageSharing.public);
   }
 
   const payload = {};
@@ -3284,14 +3300,45 @@ async function executeManageMetadata(args) {
     if (_gate) return _gate;
     const programId = args.program_id || args.object_id;
     if (!programId) return { _error: 'program_id or object_id required for update_program_org_units' };
-    if (!Array.isArray(args.org_unit_ids)) return { _error: 'org_unit_ids array required for update_program_org_units' };
-
     const mergeMode = ['replace', 'add', 'remove'].includes(args.merge_mode) ? args.merge_mode : 'replace';
-    const requestedIds = [...new Set(args.org_unit_ids.filter(Boolean))];
 
-    const progResp = await safeDhis2Fetch(
-      `programs/${programId}?fields=id,displayName,name,shortName,programType,organisationUnits[id,displayName]`
-    );
+    // "assign every org unit on the instance" is the single most common request
+    // here ("add all OUs to this program"). Without a flag for it the model has
+    // to fetch the whole hierarchy and pass it back — and when it guessed an
+    // empty array instead, the replace below wiped the program off every OU
+    // (live 2026-07-25: the program vanished from Capture entirely).
+    let requestedIds;
+    if (args.all_org_units === true) {
+      const allResp = await safeDhis2Fetch('organisationUnits?fields=id&paging=false');
+      if (allResp._error) return { _error: `Could not list organisation units: ${allResp._error}` };
+      requestedIds = (allResp.organisationUnits || []).map(o => o.id).filter(Boolean);
+      if (!requestedIds.length) return { _error: 'No organisation units exist on this instance.' };
+    } else {
+      if (!Array.isArray(args.org_unit_ids)) return { _error: 'org_unit_ids array required for update_program_org_units (or pass all_org_units:true to assign every OU on the instance).' };
+      requestedIds = [...new Set(args.org_unit_ids.filter(Boolean))];
+    }
+
+    // An EMPTY replace un-assigns the program from every org unit, which makes
+    // it disappear from Capture/Tracker completely. That is essentially never
+    // the intent — it is the signature of a model that has not fetched the OU
+    // list yet. Refuse it unless the caller says so explicitly.
+    if (mergeMode === 'replace' && !requestedIds.length && args.confirm_remove_all_org_units !== true) {
+      return {
+        _error: 'Refused: replacing the org-unit assignment with an EMPTY list would un-assign this program from EVERY organisation unit, making it disappear from Capture/Tracker for all users. NOTHING was changed.',
+        _hint: 'To assign every org unit on the instance, call this action with all_org_units:true (no org_unit_ids needed). To assign specific ones, pass their UIDs in org_unit_ids. To ADD without touching existing assignments use merge_mode:"add". If you genuinely intend to un-assign the program from every OU, re-send with confirm_remove_all_org_units:true.',
+        _scope: 'empty_org_unit_replace',
+        _no_disable: true,
+      };
+    }
+
+    // Fetch the COMPLETE object (:owner = every owned property). The payload
+    // below is a whole-object replace — DHIS2 /metadata defaults to
+    // mergeMode=REPLACE — so anything omitted is reset to its default. Sending
+    // only id/name/shortName/programType/organisationUnits silently wiped the
+    // program's SHARING back to "rw------" (and every other unsent property),
+    // which is why "add all OUs" also destroyed the access that had just been
+    // granted (live 2026-07-25).
+    const progResp = await safeDhis2Fetch(`programs/${programId}?fields=:owner`);
     if (progResp._error) return { _error: `Could not fetch program ${programId}: ${progResp._error}` };
 
     const currentOrgUnits = Array.isArray(progResp.organisationUnits) ? progResp.organisationUnits : [];
@@ -3306,15 +3353,16 @@ async function executeManageMetadata(args) {
       nextIds = requestedIds;
     }
 
+    // Whole object back, with ONLY organisationUnits changed — every other
+    // property (sharing, stages, attributes, flags) is preserved verbatim.
     const payload = {
       programs: [{
-        id: progResp.id,
-        name: progResp.name || progResp.displayName || progResp.id,
-        shortName: progResp.shortName || progResp.name || progResp.displayName || progResp.id,
-        programType: progResp.programType,
+        ...progResp,
         organisationUnits: nextIds.map(id => ({ id })),
       }],
     };
+    delete payload.programs[0]._apiPath;
+    delete payload.programs[0]._pagerInfo;
 
     // Skip backup on a pure dry-run (nothing will be committed).
     let backup = { ok: true, block: null, skipped: false };
@@ -3418,10 +3466,27 @@ async function executeManageMetadata(args) {
 
     const previousPublicAccess = obj.publicAccess;
 
-    // Snapshot the object BEFORE we change sharing.
+    // ── Sharing a PROGRAM always implies sharing its STAGES ──
+    // A programStage carries its own sharing, and its DATA bits are what gate
+    // event capture. Updating only the program leaves the stages on whatever
+    // they had (typically the rw------ default), so the program looks shared
+    // while Capture still refuses enrollments/events — the exact confusion
+    // reported live 2026-07-25. Cascade by default; cascade_to_stages:false
+    // opts out for the rare "metadata visibility only" case.
+    const cascadeStages = args.object_type === 'programs' && args.cascade_to_stages !== false;
+    let stageIds = [];
+    if (cascadeStages) {
+      const stResp = await safeDhis2Fetch(`programs/${args.object_id}?fields=programStages[id,name]`);
+      if (!stResp?._error) stageIds = (stResp.programStages || []).map(st => ({ id: st.id, name: st.name }));
+    }
+
+    // Snapshot the object (and every stage we are about to touch) BEFORE the change.
     const backup = await ensureBackupOrBail(
-      { operation: 'update_sharing', tool: 'manage_metadata', action: 'update_sharing', reason: `Sharing update on ${args.object_type}/${args.object_id}` },
-      [{ object_type: args.object_type, object_id: args.object_id, role: 'primary' }],
+      { operation: 'update_sharing', tool: 'manage_metadata', action: 'update_sharing', reason: `Sharing update on ${args.object_type}/${args.object_id}${stageIds.length ? ` (+${stageIds.length} stage(s))` : ''}` },
+      [
+        { object_type: args.object_type, object_id: args.object_id, role: 'primary' },
+        ...stageIds.map(st => ({ object_type: 'programStages', object_id: st.id, role: 'cascade' })),
+      ],
       args
     );
     if (!backup.ok) return backup.error;
@@ -3454,9 +3519,65 @@ async function executeManageMetadata(args) {
     });
     if (putResp._error) return { _error: `Failed to update sharing: ${putResp._error}`, backup: backup.block };
 
-    // 4. Verify the update
+    // 4. Verify the update ACTUALLY took effect
     const verifyResp = await safeDhis2Fetch(`sharing?type=${singularType}&id=${args.object_id}`);
     const verified = verifyResp.object || {};
+    const actualPublic = verified.publicAccess || obj.publicAccess;
+
+    // DHIS2 SILENTLY DOWNGRADES a request it cannot honour: classes whose
+    // schema says dataShareable=false (trackedEntityAttribute, dataElement,
+    // optionSet, programIndicator …) accept a "rwrw----" PUT with HTTP 200 and
+    // store "rw------". Reporting that as success is how the assistant "fixed"
+    // the same 15 attributes twice, believed it had changed something, and kept
+    // hunting a phantom cause (live 2026-07-25). Compare requested vs stored and
+    // say plainly that nothing changed, with the REASON — so the model stops
+    // instead of retrying.
+    let sharingNote = null;
+    if (args.public_access !== undefined) {
+      const requested = normalizeAccessString(args.public_access, previousPublicAccess || 'rw------');
+      if (actualPublic !== requested) {
+        const schemaResp = await safeDhis2Fetch(`schemas/${singularType}?fields=dataShareable,shareable`);
+        const dataShareable = schemaResp && !schemaResp._error ? schemaResp.dataShareable : null;
+        // Did the METADATA half (positions 1-2 — the part that actually controls
+        // visibility) land? If so this is a partial success, not a failure: many
+        // classes (dashboard, visualization, dataElement, TEA, optionSet) are
+        // metadata-only by design, and "share this dashboard publicly" is a
+        // perfectly good request whose data bits are simply not a thing. Erroring
+        // there would break working flows.
+        const metadataApplied = actualPublic.slice(0, 2) === requested.slice(0, 2);
+        const wantedData = requested.slice(2, 4) !== '--';
+        if (metadataApplied && dataShareable === false && wantedData) {
+          sharingNote = `${singularType} is metadata-only in DHIS2 (schema dataShareable=false), so the requested data bits ("${requested.slice(2, 4)}") do not apply and were dropped: stored "${actualPublic}". The metadata access you asked for WAS applied, and this class never needs data access — nothing further to do here. Do NOT retry this, and do NOT repeat it on sibling ${singularType} objects. If you are chasing a DATA-access problem, only Program and ProgramStage carry data sharing — check those, the tracked entity type, and the user's org units.`;
+        } else {
+          return {
+            _error: `Sharing was NOT applied as requested to ${args.object_type}/${args.object_id}: still "${actualPublic}" (requested "${requested}").`,
+            _hint: `The server rejected or downgraded this change and the metadata bits did not land either. Re-read the object's current sharing, check that your access string is valid, and do not assume the change took effect. Do not repeat the identical call.`,
+            _scope: 'sharing_not_applied',
+            object_type: args.object_type,
+            object_id: args.object_id,
+            requested_public_access: requested,
+            actual_public_access: actualPublic,
+            data_shareable: dataShareable,
+            backup: backup.block,
+          };
+        }
+      }
+    }
+
+    // 5. Cascade the same sharing to the program's stages.
+    const stageResults = [];
+    for (const st of stageIds) {
+      const stCur = await safeDhis2Fetch(`sharing?type=programStage&id=${st.id}`);
+      if (stCur?._error || !stCur.object) { stageResults.push({ id: st.id, name: st.name, updated: false, error: stCur?._error || 'no sharing object' }); continue; }
+      const stObj = stCur.object;
+      const stBefore = stObj.publicAccess;
+      if (args.public_access !== undefined) stObj.publicAccess = normalizeAccessString(args.public_access, stBefore || 'rw------');
+      if (Array.isArray(args.user_group_accesses)) stObj.userGroupAccesses = args.user_group_accesses.map(e => ({ ...e, access: normalizeAccessString(e.access, 'rw------') }));
+      if (Array.isArray(args.user_accesses)) stObj.userAccesses = args.user_accesses.map(e => ({ ...e, access: normalizeAccessString(e.access, 'rw------') }));
+      const stPut = await safeDhis2Fetch(`sharing?type=programStage&id=${st.id}`, { method: 'PUT', body: { object: stObj } });
+      if (stPut?._error) { stageResults.push({ id: st.id, name: st.name, updated: false, error: stPut._error }); continue; }
+      stageResults.push({ id: st.id, name: st.name, updated: true, previous_public_access: stBefore, new_public_access: stObj.publicAccess });
+    }
 
     return {
       success: true,
@@ -3465,9 +3586,14 @@ async function executeManageMetadata(args) {
       object_id: args.object_id,
       object_name: obj.displayName || obj.name || args.object_id,
       previous_public_access: previousPublicAccess,
-      new_public_access: verified.publicAccess || obj.publicAccess,
+      new_public_access: actualPublic,
       user_group_accesses: (verified.userGroupAccesses || obj.userGroupAccesses || []).length,
       user_accesses: (verified.userAccesses || obj.userAccesses || []).length,
+      ...(sharingNote ? { _data_sharing_not_applicable: sharingNote } : {}),
+      ...(stageIds.length ? {
+        stages_cascaded: stageResults,
+        _cascade_note: `Sharing a program implies sharing its stages: the same access was applied to ${stageResults.filter(r => r.updated).length}/${stageIds.length} program stage(s). Stage DATA access is what allows event capture, so this is required for the program to be usable — not an extra.`,
+      } : {}),
       _access_key: 'Positions 1-2=metadata(rw), 3-4=data(rw). "rwrw----"=full, "rw------"=metadata only, "r-r-----"=read-only.',
       backup: backup.block,
     };
@@ -6067,22 +6193,30 @@ function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKe
 
   for (const rule of (rules || [])) {
     let cond = String(rule.condition || '');
-    const usedVars = new Set((cond.match(/#\{([^}]+)\}/g) || []).map(m => m.slice(2, -1)));
-    for (const vRaw of usedVars) {
+    // BOTH sigils. A TEA-sourced program-rule variable is referenced as
+    // A{name} (the DHIS2 convention — see the demo DB's own rules); #{name} is
+    // the data-element form. Scanning only #{} meant every option comparison on
+    // an ATTRIBUTE skipped the rewrite, saved with a display-name literal, and
+    // never fired — silently (live 2026-07-25:
+    // A{clinical_diagnosis} == 'Neonatal Tetanus' instead of 'NEONATAL_TETANUS').
+    const usedVars = new Map(); // name → sigil ('#' | 'A')
+    for (const m of cond.matchAll(/([#A])\{([^}]+)\}/g)) usedVars.set(m[2], m[1]);
+    for (const [vRaw, sigil] of usedVars) {
       const osKey = varToOsKey.get(vRaw.toLowerCase());
       if (!osKey) continue;
       const os = lookup(osKey);
       if (!os) continue;
-      const varToken = `#{${vRaw}}`;
+      const varToken = `${sigil}{${vRaw}}`;
       const esc = vRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*#\\{${esc}\\}`, 'g');
+      const tok = `${sigil === '#' ? '#' : 'A'}\\{${esc}\\}`;
+      const re = new RegExp(`${tok}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*${tok}`, 'g');
       cond = cond.replace(re, (full, op1, lit1, lit2, op2) => {
         const lit = (lit1 !== undefined ? lit1 : lit2);
         const op = op1 || op2;
         if (lit === '') return full;         // empty-value check — leave alone
         const r = resolve(os, lit);
         if (!r) {
-          advisories.push(`Rule "${rule.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of its option set (codes: ${os.codes}). This comparison will never match — verify the value.`);
+          advisories.push(`Rule "${rule.name}": ${varToken} is compared to '${lit}', which is neither a code nor a name of its option set (codes: ${os.codes}). This comparison will never match — verify the value.`);
           deadLiterals.push({ rule: rule.name, variable: vRaw, literal: lit, valid_codes: os.codes });
           return full;
         }
@@ -6152,6 +6286,32 @@ const PI_D2_FUNCS_PARSER_REJECTS = new Set([
 function lintProgramIndicatorExpression(text, kind) {
   if (!text || typeof text !== 'string') return null;
   const t = text;
+
+  // ── A{…} / #{…} must contain UIDs, never display names ──
+  // Program RULES resolve A{name} against a rule-variable name; program
+  // INDICATORS do not — they need A{teaUid} and #{stageUid.deUid}. DHIS2's own
+  // /description validator ACCEPTS a display name here and returns status OK,
+  // so the indicator saves clean and only detonates later, at dashboard render
+  // time, with HTTP 500 'Cannot invoke "org.antlr.v4.runtime.Token.getText()"
+  // because "ctx.uid0" is null' — a broken tile with an error nobody can read
+  // back to a cause (live 2026-07-25: A{Clinical diagnosis} == 'MEASLES').
+  // Catch it here, before it is ever saved.
+  const UID = '[A-Za-z][A-Za-z0-9]{10}';
+  const badToken = [...t.matchAll(/([#A])\{([^}]*)\}/g)].find(([, sigil, inner]) => {
+    const body = String(inner).trim();
+    if (!body) return true;
+    if (sigil === 'A') return !new RegExp(`^${UID}$`).test(body);
+    // #{…} is either a bare DE uid or stageUid.deUid (an optional 3rd part is
+    // accepted by some versions), and V{…}/attribute forms never reach here.
+    return !new RegExp(`^${UID}(\\.${UID}){0,2}$`).test(body);
+  });
+  if (badToken) {
+    const [full, sigil, inner] = badToken;
+    return {
+      error: `"${full}" is not a valid program-indicator reference. In a PROGRAM INDICATOR, ${sigil === 'A' ? 'A{…} must contain a tracked-entity-attribute UID' : '#{…} must contain a data-element UID, or programStageUid.dataElementUid'} — display names and program-rule variable names are NOT resolved here.`,
+      hint: `Replace "${inner}" with the object's UID (get them from get_program_info or manage_program_rules(action=list_variables)). ⚠ DHIS2 will NOT stop you: /programIndicators/${kind === 'filter' ? 'filter' : 'expression'}/description returns status OK for a display name, the indicator saves, and then every analytics query for it fails with HTTP 500 "ctx.uid0 is null" — a permanently broken dashboard tile. This differs from program RULES, where A{name} IS correct.`,
+    };
+  }
 
   // Program-RULE-only d2 functions leaking into a PI. d2:contains is the #1
   // offender — common ask is "MULTI_TEXT contains X AND Y" and the model
@@ -7074,10 +7234,13 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     for (const [, prv] of existingPRVs) noteVar(prv.name, prv.useCodeForOptionSet, prv.dataElement?.id, prv.trackedEntityAttribute?.id);
 
     // Which option sets do the conditions actually reference (option vars w/ useCode)?
+    // BOTH sigils: A{name} is how a TEA-sourced variable is referenced, and
+    // scanning only #{} left every attribute option comparison unrewritten —
+    // it saved with a display-name literal and silently never fired.
     const neededOsIds = new Set();
     for (const pr of allPRs) {
-      for (const m of (pr.condition.match(/#\{([^}]+)\}/g) || [])) {
-        const info = varOptionInfo.get(m.slice(2, -1).toLowerCase());
+      for (const m of (pr.condition.matchAll(/([#A])\{([^}]+)\}/g) || [])) {
+        const info = varOptionInfo.get(String(m[2]).toLowerCase());
         if (info && info.useCode) neededOsIds.add(info.optionSetId);
       }
     }
@@ -7097,16 +7260,18 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       }
       for (const pr of allPRs) {
         let cond = pr.condition;
-        const usedVars = new Set((cond.match(/#\{([^}]+)\}/g) || []).map(m => m.slice(2, -1)));
-        for (const vRaw of usedVars) {
+        const usedVars = new Map(); // name → sigil ('#' | 'A')
+        for (const m of cond.matchAll(/([#A])\{([^}]+)\}/g)) usedVars.set(m[2], m[1]);
+        for (const [vRaw, sigil] of usedVars) {
           const info = varOptionInfo.get(vRaw.toLowerCase());
           if (!info || !info.useCode) continue;
           const os = osMap.get(info.optionSetId);
           if (!os) continue;
-          const varToken = `#{${vRaw}}`;
+          const varToken = `${sigil}{${vRaw}}`;
           const esc = vRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          // `#{var} ==|!= 'literal'` in either order.
-          const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*#\\{${esc}\\}`, 'g');
+          const tok = `${sigil === '#' ? '#' : 'A'}\\{${esc}\\}`;
+          // `<sigil>{var} ==|!= 'literal'` in either order.
+          const re = new RegExp(`${tok}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*${tok}`, 'g');
           cond = cond.replace(re, (full, op1, lit1, lit2, op2) => {
             const lit = (lit1 !== undefined ? lit1 : lit2);
             const op = op1 || op2;
@@ -7115,7 +7280,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
             const code = os.byName.get(lit.toLowerCase());
             if (code) return op1 ? `${varToken} ${op} '${code}'` : `'${code}' ${op} ${varToken}`;
             // Neither a code nor a name of this option set → advise (don't rewrite).
-            conditionOptionAdvisories.push(`Rule "${pr.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of option set "${os.name}" (codes: ${os.options.map(x => x.code).join(', ')}). This comparison will never match — verify the value.`);
+            conditionOptionAdvisories.push(`Rule "${pr.name}": ${varToken} is compared to '${lit}', which is neither a code nor a name of option set "${os.name}" (codes: ${os.options.map(x => x.code).join(', ')}). This comparison will never match — verify the value.`);
             return full;
           });
         }
@@ -7185,7 +7350,42 @@ function piMixedPrecedenceAdvisory(kind, text) {
   return `${kind} mixes AND and OR without parentheses — AND binds tighter, so "A || B && C" means "A || (B && C)". If you meant "(A || B) && C", add explicit parentheses and update this indicator.`;
 }
 
+// The /description endpoint is an ADVISORY pre-check: the authoritative gate is
+// the VALIDATE→COMMIT metadata import. So a TRANSPORT/SERVER failure there (5xx,
+// network blip) must never be read as "this expression is invalid" — doing so
+// aborted a whole 4-indicator batch on one transient 500 ("All 4 program
+// indicator(s) failed validation — nothing was created", live 2026-07-25).
+// Retry once, then report the result as INCONCLUSIVE so callers proceed to the
+// import and let the server's real validator decide. A semantic rejection
+// (HTTP 200 + status ERROR) is unaffected and still fails fast.
+function piValidationInconclusive(r) {
+  if (!r || !r._error) return false;
+  const st = Number(r._status) || 0;
+  if (st >= 500) return true;
+  return /failed to fetch|network|timed?\s?out|socket|connection/i.test(String(r._error));
+}
+
+async function validateProgramIndicatorExpressionResilient(kind, text, programId) {
+  let r = await validateProgramIndicatorExpression(kind, text, programId);
+  if (piValidationInconclusive(r)) {
+    await new Promise(res => setTimeout(res, 400));
+    r = await validateProgramIndicatorExpression(kind, text, programId);
+    if (piValidationInconclusive(r)) {
+      console.warn(`[PI] ${kind} validation inconclusive (server ${r._status || 'error'}) — deferring to the metadata import`);
+      return { status: 'OK', _inconclusive: true, _validator_error: r._error };
+    }
+  }
+  return r;
+}
+
 async function validateProgramIndicatorExpression(kind, text, programId) {
+  // An EMPTY body makes /programIndicators/{expression|filter}/description
+  // answer HTTP 500 (verified 2.42.5.1, 2026-07-25). An absent filter is
+  // legitimate — it just means "no filter" — so treat blank as valid instead of
+  // burning a failed API call on it.
+  if (!String(text || '').trim()) {
+    return { status: 'OK', description: `(no ${kind} — nothing to validate)`, _skipped_empty: true };
+  }
   if (!dhis2.baseUrl || !dhis2.apiVersion) {
     const ok = await ensureConnected();
     if (!ok) return { _error: 'Not connected to DHIS2' };
@@ -7744,7 +7944,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
           const newMessages = [];
           for (const [kind, text] of checks) {
             try {
-              const res = await validateProgramIndicatorExpression(kind, text, programId);
+              const res = await validateProgramIndicatorExpressionResilient(kind, text, programId);
               serverValidated++;
               // DHIS2 returns { status: "OK"|"ERROR", description, message }
               const status = res?.status;
@@ -7983,7 +8183,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
         if (!progIdForCheck) continue;
         for (const [kind, text] of [['expression', pi.expression], ['filter', pi.filter]]) {
           if (!text || !String(text).trim()) continue;
-          const res = await validateProgramIndicatorExpression(kind, text, progIdForCheck);
+          const res = await validateProgramIndicatorExpressionResilient(kind, text, progIdForCheck);
           const status = res?.status;
           const bad = res?._error || (status && status !== 'OK' && status !== 'VALID' && status !== 'SUCCESS');
           if (bad) {
@@ -8277,7 +8477,7 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
   if (pi.filter && pi.filter.trim()) exprChecks.push(['filter', pi.filter]);
   const validationResults = await Promise.all(
     exprChecks.map(([kind, text]) =>
-      validateProgramIndicatorExpression(kind, text, programId).then(r => ({ kind, text, r }))
+      validateProgramIndicatorExpressionResilient(kind, text, programId).then(r => ({ kind, text, r }))
     )
   );
   for (const { kind, text, r } of validationResults) {
