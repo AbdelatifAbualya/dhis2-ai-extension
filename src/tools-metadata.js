@@ -1,5 +1,24 @@
 // ── Tool Execution ───────────────────────────────────────────────────────────
 
+// Program-bound write actions covered by the named-program substitution guard
+// (core.js). Only actions that take an explicit program UID and CREATE/MODIFY
+// content on that program are listed — reads and non-program writes pass free.
+// Analytics-table generation is asynchronous. dhis2_query awaits it (see the
+// resourceTables/analytics branch) so the model gets one definitive answer
+// instead of inventing a polling loop. The cap keeps a very large instance from
+// blocking the whole turn — past it we report "still running, do not poll".
+const ANALYTICS_JOB_MAX_WAIT_MS = 180_000;
+const ANALYTICS_JOB_POLL_MS = 5_000;
+
+const PROGRAM_BOUND_WRITE_ACTIONS = {
+  manage_line_lists: ['create', 'update'],
+  manage_program_rules: ['create', 'update', 'bulk_fix_conditions'],
+  manage_program_indicators: ['create', 'update', 'bulk_fix', 'bulk_fix_expressions'],
+  manage_program_notifications: ['create', 'create_and_link'],
+  create_metadata: ['add_stage', 'add_data_elements_to_stage', 'add_program_rules'],
+  manage_metadata: ['add_program_attributes'],
+};
+
 async function executeTool(name, args) {
   if (!TOOL_ROUTER[name]) {
     return { _error: `Unknown tool: ${name}` };
@@ -10,6 +29,22 @@ async function executeTool(name, args) {
   // prompt content. De-identified aggregates and metadata pass straight through.
   const _privacyBlock = enforcePatientDataPrivacyGate(name, args);
   if (_privacyBlock) return _privacyBlock;
+
+  // Named-program substitution gate: after a name-filtered program search
+  // returned 0 matches this turn, program-bound writes against a DIFFERENT
+  // program are refused so the model cannot silently build the user's request
+  // on a lookalike program (see core.js for the live incident this prevents).
+  if ((dhis2.missingNamedTargets || []).length) {
+    const _gatedActions = PROGRAM_BOUND_WRITE_ACTIONS[name];
+    if (_gatedActions && _gatedActions.includes(String(args?.action || ''))) {
+      // For add_program_attributes the program UID rides in object_id; every
+      // other gated tool carries it in program_id/program.
+      const _progUid = args.program_id || args.program
+        || (name === 'manage_metadata' ? args.object_id : null);
+      const _subStop = await namedProgramSubstitutionStop(name, args.action, _progUid);
+      if (_subStop) return _subStop;
+    }
+  }
 
   const ctx = dhis2.pageContext || {};
   const programId = ctx.programId;
@@ -33,8 +68,17 @@ async function executeTool(name, args) {
     // write authorization the same way as the dedicated manage_* tools, so the
     // model cannot route around the gates by sending a raw API call.
     if (method !== 'GET') {
-      const _gate = requireWriteAuth('dhis2_query', method, { path: args.path });
-      if (_gate) return _gate;
+      // Running the analytics/resource tables is MAINTENANCE, not a write: it
+      // creates no metadata and changes no user data, it only rebuilds derived
+      // tables from what already exists. Gating it behind write authorization
+      // blocked the routine "run analytics so the dashboard populates" step on
+      // an otherwise read-only turn, with nothing destructive at stake.
+      const _isAnalyticsRun = /^(?:resourceTables(?:\/analytics)?|jobConfigurations\/analytics|maintenance\/analyticsTables?)(\b|\?|$)/i
+        .test(String(args.path || '').replace(/^\//, '').replace(/^api\/\d+\//, ''));
+      if (!_isAnalyticsRun) {
+        const _gate = requireWriteAuth('dhis2_query', method, { path: args.path });
+        if (_gate) return _gate;
+      }
     }
     const opts = {};
     if (method !== 'GET') opts.method = method;
@@ -121,6 +165,126 @@ async function executeTool(name, args) {
           opts._backup_block = bulkBackup.block;
         }
       }
+    }
+
+    // ── PI expression/filter validator: heal GET → the POST it must be ──
+    // /programIndicators/{expression|filter}/description is POST-only with the
+    // expression as a text/plain BODY. A GET (the intuitive shape, and what the
+    // model reaches for) returns HTTP 405 — three of them in a row tripped the
+    // HTTP-error breaker and killed a working turn (live 2026-07-25). The
+    // intent is unambiguous, so run the correct request instead of failing.
+    if (/^programIndicators\/(expression|filter)\/description(\b|\?|$)/.test(safePath)) {
+      const kind = /^programIndicators\/filter\//.test(safePath) ? 'filter' : 'expression';
+      const qs = new URLSearchParams((safePath.split('?')[1] || ''));
+      // The expression may arrive as a query param (the GET shape) or as the body.
+      const expr = (typeof args.body === 'string' ? args.body : null)
+        || qs.get('expression') || qs.get('filter')
+        || (args.body && typeof args.body === 'object' ? String(args.body.expression || args.body.filter || '') : '');
+      const pid = qs.get('programId') || args.program_id || ctx.programId || dhis2.programMetadata?.id || '';
+      if (!expr) {
+        return {
+          _error: 'The program-indicator description endpoint needs the expression itself. Nothing was sent.',
+          _hint: 'Prefer manage_program_indicators(action="create", dry_run=true) — it validates expression AND filter against the program and explains any rejection. If you call this endpoint directly, put the expression in "body".',
+        };
+      }
+      const out = await validateProgramIndicatorExpression(kind, expr, pid);
+      return {
+        ...out,
+        _validated: { kind, expression: expr, program_id: pid || null },
+        _hint: out && out._error
+          ? `The ${kind} was REJECTED. Fix it against the supported PI grammar before saving; do not retry the same text.`
+          : `The ${kind} is valid. Note: this endpoint is POST-only — a GET returns HTTP 405, so use manage_program_indicators(dry_run=true) rather than hand-calling it.`,
+      };
+    }
+
+    // ── Analytics-tables run: ONE call that waits for the job to finish ──
+    // Analytics generation is asynchronous, and every analytics-dependent step
+    // of a build (line lists, dashboards, PI values) is blocked until it ends —
+    // so the model has to know when that is. With a bare fire-and-forget POST it
+    // improvised a polling loop over jobConfigurations/{taskId} (live
+    // 2026-07-25), which made no progress, tripped the no-progress guard twice
+    // and got dhis2_query disabled mid-task. Awaiting the job here turns that
+    // whole failure mode into a single definitive answer.
+    // `resourceTables/analytics` is the ONLY endpoint that starts this job.
+    // jobConfigurations/analytics is the intuitive guess and returns 405
+    // (verified 2.42.5.1, 2026-07-25), so accept it and route to the real one —
+    // query params such as ?lastYears=5 are preserved.
+    // POST /api/resourceTables/analytics is the ONLY endpoint that starts an
+    // analytics run. Models invent endless variants — jobConfigurations/analytics,
+    // maintenance/analyticsTables, resourceTables/analyticsProgramDataElementGroupJob,
+    // maintenance/analyticsTablesProgramDataIndex — every one a 404 (all observed
+    // live 2026-07-25). Enumerating spellings is a losing game, so treat ANY POST
+    // whose path mentions "analytic" and is not a genuine analytics WRITE
+    // endpoint as a mis-spelling of the real one.
+    const analyticsRunMatch =
+      /^(?:resourceTables|jobConfigurations)\/analytics/i.test(safePath)
+      || /^maintenance\/analytic/i.test(safePath)
+      || (/analytic/i.test(safePath.split('?')[0]) && !/^analytics(\/|\?|$)/i.test(safePath));
+    if (method === 'POST' && analyticsRunMatch) {
+      // Keep only the parameters the real endpoint understands (lastYears,
+      // skipResourceTables, skipOutliers); everything else was invented for a
+      // fictional endpoint and would be ignored or rejected.
+      const keepParams = new URLSearchParams();
+      for (const [k, v] of new URLSearchParams(safePath.split('?')[1] || '')) {
+        if (/^(lastYears|skipResourceTables|skipOutliers|skipTableTypes|skipPrograms)$/i.test(k)) keepParams.append(k, v);
+      }
+      const qs = keepParams.toString();
+      const analyticsPath = `resourceTables/analytics${qs ? `?${qs}` : ''}`;
+      if (analyticsPath !== safePath) {
+        console.log(`[dhis2_query] Healed analytics-run endpoint ${safePath} → ${analyticsPath}`);
+      }
+      const started = await safeDhis2Fetch(analyticsPath, { method: 'POST' });
+      if (started?._error) return started;
+      const jobId = started?.response?.id || null;
+      if (!jobId) {
+        return { ...started, _hint: 'Analytics generation was started but the server returned no job id, so it could not be awaited. Do NOT poll for status — continue with the rest of the task and tell the user analytics is running.' };
+      }
+      const t0 = Date.now();
+      let status = 'RUNNING';
+      let message = null;
+      let failed = null;
+      // Bounded wait. Small instances finish in well under a minute; a big one
+      // can run for many minutes, and blocking the whole turn on it is worse
+      // than reporting "still running", so we cap the wait and hand back a
+      // definitive do-not-poll instruction either way.
+      while (Date.now() - t0 < ANALYTICS_JOB_MAX_WAIT_MS) {
+        await new Promise(r => setTimeout(r, ANALYTICS_JOB_POLL_MS));
+        const notes = await safeDhis2Fetch(`system/tasks/ANALYTICS_TABLE/${jobId}`);
+        if (notes?._error) break;                       // transport problem — stop waiting, report RUNNING
+        if (!Array.isArray(notes) || !notes.length) continue; // queued, not started yet
+        // `completed` is checked FIRST and wins. DHIS2 emits ERROR-level
+        // notifications for non-fatal conditions during a perfectly successful
+        // run (e.g. "skipped stage. 0 successful and 1 failed items"), so
+        // treating any ERROR entry as fatal reported a healthy analytics run as
+        // FAILED and sent the model hunting for a job-status endpoint that does
+        // not exist — three 404/400s (live 2026-07-25).
+        const done = notes.find(n => n && n.completed === true);
+        if (done) { status = 'COMPLETED'; message = done.message || null; break; }
+        // Only a HARD failure ends the wait: the run says so explicitly.
+        const err = notes.find(n => n && String(n.level).toUpperCase() === 'ERROR'
+          && /process failed|aborted|could not|exception|fatal/i.test(String(n.message || '')));
+        if (err) { failed = err.message || 'Analytics generation reported an error.'; break; }
+        broadcast({ type: 'AI_THINKING', iteration: 0, label: `Generating analytics tables… (${Math.round((Date.now() - t0) / 1000)}s)` });
+      }
+      const waited = Math.round((Date.now() - t0) / 1000);
+      if (failed) {
+        return {
+          _error: `Analytics table generation FAILED after ${waited}s: ${failed}`,
+          _hint: 'Analytics data will not be available. Report this to the user; do not retry blindly — the same job will fail the same way. The rest of the metadata you created is unaffected.',
+          job_id: jobId, status: 'FAILED', waited_seconds: waited,
+        };
+      }
+      return {
+        success: true,
+        job_id: jobId,
+        status,
+        message: message || started?.message || null,
+        waited_seconds: waited,
+        _apiPath: `/api/${dhis2.apiVersion}/resourceTables/analytics`,
+        _hint: status === 'COMPLETED'
+          ? `Analytics tables finished in ${waited}s and this call already waited for them — analytics queries for the new metadata now work. Do NOT check the job status again; move on to the next step.`
+          : `Analytics generation is STILL RUNNING after ${waited}s (large instances take several minutes). This call already waited — do NOT poll the job status, and do NOT call resourceTables/analytics again; repeated status checks make no progress and will be blocked. Continue with the remaining steps (definitions save fine without analytics) and tell the user that data values will appear once the run completes.`,
+      };
     }
 
     const trackerWriteResult = await executeTrackerWrite(safePath, method, args.body, ctx);
@@ -368,6 +532,32 @@ async function executeTool(name, args) {
     if (method === 'GET') {
       const invalidProg = await validateAnalyticsProgramId(safePath);
       if (invalidProg) return invalidProg;
+      // `dimension=dx:<uid>` on an event/enrollment analytics endpoint is a
+      // guaranteed 409 whose message names an internal SQL column. Heal it to
+      // the bare-UID form the endpoint actually takes.
+      // analytics/event|enrollment → the plural resource DHIS2 actually serves.
+      const pluralHeal = healAnalyticsResourcePlural(safePath);
+      if (pluralHeal.healed) {
+        console.log(`[dhis2_query] Healed analytics resource name → ${pluralHeal.path}`);
+        safePath = pluralHeal.path;
+      }
+      // Multiple dimensions packed into one dimension= parameter.
+      const packHeal = healPackedAnalyticsDimensions(safePath);
+      if (packHeal.healed) {
+        console.log(`[dhis2_query] Split packed analytics dimensions → ${packHeal.path}`);
+        safePath = packHeal.path;
+      }
+      const dxHeal = healEventAnalyticsDxDimension(safePath);
+      if (dxHeal.healed) {
+        console.log(`[dhis2_query] Healed dx: dimension for an event/enrollment analytics query → ${dxHeal.path}`);
+        safePath = dxHeal.path;
+      }
+      // Two data items asked for as two dx dimensions → 409. Merge them.
+      const dupHeal = healDuplicateDxDimension(safePath);
+      if (dupHeal.healed) {
+        console.log(`[dhis2_query] Merged repeated dx dimensions → ${dupHeal.path}`);
+        safePath = dupHeal.path;
+      }
     }
 
     // ── Auto-snapshot before any item-level metadata mutation routed through
@@ -414,6 +604,24 @@ async function executeTool(name, args) {
     // the user — can see how to restore.
     if (opts._backup_block && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult)) {
       writeResult.backup = opts._backup_block;
+    }
+    // Named-target substitution guard bookkeeping (core.js) for RAW program
+    // searches — the model sometimes searches via dhis2_query instead of
+    // search_metadata, and the guard must arm/disarm identically on that path.
+    if (method === 'GET' && writeResult && typeof writeResult === 'object' && !writeResult._error
+        && /^(?:\/?api\/(?:\d+\/)?)?programs(?:\.json)?\?/i.test(safePath)
+        && Array.isArray(writeResult.programs)) {
+      if (writeResult.programs.length) {
+        clearNamedTargetsFoundIn(writeResult.programs.map(o => o.displayName || o.name));
+      } else {
+        const nf = safePath.match(/filter=(?:displayName|name)(?::|%3A)i?like(?::|%3A)([^&]+)/i);
+        let q = null;
+        try { q = nf ? decodeURIComponent(nf[1].replace(/\+/g, ' ')) : null; } catch { q = nf ? nf[1] : null; }
+        if (q) {
+          noteMissingNamedTarget('programs', q);
+          writeResult._hint = `No programs match "${q}" on this instance. If the user asked for this program BY NAME, it does NOT exist — STOP, tell the user, list the closest existing program names, and ask whether to create it, use a specific existing program, or stop. NEVER silently substitute a similar program and build the user's request on it.`;
+        }
+      }
     }
     return writeResult;
   }
@@ -845,6 +1053,21 @@ async function executeTool(name, args) {
           }
           return result;
         }
+        // Ground the stage id against the target program BEFORE fetching:
+        // stale/hallucinated stage ids from long conversations otherwise
+        // produce a raw 404 (observed live 2026-07-19). The membership probe
+        // always succeeds and its result doubles as the correction hint.
+        const memberProbe = await safeDhis2Fetch(
+          `programStages?filter=program.id:eq:${effProgramId}&fields=id,displayName&paging=false`
+        );
+        const members = memberProbe?.programStages || [];
+        if (!memberProbe?._error && members.length && !members.some(st => st.id === args.target_id)) {
+          return {
+            _error: `"${args.target_id}" is not a stage of program ${effProgramId}.`,
+            _hint: `Use one of this program's real stage ids: ${members.map(st => `${st.displayName} (${st.id})`).join(', ')}.`,
+            valid_stages: members,
+          };
+        }
         const result = await safeDhis2Fetch(
           `programStages/${args.target_id}?fields=id,displayName,description,executionDateLabel,formType,sortOrder,programStageSections[id,displayName,sortOrder,dataElements[id]],programStageDataElements[compulsory,displayInReports,dataElement[id,displayName,displayFormName,valueType,description,optionSetValue,optionSet[id,displayName,options[id,displayName,code]]]]`
         );
@@ -982,6 +1205,20 @@ async function executeTool(name, args) {
       };
       resp[type] = resp[type].slice().sort((a, b) => rank(a) - rank(b));
     }
+    // Named-target substitution guard bookkeeping (core.js): a specific
+    // name-filtered program search with 0 hits ARMS the guard; any result set
+    // containing a matching program name DISARMS it. The empty-result hint
+    // applies to every object type — a user-named object that does not exist
+    // is a stop-and-ask, never a "pick the closest match".
+    if (resp && !resp._error && Array.isArray(resp[type])) {
+      if (type === 'programs' && resp[type].length) {
+        clearNamedTargetsFoundIn(resp[type].map(o => o.displayName));
+      }
+      if (nameFilter && resp[type].length === 0) {
+        noteMissingNamedTarget(type, nameFilter);
+        resp._hint = `No ${type} match "${nameFilter}" on this instance. If the user asked for this object BY NAME, it does NOT exist — STOP, tell the user, list the closest existing names, and ask how to proceed. NEVER silently substitute a similar object and build the user's request on it. (Only if the user explicitly asked you to CREATE this object is an empty result here expected — then proceed with creation.)`;
+      }
+    }
     return resp;
   }
 
@@ -1069,7 +1306,6 @@ async function executeTool(name, args) {
       source: {
         json: LINE_LISTING_JSON_PATH,
         system_prompt: LINE_LISTING_SYSTEM_PROMPT_PATH,
-        router: LINE_LISTING_ROUTER_PATH,
       },
       usage: {
         mode: 'route-first',
@@ -1993,6 +2229,11 @@ async function executeTool(name, args) {
   // ── manage_maps ──
   if (name === 'manage_maps') {
     return await executeManageMaps(args);
+  }
+
+  // ── manage_line_lists ──
+  if (name === 'manage_line_lists') {
+    return await executeManageLineLists(args);
   }
 
   // ── manage_backups ──
@@ -2999,10 +3240,55 @@ async function createIndicator(args) {
   const itype = await resolveIndicatorType(ind.indicator_type);
   if (itype._error) return itype;
 
+  // Heal common reference mistakes BEFORE validation (all advisory-reported):
+  //   • #{<uid>} where the uid is a PROGRAM INDICATOR → I{<uid>} (aggregate
+  //     indicator grammar references PIs with I{}, not #{});
+  //   • I{<name>} / #{<name>} where a NAME was passed instead of a UID →
+  //     resolved against programIndicators / indicators / aggregate DEs by
+  //     exact name (unique match only).
+  // Observed live 2026-07-19: a weak model burned 4 validation failures and a
+  // circuit-breaker disable on exactly these shapes.
+  const expressionRewrites = [];
+  {
+    const healExpr = async (label, expr) => {
+      let out = String(expr);
+      const uidTokens = [...out.matchAll(/#\{([A-Za-z][A-Za-z0-9]{10})\}/g)].map(m => m[1]);
+      if (uidTokens.length) {
+        const piResp = await safeDhis2Fetch(`programIndicators?filter=id:in:[${[...new Set(uidTokens)].join(',')}]&fields=id&paging=false`);
+        for (const pi of (piResp?.programIndicators || [])) {
+          out = out.split(`#{${pi.id}}`).join(`I{${pi.id}}`);
+          expressionRewrites.push({ where: label, from: `#{${pi.id}}`, to: `I{${pi.id}}`, reason: 'program indicators are referenced with I{} in indicator expressions' });
+        }
+      }
+      const nameTokens = [...out.matchAll(/(I|#)\{([^}]+)\}/g)]
+        .filter(m => !/^[A-Za-z][A-Za-z0-9]{10}$/.test(m[2]) && !/^[A-Za-z][A-Za-z0-9]{10}\.[A-Za-z][A-Za-z0-9]{10}$/.test(m[2]));
+      for (const m of nameTokens) {
+        const raw = m[2].trim();
+        const [piR, indR, deR] = await Promise.all([
+          safeDhis2Fetch(`programIndicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+          safeDhis2Fetch(`indicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+          safeDhis2Fetch(`dataElements?filter=name:eq:${encodeURIComponent(raw)}&filter=domainType:eq:AGGREGATE&fields=id&pageSize=2`),
+        ]);
+        const pi = (piR?.programIndicators || []); const indL = (indR?.indicators || []); const de = (deR?.dataElements || []);
+        let to = null;
+        if (pi.length === 1) to = `I{${pi[0].id}}`;
+        else if (indL.length === 1) to = `N{${indL[0].id}}`;
+        else if (de.length === 1) to = `#{${de[0].id}}`;
+        if (to) {
+          out = out.split(m[0]).join(to);
+          expressionRewrites.push({ where: label, from: m[0], to, reason: 'resolved object name to its UID reference' });
+        }
+      }
+      return out;
+    };
+    ind.numerator = await healExpr('numerator', ind.numerator);
+    ind.denominator = await healExpr('denominator', ind.denominator);
+  }
+
   // Server-validate BOTH expressions before building the payload — a broken
   // reference is caught here with the parser's exact error, not silently saved.
   const numChk = await describeValidationExpression(ind.numerator);
-  if (!numChk.ok) return { _error: `numerator rejected by DHIS2: ${numChk.error}`, _hint: 'Confirm each #{dataElementUid} / #{deUid.cocUid} / R{dsUid.REPORTING_RATE} / I{programIndicatorUid} exists (use search_metadata to find UIDs) and the syntax is well-formed, then retry.' };
+  if (!numChk.ok) return { _error: `numerator rejected by DHIS2: ${numChk.error}`, _hint: `Reference grammar for AGGREGATE indicators: program indicator = I{<piUid>}, other indicator = N{<indicatorUid>}, aggregate data element = #{<deUid>} (optionally #{de.coc}), reporting rate = R{dsUid.REPORTING_RATE}, constant = C{uid}. Program-rule/PI functions (d2:*) and V{} variables are NOT valid here. The numerator after auto-healing was: ${ind.numerator}. Confirm each UID exists (search_metadata) and retry.`, ...(expressionRewrites.length ? { expression_rewrites: expressionRewrites } : {}) };
   const denChk = await describeValidationExpression(ind.denominator);
   if (!denChk.ok) return { _error: `denominator rejected by DHIS2: ${denChk.error}`, _hint: 'Confirm each reference exists (use search_metadata) and the syntax is well-formed. For a plain count/sum use denominator "1".' };
 
@@ -3053,6 +3339,7 @@ async function createIndicator(args) {
   return {
     success: true,
     action: 'create',
+    ...(expressionRewrites.length ? { expression_rewrites: expressionRewrites } : {}),
     indicator_id: id,
     indicator: { id, name, shortName, indicatorType: itype.name, factor: itype.factor, numerator: indObj.numerator, denominator: indObj.denominator, annualized: indObj.annualized, legendSetIds: legendRefs.ids.length ? legendRefs.ids : undefined },
     // Confirm the attached legend set(s) so a multi-step caller can report the
@@ -3792,6 +4079,27 @@ async function createLegendSet(args) {
   }
   if (!ls.name || !String(ls.name).trim()) return { _error: 'legend_set.name is required.' };
 
+  // Never-recreate: a same-name legend set is REUSED, not 409'd. Weak models
+  // routinely re-issue a create for a set they already made earlier in the
+  // turn (observed live 2026-07-19) — the duplicate 409 then burned a failed
+  // API call and a retry loop. Returning the existing set is always safe: the
+  // caller wanted a set with this name to exist, and its actual bands are
+  // included so the model can add/adjust if they differ.
+  {
+    const probe = await safeDhis2Fetch(`legendSets?filter=name:eq:${encodeURIComponent(String(ls.name).trim())}&fields=id,name,legends[id,name,startValue,endValue,color]&pageSize=2`);
+    const existing = probe?.legendSets?.[0];
+    if (existing) {
+      return {
+        success: true,
+        action: 'create',
+        _idempotent_reuse: true,
+        legend_set_id: existing.id,
+        legend_set: existing,
+        message: `Legend set "${existing.name}" already exists (${existing.id}) — reusing it instead of creating a duplicate. Its current bands are listed; use add_legends/update if they need adjusting.`,
+      };
+    }
+  }
+
   let legends;
   if (args.auto_bands && typeof args.auto_bands === 'object') {
     const gen = buildLegendAutoBands(args.auto_bands);
@@ -3847,13 +4155,6 @@ async function createLegendSet(args) {
 // All shared helpers (generateDhis2Uid, postMetadataPayload, safeDhis2Fetch,
 // requireWriteAuth) are reused with their existing signatures — no shared
 // code's behaviour changes.
-
-// DHIS2 minor version as a number (e.g. 42), or null if unknown. dhis2.apiVersion
-// is set to info.version.split('.')[1] on connect, so it is already the minor.
-function getDhis2MinorVersion() {
-  const v = parseInt(dhis2.apiVersion, 10);
-  return Number.isFinite(v) ? v : null;
-}
 
 // Locate an existing analytics favorite (chart / pivot) regardless of DHIS2
 // version. 2.34+ unifies them under `visualizations`; older servers split them
@@ -3955,8 +4256,37 @@ async function resolveDataItemTypes(uids) {
     }
   }
   for (const o of (piResp?.programIndicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'PROGRAM_INDICATOR';
-  const unresolved = list.filter(u => !typeMap[u]);
-  return { typeMap, unresolved, trackerNames };
+  let unresolved = list.filter(u => !typeMap[u]);
+
+  // Name → UID aliasing: models routinely pass an object's NAME as a data
+  // item (observed live 2026-07-19: data_items:["Early ANC initiation
+  // (before 12 weeks)"] → hard failure + circuit breaker). Anything that is
+  // not UID-shaped is resolved by exact name against indicators / program
+  // indicators / aggregate DEs; a UNIQUE match substitutes the UID IN PLACE
+  // in the caller's array (both create_visualization and dashboard items pass
+  // spec.data_items by reference) and is reported in `aliases`.
+  const aliases = [];
+  const nameItems = unresolved.filter(u => !/^[A-Za-z][A-Za-z0-9]{10}$/.test(u));
+  for (const raw of nameItems) {
+    const [indR, piR, deR] = await Promise.all([
+      safeDhis2Fetch(`indicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+      safeDhis2Fetch(`programIndicators?filter=name:eq:${encodeURIComponent(raw)}&fields=id&pageSize=2`),
+      safeDhis2Fetch(`dataElements?filter=name:eq:${encodeURIComponent(raw)}&filter=domainType:eq:AGGREGATE&fields=id&pageSize=2`),
+    ]);
+    let id = null, type = null;
+    if ((indR?.indicators || []).length === 1) { id = indR.indicators[0].id; type = 'INDICATOR'; }
+    else if ((piR?.programIndicators || []).length === 1) { id = piR.programIndicators[0].id; type = 'PROGRAM_INDICATOR'; }
+    else if ((deR?.dataElements || []).length === 1) { id = deR.dataElements[0].id; type = 'DATA_ELEMENT'; }
+    if (id) {
+      typeMap[id] = type;
+      aliases.push({ name: raw, id, type });
+      if (Array.isArray(uids)) {
+        for (let i = 0; i < uids.length; i++) if (String(uids[i]).trim() === raw) uids[i] = id;
+      }
+    }
+  }
+  if (aliases.length) unresolved = unresolved.filter(u => !aliases.some(a => a.name === u));
+  return { typeMap, unresolved, trackerNames, aliases };
 }
 
 // Build a complete, render-correct visualization object from a friendly spec.
@@ -3965,7 +4295,12 @@ async function resolveDataItemTypes(uids) {
 function buildVisualizationObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'visualization spec object is required.' };
   const type = String(spec.vis_type || spec.type || 'COLUMN').toUpperCase();
-  if (!VIZ_TYPES.has(type)) return { _error: `Unsupported vis_type "${type}". One of: ${[...VIZ_TYPES].join(', ')}.` };
+  if (!VIZ_TYPES.has(type)) {
+    const hint = /^MAP$/i.test(type)
+      ? 'A MAP is NOT a visualization type. Create the thematic map first with manage_maps(action="create", data_item=<programIndicator/indicator UID>, org_unit_level=2, legend_set_id=…), then add it as a dashboard tile with { type:"MAP", map_id:<the returned map_id> } — do NOT put it in a new_visualization.'
+      : `Pick a chart/table/tile type from: ${[...VIZ_TYPES].join(', ')}.`;
+    return { _error: `Unsupported vis_type "${type}". One of: ${[...VIZ_TYPES].join(', ')}.`, _hint: hint };
+  }
   const name = String(spec.name || '').trim();
   if (!name) return { _error: 'visualization name is required.' };
 
@@ -4373,7 +4708,7 @@ async function executeManageDashboards(args) {
     const dashboardItems = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
       const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
       const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
       let x, y;
@@ -4392,10 +4727,14 @@ async function executeManageDashboards(args) {
       } else if (itType === 'MAP') {
         if (!it.map_id) return { _error: `Item ${i + 1} is a MAP but has no map_id.` };
         di.map = { id: it.map_id };
+      } else if (itType === 'EVENT_VISUALIZATION') {
+        const evId = it.event_visualization_id || it.line_list_id;
+        if (!evId) return { _error: `Item ${i + 1} is an EVENT_VISUALIZATION (line list) but has no event_visualization_id / line_list_id.` };
+        di.eventVisualization = { id: evId };
       } else if (itType === 'TEXT') {
         di.text = String(it.text || '');
       } else {
-        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT.` };
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list) or TEXT.` };
       }
       dashboardItems.push(di);
     }
@@ -4417,6 +4756,13 @@ async function executeManageDashboards(args) {
       const foundM = new Set((mr?.maps || []).map(o => o.id));
       const missingM = refMapIds.filter(id => !foundM.has(id));
       if (missingM.length) return { _error: `These referenced map UIDs do not exist: ${missingM.join(', ')}.` };
+    }
+    const refEvIds = [...new Set(dashboardItems.filter(di => di.type === 'EVENT_VISUALIZATION').map(di => di.eventVisualization.id))];
+    if (refEvIds.length) {
+      const er = await safeDhis2Fetch(`eventVisualizations.json?filter=id:in:[${refEvIds.join(',')}]&fields=id&paging=false`);
+      const foundE = new Set((er?.eventVisualizations || []).map(o => o.id));
+      const missingE = refEvIds.filter(id => !foundE.has(id));
+      if (missingE.length) return { _error: `These referenced line-list (eventVisualization) UIDs do not exist: ${missingE.join(', ')}.`, _hint: 'Create them first with manage_line_lists, or fix the UIDs via manage_line_lists(action="list").' };
     }
 
     const dashId = generateDhis2Uid();
@@ -4506,7 +4852,7 @@ async function executeManageDashboards(args) {
     const summary = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
       const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
       const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
       let x, y;
@@ -4538,11 +4884,19 @@ async function executeManageDashboards(args) {
         if (mr?._error) return { _error: `Item ${i + 1}: could not verify map ${mapId}: ${mr._error}` };
         di.map = { id: mapId };
         summary.push({ item_id: di.id, type: 'MAP', object_id: mapId, object_name: mr.displayName || null });
+      } else if (itType === 'EVENT_VISUALIZATION') {
+        const evId = it.event_visualization_id || it.line_list_id || it.id;
+        if (!evId) return { _error: `Item ${i + 1} is an EVENT_VISUALIZATION (line list) but has no event_visualization_id / line_list_id.` };
+        const er = await safeDhis2Fetch(`eventVisualizations/${evId}?fields=id,displayName,type`);
+        if (er?._status === 404) return { _error: `Item ${i + 1}: line list (eventVisualization) "${evId}" does not exist (404). Not adding a broken tile.`, _hint: 'Create it first with manage_line_lists, or confirm the UID via manage_line_lists(action="list").' };
+        if (er?._error) return { _error: `Item ${i + 1}: could not verify line list ${evId}: ${er._error}` };
+        di.eventVisualization = { id: evId };
+        summary.push({ item_id: di.id, type: 'EVENT_VISUALIZATION', object_id: evId, object_name: er.displayName || null });
       } else if (itType === 'TEXT') {
         di.text = String(it.text || '');
         summary.push({ item_id: di.id, type: 'TEXT' });
       } else {
-        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP or TEXT (or new_visualization).` };
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list) or TEXT (or new_visualization).` };
       }
       newItems.push(di);
     }
@@ -5622,7 +5976,26 @@ function resolveRuleTokenBindings(rule, deNames, teaNames, existingVarNames = ne
     if (preferred.length === 1) return preferred[0];
     if (preferred.length > 1) return null;
     const other = prefix(kinds[1][0], kinds[1][1]);
-    return other.length === 1 ? other[0] : null;
+    if (other.length === 1) return other[0];
+    // Underscore-insensitive last resort: weak models emit near-miss tokens
+    // ("haemoglobin_in_g_d_l" for "haemoglobin_in_g_dl"). Only an UNAMBIGUOUS
+    // squash-equality/prefix match resolves.
+    const squash = (x) => String(x).replace(/_/g, '');
+    const sq = squash(token);
+    const sqMatch = (names, kind) => {
+      const eq = [], pref2 = [];
+      for (const n of names) {
+        const sn = squash(sanitizeVariableName(n));
+        if (sn === sq) eq.push({ kind, name: n });
+        else if (sn.startsWith(sq) || sq.startsWith(sn)) pref2.push({ kind, name: n });
+      }
+      return eq.length ? eq : pref2;
+    };
+    const sq1 = sqMatch(kinds[0][0], kinds[0][1]);
+    if (sq1.length === 1) return sq1[0];
+    if (sq1.length > 1) return null;
+    const sq2 = sqMatch(kinds[1][0], kinds[1][1]);
+    return sq2.length === 1 ? sq2[0] : null;
   };
   for (const [re, teaOnly] of [[/#\{([^}]+)\}/g, false], [/A\{([^}]+)\}/g, true]]) {
     for (const m of text.matchAll(re)) {
@@ -5988,6 +6361,42 @@ function inferValueType(rawName, fallback = 'TEXT') {
   if (/\bpercent(age)?\b|\(\s*%\s*\)|\s%$/.test(name)) return 'PERCENTAGE';
   if (/\(\s*(cm|kg|mm|g|ml|mg|cm3|m|kg\/m2|mmhg|bpm|°c|c)\s*\)|\b(in|in cm|in kg|in mm|in g|in ml)\b/.test(name)) return 'NUMBER';
   return fallback;
+}
+
+// ── Reuse-compatibility gate for existing DEs / TEAs ─────────────────────────
+// Reusing an existing object by name is the never-recreate doctrine — but a
+// same-name object whose definition CONTRADICTS the request silently breaks the
+// program (live 2026-07-18: existing DE "Mode of delivery" was bound to a
+// 2-option Vaginal/Cesarean set while the program needed 5 modes; blind reuse
+// dropped 3 options and made every caesarean rule dead). Reuse is allowed when:
+//   • the requested value type is in the same FAMILY as the existing one
+//     (numeric/date/boolean/text buckets — INTEGER_POSITIVE reuses a NUMBER
+//     field fine; a DATE can never reuse a TEXT), and
+//   • when the request carries an inline option_set, the existing object's
+//     option set already contains every requested option (case-insensitive).
+// Anything else returns a reason string and the caller creates a coexisting
+// "<name> (<program short name>)" object instead.
+function valueTypeFamily(vt) {
+  const v = String(vt || '').toUpperCase();
+  if (/^(NUMBER|INTEGER|INTEGER_POSITIVE|INTEGER_NEGATIVE|INTEGER_ZERO_OR_POSITIVE|PERCENTAGE|UNIT_INTERVAL)$/.test(v)) return 'numeric';
+  if (/^(DATE|DATETIME|AGE)$/.test(v)) return 'date';
+  if (/^(BOOLEAN|TRUE_ONLY)$/.test(v)) return 'boolean';
+  if (/^(TEXT|LONG_TEXT|MULTI_TEXT|PHONE_NUMBER|EMAIL|URL|USERNAME)$/.test(v)) return 'text';
+  return v; // ORGANISATION_UNIT, COORDINATE, FILE_RESOURCE, IMAGE… must match exactly
+}
+function reuseIncompatibilityReason(reqDef, existing) {
+  if (!reqDef) return null;
+  const reqVt = reqDef.value_type || reqDef.valueType;
+  if (reqVt && existing.valueType && valueTypeFamily(reqVt) !== valueTypeFamily(existing.valueType)) {
+    return `existing value type ${existing.valueType} is incompatible with requested ${reqVt}`;
+  }
+  const reqOpts = reqDef.option_set && Array.isArray(reqDef.option_set.options) ? reqDef.option_set.options : null;
+  if (reqOpts && reqOpts.length) {
+    const have = new Set((existing.optionSet?.options || []).map(o => String((o && (o.name ?? o)) || '').toLowerCase()));
+    const missing = reqOpts.map(o => (typeof o === 'string' ? o : o?.name)).filter(n => n && !have.has(String(n).toLowerCase()));
+    if (missing.length) return `existing option set is missing requested option(s): ${missing.join(', ')}`;
+  }
+  return null;
 }
 
 function buildDataElement(de, defaultCatComboId, optionSetUidMap, seenShortNames = null, opts = {}) {

@@ -1080,7 +1080,11 @@ function validateAndHealProgramInput(args) {
     if (nonEmpty(a.id)) return;    // reusing an existing TEA by UID — name/type not required
     nameRequiredTotal++;
     if (!nonEmpty(a.name)) { nameMissingCount++; issues.push(`program_attributes[${i}] is missing a name`); return; }
-    if (!nonEmpty(a.value_type)) issues.push(`attribute "${a.name}" is missing value_type (e.g. TEXT, NUMBER, DATE, BOOLEAN)`);
+    // No value_type is NOT a hard error: the documented reuse pattern lists an
+    // EXISTING attribute by bare name (the dedup probe attaches it), and for a
+    // genuinely new one the builder infers a type from the name (inferValueType)
+    // — blocking here contradicted the tool's own manual (live 2026-07-18).
+    if (!nonEmpty(a.value_type)) heals.push(`attribute "${a.name}" has no value_type — will reuse the existing attribute of that name, or infer the type from the name if new`);
     if (a.option_set && typeof a.option_set === 'object') {
       if (!nonEmpty(a.option_set.name)) { a.option_set.name = a.name; heals.push(`named the option set for attribute "${a.name}"`); }
       if (!Array.isArray(a.option_set.options) || !a.option_set.options.filter(nonEmpty).length) issues.push(`option set for attribute "${a.name}" has no options`);
@@ -1098,7 +1102,9 @@ function validateAndHealProgramInput(args) {
       if (!d || typeof d !== 'object') { issues.push(`stage "${sName}" data_elements[${di}] is not an object`); return; }
       nameRequiredTotal++;
       if (!nonEmpty(d.name)) { nameMissingCount++; issues.push(`stage "${sName}" data_elements[${di}] is missing a name`); return; }
-      if (!nonEmpty(d.value_type)) issues.push(`data element "${d.name}" (stage "${sName}") is missing value_type (e.g. TEXT, NUMBER, DATE, BOOLEAN)`);
+      // Same as attributes: existing DEs are reused by bare name and new ones
+      // get an inferred type — a missing value_type is a heal, not a block.
+      if (!nonEmpty(d.value_type)) heals.push(`data element "${d.name}" (stage "${sName}") has no value_type — will reuse the existing data element of that name, or infer the type from the name if new`);
       if (d.option_set && typeof d.option_set === 'object') {
         if (!nonEmpty(d.option_set.name)) { d.option_set.name = d.name; heals.push(`named the option set for data element "${d.name}"`); }
         if (!Array.isArray(d.option_set.options) || !d.option_set.options.filter(nonEmpty).length) issues.push(`option set for data element "${d.name}" has no options`);
@@ -1261,11 +1267,36 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       const person = allTets.find(t => /person/i.test(t.name || '') || /person/i.test(t.displayName || ''));
       if (person) tetId = person.id;
     }
+    if (!tetId && rawTet && !hasUidShape(rawTet)) {
+      // The requested NAME resolves to nothing — CREATE the tracked entity
+      // type instead of failing. create_program promises the full dependency
+      // chain, and "use <X> as the tracked entity type" for a brand-new type
+      // is a normal part of a tracker build (live 2026-07-18: "Pregnant
+      // Woman"). UID-shaped inputs still fail below: an unresolvable UID is a
+      // hallucination, not a creation request.
+      const tetName = String(rawTet).trim();
+      const newTet = {
+        id: generateDhis2Uid(),
+        name: tetName,
+        shortName: tetName.substring(0, 50),
+        description: `Tracked entity type for the "${args.program_name}" program.`,
+      };
+      const tetImport = await postMetadataPayload({ trackedEntityTypes: [newTet] }, args.dry_run_only);
+      if (tetImport && tetImport.success !== false && !tetImport._error) {
+        tetId = newTet.id;
+        console.log(`[create_program] Created TrackedEntityType "${tetName}" (${tetId})`);
+      } else {
+        return {
+          _error: `TrackedEntityType "${tetName}" does not exist and could not be created: ${tetImport?._error || (tetImport?.errors || []).join('; ') || 'unknown import error'}`,
+          _hint: 'Fix the reported error and retry with the SAME tracked_entity_type_id name. Only fall back to omitting it (defaults to Person) if the user did not request a specific tracked entity type — do not substitute Person for a named type.',
+        };
+      }
+    }
     if (!tetId) {
       const available = allTets.map(t => `${t.displayName || t.name} (${t.id})`).join(', ') || '(none exist on this server)';
       return {
         _error: `Could not resolve a TrackedEntityType${rawTet ? ` for tracked_entity_type_id="${rawTet}"` : ''} on this server.`,
-        _hint: `Do NOT guess a UID. Available TrackedEntityTypes: ${available}. Pass tracked_entity_type_id as one of those UIDs (or its exact name), or omit it to use a Person type. If none exist, create one first.`,
+        _hint: `Do NOT guess a UID. If the program spec NAMES a tracked entity type (e.g. "Pregnant Woman"), retry with that exact NAME as tracked_entity_type_id — an existing one is reused, a missing one is CREATED. Only omit tracked_entity_type_id (which defaults to Person) when the user did NOT request a specific type — do not silently substitute Person for a named type. Available TrackedEntityTypes: ${available}.`,
         _available_tracked_entity_types: allTets.map(t => ({ id: t.id, name: t.displayName || t.name })),
       };
     }
@@ -1422,8 +1453,23 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           valueType: attr.value_type || (attr.option_set ? 'TEXT' : inferValueType(attr.name, 'TEXT')),
           aggregationType: 'NONE',
         };
+        if (attr.description && typeof attr.description === 'string') {
+          tea.description = attr.description;
+        }
         if (attr.option_set && optionSetUidMap[attr.option_set.name]) {
           tea.optionSet = { id: optionSetUidMap[attr.option_set.name] };
+        }
+        // Unique / auto-generated identifier attributes ("client ID",
+        // "registration number"): DHIS2 needs unique=true, and for
+        // auto-generation generated=true + a TextPattern containing a
+        // generated segment. Capture then offers/fills the value automatically.
+        if (attr.unique === true || attr.generated === true) {
+          tea.unique = true;
+          if (attr.generated === true) {
+            tea.generated = true;
+            tea.pattern = attr.pattern || 'RANDOM(########)';
+            tea.valueType = 'TEXT'; // generated patterns are TEXT by definition
+          }
         }
         allTrackedEntityAttributes.push(tea);
         teaUidMap[attr.name] = teaUid;
@@ -1444,14 +1490,48 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // Capability is identical; latency drops from N RTTs to 2.
 
   // 1. Check option sets by name — one batched query, then remap & flag.
+  // ⚠ Reuse is gated on COMPATIBILITY, not just the name: an instance often
+  // already has a generic set with the same name but different options (live
+  // 2026-07-18: existing "Mode of Delivery" = Vaginal/Cesarean only, while the
+  // program needed 5 modes incl. planned/emergency caesarean — blind reuse
+  // silently dropped 3 options AND made every rule comparing the missing codes
+  // dead). A same-name set is reused ONLY when it already contains every
+  // requested option (case-insensitive by name); otherwise OUR new set is kept
+  // and renamed "<name> (<program short name>)" so both can coexist.
   const reusedOptionSetNames = new Set(); // sets that already exist server-side — their REAL option codes may differ from our locally derived ones
+  const optionSetRenames = [];            // [{requested, final, existing_id, missing}] advisory for the caller
+  const osSuffix = (args.program_short_name || args.program_name || '').trim();
+  const osOptionNames = (osObj) => (osObj.options || []).map(r => String(r.name || '').toLowerCase());
+  const localOsOptionNames = (name) => {
+    // names of the options we built locally for this set (allOptions holds them)
+    const ids = new Set((allOptionSets.find(o => o.name === name)?.options || []).map(r => r.id));
+    return allOptions.filter(o => ids.has(o.id)).map(o => String(o.name).toLowerCase());
+  };
+  const tryReuseOptionSet = (os, ex) => {
+    // ex: existing server set {id, name, options:[{name}]}. Returns true when reused.
+    const existing = new Set(osOptionNames(ex));
+    const missing = localOsOptionNames(os.name).filter(n => !existing.has(n));
+    if (missing.length) {
+      const finalName = `${os.name} (${osSuffix})`.substring(0, 230);
+      optionSetRenames.push({ requested: os.name, final: finalName, existing_id: ex.id, missing_in_existing: missing });
+      os.name = finalName; // keep OUR set (with all requested options) under a coexisting name
+      return false;
+    }
+    const oldId = os.id;
+    optionSetUidMap[os.name] = ex.id;
+    os._skip = true;
+    reusedOptionSetNames.add(os.name);
+    for (const de of allDataElements) { if (de.optionSet?.id === oldId) de.optionSet.id = ex.id; }
+    for (const tea of allTrackedEntityAttributes) { if (tea.optionSet?.id === oldId) tea.optionSet.id = ex.id; }
+    return true;
+  };
   if (allOptionSets.length > 0) {
     const osNames = allOptionSets.map(o => o.name);
     const osBatches = [];
     for (let i = 0; i < osNames.length; i += 50) osBatches.push(osNames.slice(i, i + 50));
     const osResponses = await Promise.all(osBatches.map(batch => {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
-      return safeDhis2Fetch(`optionSets?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
+      return safeDhis2Fetch(`optionSets?filter=name:in:[${nameFilter}]&fields=id,name,options[name]&pageSize=50`);
     }));
     // Fail LOUD on probe errors — see the DE/TEA probe block below for why.
     const osProbeFailures = osResponses.filter(r => r?._error).map(r => `optionSets name probe: ${r._error}`);
@@ -1467,17 +1547,28 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     }
     for (const resp of osResponses) {
       for (const ex of (resp?.optionSets || [])) {
-        const os = allOptionSets.find(o => o.name === ex.name);
-        if (os && !os._skip) {
-          const oldId = os.id;
-          optionSetUidMap[os.name] = ex.id;
-          os._skip = true;
-          reusedOptionSetNames.add(os.name);
-          for (const de of allDataElements) { if (de.optionSet?.id === oldId) de.optionSet.id = ex.id; }
-          for (const tea of allTrackedEntityAttributes) { if (tea.optionSet?.id === oldId) tea.optionSet.id = ex.id; }
-        }
+        const os = allOptionSets.find(o => o.name === ex.name && !o._skip);
+        if (os) tryReuseOptionSet(os, ex);
       }
     }
+    // Case-insensitive second pass, mirroring the DE/TEA ci pass below: a set
+    // named "Blood group" must reuse (or coexist with) an existing "Blood
+    // Group" — DHIS2's unique constraint is case-sensitive, so a case variant
+    // would import as a silent near-duplicate.
+    await Promise.all(allOptionSets.filter(o => !o._skip && !optionSetRenames.some(r => r.final === o.name)).map(async (os) => {
+      const resp = await safeDhis2Fetch(`optionSets?filter=name:ilike:${encodeURIComponent(os.name)}&fields=id,name,options[name]&pageSize=10`);
+      if (resp?._error) return;
+      const hit = (resp?.optionSets || []).find(x => String(x.name || '').toLowerCase() === String(os.name).toLowerCase());
+      if (hit) tryReuseOptionSet(os, hit);
+    }));
+    // A renamed set's new "<name> (<short>)" could itself collide — shard it.
+    await Promise.all(allOptionSets.filter(o => !o._skip && optionSetRenames.some(r => r.final === o.name)).map(async (os) => {
+      const resp = await safeDhis2Fetch(`optionSets?filter=name:ilike:${encodeURIComponent(os.name)}&fields=id,name&pageSize=5`);
+      if (resp?._error) return;
+      if ((resp?.optionSets || []).some(x => String(x.name || '').toLowerCase() === String(os.name).toLowerCase())) {
+        os.name = `${os.name} ${generateDhis2Uid().slice(-4)}`.substring(0, 230);
+      }
+    }));
   }
   const filteredOptionSets = allOptionSets.filter(os => !os._skip);
 
@@ -1517,11 +1608,11 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const [deResponses, teaResponses, explicitTeaResp] = await Promise.all([
     Promise.all(deBatches.map(batch => {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
-      return safeDhis2Fetch(`dataElements?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
+      return safeDhis2Fetch(`dataElements?filter=name:in:[${nameFilter}]&fields=id,name,valueType,optionSet[options[name]]&pageSize=50`);
     })),
     Promise.all(teaBatches.map(batch => {
       const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
-      return safeDhis2Fetch(`trackedEntityAttributes?filter=name:in:[${nameFilter}]&fields=id,name&pageSize=50`);
+      return safeDhis2Fetch(`trackedEntityAttributes?filter=name:in:[${nameFilter}]&fields=id,name,valueType,optionSet[options[name]]&pageSize=50`);
     })),
     explicitTeaIds.length
       ? safeDhis2Fetch(`trackedEntityAttributes?filter=id:in:[${explicitTeaIds.map(t => t.id).join(',')}]&fields=id,name&paging=false`)
@@ -1567,19 +1658,39 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     }
   }
 
-  // Apply DE dedup
+  // Input definitions by name — the reuse gate compares the REQUESTED value
+  // type / options against the existing object, not our built defaults.
+  const inputDeDefByName = new Map();
+  for (const st of stages) for (const d of (st.data_elements || [])) if (d && d.name && !inputDeDefByName.has(d.name)) inputDeDefByName.set(d.name, d);
+  const inputTeaDefByName = new Map();
+  for (const a of (args.program_attributes || [])) if (a && a.name && !inputTeaDefByName.has(a.name)) inputTeaDefByName.set(a.name, a);
+  const objectRenames = []; // [{type, requested, final, existing_id, reason}]
+  const renameForCoexistence = (obj, type, ex, reason) => {
+    const finalName = `${obj.name} (${osSuffix})`.substring(0, 230);
+    objectRenames.push({ type, requested: obj.name, final: finalName, existing_id: ex.id, reason });
+    obj.name = finalName;
+    obj._renamed = true;
+  };
+
+  // Apply DE dedup (gated: same value-type family + option superset)
   for (const resp of deResponses) {
     for (const ex of (resp?.dataElements || [])) {
-      const de = allDataElements.find(d => d.name === ex.name && !d._skip);
-      if (de) { deUidMap[de.name] = ex.id; de._skip = true; }
+      const de = allDataElements.find(d => d.name === ex.name && !d._skip && !d._renamed);
+      if (!de) continue;
+      const reason = reuseIncompatibilityReason(inputDeDefByName.get(de.name), ex);
+      if (reason) { renameForCoexistence(de, 'dataElement', ex, reason); continue; }
+      deUidMap[de.name] = ex.id; de._skip = true;
     }
   }
 
-  // Apply TEA dedup
+  // Apply TEA dedup (same gate)
   for (const resp of teaResponses) {
     for (const ex of (resp?.trackedEntityAttributes || [])) {
-      const tea = allTrackedEntityAttributes.find(t => t.name === ex.name && !t._skip);
-      if (tea) { teaUidMap[tea.name] = ex.id; tea._skip = true; }
+      const tea = allTrackedEntityAttributes.find(t => t.name === ex.name && !t._skip && !t._renamed);
+      if (!tea) continue;
+      const reason = reuseIncompatibilityReason(inputTeaDefByName.get(tea.name), ex);
+      if (reason) { renameForCoexistence(tea, 'trackedEntityAttribute', ex, reason); continue; }
+      teaUidMap[tea.name] = ex.id; tea._skip = true;
     }
   }
 
@@ -1594,16 +1705,28 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // connectivity, and a residual duplicate is still caught by the
   // name-conflict self-healing in postMetadataPayload.
   {
-    const ciReuse = async (obj, resource, key, uidMap) => {
-      const resp = await safeDhis2Fetch(`${resource}?filter=name:ilike:${encodeURIComponent(obj.name)}&fields=id,name&pageSize=10`);
+    const ciReuse = async (obj, resource, key, uidMap, defByName, type) => {
+      const resp = await safeDhis2Fetch(`${resource}?filter=name:ilike:${encodeURIComponent(obj.name)}&fields=id,name,valueType,optionSet[options[name]]&pageSize=10`);
       if (resp?._error) return;
       const hit = (resp?.[key] || []).find(x => String(x.name || '').toLowerCase() === String(obj.name).toLowerCase());
-      if (hit) { uidMap[obj.name] = hit.id; obj._skip = true; }
+      if (!hit) return;
+      const reason = reuseIncompatibilityReason(defByName.get(obj.name), hit);
+      if (reason) { renameForCoexistence(obj, type, hit, reason); return; }
+      uidMap[obj.name] = hit.id; obj._skip = true;
     };
     await Promise.all([
-      ...allDataElements.filter(d => !d._skip).map(d => ciReuse(d, 'dataElements', 'dataElements', deUidMap)),
-      ...allTrackedEntityAttributes.filter(t => !t._skip).map(t => ciReuse(t, 'trackedEntityAttributes', 'trackedEntityAttributes', teaUidMap)),
+      ...allDataElements.filter(d => !d._skip && !d._renamed).map(d => ciReuse(d, 'dataElements', 'dataElements', deUidMap, inputDeDefByName, 'dataElement')),
+      ...allTrackedEntityAttributes.filter(t => !t._skip && !t._renamed).map(t => ciReuse(t, 'trackedEntityAttributes', 'trackedEntityAttributes', teaUidMap, inputTeaDefByName, 'trackedEntityAttribute')),
     ]);
+    // Renamed coexistence names could themselves collide — shard them.
+    await Promise.all([...allDataElements, ...allTrackedEntityAttributes].filter(o => o._renamed).map(async (obj) => {
+      const resource = allDataElements.includes(obj) ? 'dataElements' : 'trackedEntityAttributes';
+      const resp = await safeDhis2Fetch(`${resource}?filter=name:ilike:${encodeURIComponent(obj.name)}&fields=id,name&pageSize=5`);
+      if (resp?._error) return;
+      if ((resp?.[resource] || []).some(x => String(x.name || '').toLowerCase() === String(obj.name).toLowerCase())) {
+        obj.name = `${obj.name} ${generateDhis2Uid().slice(-4)}`.substring(0, 230);
+      }
+    }));
   }
   const filteredDataElements = allDataElements.filter(de => !de._skip);
   const filteredTEAs = allTrackedEntityAttributes.filter(tea => !tea._skip);
@@ -1747,6 +1870,12 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     organisationUnits: orgUnitIds.map(id => ({ id })),
     programStages: stageUids.map(id => ({ id })),
   };
+  if (args.program_description) program.description = String(args.program_description);
+  if (args.program_color || args.program_icon) {
+    program.style = {};
+    if (args.program_color) program.style.color = String(args.program_color);
+    if (args.program_icon) program.style.icon = String(args.program_icon);
+  }
   if (isTracker && tetId) {
     program.trackedEntityType = { id: tetId };
   }
@@ -1773,6 +1902,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const prvCreated = {}; // track created variables by name
   let ruleConditionAdvisories = [];
   let ruleConditionRewrites = [];
+  let ruleDeadLiterals = [];
   let ruleTokenRewrites = [];
   let ruleAutoGuards = [];
   // Rules that could not be built (unresolved variable/stage/section refs) are
@@ -1953,6 +2083,8 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         const actContent = act.content || norm.content;
         if (actContent) pra.content = actContent;
         if (act.data) pra.data = act.data;
+        if (act.location) pra.location = act.location;
+        else if (pra.programRuleActionType === 'DISPLAYTEXT' || pra.programRuleActionType === 'DISPLAYKEYVALUEPAIR') pra.location = 'feedback';
         if (act.data_element_name && deUidMap[act.data_element_name]) {
           pra.dataElement = { id: deUidMap[act.data_element_name] };
         }
@@ -2095,6 +2227,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       });
       ruleConditionAdvisories = mapped.advisories;
       ruleConditionRewrites = mapped.rewrites;
+      ruleDeadLiterals = mapped.deadLiterals || [];
     }
     ruleAutoGuards = autoGuardedConditions;
   }
@@ -2245,9 +2378,15 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     programRules: allProgramRules.map(r => ({ id: r.id, name: r.name })),
     programIndicators: indicatorResults,
     orgUnits: orgUnitIds,
+    ...(optionSetRenames.length ? { option_set_renames: optionSetRenames } : {}),
+    ...(objectRenames.length ? { reuse_conflict_renames: objectRenames } : {}),
     ...(ruleAutoGuards.length ? { auto_guarded_conditions: ruleAutoGuards } : {}),
     ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
     ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
+    ...(ruleDeadLiterals.length ? {
+      dead_option_literals: ruleDeadLiterals,
+      dead_option_literals_action: `${ruleDeadLiterals.length} rule/ASSIGN comparison(s) reference a value that is not an option (code or name) of the target option set — these WILL NEVER FIRE. Fix each listed literal to a valid option code via manage_program_rules (update the rule condition or ASSIGN data), or the corresponding program behaviour will silently not work.`,
+    } : {}),
     ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
     ...(skippedRules.length ? { skipped_rules: skippedRules } : {}),
     ...(ruleActionFixes.length ? { rule_action_fixes: ruleActionFixes } : {}),
@@ -2316,14 +2455,35 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   };
 }
 
+
+// On a FAILED atomic import the pre-generated ids in a summary are PHANTOMS —
+// exposing them poisons the model's known-id memory and produces follow-up
+// 404s (observed live 2026-07-18: a 500-failed rules batch leaked rule ids the
+// model then tried to GET). Return the failure WITHOUT any generated ids.
+function failedImportResult(result, what) {
+  return {
+    ...result,
+    success: false,
+    nothing_created: true,
+    _hint: `${result?._hint ? result._hint + ' ' : ''}The import is ATOMIC and it failed — NOTHING was created by this ${what} call. Do NOT reuse any ids from this attempt. Fix the reported error and re-issue the call.`,
+  };
+}
+
 async function addStageToProgram(args, defaultCatComboId) {
   if (!args.program_id) return { _error: 'Missing program_id for add_stage' };
   if (!args.stage) return { _error: 'Missing stage object for add_stage' };
 
   const stage = args.stage;
 
-  // Get existing program to determine sort order
-  const progResp = await safeDhis2Fetch(`programs/${args.program_id}?fields=id,programStages[id,sortOrder]`);
+  // Get existing program to determine sort order (name is used to disambiguate
+  // a globally-colliding stage name, mirroring create_program).
+  // `sharing` is fetched so the new stage can INHERIT the program's access (see
+  // where stageObj is built): a stage created without it silently gets DHIS2's
+  // default rw------ (metadata only, NO data access), which blocks event entry
+  // on that stage while the program itself looks correctly shared. That is the
+  // "I can't add a new enrollment / none of the stages appear" failure reported
+  // live 2026-07-25 — three of four stages had been added with add_stage.
+  const progResp = await safeDhis2Fetch(`programs/${args.program_id}?fields=id,name,shortName,sharing,programStages[id,sortOrder]`);
   if (progResp._error) return { _error: `Could not load program ${args.program_id}: ${progResp._error}` };
   const existingStageCount = progResp?.programStages?.length || 0;
 
@@ -2350,8 +2510,183 @@ async function addStageToProgram(args, defaultCatComboId) {
     }
   }
 
-  // Pre-probe DHIS2 for shortName collisions on these new DEs.
-  await disambiguateShortNamesAgainstServer(allDataElements, 'dataElements', 'dataElements');
+  // ── Reuse existing option sets / data elements by exact name ───────────────
+  // add_stage is the recommended path for building VERY LARGE programs
+  // incrementally (shell + first stage, then add_stage per remaining stage), so
+  // it MUST honor the same never-recreate guarantee as create_program: later
+  // stages routinely repeat earlier stages' DEs (blood pressure, haemoglobin,
+  // referral fields) and shared option sets (Yes/No lists, urine protein
+  // grades). Without this probe every repeat 409'd the atomic import. Probes
+  // fail LOUD: proceeding blind would create duplicates.
+  const optionSetRenames = []; // [{requested, final, existing_id, missing_in_existing}]
+  {
+    const osSuffix = (progResp.shortName || progResp.name || '').trim();
+    const localOsOptionNames = (name) => {
+      const ids = new Set((allOptionSets.find(o => o.name === name)?.options || []).map(r => r.id));
+      return allOptions.filter(o => ids.has(o.id)).map(o => String(o.name).toLowerCase());
+    };
+    // Same compatibility gate as create_program: reuse a same-name existing set
+    // ONLY when it already contains every requested option; otherwise keep OUR
+    // set under a coexisting "<name> (<program short>)" name.
+    const tryReuseOptionSet = (os, ex) => {
+      const existing = new Set((ex.options || []).map(r => String(r.name || '').toLowerCase()));
+      const missing = localOsOptionNames(os.name).filter(n => !existing.has(n));
+      if (missing.length) {
+        const finalName = `${os.name} (${osSuffix})`.substring(0, 230);
+        optionSetRenames.push({ requested: os.name, final: finalName, existing_id: ex.id, missing_in_existing: missing });
+        os.name = finalName;
+        return false;
+      }
+      const oldId = os.id;
+      optionSetUidMap[os.name] = ex.id;
+      os._skip = true;
+      for (const de of allDataElements) { if (de.optionSet?.id === oldId) de.optionSet.id = ex.id; }
+      return true;
+    };
+    if (allOptionSets.length > 0) {
+      const osNames = allOptionSets.map(o => o.name);
+      const osBatches = [];
+      for (let i = 0; i < osNames.length; i += 50) osBatches.push(osNames.slice(i, i + 50));
+      const osResponses = await Promise.all(osBatches.map(batch => {
+        const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
+        return safeDhis2Fetch(`optionSets?filter=name:in:[${nameFilter}]&fields=id,name,options[name]&pageSize=50`);
+      }));
+      const osProbeFailures = osResponses.filter(r => r?._error).map(r => `optionSets name probe: ${r._error}`);
+      if (osProbeFailures.length) {
+        return {
+          success: false,
+          nothing_created: true,
+          phase: 'pre_check',
+          _error: `Aborted BEFORE creating anything: could not check the server for existing option sets (${osProbeFailures.join('; ')})`,
+          errors: osProbeFailures,
+          _hint: 'The duplicate-check query against DHIS2 failed, so existing option sets could not be detected and creating blindly would duplicate them. Nothing was imported. Verify connectivity/permissions and retry the SAME add_stage call.',
+        };
+      }
+      for (const resp of osResponses) {
+        for (const ex of (resp?.optionSets || [])) {
+          const os = allOptionSets.find(o => o.name === ex.name && !o._skip);
+          if (os) tryReuseOptionSet(os, ex);
+        }
+      }
+      // Case-insensitive second pass (DHIS2's unique constraint is
+      // case-sensitive, so "Blood group" vs existing "Blood Group" would
+      // import as a silent near-duplicate).
+      await Promise.all(allOptionSets.filter(o => !o._skip && !optionSetRenames.some(r => r.final === o.name)).map(async (os) => {
+        const resp = await safeDhis2Fetch(`optionSets?filter=name:ilike:${encodeURIComponent(os.name)}&fields=id,name,options[name]&pageSize=10`);
+        if (resp?._error) return;
+        const hit = (resp?.optionSets || []).find(x => String(x.name || '').toLowerCase() === String(os.name).toLowerCase());
+        if (hit) tryReuseOptionSet(os, hit);
+      }));
+      // A renamed set's "<name> (<short>)" could itself collide — shard it.
+      await Promise.all(allOptionSets.filter(o => !o._skip && optionSetRenames.some(r => r.final === o.name)).map(async (os) => {
+        const resp = await safeDhis2Fetch(`optionSets?filter=name:ilike:${encodeURIComponent(os.name)}&fields=id,name&pageSize=5`);
+        if (resp?._error) return;
+        if ((resp?.optionSets || []).some(x => String(x.name || '').toLowerCase() === String(os.name).toLowerCase())) {
+          os.name = `${os.name} ${generateDhis2Uid().slice(-4)}`.substring(0, 230);
+        }
+      }));
+    }
+  }
+  const skippedOptionIds = new Set();
+  for (const os of allOptionSets) {
+    if (os._skip && os.options) {
+      for (const ref of os.options) skippedOptionIds.add(ref.id);
+    }
+  }
+  const finalOptionSets = allOptionSets.filter(os => !os._skip);
+  const finalOptions = allOptions.filter(opt => !skippedOptionIds.has(opt.id));
+
+  const reusedDataElements = []; // [{name, id}] — existing DEs attached instead of recreated
+  const deRenames = [];          // [{type, requested, final, existing_id, reason}] — incompatible same-name DEs we coexisted with
+  if (allDataElements.length > 0) {
+    const deNames = allDataElements.map(d => d.name);
+    const deBatches = [];
+    for (let i = 0; i < deNames.length; i += 50) deBatches.push(deNames.slice(i, i + 50));
+    const deResponses = await Promise.all(deBatches.map(batch => {
+      const nameFilter = batch.map(n => encodeURIComponent(n)).join(',');
+      return safeDhis2Fetch(`dataElements?filter=name:in:[${nameFilter}]&fields=id,name,valueType,optionSet[options[name]]&pageSize=50`);
+    }));
+    const deProbeFailures = deResponses.filter(r => r?._error).map(r => `dataElements name probe: ${r._error}`);
+    if (deProbeFailures.length) {
+      return {
+        success: false,
+        nothing_created: true,
+        phase: 'pre_check',
+        _error: `Aborted BEFORE creating anything: could not check the server for existing data elements (${deProbeFailures.join('; ')})`,
+        errors: deProbeFailures,
+        _hint: 'The duplicate-check queries against DHIS2 failed, so existing data elements could not be detected. Creating blindly would duplicate metadata that may already exist. Nothing was imported. Verify connectivity/permissions and retry the SAME add_stage call.',
+      };
+    }
+    const inputDeDefByName = new Map();
+    for (const d of (stage.data_elements || [])) if (d && d.name && !inputDeDefByName.has(d.name)) inputDeDefByName.set(d.name, d);
+    const stageSuffix = (progResp.shortName || progResp.name || '').trim();
+    const renameDe = (de, ex, reason) => {
+      const finalName = `${de.name} (${stageSuffix})`.substring(0, 230);
+      deRenames.push({ type: 'dataElement', requested: de.name, final: finalName, existing_id: ex.id, reason });
+      de.name = finalName;
+      de._renamed = true;
+    };
+    for (const resp of deResponses) {
+      for (const ex of (resp?.dataElements || [])) {
+        const de = allDataElements.find(d => d.name === ex.name && !d._skip && !d._renamed);
+        if (!de) continue;
+        // Same reuse gate as create_program: never bind this stage to an
+        // existing DE whose type/options contradict the request.
+        const reason = reuseIncompatibilityReason(inputDeDefByName.get(de.name), ex);
+        if (reason) { renameDe(de, ex, reason); continue; }
+        deUidMap[de.name] = ex.id;
+        de._skip = true;
+        reusedDataElements.push({ name: de.name, id: ex.id });
+      }
+    }
+    // Case-insensitive second pass, mirroring create_program: "Systolic blood
+    // pressure" must reuse an existing "Systolic Blood Pressure" — the exact
+    // in: probe misses case variants and a case-different DE imports as a
+    // silent near-duplicate (observed live 2026-07-18 on stage 2).
+    await Promise.all(allDataElements.filter(d => !d._skip && !d._renamed).map(async (de) => {
+      const resp = await safeDhis2Fetch(`dataElements?filter=name:ilike:${encodeURIComponent(de.name)}&fields=id,name,valueType,optionSet[options[name]]&pageSize=10`);
+      if (resp?._error) return;
+      const hit = (resp?.dataElements || []).find(x => String(x.name || '').toLowerCase() === String(de.name).toLowerCase());
+      if (!hit) return;
+      const reason = reuseIncompatibilityReason(inputDeDefByName.get(de.name), hit);
+      if (reason) { renameDe(de, hit, reason); return; }
+      deUidMap[de.name] = hit.id;
+      de._skip = true;
+      reusedDataElements.push({ name: de.name, id: hit.id });
+    }));
+    // Renamed coexistence names could themselves collide — shard them.
+    await Promise.all(allDataElements.filter(d => d._renamed).map(async (de) => {
+      const resp = await safeDhis2Fetch(`dataElements?filter=name:ilike:${encodeURIComponent(de.name)}&fields=id,name&pageSize=5`);
+      if (resp?._error) return;
+      if ((resp?.dataElements || []).some(x => String(x.name || '').toLowerCase() === String(de.name).toLowerCase())) {
+        de.name = `${de.name} ${generateDhis2Uid().slice(-4)}`.substring(0, 230);
+      }
+    }));
+  }
+  const finalDataElements = allDataElements.filter(de => !de._skip);
+
+  // Pre-probe DHIS2 for shortName collisions on the genuinely NEW DEs only.
+  await disambiguateShortNamesAgainstServer(finalDataElements, 'dataElements', 'dataElements');
+
+  // ── Stage name: DHIS2 enforces GLOBAL uniqueness on ProgramStage.name ──────
+  // Same probe chain as create_program: original → "<name> - <program short>"
+  // → UID-shard suffix.
+  let finalStageName = stage.name;
+  {
+    const programShortForSuffix = (progResp.shortName || progResp.name || '').trim();
+    let probe = await safeDhis2Fetch(
+      `programStages?filter=name:eq:${encodeURIComponent(finalStageName)}&fields=id&pageSize=1`
+    );
+    if (probe?.programStages?.length && programShortForSuffix) {
+      finalStageName = `${stage.name} - ${programShortForSuffix}`.substring(0, 230);
+      probe = await safeDhis2Fetch(
+        `programStages?filter=name:eq:${encodeURIComponent(finalStageName)}&fields=id&pageSize=1`
+      );
+    }
+    if (probe?.programStages?.length) {
+      finalStageName = `${stage.name} ${generateDhis2Uid().slice(-4)}`.substring(0, 230);
+    }
+  }
 
   const stageUid = generateDhis2Uid();
   const psdes = (stage.data_elements || []).map((de, j) => ({
@@ -2360,30 +2695,70 @@ async function addStageToProgram(args, defaultCatComboId) {
     sortOrder: j + 1,
   }));
 
+  // Optional visual sections — identical construction to create_program:
+  // sections are a TOP-LEVEL metadata collection (DHIS2 rejects full section
+  // objects nested inside the stage); the stage references them by id.
+  const psSections = [];
+  for (let k = 0; k < (stage.sections || []).length; k++) {
+    const sec = stage.sections[k];
+    const deRefs = (sec && (sec.data_elements || sec.dataElements) || [])
+      .map(n => deUidMap[typeof n === 'string' ? n : (n && n.name)])
+      .filter(Boolean)
+      .map(id => ({ id }));
+    if (!sec || !sec.name || !deRefs.length) continue;
+    psSections.push({
+      id: generateDhis2Uid(),
+      name: sec.name,
+      sortOrder: k + 1,
+      programStage: { id: stageUid },
+      dataElements: deRefs,
+    });
+  }
+
   const stageObj = {
     id: stageUid,
-    name: stage.name,
+    name: finalStageName,
     program: { id: args.program_id },
     sortOrder: existingStageCount + 1,
     repeatable: stage.repeatable || false,
     programStageDataElements: psdes,
   };
+  if (psSections.length) {
+    stageObj.programStageSections = psSections.map(s => ({ id: s.id }));
+  }
+  // Inherit the PROGRAM's sharing. A programStage is data-shareable, and its
+  // data bits are what actually gate event capture — so a stage that does not
+  // carry the program's access is invisible/unusable for data entry even
+  // though the program is shared correctly. Sharing a program always implies
+  // sharing its stages; an explicit `stage.sharing` still wins.
+  const inheritedStageSharing = stage.sharing || progResp.sharing || null;
+  if (inheritedStageSharing && inheritedStageSharing.public) {
+    stageObj.sharing = inheritedStageSharing;
+    stageObj.publicAccess = normalizeAccessString(inheritedStageSharing.public);
+  }
 
   const payload = {};
-  if (allOptions.length) payload.options = allOptions;
-  if (allOptionSets.length) payload.optionSets = allOptionSets;
-  if (allDataElements.length) payload.dataElements = allDataElements;
+  if (finalOptions.length) payload.options = finalOptions;
+  if (finalOptionSets.length) payload.optionSets = finalOptionSets;
+  if (finalDataElements.length) payload.dataElements = finalDataElements;
   payload.programStages = [stageObj];
+  if (psSections.length) payload.programStageSections = psSections;
 
   const result = await postMetadataPayload(payload, args.dry_run_only);
+  if (result && (result.success === false || result._error)) return failedImportResult(result, 'add_stage');
 
   return {
     ...result,
     summary: {
-      stage: { id: stageUid, name: stage.name, dataElements: (stage.data_elements || []).length },
+      stage: { id: stageUid, name: finalStageName, dataElements: (stage.data_elements || []).length },
+      ...(finalStageName !== stage.name ? { stage_renamed: { original: stage.name, final: finalStageName } } : {}),
       program_id: args.program_id,
       dataElements: Object.entries(deUidMap).map(([name, id]) => ({ name, id })),
+      reused_existing_data_elements: reusedDataElements,
+      ...(deRenames.length ? { reuse_conflict_renames: deRenames } : {}),
+      ...(optionSetRenames.length ? { option_set_renames: optionSetRenames } : {}),
       optionSets: Object.entries(optionSetUidMap).map(([name, id]) => ({ name, id })),
+      sections: psSections.map(s => ({ name: s.name, id: s.id })),
     },
   };
 }
@@ -2396,9 +2771,14 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
     return { _error: 'Provide data_element_ids (existing DE IDs) or data_elements (new DE definitions) for add_data_elements_to_stage' };
   }
 
-  // 1. Fetch the full current stage — we need name + program for a valid PUT
+  // 1. Fetch the full current stage — we need name + program for a valid PUT.
+  // CRITICAL: also fetch formType + programStageSections. A programStages PUT
+  // REPLACES the whole object, so omitting these two fields makes DHIS2 delete
+  // every section and revert the form to DEFAULT — the exact data-loss bug this
+  // tool used to cause. We read them here so we can send them back untouched
+  // (and route the new DE into the right section below).
   const stageResp = await safeDhis2Fetch(
-    `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,programStageDataElements[id,dataElement[id],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
+    `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
   );
   if (stageResp._error) return { _error: `Could not load stage ${args.stage_id}: ${stageResp._error}` };
   if (!stageResp.name) return { _error: `Stage ${args.stage_id} is missing required 'name' field` };
@@ -2408,6 +2788,50 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
   const existingIds = new Set(existing.map(psde => psde.dataElement?.id).filter(Boolean));
   const maxSortOrder = existing.reduce((m, e) => Math.max(m, e.sortOrder || 0), 0);
   let sortCounter = maxSortOrder;
+
+  // ── Section awareness ──────────────────────────────────────────────────────
+  // A stage renders as a sectioned form when it has programStageSections. When
+  // it does, a newly-added DE that is NOT placed in a section is invisible on
+  // the form. So if the stage is sectioned and the caller asks to add something,
+  // we must resolve WHICH section the new field(s) belong to before touching the
+  // server — and refuse (rather than orphan the field or wipe sections) when the
+  // target is ambiguous.
+  const sections = stageResp.programStageSections || [];
+  const hasSections = sections.length > 0;
+  const sectionList = sections.map(s => ({ id: s.id, name: s.name, data_element_count: (s.dataElements || []).length }));
+
+  // Will this call actually add anything new? (existing IDs already in the stage
+  // are skipped; new DE definitions are assumed to add.)
+  const willAddExistingIds = hasExistingIds && args.data_element_ids.some(id => !existingIds.has(id));
+  const willAddSomething = hasNewDEs || willAddExistingIds;
+
+  let targetSection = null;
+  if (hasSections && willAddSomething) {
+    if (args.section_id) {
+      targetSection = sections.find(s => s.id === args.section_id) || null;
+      if (!targetSection) {
+        return { _error: `Section id "${args.section_id}" is not a section of stage "${stageResp.name}".`, available_sections: sectionList };
+      }
+    } else if (args.section_name) {
+      const want = String(args.section_name).trim().toLowerCase();
+      targetSection = sections.find(s => (s.name || '').trim().toLowerCase() === want)
+        || sections.find(s => (s.name || '').trim().toLowerCase().includes(want)) || null;
+      if (!targetSection) {
+        return { _error: `No section matching "${args.section_name}" in stage "${stageResp.name}".`, available_sections: sectionList };
+      }
+    } else if (sections.length === 1) {
+      targetSection = sections[0]; // unambiguous — the stage has exactly one section
+    } else {
+      // Ambiguous: multiple sections, none specified. STOP — do not orphan the
+      // field or drop sections. Let the model ask the user which section.
+      return {
+        _error: `Stage "${stageResp.name}" uses a SECTION form with ${sections.length} sections. Tell me which section the new data element(s) should go into so they show up on the form.`,
+        _requires_user_confirmation: true,
+        available_sections: sectionList,
+        _hint: 'Re-call add_data_elements_to_stage with section_name (or section_id). All existing sections are preserved either way; this only decides where the NEW field appears.',
+      };
+    }
+  }
 
   // Preserve the existing elements as-is in the PUT body
   const updatedPsdes = existing.map(psde => ({
@@ -2424,6 +2848,7 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
   }));
 
   const addedElements = [];
+  const addedDeIds = []; // DE ids actually appended to the stage (for section routing)
 
   // 2. Create new DEs if requested, then queue them for the stage
   if (hasNewDEs) {
@@ -2475,6 +2900,7 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
           skipAnalytics: false,
         });
         addedElements.push({ id: deId, name: de.name });
+        addedDeIds.push(deId);
       }
     }
   }
@@ -2496,6 +2922,7 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
           skipAnalytics: false,
         });
         addedElements.push({ id: deId });
+        addedDeIds.push(deId);
       } else {
         addedElements.push({ id: deId, note: 'already_in_stage' });
       }
@@ -2507,13 +2934,36 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
       success: true, phase: 'dry_run',
       message: 'Dry run: no changes made.',
       stage_id: args.stage_id, stage_name: stageResp.name,
+      form_type: stageResp.formType || 'DEFAULT',
       would_add: addedElements.filter(e => !e.note),
+      ...(hasSections ? { would_place_in_section: targetSection ? { id: targetSection.id, name: targetSection.name } : null } : {}),
     };
   }
 
-  // 4. PUT the complete stage back with name + program + full programStageDataElements
-  // DHIS2 PUT on programStages requires 'name' and 'program' — sending only
-  // programStageDataElements causes 409 "Missing required property name".
+  // 3b. Snapshot the stage (and the target section, if any) BEFORE we mutate it.
+  // A full-object PUT on a program stage is inherently destructive to its
+  // sections, so a restorable backup is mandatory here — same guarantee the
+  // remove_from_stage path already gives.
+  const backupTargets = [{ object_type: 'programStages', object_id: args.stage_id, role: 'primary' }];
+  if (targetSection) backupTargets.push({ object_type: 'programStageSections', object_id: targetSection.id, role: 'section' });
+  const backup = await ensureBackupOrBail(
+    {
+      operation: 'add_data_elements_to_stage',
+      tool: 'create_metadata',
+      action: 'add_data_elements_to_stage',
+      reason: `Adding ${addedDeIds.length} data element(s) to stage ${stageResp.name}${targetSection ? ` (section "${targetSection.name}")` : ''}`,
+    },
+    backupTargets,
+    args
+  );
+  if (!backup.ok) return backup.error;
+
+  // 4. PUT the complete stage back. DHIS2 PUT on programStages REPLACES the
+  // whole object, so we MUST echo back formType AND the existing section
+  // references (as id-refs) — otherwise DHIS2 deletes every section and reverts
+  // the form to DEFAULT. Sending id-refs preserves each section object and its
+  // own dataElements untouched; the target section's membership is updated in a
+  // dedicated PUT below (step 5).
   const stageUpdate = {
     name: stageResp.name,
     program: { id: stageResp.program.id },
@@ -2521,12 +2971,14 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
     repeatable: stageResp.repeatable || false,
     programStageDataElements: updatedPsdes,
   };
+  if (stageResp.formType) stageUpdate.formType = stageResp.formType;
+  if (hasSections) stageUpdate.programStageSections = sections.map(s => ({ id: s.id }));
 
   const putResp = await safeDhis2Fetch(`programStages/${args.stage_id}`, {
     method: 'PUT',
     body: stageUpdate,
   });
-  if (putResp._error) return { _error: `Failed to update stage: ${putResp._error}` };
+  if (putResp._error) return { _error: `Failed to update stage: ${putResp._error}`, backup: backup.block };
 
   // Surface any DHIS2 import-level errors from the PUT response
   const putStatus = putResp?.status || putResp?.response?.status;
@@ -2538,13 +2990,48 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
         for (const er of (or.errorReports || [])) errors.push(er.message);
       }
     }
-    return { _error: `Stage update failed: ${putResp?.message || 'Unknown error'}`, errors };
+    return { _error: `Stage update failed: ${putResp?.message || 'Unknown error'}`, errors, backup: backup.block };
+  }
+
+  // 5. Place the newly-added DE(s) into the target section so they render on the
+  // sectioned form. The DE is already a programStageDataElement of the stage
+  // (step 4), which is a precondition for section membership. We fetch the full
+  // section via :owner and PUT it back with the new ids appended, so no section
+  // property is lost.
+  let sectionUpdate = null;
+  if (targetSection && addedDeIds.length) {
+    const secFull = await safeDhis2Fetch(`programStageSections/${targetSection.id}?fields=:owner`);
+    if (secFull?._error) {
+      sectionUpdate = { section_id: targetSection.id, placed: false, warning: `Could not load section to add the field: ${secFull._error}. The data element is on the stage but not yet in a section.` };
+    } else {
+      const secDeIds = new Set((secFull.dataElements || []).map(d => d.id));
+      const mergedDes = [...(secFull.dataElements || [])];
+      for (const id of addedDeIds) if (!secDeIds.has(id)) mergedDes.push({ id });
+      secFull.dataElements = mergedDes;
+      if (!secFull.programStage) secFull.programStage = { id: args.stage_id };
+      const secPut = await safeDhis2Fetch(`programStageSections/${targetSection.id}`, { method: 'PUT', body: secFull });
+      if (secPut?._error || (secPut?.status || secPut?.response?.status) === 'ERROR') {
+        const errs = [];
+        for (const tr of (secPut?.response?.typeReports || [])) {
+          for (const or of (tr.objectReports || [])) {
+            for (const er of (or.errorReports || [])) errs.push(er.message);
+          }
+        }
+        sectionUpdate = { section_id: targetSection.id, section_name: targetSection.name, placed: false, warning: `Field added to the stage but placing it in section "${targetSection.name}" failed: ${secPut?._error || errs.join('; ') || 'unknown error'}. Restore from backup if needed.` };
+      } else {
+        sectionUpdate = { section_id: targetSection.id, section_name: targetSection.name, placed: true };
+      }
+    }
   }
 
   return {
     success: true,
     stage_id: args.stage_id,
     stage_name: stageResp.name,
+    form_type: stageResp.formType || 'DEFAULT',
+    sections_preserved: hasSections ? sections.length : 0,
+    ...(sectionUpdate ? { section_placement: sectionUpdate } : {}),
+    backup: backup.block,
     added_elements: addedElements,
     total_elements: updatedPsdes.length,
   };
@@ -2561,12 +3048,17 @@ async function executeManageMetadata(args) {
     if (!args.stage_id) return { _error: 'stage_id required for remove_from_stage' };
     if (!args.data_element_ids?.length) return { _error: 'data_element_ids (array of DE UIDs) required for remove_from_stage' };
 
-    // Fetch the full current stage — we need name + program for a valid PUT
+    // Fetch the full current stage — we need name + program for a valid PUT.
+    // Also fetch formType + programStageSections: a programStages PUT REPLACES
+    // the object, so omitting them would delete every section and revert the
+    // form to DEFAULT (same data-loss bug the add path had).
     const stageResp = await safeDhis2Fetch(
-      `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,programStageDataElements[id,dataElement[id,name],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
+      `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id,name],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
     );
     if (stageResp._error) return { _error: `Could not load stage ${args.stage_id}: ${stageResp._error}` };
     if (!stageResp.name || !stageResp.program?.id) return { _error: `Stage ${args.stage_id} is missing required 'name' or program reference` };
+    const rmSections = stageResp.programStageSections || [];
+    const rmHasSections = rmSections.length > 0;
 
     const removeSet = new Set(args.data_element_ids);
     const existing = stageResp.programStageDataElements || [];
@@ -2600,15 +3092,32 @@ async function executeManageMetadata(args) {
       };
     }
 
-    // Snapshot the stage BEFORE we mutate it.
+    // Which sections reference a DE we're about to remove? They must be updated
+    // too, else they'd point at a DE that is no longer a stage PSDE.
+    const rmSectionsToFix = rmSections.filter(s => (s.dataElements || []).some(d => removeSet.has(d.id)));
+
+    // Snapshot the stage AND every affected section BEFORE we mutate them.
+    const rmBackupTargets = [{ object_type: 'programStages', object_id: args.stage_id, role: 'primary' }];
+    for (const s of rmSectionsToFix) rmBackupTargets.push({ object_type: 'programStageSections', object_id: s.id, role: 'section' });
     const backup = await ensureBackupOrBail(
       { operation: 'remove_from_stage', tool: 'manage_metadata', action: 'remove_from_stage', reason: `Removing ${removed.length} data element(s) from stage ${stageResp.name}` },
-      [{ object_type: 'programStages', object_id: args.stage_id, role: 'primary' }],
+      rmBackupTargets,
       args
     );
     if (!backup.ok) return backup.error;
 
-    // PUT the complete stage back without the removed elements
+    // Remove the DE(s) from their sections FIRST — a section may not reference a
+    // DE that is no longer a stage PSDE, so this must precede the stage PUT.
+    for (const s of rmSectionsToFix) {
+      const secFull = await safeDhis2Fetch(`programStageSections/${s.id}?fields=:owner`);
+      if (secFull?._error) continue;
+      secFull.dataElements = (secFull.dataElements || []).filter(d => !removeSet.has(d.id));
+      if (!secFull.programStage) secFull.programStage = { id: args.stage_id };
+      await safeDhis2Fetch(`programStageSections/${s.id}`, { method: 'PUT', body: secFull });
+    }
+
+    // PUT the complete stage back without the removed elements, echoing formType
+    // and the surviving section references so DHIS2 keeps the sectioned form.
     const stageUpdate = {
       name: stageResp.name,
       program: { id: stageResp.program.id },
@@ -2616,6 +3125,8 @@ async function executeManageMetadata(args) {
       repeatable: stageResp.repeatable || false,
       programStageDataElements: kept,
     };
+    if (stageResp.formType) stageUpdate.formType = stageResp.formType;
+    if (rmHasSections) stageUpdate.programStageSections = rmSections.map(s => ({ id: s.id }));
 
     const putResp = await safeDhis2Fetch(`programStages/${args.stage_id}`, {
       method: 'PUT',
@@ -2640,6 +3151,8 @@ async function executeManageMetadata(args) {
       action: 'remove_from_stage',
       stage_id: args.stage_id,
       stage_name: stageResp.name,
+      form_type: stageResp.formType || 'DEFAULT',
+      sections_preserved: rmHasSections ? rmSections.length : 0,
       removed_elements: removed,
       remaining_elements: kept.length,
       backup: backup.block,
@@ -2787,14 +3300,45 @@ async function executeManageMetadata(args) {
     if (_gate) return _gate;
     const programId = args.program_id || args.object_id;
     if (!programId) return { _error: 'program_id or object_id required for update_program_org_units' };
-    if (!Array.isArray(args.org_unit_ids)) return { _error: 'org_unit_ids array required for update_program_org_units' };
-
     const mergeMode = ['replace', 'add', 'remove'].includes(args.merge_mode) ? args.merge_mode : 'replace';
-    const requestedIds = [...new Set(args.org_unit_ids.filter(Boolean))];
 
-    const progResp = await safeDhis2Fetch(
-      `programs/${programId}?fields=id,displayName,name,shortName,programType,organisationUnits[id,displayName]`
-    );
+    // "assign every org unit on the instance" is the single most common request
+    // here ("add all OUs to this program"). Without a flag for it the model has
+    // to fetch the whole hierarchy and pass it back — and when it guessed an
+    // empty array instead, the replace below wiped the program off every OU
+    // (live 2026-07-25: the program vanished from Capture entirely).
+    let requestedIds;
+    if (args.all_org_units === true) {
+      const allResp = await safeDhis2Fetch('organisationUnits?fields=id&paging=false');
+      if (allResp._error) return { _error: `Could not list organisation units: ${allResp._error}` };
+      requestedIds = (allResp.organisationUnits || []).map(o => o.id).filter(Boolean);
+      if (!requestedIds.length) return { _error: 'No organisation units exist on this instance.' };
+    } else {
+      if (!Array.isArray(args.org_unit_ids)) return { _error: 'org_unit_ids array required for update_program_org_units (or pass all_org_units:true to assign every OU on the instance).' };
+      requestedIds = [...new Set(args.org_unit_ids.filter(Boolean))];
+    }
+
+    // An EMPTY replace un-assigns the program from every org unit, which makes
+    // it disappear from Capture/Tracker completely. That is essentially never
+    // the intent — it is the signature of a model that has not fetched the OU
+    // list yet. Refuse it unless the caller says so explicitly.
+    if (mergeMode === 'replace' && !requestedIds.length && args.confirm_remove_all_org_units !== true) {
+      return {
+        _error: 'Refused: replacing the org-unit assignment with an EMPTY list would un-assign this program from EVERY organisation unit, making it disappear from Capture/Tracker for all users. NOTHING was changed.',
+        _hint: 'To assign every org unit on the instance, call this action with all_org_units:true (no org_unit_ids needed). To assign specific ones, pass their UIDs in org_unit_ids. To ADD without touching existing assignments use merge_mode:"add". If you genuinely intend to un-assign the program from every OU, re-send with confirm_remove_all_org_units:true.',
+        _scope: 'empty_org_unit_replace',
+        _no_disable: true,
+      };
+    }
+
+    // Fetch the COMPLETE object (:owner = every owned property). The payload
+    // below is a whole-object replace — DHIS2 /metadata defaults to
+    // mergeMode=REPLACE — so anything omitted is reset to its default. Sending
+    // only id/name/shortName/programType/organisationUnits silently wiped the
+    // program's SHARING back to "rw------" (and every other unsent property),
+    // which is why "add all OUs" also destroyed the access that had just been
+    // granted (live 2026-07-25).
+    const progResp = await safeDhis2Fetch(`programs/${programId}?fields=:owner`);
     if (progResp._error) return { _error: `Could not fetch program ${programId}: ${progResp._error}` };
 
     const currentOrgUnits = Array.isArray(progResp.organisationUnits) ? progResp.organisationUnits : [];
@@ -2809,15 +3353,16 @@ async function executeManageMetadata(args) {
       nextIds = requestedIds;
     }
 
+    // Whole object back, with ONLY organisationUnits changed — every other
+    // property (sharing, stages, attributes, flags) is preserved verbatim.
     const payload = {
       programs: [{
-        id: progResp.id,
-        name: progResp.name || progResp.displayName || progResp.id,
-        shortName: progResp.shortName || progResp.name || progResp.displayName || progResp.id,
-        programType: progResp.programType,
+        ...progResp,
         organisationUnits: nextIds.map(id => ({ id })),
       }],
     };
+    delete payload.programs[0]._apiPath;
+    delete payload.programs[0]._pagerInfo;
 
     // Skip backup on a pure dry-run (nothing will be committed).
     let backup = { ok: true, block: null, skipped: false };
@@ -2921,10 +3466,27 @@ async function executeManageMetadata(args) {
 
     const previousPublicAccess = obj.publicAccess;
 
-    // Snapshot the object BEFORE we change sharing.
+    // ── Sharing a PROGRAM always implies sharing its STAGES ──
+    // A programStage carries its own sharing, and its DATA bits are what gate
+    // event capture. Updating only the program leaves the stages on whatever
+    // they had (typically the rw------ default), so the program looks shared
+    // while Capture still refuses enrollments/events — the exact confusion
+    // reported live 2026-07-25. Cascade by default; cascade_to_stages:false
+    // opts out for the rare "metadata visibility only" case.
+    const cascadeStages = args.object_type === 'programs' && args.cascade_to_stages !== false;
+    let stageIds = [];
+    if (cascadeStages) {
+      const stResp = await safeDhis2Fetch(`programs/${args.object_id}?fields=programStages[id,name]`);
+      if (!stResp?._error) stageIds = (stResp.programStages || []).map(st => ({ id: st.id, name: st.name }));
+    }
+
+    // Snapshot the object (and every stage we are about to touch) BEFORE the change.
     const backup = await ensureBackupOrBail(
-      { operation: 'update_sharing', tool: 'manage_metadata', action: 'update_sharing', reason: `Sharing update on ${args.object_type}/${args.object_id}` },
-      [{ object_type: args.object_type, object_id: args.object_id, role: 'primary' }],
+      { operation: 'update_sharing', tool: 'manage_metadata', action: 'update_sharing', reason: `Sharing update on ${args.object_type}/${args.object_id}${stageIds.length ? ` (+${stageIds.length} stage(s))` : ''}` },
+      [
+        { object_type: args.object_type, object_id: args.object_id, role: 'primary' },
+        ...stageIds.map(st => ({ object_type: 'programStages', object_id: st.id, role: 'cascade' })),
+      ],
       args
     );
     if (!backup.ok) return backup.error;
@@ -2957,9 +3519,65 @@ async function executeManageMetadata(args) {
     });
     if (putResp._error) return { _error: `Failed to update sharing: ${putResp._error}`, backup: backup.block };
 
-    // 4. Verify the update
+    // 4. Verify the update ACTUALLY took effect
     const verifyResp = await safeDhis2Fetch(`sharing?type=${singularType}&id=${args.object_id}`);
     const verified = verifyResp.object || {};
+    const actualPublic = verified.publicAccess || obj.publicAccess;
+
+    // DHIS2 SILENTLY DOWNGRADES a request it cannot honour: classes whose
+    // schema says dataShareable=false (trackedEntityAttribute, dataElement,
+    // optionSet, programIndicator …) accept a "rwrw----" PUT with HTTP 200 and
+    // store "rw------". Reporting that as success is how the assistant "fixed"
+    // the same 15 attributes twice, believed it had changed something, and kept
+    // hunting a phantom cause (live 2026-07-25). Compare requested vs stored and
+    // say plainly that nothing changed, with the REASON — so the model stops
+    // instead of retrying.
+    let sharingNote = null;
+    if (args.public_access !== undefined) {
+      const requested = normalizeAccessString(args.public_access, previousPublicAccess || 'rw------');
+      if (actualPublic !== requested) {
+        const schemaResp = await safeDhis2Fetch(`schemas/${singularType}?fields=dataShareable,shareable`);
+        const dataShareable = schemaResp && !schemaResp._error ? schemaResp.dataShareable : null;
+        // Did the METADATA half (positions 1-2 — the part that actually controls
+        // visibility) land? If so this is a partial success, not a failure: many
+        // classes (dashboard, visualization, dataElement, TEA, optionSet) are
+        // metadata-only by design, and "share this dashboard publicly" is a
+        // perfectly good request whose data bits are simply not a thing. Erroring
+        // there would break working flows.
+        const metadataApplied = actualPublic.slice(0, 2) === requested.slice(0, 2);
+        const wantedData = requested.slice(2, 4) !== '--';
+        if (metadataApplied && dataShareable === false && wantedData) {
+          sharingNote = `${singularType} is metadata-only in DHIS2 (schema dataShareable=false), so the requested data bits ("${requested.slice(2, 4)}") do not apply and were dropped: stored "${actualPublic}". The metadata access you asked for WAS applied, and this class never needs data access — nothing further to do here. Do NOT retry this, and do NOT repeat it on sibling ${singularType} objects. If you are chasing a DATA-access problem, only Program and ProgramStage carry data sharing — check those, the tracked entity type, and the user's org units.`;
+        } else {
+          return {
+            _error: `Sharing was NOT applied as requested to ${args.object_type}/${args.object_id}: still "${actualPublic}" (requested "${requested}").`,
+            _hint: `The server rejected or downgraded this change and the metadata bits did not land either. Re-read the object's current sharing, check that your access string is valid, and do not assume the change took effect. Do not repeat the identical call.`,
+            _scope: 'sharing_not_applied',
+            object_type: args.object_type,
+            object_id: args.object_id,
+            requested_public_access: requested,
+            actual_public_access: actualPublic,
+            data_shareable: dataShareable,
+            backup: backup.block,
+          };
+        }
+      }
+    }
+
+    // 5. Cascade the same sharing to the program's stages.
+    const stageResults = [];
+    for (const st of stageIds) {
+      const stCur = await safeDhis2Fetch(`sharing?type=programStage&id=${st.id}`);
+      if (stCur?._error || !stCur.object) { stageResults.push({ id: st.id, name: st.name, updated: false, error: stCur?._error || 'no sharing object' }); continue; }
+      const stObj = stCur.object;
+      const stBefore = stObj.publicAccess;
+      if (args.public_access !== undefined) stObj.publicAccess = normalizeAccessString(args.public_access, stBefore || 'rw------');
+      if (Array.isArray(args.user_group_accesses)) stObj.userGroupAccesses = args.user_group_accesses.map(e => ({ ...e, access: normalizeAccessString(e.access, 'rw------') }));
+      if (Array.isArray(args.user_accesses)) stObj.userAccesses = args.user_accesses.map(e => ({ ...e, access: normalizeAccessString(e.access, 'rw------') }));
+      const stPut = await safeDhis2Fetch(`sharing?type=programStage&id=${st.id}`, { method: 'PUT', body: { object: stObj } });
+      if (stPut?._error) { stageResults.push({ id: st.id, name: st.name, updated: false, error: stPut._error }); continue; }
+      stageResults.push({ id: st.id, name: st.name, updated: true, previous_public_access: stBefore, new_public_access: stObj.publicAccess });
+    }
 
     return {
       success: true,
@@ -2968,9 +3586,14 @@ async function executeManageMetadata(args) {
       object_id: args.object_id,
       object_name: obj.displayName || obj.name || args.object_id,
       previous_public_access: previousPublicAccess,
-      new_public_access: verified.publicAccess || obj.publicAccess,
+      new_public_access: actualPublic,
       user_group_accesses: (verified.userGroupAccesses || obj.userGroupAccesses || []).length,
       user_accesses: (verified.userAccesses || obj.userAccesses || []).length,
+      ...(sharingNote ? { _data_sharing_not_applicable: sharingNote } : {}),
+      ...(stageIds.length ? {
+        stages_cascaded: stageResults,
+        _cascade_note: `Sharing a program implies sharing its stages: the same access was applied to ${stageResults.filter(r => r.updated).length}/${stageIds.length} program stage(s). Stage DATA access is what allows event capture, so this is required for the program to be usable — not an extra.`,
+      } : {}),
       _access_key: 'Positions 1-2=metadata(rw), 3-4=data(rw). "rwrw----"=full, "rw------"=metadata only, "r-r-----"=read-only.',
       backup: backup.block,
     };
@@ -3473,13 +4096,21 @@ async function checkMetadataReferences(objectType, objectId) {
     if (!indResp._error && indResp.indicators?.length) {
       refs.indicators_using_legendset = indResp.indicators.map(x => ({ id: x.id, name: x.name }));
     }
-    const visResp = await safeDhis2Fetch(`visualizations?filter=legendSet.id:eq:${id}&fields=id,name&paging=false`);
+    // The visualization schema's property is `legend` (LegendDefinitions) —
+    // `legendSet.id` is not a valid filter path on 2.40+ and returns HTTP 400.
+    const visResp = await safeDhis2Fetch(`visualizations?filter=legend.set.id:eq:${id}&fields=id,name&paging=false`);
     if (!visResp._error && visResp.visualizations?.length) {
       refs.visualizations_using_legendset = visResp.visualizations.map(x => ({ id: x.id, name: x.name }));
     }
     const mapResp = await safeDhis2Fetch(`maps?filter=mapViews.legendSet.id:eq:${id}&fields=id,name&paging=false`);
     if (!mapResp._error && mapResp.maps?.length) {
       refs.maps_using_legendset = mapResp.maps.map(x => ({ id: x.id, name: x.name }));
+    }
+    // Saved line lists (eventVisualizations) reference legend sets too — a
+    // FIXED-strategy line list breaks if its legend set disappears.
+    const evResp = await safeDhis2Fetch(`eventVisualizations?filter=legend.set.id:eq:${id}&fields=id,name&paging=false`);
+    if (!evResp._error && evResp.eventVisualizations?.length) {
+      refs.line_lists_using_legendset = evResp.eventVisualizations.map(x => ({ id: x.id, name: x.name }));
     }
   }
 
@@ -3557,6 +4188,7 @@ function buildDeletionHint(objectType, objectId, refs) {
 }
 
 async function addProgramRules(args) {
+  const actionTypeFixes = []; // invalid/aliased rule-action types normalized client-side
   if (!args.program_id) return { _error: 'Missing program_id for add_program_rules' };
   if (!args.program_rules?.length) return { _error: 'Missing program_rules array' };
 
@@ -3754,6 +4386,13 @@ async function addProgramRules(args) {
     const actionRefs = [];
 
     for (const act of (rule.actions || [])) {
+      // Invalid enum values 409/500 the WHOLE atomic import at deserialization
+      // — normalize/alias/drop them client-side exactly like create_program.
+      const norm = normalizeRuleActionType(act.type, act.content);
+      if (norm.skip) { actionTypeFixes.push({ rule: rule.name, action_type: act.type, outcome: 'dropped', detail: norm.note }); continue; }
+      if (norm.note) actionTypeFixes.push({ rule: rule.name, action_type: act.type, outcome: `translated to ${norm.type}`, detail: norm.note });
+      act.type = norm.type;
+      if (norm.content && !act.content) act.content = norm.content;
       const praUid = generateDhis2Uid();
       actionRefs.push({ id: praUid });
       const pra = {
@@ -3763,6 +4402,8 @@ async function addProgramRules(args) {
       };
       if (act.content) pra.content = act.content;
       if (act.data) pra.data = act.data;
+      if (act.location) pra.location = act.location;
+      else if (pra.programRuleActionType === 'DISPLAYTEXT' || pra.programRuleActionType === 'DISPLAYKEYVALUEPAIR') pra.location = 'feedback';
       if (act.data_element_id) {
         // Direct ID target — used by HIDEALLFIELDS expansion and any explicit id pass-through.
         pra.dataElement = { id: act.data_element_id };
@@ -3807,6 +4448,7 @@ async function addProgramRules(args) {
   // option-NAME literal to its code and flag literals that match neither.
   let ruleConditionAdvisories = [];
   let ruleConditionRewrites = [];
+  let ruleDeadLiterals = [];
   {
     const deIdToOsId = new Map();
     for (const [n, id] of Object.entries(deNameToId)) {
@@ -3865,6 +4507,7 @@ async function addProgramRules(args) {
       });
       ruleConditionAdvisories = mapped.advisories;
       ruleConditionRewrites = mapped.rewrites;
+      ruleDeadLiterals = mapped.deadLiterals || [];
     }
   }
 
@@ -3874,6 +4517,7 @@ async function addProgramRules(args) {
   if (allPRs.length) payload.programRules = allPRs;
 
   const result = await postMetadataPayload(payload, args.dry_run_only);
+  if (result && (result.success === false || result._error)) return failedImportResult(result, 'add_program_rules');
 
   return {
     ...result,
@@ -3882,12 +4526,17 @@ async function addProgramRules(args) {
       programRules: allPRs.map(r => ({ id: r.id, name: r.name })),
       programRuleVariables: allPRVs.map(v => ({ id: v.id, name: v.name })),
       programRuleActions: allPRAs.map(a => ({ id: a.id, type: a.programRuleActionType })),
+      ...(actionTypeFixes.length ? { action_type_fixes: actionTypeFixes } : {}),
       ...(sugarSideEffects.stageUpdates.length ? { compulsory_flags_cleared: sugarSideEffects.stageUpdates } : {}),
       ...(sugarSideEffects.errors.length ? { compulsory_flag_errors: sugarSideEffects.errors } : {}),
       ...(sugarPlan.siblingMandateRules.length ? { auto_paired_mandate_rules: sugarPlan.siblingMandateRules.map(r => r.name) } : {}),
       ...(autoGuardedConditions.length ? { auto_guarded_conditions: autoGuardedConditions } : {}),
       ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
       ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
+      ...(ruleDeadLiterals.length ? {
+        dead_option_literals: ruleDeadLiterals,
+        dead_option_literals_action: `${ruleDeadLiterals.length} rule/ASSIGN comparison(s) reference a value that is not an option (code or name) of the target option set — these WILL NEVER FIRE. Fix each listed literal to a valid option code via manage_program_rules, or the corresponding program behaviour will silently not work.`,
+      } : {}),
       ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
     },
   };
@@ -4392,7 +5041,11 @@ async function validateProgramRuleCondition(condition, programId) {
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: condition || '',
+      redirect: 'manual',
     });
+    if (resp.type === 'opaqueredirect' || resp.status === 0) {
+      return { _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true };
+    }
     const bodyText = await resp.text().catch(() => '');
     if (!resp.ok) {
       try {
@@ -4640,6 +5293,10 @@ async function executeManageProgramRules(args, ctxProgramId) {
     const reusableOldIds = merged.actions ? [...oldActionIds] : [];
     const newActionIds = [];
     for (const act of actionsToPost) {
+      const norm = normalizeRuleActionType(act.type, act.content);
+      if (norm.skip) continue; // invalid enum would 409 the whole update
+      act.type = norm.type;
+      if (norm.content && !act.content) act.content = norm.content;
       const praId = act._existingId || reusableOldIds.shift() || generateDhis2Uid();
       newActionIds.push(praId);
       const pra = {
@@ -4650,6 +5307,8 @@ async function executeManageProgramRules(args, ctxProgramId) {
       };
       if (act.content) pra.content = act.content;
       if (act.data) pra.data = act.data;
+      if (act.location) pra.location = act.location;
+      else if (pra.programRuleActionType === 'DISPLAYTEXT' || pra.programRuleActionType === 'DISPLAYKEYVALUEPAIR') pra.location = 'feedback';
       if (act.data_element_id) pra.dataElement = { id: act.data_element_id };
       if (act.tei_attribute_id) pra.trackedEntityAttribute = { id: act.tei_attribute_id };
       if (act.program_stage_id) pra.programStage = { id: act.program_stage_id };
@@ -5251,12 +5910,16 @@ const VALID_PR_ACTION_TYPES = new Set([
   'CREATEEVENT', 'SETMANDATORYFIELD', 'SENDMESSAGE', 'SCHEDULEMESSAGE', 'SCHEDULEEVENT',
   'HIDEOPTION', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP',
 ]);
+// NOTE: SHOWWARNINGINFORMATION is documented in some DHIS2 docs but the server
+// enum REJECTS it (verified live on 2.42.5.1: "Cannot deserialize … from String
+// \"SHOWWARNINGINFORMATION\"") — aliased to SHOWWARNING below.
 
 // Model-invented action types that map to a real, closest-intent action. DHIS2
 // has NO "complete/close enrollment" rule action, so the documented best effort
 // is a visible completion PROMPT (SHOWWARNING with static content).
 const PR_COMPLETE_PROMPT = 'This case meets the completion criteria — complete the enrollment to close the tracker file. (DHIS2 has no automatic complete-enrollment program-rule action.)';
 const PR_ACTION_TYPE_ALIASES = {
+  SHOWWARNINGINFORMATION: { type: 'SHOWWARNING' },
   COMPLETEENROLLMENT: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
   COMPLETEEVENT: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
   CLOSEENROLLMENT: { type: 'SHOWWARNING', content: PR_COMPLETE_PROMPT },
@@ -5388,35 +6051,55 @@ function lintRuleVisibilitySemantics(newRules, existingRules = []) {
     }
   }
 
-  // 3. Complementary / duplicate hide pairs on the same target (batch-internal
-  // and new-vs-existing). Complementary pair ⇒ the target is hidden in EVERY
-  // case; duplicate ⇒ redundant twin rule.
-  const hideEntries = (list, isNew) => {
+  // 3. Complementary / duplicate action pairs (batch-internal and new-vs-existing).
+  //   - HIDE pairs: COMPLEMENTARY conditions ⇒ target hidden in EVERY case;
+  //     EQUIVALENT ⇒ redundant twin.
+  //   - Also catch EXACT-DUPLICATE rules for other deterministic actions:
+  //     SETMANDATORYFIELD on the same target, and UNTARGETED SHOWWARNING /
+  //     SHOWERROR / WARNING|ERRORONCOMPLETE. The same effect under an equivalent
+  //     condition is a redundant twin that fires twice in Capture (root cause of
+  //     "two identical BP warnings" / "referral set mandatory twice"). ASSIGN and
+  //     DISPLAY* are deliberately excluded: ASSIGN-same-target-different-value is
+  //     a CONFLICT not a duplicate, and DISPLAY feedback may legitimately repeat.
+  const UNTARGETED_DUP_TYPES = new Set(['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE']);
+  const TARGETED_DUP_TYPES = new Set([...PR_HIDE_ACTION_TYPES, 'SETMANDATORYFIELD']);
+  const dupEntries = (list, isNew) => {
     const out = [];
     for (const r of list) {
       for (const act of r.actions) {
-        if (PR_HIDE_ACTION_TYPES.has(act.type)) out.push({ rule: r, act, isNew });
+        const targeted = !!(act.keys && act.keys.size > 0);
+        if (targeted ? TARGETED_DUP_TYPES.has(act.type) : UNTARGETED_DUP_TYPES.has(act.type)) {
+          out.push({ rule: r, act, isNew, targeted });
+        }
       }
     }
     return out;
   };
-  const newHides = hideEntries(news, true);
-  const allHides = [...newHides, ...hideEntries(olds, false)];
+  const newDups = dupEntries(news, true);
+  const allDups = [...newDups, ...dupEntries(olds, false)];
   const flagged = new Set();
-  for (const a of newHides) {
-    for (const b of allHides) {
+  for (const a of newDups) {
+    for (const b of allDups) {
       if (a === b || a.rule === b.rule) continue;
-      if (a.act.type !== b.act.type || !_prKeysIntersect(a.act.keys, b.act.keys)) continue;
-      const pairKey = [a.rule.name, b.rule.name, a.act.label].sort().join('|');
+      if (a.act.type !== b.act.type) continue;
+      // Same target: both untargeted (identical effect) OR overlapping target keys.
+      const sameTarget = (a.targeted && b.targeted)
+        ? _prKeysIntersect(a.act.keys, b.act.keys)
+        : (!a.targeted && !b.targeted);
+      if (!sameTarget) continue;
+      const label = a.act.label || a.act.type;
+      const pairKey = [a.rule.name, b.rule.name, String(label)].sort().join('|');
       if (flagged.has(pairKey)) continue;
-      if (_prConditionsComplementary(a.rule.condition, b.rule.condition)) {
+      const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
+      if (PR_HIDE_ACTION_TYPES.has(a.act.type) && _prConditionsComplementary(a.rule.condition, b.rule.condition)) {
         flagged.add(pairKey);
-        const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
         errors.push(`Rule "${a.rule.name}" and ${bDesc} BOTH hide "${a.act.label}" under COMPLEMENTARY conditions ("${a.rule.condition}" vs "${b.rule.condition}") — together they hide it in every case, so the field/stage never appears. Keep ONLY the rule whose condition expresses when to HIDE and drop the other. ${PR_ONE_RULE_DOCTRINE}`);
       } else if (_prConditionsEquivalent(a.rule.condition, b.rule.condition)) {
         flagged.add(pairKey);
-        const bDesc = b.isNew ? `rule "${b.rule.name}" in this same request` : `EXISTING rule "${b.rule.name}"${b.rule.id ? ` (${b.rule.id})` : ''}`;
-        errors.push(`Rule "${a.rule.name}" duplicates ${bDesc}: same ${a.act.type} target "${a.act.label}" under an equivalent condition. Do not create duplicate rules — keep one.`);
+        const tgtDesc = a.targeted
+          ? `same ${a.act.type} target "${a.act.label}"`
+          : `an equivalent ${a.act.type} (same effect) `;
+        errors.push(`Rule "${a.rule.name}" duplicates ${bDesc}: ${tgtDesc} under an equivalent condition — it fires redundantly (the user sees the effect twice). Do not create duplicate rules — keep ONE (merge the messages/targets if both were intended, or stage-scope them).`);
       }
     }
   }
@@ -5467,39 +6150,79 @@ function autoGuardNumericComparisons(condition) {
 function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKey, optionsByOsKey }) {
   const advisories = [];
   const rewrites = [];
+  // Literals that match NO option even after normalization. Their rule/ASSIGN can
+  // never fire, so callers surface these PROMINENTLY (dead_option_literals) instead
+  // of leaving a silently-inert rule in the program (root cause of "many program
+  // rules don't work" — the comparison value simply isn't in the option set).
+  const deadLiterals = [];
+  // Tolerant match key: case-fold + collapse every run of non-alphanumerics to a
+  // single space. Lets '1+' match an option coded/named '1 +', 'Severe headache /
+  // visual symptoms' match 'Severe headache/visual symptoms', and stray case or
+  // spacing resolve to the real code instead of shipping a dead comparison.
+  const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   const lookup = (osKey) => {
     const opts = optionsByOsKey.get(osKey);
     if (!opts || !opts.length) return null;
+    const byNameNorm = new Map();
+    const byCodeNorm = new Map();
+    for (const o of opts) {
+      if (!byNameNorm.has(norm(o.name))) byNameNorm.set(norm(o.name), String(o.code));
+      if (!byCodeNorm.has(norm(o.code))) byCodeNorm.set(norm(o.code), String(o.code));
+    }
     return {
       byCode: new Set(opts.map(o => String(o.code))),
       byName: new Map(opts.map(o => [String(o.name).toLowerCase(), String(o.code)])),
+      byNameNorm,
+      byCodeNorm,
       codes: opts.map(o => o.code).join(', '),
     };
+  };
+  // exact code → {code, exact:true}; exact/normalized name or normalized code →
+  // {code, normalized?}; no match at all → null.
+  const resolve = (os, lit) => {
+    if (os.byCode.has(lit)) return { code: lit, exact: true };
+    const exactName = os.byName.get(lit.toLowerCase());
+    if (exactName) return { code: exactName };
+    const n = norm(lit);
+    const nn = os.byNameNorm.get(n);
+    if (nn) return { code: nn, normalized: true };
+    const nc = os.byCodeNorm.get(n);
+    if (nc) return { code: nc, normalized: true };
+    return null;
   };
 
   for (const rule of (rules || [])) {
     let cond = String(rule.condition || '');
-    const usedVars = new Set((cond.match(/#\{([^}]+)\}/g) || []).map(m => m.slice(2, -1)));
-    for (const vRaw of usedVars) {
+    // BOTH sigils. A TEA-sourced program-rule variable is referenced as
+    // A{name} (the DHIS2 convention — see the demo DB's own rules); #{name} is
+    // the data-element form. Scanning only #{} meant every option comparison on
+    // an ATTRIBUTE skipped the rewrite, saved with a display-name literal, and
+    // never fired — silently (live 2026-07-25:
+    // A{clinical_diagnosis} == 'Neonatal Tetanus' instead of 'NEONATAL_TETANUS').
+    const usedVars = new Map(); // name → sigil ('#' | 'A')
+    for (const m of cond.matchAll(/([#A])\{([^}]+)\}/g)) usedVars.set(m[2], m[1]);
+    for (const [vRaw, sigil] of usedVars) {
       const osKey = varToOsKey.get(vRaw.toLowerCase());
       if (!osKey) continue;
       const os = lookup(osKey);
       if (!os) continue;
-      const varToken = `#{${vRaw}}`;
+      const varToken = `${sigil}{${vRaw}}`;
       const esc = vRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*#\\{${esc}\\}`, 'g');
+      const tok = `${sigil === '#' ? '#' : 'A'}\\{${esc}\\}`;
+      const re = new RegExp(`${tok}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*${tok}`, 'g');
       cond = cond.replace(re, (full, op1, lit1, lit2, op2) => {
         const lit = (lit1 !== undefined ? lit1 : lit2);
         const op = op1 || op2;
         if (lit === '') return full;         // empty-value check — leave alone
-        if (os.byCode.has(lit)) return full; // already a code — leave alone
-        const code = os.byName.get(lit.toLowerCase());
-        if (code) {
-          rewrites.push(`Rule "${rule.name}": '${lit}' → option code '${code}'`);
-          return op1 ? `${varToken} ${op} '${code}'` : `'${code}' ${op} ${varToken}`;
+        const r = resolve(os, lit);
+        if (!r) {
+          advisories.push(`Rule "${rule.name}": ${varToken} is compared to '${lit}', which is neither a code nor a name of its option set (codes: ${os.codes}). This comparison will never match — verify the value.`);
+          deadLiterals.push({ rule: rule.name, variable: vRaw, literal: lit, valid_codes: os.codes });
+          return full;
         }
-        advisories.push(`Rule "${rule.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of its option set (codes: ${os.codes}). This comparison will never match — verify the value.`);
-        return full;
+        if (r.exact) return full;            // already a code — leave alone
+        rewrites.push(`Rule "${rule.name}": '${lit}' → option code '${r.code}'${r.normalized ? ' (normalized match)' : ''}`);
+        return op1 ? `${varToken} ${op} '${r.code}'` : `'${r.code}' ${op} ${varToken}`;
       });
     }
     rule.condition = cond;
@@ -5515,17 +6238,19 @@ function rewriteOptionLiteralsGeneric({ rules, actions, varToOsKey, targetToOsKe
     const literal = typeof pra.data === 'string' && pra.data.trim().match(/^'([^']*)'$/);
     if (!literal) continue; // dynamic expression — can't statically check
     const value = literal[1];
-    if (value === '' || os.byCode.has(value)) continue;
-    const code = os.byName.get(value.toLowerCase());
-    if (code) {
-      rewrites.push(`ASSIGN '${value}' → option code '${code}'`);
-      pra.data = `'${code}'`;
+    if (value === '') continue;
+    const r = resolve(os, value);
+    if (r && r.exact) continue;             // already a code — leave alone
+    if (r) {
+      rewrites.push(`ASSIGN '${value}' → option code '${r.code}'${r.normalized ? ' (normalized match)' : ''}`);
+      pra.data = `'${r.code}'`;
     } else {
       advisories.push(`ASSIGN uses '${value}', which is neither an option code nor an option name of the target's option set (codes: ${os.codes}). The assigned value will bounce on save — fix it.`);
+      deadLiterals.push({ assign: true, literal: value, valid_codes: os.codes });
     }
   }
 
-  return { advisories, rewrites };
+  return { advisories, rewrites, deadLiterals };
 }
 
 // PI grammar — d2 functions DHIS2 2.41 actually accepts inside a programIndicator
@@ -5562,6 +6287,32 @@ function lintProgramIndicatorExpression(text, kind) {
   if (!text || typeof text !== 'string') return null;
   const t = text;
 
+  // ── A{…} / #{…} must contain UIDs, never display names ──
+  // Program RULES resolve A{name} against a rule-variable name; program
+  // INDICATORS do not — they need A{teaUid} and #{stageUid.deUid}. DHIS2's own
+  // /description validator ACCEPTS a display name here and returns status OK,
+  // so the indicator saves clean and only detonates later, at dashboard render
+  // time, with HTTP 500 'Cannot invoke "org.antlr.v4.runtime.Token.getText()"
+  // because "ctx.uid0" is null' — a broken tile with an error nobody can read
+  // back to a cause (live 2026-07-25: A{Clinical diagnosis} == 'MEASLES').
+  // Catch it here, before it is ever saved.
+  const UID = '[A-Za-z][A-Za-z0-9]{10}';
+  const badToken = [...t.matchAll(/([#A])\{([^}]*)\}/g)].find(([, sigil, inner]) => {
+    const body = String(inner).trim();
+    if (!body) return true;
+    if (sigil === 'A') return !new RegExp(`^${UID}$`).test(body);
+    // #{…} is either a bare DE uid or stageUid.deUid (an optional 3rd part is
+    // accepted by some versions), and V{…}/attribute forms never reach here.
+    return !new RegExp(`^${UID}(\\.${UID}){0,2}$`).test(body);
+  });
+  if (badToken) {
+    const [full, sigil, inner] = badToken;
+    return {
+      error: `"${full}" is not a valid program-indicator reference. In a PROGRAM INDICATOR, ${sigil === 'A' ? 'A{…} must contain a tracked-entity-attribute UID' : '#{…} must contain a data-element UID, or programStageUid.dataElementUid'} — display names and program-rule variable names are NOT resolved here.`,
+      hint: `Replace "${inner}" with the object's UID (get them from get_program_info or manage_program_rules(action=list_variables)). ⚠ DHIS2 will NOT stop you: /programIndicators/${kind === 'filter' ? 'filter' : 'expression'}/description returns status OK for a display name, the indicator saves, and then every analytics query for it fails with HTTP 500 "ctx.uid0 is null" — a permanently broken dashboard tile. This differs from program RULES, where A{name} IS correct.`,
+    };
+  }
+
   // Program-RULE-only d2 functions leaking into a PI. d2:contains is the #1
   // offender — common ask is "MULTI_TEXT contains X AND Y" and the model
   // reaches for the rule-engine helper. The DHIS2 PI parser rejects it with
@@ -5595,7 +6346,7 @@ function lintProgramIndicatorExpression(text, kind) {
     if (!VALID_PI_D2_FUNCS.has(fn)) {
       return {
         error: `Unknown program-indicator function: \`d2:${fn}(\`.`,
-        hint: `Supported PI d2 functions (parser-verified on 2.42/2.43): ${SUPPORTED_LIST}.`,
+        hint: `d2:${fn} does not exist in the PI grammar — do NOT retry it. Supported PI d2 functions (parser-verified on 2.42/2.43): ${SUPPORTED_LIST}. To COUNT events/enrollments matching a condition, no counting function is needed: set analytics_type EVENT with expression \`V{event_count}\` (or ENROLLMENT with \`V{tei_count}\`/\`V{enrollment_count}\`) and put the condition in \`filter\` (e.g. filter: "#{<stageUid>.<deUid>} == 'CODE'"). The #{stage.de} references themselves scope the count to that stage.`,
       };
     }
   }
@@ -5635,6 +6386,13 @@ function lintProgramIndicatorExpression(text, kind) {
   if (/\bI\{[^}]+\}/.test(t)) return { error: 'I{} (indicator) references are not valid in program indicators.', hint: 'Compose the calculation directly in this PI using #{stage.de} / A{tea}.' };
   if (/\bOUG\{[^}]+\}/.test(t)) return { error: 'OUG{} (org unit group) references are not valid in program indicators.', hint: 'Scope by org unit in the ANALYTICS request instead: put the org-unit group / OUs in the visualization\'s ou dimension (e.g. OU_GROUP-<ougId> in dhis2 analytics, or org_units in manage_dashboards). The PI itself must stay OU-agnostic — d2:inOrgUnitGroup is rejected by the PI parser on 2.42/2.43.' };
 
+  // Mixed &&/|| without parentheses: && binds TIGHTER, so `A || B && C` is
+  // `A || (B && C)` — almost never what a "mode is (P or E) and indication is X"
+  // filter intends. Hard-block would be wrong (the precedence CAN be intended),
+  // so this returns nothing here; the caller surfaces it as an advisory. Kept
+  // as a helper for both expression kinds.
+  // (checked inline below via _piMixedPrecedenceAdvisory)
+
   // Same-field equality against two DIFFERENT literals is impossible ONLY when the
   // comparisons are AND-ed: `#{X} == 'A' && #{X} == 'B'`. The OR form
   // `#{X} == 'A' || #{X} == 'B'` is the NORMAL, correct way to match one of several
@@ -5644,7 +6402,11 @@ function lintProgramIndicatorExpression(text, kind) {
   // any of them. (The old check counted same-ref equalities across the whole
   // filter and wrongly rejected valid `||` "field in set" filters.)
   if (kind === 'filter') {
-    for (const term of t.split('||')) {
+    // The DHIS2 expression parser accepts BOTH `||` and the keyword `or`
+    // (verified live 2.42.5.1) — split OR-terms on either, or a valid
+    // "field is A or B" filter written with the keyword form false-positives
+    // as a contradiction (observed live 2026-07-19).
+    for (const term of t.split(/\|\||\bor\b/i)) {
       const byRef = new Map(); // ref → Set(distinct literals compared with ==)
       for (const m of term.matchAll(/(#\{[^}]+\}|A\{[^}]+\})\s*==\s*'([^']*)'/g)) {
         if (!byRef.has(m[1])) byRef.set(m[1], new Set());
@@ -5696,7 +6458,7 @@ function applyRuleActionSugar(rules, programStages) {
   const result = { psdesToFlipNonCompulsory: [], siblingMandateRules: [] };
 
   const TEMPLATE_TYPES = new Set([
-    'SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE', 'SHOWWARNINGINFORMATION',
+    'SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE',
   ]);
   const VAR_REF_PATTERN = /[#A]\{[^}]+\}/g;
   const splitTemplateContent = (raw) => {
@@ -5943,6 +6705,32 @@ async function resolveRuleActionTargetNames(pid, actions) {
 }
 
 async function _buildAndPostProgramRules(programId, rules, dryRun) {
+  const actionTypeFixes = []; // invalid/aliased rule-action types normalized client-side
+  // Client-side incomplete-input gate: a rule with no name/condition/actions
+  // would bounce the whole atomic bundle at server validation ("Missing
+  // required property `name`") — refuse BEFORE any API call, as an
+  // incomplete-call (non-disabling) so a corrected retry runs normally.
+  {
+    const bad = [];
+    (rules || []).forEach((r, i) => {
+      if (!r || typeof r !== 'object' || !Object.keys(r).length) { bad.push(`rules[${i}] is empty`); return; }
+      if (!String(r.name || '').trim()) bad.push(`rules[${i}] is missing name`);
+      if (!String(r.condition || '').trim()) bad.push(`rules[${i}]${r.name ? ` ("${r.name}")` : ''} is missing condition`);
+      if (!Array.isArray(r.actions) || !r.actions.length) bad.push(`rules[${i}]${r.name ? ` ("${r.name}")` : ''} has no actions`);
+    });
+    if (!Array.isArray(rules) || !rules.length) bad.push('no rules were provided');
+    if (bad.length) {
+      return {
+        success: false,
+        nothing_created: true,
+        phase: 'input_validation',
+        _error: `Program-rule input is incomplete — ${bad.slice(0, 8).join('; ')}${bad.length > 8 ? `; …and ${bad.length - 8} more` : ''}. NOTHING was created (no API call was made).`,
+        _hint: 'Each rule needs { name, condition, actions:[{type, …}] }. Re-send the COMPLETE rule definition(s). This was caught client-side; the tool remains fully available.',
+        _scope: 'incomplete_call',
+        _no_disable: true,
+      };
+    }
+  }
   // 1. Lint conditions for known-broken boolean patterns.
   const lintErrors = [];
   for (const rule of rules) {
@@ -6069,6 +6857,26 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     return undefined;
   };
 
+  // Fuzzy fallback for name lookups against a sanitized-name map: exact match
+  // failed, so try underscore-insensitive equality, then a UNIQUE prefix match
+  // (either direction). Weak models emit near-miss tokens ("haemoglobin_in_g_d_l"
+  // for "…_g_dl"), and the reuse-compatibility gate can rename a DE to
+  // "<name> (<program short>)" so the model's shorter token is a strict prefix.
+  // Only an unambiguous match resolves; ambiguity returns null.
+  const fuzzyBySanitized = (map, rawName) => {
+    const sk = String(sanitizeVariableName(rawName)).replace(/_/g, '');
+    if (!sk) return null;
+    const eq = [], pref = [];
+    for (const [k, entry] of map) {
+      const ks = String(k).replace(/_/g, '');
+      if (ks === sk) eq.push(entry);
+      else if (ks.startsWith(sk) || sk.startsWith(ks)) pref.push(entry);
+    }
+    if (eq.length === 1) return eq[0];
+    if (eq.length === 0 && pref.length === 1) return pref[0];
+    return null;
+  };
+
   // Resolve a rule action's TARGET (the DE/TEA the action acts on) from either an
   // explicit UID (data_element_id / tei_attribute_id) OR a display name
   // (data_element_name / tracked_entity_attribute_name). The schema advertises the
@@ -6084,6 +6892,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     return deByDisplayName.get(nm)
       || deBySanitized.get(String(nm).toLowerCase())
       || deBySanitized.get(sanitizeVariableName(nm))
+      || fuzzyBySanitized(deBySanitized, nm)
       || null;
   };
   const resolveActionTeaEntry = (act) => {
@@ -6094,6 +6903,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     return teaByDisplayName.get(nm)
       || teaBySanitized.get(String(nm).toLowerCase())
       || teaBySanitized.get(sanitizeVariableName(nm))
+      || fuzzyBySanitized(teaBySanitized, nm)
       || null;
   };
 
@@ -6181,8 +6991,9 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       return true;
     }
 
-    // Auto-resolve via DE display name (sanitized).
-    const deEntry = deBySanitized.get(key) || deBySanitized.get(sanitizeVariableName(name));
+    // Auto-resolve via DE display name (sanitized; fuzzy = underscore-
+    // insensitive equality, then unique prefix — see fuzzyBySanitized).
+    const deEntry = deBySanitized.get(key) || deBySanitized.get(sanitizeVariableName(name)) || fuzzyBySanitized(deBySanitized, name);
     if (deEntry) {
       const prv = buildPRVFromDE(name, deEntry, rule);
       allPRVs.push(prv);
@@ -6191,8 +7002,8 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       return true;
     }
 
-    // Auto-resolve via TEA display name (sanitized).
-    const teaEntry = teaBySanitized.get(key) || teaBySanitized.get(sanitizeVariableName(name));
+    // Auto-resolve via TEA display name (sanitized + fuzzy).
+    const teaEntry = teaBySanitized.get(key) || teaBySanitized.get(sanitizeVariableName(name)) || fuzzyBySanitized(teaBySanitized, name);
     if (teaEntry) {
       const prv = buildPRVFromTEA(name, teaEntry);
       allPRVs.push(prv);
@@ -6274,6 +7085,11 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     // Build this rule's actions (regardless of unresolved refs — we'll abort below if any).
     const actionRefs = [];
     for (const act of (rule.actions || [])) {
+      const norm = normalizeRuleActionType(act.type, act.content);
+      if (norm.skip) { actionTypeFixes.push({ rule: rule.name, action_type: act.type, outcome: 'dropped', detail: norm.note }); continue; }
+      if (norm.note) actionTypeFixes.push({ rule: rule.name, action_type: act.type, outcome: `translated to ${norm.type}`, detail: norm.note });
+      act.type = norm.type;
+      if (norm.content && !act.content) act.content = norm.content;
       const praUid = generateDhis2Uid();
       actionRefs.push({ id: praUid });
       const pra = {
@@ -6284,6 +7100,8 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       };
       if (act.content) pra.content = act.content;
       if (act.data) pra.data = act.data;
+      if (act.location) pra.location = act.location;
+      else if (pra.programRuleActionType === 'DISPLAYTEXT' || pra.programRuleActionType === 'DISPLAYKEYVALUEPAIR') pra.location = 'feedback';
       // Resolve the action's target DE/TEA by id OR by display name. Previously
       // only *_id was honored, so a name-targeted ASSIGN/SETMANDATORYFIELD/HIDEFIELD
       // saved with no target and DHIS2 rejected the whole bundle at validation.
@@ -6416,10 +7234,13 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     for (const [, prv] of existingPRVs) noteVar(prv.name, prv.useCodeForOptionSet, prv.dataElement?.id, prv.trackedEntityAttribute?.id);
 
     // Which option sets do the conditions actually reference (option vars w/ useCode)?
+    // BOTH sigils: A{name} is how a TEA-sourced variable is referenced, and
+    // scanning only #{} left every attribute option comparison unrewritten —
+    // it saved with a display-name literal and silently never fired.
     const neededOsIds = new Set();
     for (const pr of allPRs) {
-      for (const m of (pr.condition.match(/#\{([^}]+)\}/g) || [])) {
-        const info = varOptionInfo.get(m.slice(2, -1).toLowerCase());
+      for (const m of (pr.condition.matchAll(/([#A])\{([^}]+)\}/g) || [])) {
+        const info = varOptionInfo.get(String(m[2]).toLowerCase());
         if (info && info.useCode) neededOsIds.add(info.optionSetId);
       }
     }
@@ -6439,16 +7260,18 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       }
       for (const pr of allPRs) {
         let cond = pr.condition;
-        const usedVars = new Set((cond.match(/#\{([^}]+)\}/g) || []).map(m => m.slice(2, -1)));
-        for (const vRaw of usedVars) {
+        const usedVars = new Map(); // name → sigil ('#' | 'A')
+        for (const m of cond.matchAll(/([#A])\{([^}]+)\}/g)) usedVars.set(m[2], m[1]);
+        for (const [vRaw, sigil] of usedVars) {
           const info = varOptionInfo.get(vRaw.toLowerCase());
           if (!info || !info.useCode) continue;
           const os = osMap.get(info.optionSetId);
           if (!os) continue;
-          const varToken = `#{${vRaw}}`;
+          const varToken = `${sigil}{${vRaw}}`;
           const esc = vRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          // `#{var} ==|!= 'literal'` in either order.
-          const re = new RegExp(`#\\{${esc}\\}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*#\\{${esc}\\}`, 'g');
+          const tok = `${sigil === '#' ? '#' : 'A'}\\{${esc}\\}`;
+          // `<sigil>{var} ==|!= 'literal'` in either order.
+          const re = new RegExp(`${tok}\\s*(==|!=)\\s*'([^']*)'|'([^']*)'\\s*(==|!=)\\s*${tok}`, 'g');
           cond = cond.replace(re, (full, op1, lit1, lit2, op2) => {
             const lit = (lit1 !== undefined ? lit1 : lit2);
             const op = op1 || op2;
@@ -6457,7 +7280,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
             const code = os.byName.get(lit.toLowerCase());
             if (code) return op1 ? `${varToken} ${op} '${code}'` : `'${code}' ${op} ${varToken}`;
             // Neither a code nor a name of this option set → advise (don't rewrite).
-            conditionOptionAdvisories.push(`Rule "${pr.name}": #{${vRaw}} is compared to '${lit}', which is neither a code nor a name of option set "${os.name}" (codes: ${os.options.map(x => x.code).join(', ')}). This comparison will never match — verify the value.`);
+            conditionOptionAdvisories.push(`Rule "${pr.name}": ${varToken} is compared to '${lit}', which is neither a code nor a name of option set "${os.name}" (codes: ${os.options.map(x => x.code).join(', ')}). This comparison will never match — verify the value.`);
             return full;
           });
         }
@@ -6472,10 +7295,12 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   payload.programRules = allPRs;
 
   const result = await postMetadataPayload(payload, dryRun);
+  if (result && (result.success === false || result._error)) return failedImportResult(result, 'program-rule create');
   return {
     ...result,
     summary: {
       programRules: allPRs.map(r => ({ id: r.id, name: r.name })),
+      ...(actionTypeFixes.length ? { action_type_fixes: actionTypeFixes } : {}),
       programRuleVariables: allPRVs.map(v => ({ id: v.id, name: v.name, sourceType: v.programRuleVariableSourceType, dataElement: v.dataElement?.id, trackedEntityAttribute: v.trackedEntityAttribute?.id })),
       programRuleActions: allPRAs.map(a => ({ id: a.id, type: a.programRuleActionType })),
       auto_created_variables: autoCreated,
@@ -6510,7 +7335,57 @@ function varRefsCovered(rules, existingPRVs) {
 
 // Validate a program indicator expression/filter via DHIS2's server-side description endpoint.
 // The endpoint accepts a raw text body (Content-Type: text/plain) and returns { status, description, message }.
+
+// Advisory (never blocking): mixed AND/OR without any parentheses — && binds
+// tighter than ||, so `A || B && C` means `A || (B && C)`; a filter written as
+// "mode is planned or emergency AND indication is X" silently counts every
+// planned event (observed live 2026-07-19). The model gets this back with the
+// save result so it can add explicit parentheses.
+function piMixedPrecedenceAdvisory(kind, text) {
+  const t = String(text || '');
+  if (!t || t.includes('(')) return null;
+  const hasOr = /\|\||\bor\b/i.test(t);
+  const hasAnd = /&&|\band\b/i.test(t);
+  if (!hasOr || !hasAnd) return null;
+  return `${kind} mixes AND and OR without parentheses — AND binds tighter, so "A || B && C" means "A || (B && C)". If you meant "(A || B) && C", add explicit parentheses and update this indicator.`;
+}
+
+// The /description endpoint is an ADVISORY pre-check: the authoritative gate is
+// the VALIDATE→COMMIT metadata import. So a TRANSPORT/SERVER failure there (5xx,
+// network blip) must never be read as "this expression is invalid" — doing so
+// aborted a whole 4-indicator batch on one transient 500 ("All 4 program
+// indicator(s) failed validation — nothing was created", live 2026-07-25).
+// Retry once, then report the result as INCONCLUSIVE so callers proceed to the
+// import and let the server's real validator decide. A semantic rejection
+// (HTTP 200 + status ERROR) is unaffected and still fails fast.
+function piValidationInconclusive(r) {
+  if (!r || !r._error) return false;
+  const st = Number(r._status) || 0;
+  if (st >= 500) return true;
+  return /failed to fetch|network|timed?\s?out|socket|connection/i.test(String(r._error));
+}
+
+async function validateProgramIndicatorExpressionResilient(kind, text, programId) {
+  let r = await validateProgramIndicatorExpression(kind, text, programId);
+  if (piValidationInconclusive(r)) {
+    await new Promise(res => setTimeout(res, 400));
+    r = await validateProgramIndicatorExpression(kind, text, programId);
+    if (piValidationInconclusive(r)) {
+      console.warn(`[PI] ${kind} validation inconclusive (server ${r._status || 'error'}) — deferring to the metadata import`);
+      return { status: 'OK', _inconclusive: true, _validator_error: r._error };
+    }
+  }
+  return r;
+}
+
 async function validateProgramIndicatorExpression(kind, text, programId) {
+  // An EMPTY body makes /programIndicators/{expression|filter}/description
+  // answer HTTP 500 (verified 2.42.5.1, 2026-07-25). An absent filter is
+  // legitimate — it just means "no filter" — so treat blank as valid instead of
+  // burning a failed API call on it.
+  if (!String(text || '').trim()) {
+    return { status: 'OK', description: `(no ${kind} — nothing to validate)`, _skipped_empty: true };
+  }
   if (!dhis2.baseUrl || !dhis2.apiVersion) {
     const ok = await ensureConnected();
     if (!ok) return { _error: 'Not connected to DHIS2' };
@@ -6527,7 +7402,11 @@ async function validateProgramIndicatorExpression(kind, text, programId) {
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: text || '',
+      redirect: 'manual',
     });
+    if (resp.type === 'opaqueredirect' || resp.status === 0) {
+      return { _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true };
+    }
     const bodyText = await resp.text().catch(() => '');
     if (!resp.ok) {
       // Some DHIS2 versions return 409/400 with JSON { message }; surface that as the error.
@@ -7065,7 +7944,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
           const newMessages = [];
           for (const [kind, text] of checks) {
             try {
-              const res = await validateProgramIndicatorExpression(kind, text, programId);
+              const res = await validateProgramIndicatorExpressionResilient(kind, text, programId);
               serverValidated++;
               // DHIS2 returns { status: "OK"|"ERROR", description, message }
               const status = res?.status;
@@ -7304,7 +8183,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
         if (!progIdForCheck) continue;
         for (const [kind, text] of [['expression', pi.expression], ['filter', pi.filter]]) {
           if (!text || !String(text).trim()) continue;
-          const res = await validateProgramIndicatorExpression(kind, text, progIdForCheck);
+          const res = await validateProgramIndicatorExpressionResilient(kind, text, progIdForCheck);
           const status = res?.status;
           const bad = res?._error || (status && status !== 'OK' && status !== 'VALID' && status !== 'SUCCESS');
           if (bad) {
@@ -7379,7 +8258,13 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     const _gate = requireWriteAuth('manage_program_indicators', 'create');
     if (_gate) return _gate;
     if (!programId) return { _error: 'program_id required for create' };
-    if (!args.indicator) return { _error: 'indicator object required for create' };
+    // BATCH create: indicators:[…] validates & commits MANY PIs in ONE metadata
+    // import — the only way a big analytical build (15-40 PIs) fits the loop budget.
+    if (Array.isArray(args.indicators)) {
+      if (!args.indicators.length) return { _error: 'indicators array is empty — pass at least one indicator object, or use the single `indicator` field.' };
+      return await _buildAndPostProgramIndicatorsBatch(programId, args.indicators, args.dry_run_only);
+    }
+    if (!args.indicator) return { _error: 'indicator object (or indicators array for a batch) required for create' };
     if (!args.indicator.name) return { _error: 'indicator.name is required' };
     return await _buildAndPostProgramIndicator(programId, null, args.indicator, args.dry_run_only);
   }
@@ -7469,9 +8354,17 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
 
 // Build and POST a program indicator object.
 // indicator_id=null → create new; indicator_id=string → update existing.
-async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, dryRun) {
-  // Resolve default categoryCombo once
-  const catComboId = indicator._catComboId
+// Build + fully validate ONE program-indicator object WITHOUT posting it.
+// Extracted from _buildAndPostProgramIndicator so batch create can validate many
+// indicators and then commit them in a SINGLE metadata import. Returns
+// { pi, precedenceAdvisories } on success, or an { _error, _hint, … } object shaped
+// exactly like the create-time refusals. opts.catComboId / opts.progStagesById let
+// the batch driver resolve the default category combo and the program's stage→DE
+// structure ONCE and share them across the whole batch instead of refetching per
+// indicator (47 identical program fetches → 1 on the pregnancy analytics build).
+async function _prepareProgramIndicatorObject(programId, indicatorId, indicator, opts = {}) {
+  // Resolve default categoryCombo once (batch driver shares one across all PIs)
+  const catComboId = indicator._catComboId || opts.catComboId
     || (await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1'))?.categoryCombos?.[0]?.id
     || 'bjDvmb4bfuf';
 
@@ -7533,6 +8426,50 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
     }
   }
 
+  // Ground every #{stage.de} reference against the program's REAL structure
+  // BEFORE server validation. A stale/hallucinated stage or DE uid otherwise
+  // comes back as a bare "Expression is not valid" with no clue (observed live
+  // 2026-07-19: a model reused a stage id from a trimmed conversation and
+  // burned 4 rejections + a circuit-breaker disable). The precise listing lets
+  // the model self-correct in ONE step.
+  if (programId) {
+    const refRe = /#\{([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})\}/g;
+    const refs = [];
+    for (const text of [pi.expression, pi.filter]) {
+      for (const m of String(text || '').matchAll(refRe)) refs.push({ stage: m[1], de: m[2], token: m[0] });
+    }
+    if (refs.length) {
+      let stageById = opts.progStagesById || null;
+      if (!stageById) {
+        const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName]]]`);
+        if (!progResp?._error && Array.isArray(progResp?.programStages)) {
+          stageById = new Map(progResp.programStages.map(st => [st.id, st]));
+        }
+      }
+      if (stageById) {
+        const problems = [];
+        for (const r of [...new Map(refs.map(x => [x.token, x])).values()]) {
+          const st = stageById.get(r.stage);
+          if (!st) {
+            problems.push(`${r.token}: "${r.stage}" is not a stage of this program`);
+            continue;
+          }
+          if (!(st.programStageDataElements || []).some(pd => pd.dataElement?.id === r.de)) {
+            problems.push(`${r.token}: data element "${r.de}" is not on stage "${st.displayName}"`);
+          }
+        }
+        if (problems.length) {
+          const stageList = [...stageById.values()].map(st => `${st.displayName} (${st.id})`).join(', ');
+          return {
+            _error: `Program indicator ${indicatorId ? 'update' : 'create'} blocked: expression/filter references do not match the program structure — ${problems.join('; ')}.`,
+            _hint: `Use the program's REAL stage ids: ${stageList}. Fetch a stage's data elements with get_program_info(info_type="stage_details", target_id=<stageId>) and rebuild the #{stageUid.deUid} references. Nothing was saved.`,
+            problems,
+          };
+        }
+      }
+    }
+  }
+
   // Server-side validation — authoritative. Catches semantic errors the local
   // lint can't (unresolved DE/stage/TEA IDs, type mismatches, parser quirks).
   const exprChecks = [];
@@ -7540,7 +8477,7 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   if (pi.filter && pi.filter.trim()) exprChecks.push(['filter', pi.filter]);
   const validationResults = await Promise.all(
     exprChecks.map(([kind, text]) =>
-      validateProgramIndicatorExpression(kind, text, programId).then(r => ({ kind, text, r }))
+      validateProgramIndicatorExpressionResilient(kind, text, programId).then(r => ({ kind, text, r }))
     )
   );
   for (const { kind, text, r } of validationResults) {
@@ -7562,8 +8499,24 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
     }
   }
 
+  const precedenceAdvisories = [
+    piMixedPrecedenceAdvisory('expression', pi.expression),
+    piMixedPrecedenceAdvisory('filter', pi.filter),
+  ].filter(Boolean);
+
+  return { pi, precedenceAdvisories };
+}
+
+// Commit ONE program indicator (create or update). Validates via
+// _prepareProgramIndicatorObject, then disambiguates shortName/name and POSTs it.
+async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, dryRun) {
+  const prepared = await _prepareProgramIndicatorObject(programId, indicatorId, indicator);
+  if (prepared._error) return prepared;
+  const { pi, precedenceAdvisories } = prepared;
+  const uid = pi.id;
+
   if (dryRun) {
-    return { success: true, phase: 'dry_run', message: 'Dry run only. No changes committed.', would_save: pi };
+    return { success: true, phase: 'dry_run', message: 'Dry run only. No changes committed.', would_save: pi, ...(precedenceAdvisories.length ? { precedence_advisories: precedenceAdvisories } : {}) };
   }
 
   // For CREATE, pre-probe the server for shortName collisions. UPDATE keeps
@@ -7597,6 +8550,7 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   const result = await postMetadataPayload({ programIndicators: [pi] }, false);
   const out = {
     ...result,
+    ...(precedenceAdvisories.length ? { precedence_advisories: precedenceAdvisories } : {}),
     summary: {
       indicator: { id: uid, name: pi.name },
       ...(renamedFrom ? { name_auto_disambiguated: { from: renamedFrom, to: pi.name, reason: 'a program indicator with the requested name already exists (names are globally unique)' } } : {}),
@@ -7613,6 +8567,141 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   // never yield a chainable-but-nonexistent UID.
   if (result && result.success) out.program_indicator_id = uid;
   return out;
+}
+
+// Batch create: validate MANY program indicators, then commit the valid ones in a
+// SINGLE /metadata import. This is what makes big analytical builds fit the agentic
+// loop budget — the pregnancy analytics prompt needs ~15-40 PIs; one-per-call burned
+// all 50 loop iterations on PI creation alone and never reached the charts/dashboard.
+// Invalid indicators are SKIPPED (never disable the tool) and reported under failed[]
+// so the model can fix just those, not re-run the whole batch. Program structure +
+// default category combo are fetched ONCE and shared across the batch.
+async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun) {
+  const catComboId = (await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1'))?.categoryCombos?.[0]?.id || 'bjDvmb4bfuf';
+  let progStagesById = null;
+  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName]]]`);
+  if (!progResp?._error && Array.isArray(progResp?.programStages)) {
+    progStagesById = new Map(progResp.programStages.map(st => [st.id, st]));
+  }
+  const opts = { catComboId, progStagesById };
+
+  // Validate/build every indicator with bounded concurrency (a 40-PI batch would
+  // otherwise fire 80 description POSTs at once). Preserve input order for reporting.
+  const prepared = new Array(indicators.length);
+  const CONC = 6;
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= indicators.length) return;
+      const ind = indicators[idx];
+      if (!ind || !ind.name || !String(ind.name).trim()) {
+        prepared[idx] = { _error: 'indicator.name is required' };
+        continue;
+      }
+      prepared[idx] = await _prepareProgramIndicatorObject(programId, null, ind, opts);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONC, indicators.length) }, worker));
+
+  const validPis = [];
+  const validAdvisories = [];
+  const failed = [];
+  for (let i = 0; i < indicators.length; i++) {
+    const p = prepared[i];
+    if (p && p._error) {
+      failed.push({ index: i, name: indicators[i]?.name || null, _error: p._error, _hint: p._hint, expression: p.expression, filter: p.filter });
+    } else if (p && p.pi) {
+      validPis.push(p.pi);
+      if (p.precedenceAdvisories?.length) validAdvisories.push(...p.precedenceAdvisories);
+    }
+  }
+
+  if (dryRun) {
+    return {
+      success: failed.length === 0,
+      phase: 'dry_run',
+      message: `Dry run only. ${validPis.length} indicator(s) would be created, ${failed.length} rejected. Nothing committed.`,
+      would_create: validPis.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
+      ...(failed.length ? { failed } : {}),
+      ...(validAdvisories.length ? { precedence_advisories: validAdvisories } : {}),
+    };
+  }
+
+  if (!validPis.length) {
+    return {
+      _error: `All ${indicators.length} program indicator(s) failed validation — nothing was created.`,
+      failed,
+      _hint: 'Fix each _error above and retry. Common causes: an unsupported d2:* function, a #{stage.de} reference not on that stage, or a division/percentage expression the parser rejects (use d2:condition("<numerator condition>", 100, 0) with aggregation_type "AVERAGE" for a coverage %).',
+    };
+  }
+
+  // shortName uniqueness: server (batched probes) THEN intra-batch (the server probe
+  // early-returns when there are no server collisions, so two identical shortNames
+  // minted in THIS call could still slip through).
+  await disambiguateShortNamesAgainstServer(validPis, 'programIndicators', 'programIndicators');
+  {
+    const seenSn = new Set();
+    for (const p of validPis) {
+      if (!p.shortName) continue;
+      if (seenSn.has(p.shortName)) {
+        const base = p.shortName.slice(0, 45).replace(/\s+$/, '');
+        let sn, g = 0;
+        do { sn = `${base} ${generateDhis2Uid().slice(-4)}`; g++; } while (seenSn.has(sn) && g < 5);
+        p.shortName = sn;
+      }
+      seenSn.add(p.shortName);
+    }
+  }
+
+  // NAME is globally unique on programIndicators. One batched probe per 50 names,
+  // then rename any that already exist on the server OR collide within this batch.
+  const nameTaken = new Set();
+  for (let i = 0; i < validPis.length; i += 50) {
+    const chunk = validPis.slice(i, i + 50);
+    const filter = chunk.map(p => encodeURIComponent(p.name)).join(',');
+    const resp = await safeDhis2Fetch(`programIndicators?filter=name:in:[${filter}]&fields=id,name&paging=false`);
+    for (const ex of (resp?.programIndicators || [])) {
+      if (!chunk.some(p => p.id === ex.id) && ex.name) nameTaken.add(ex.name);
+    }
+  }
+  const seenNames = new Set();
+  const renamed = [];
+  for (const p of validPis) {
+    if (nameTaken.has(p.name) || seenNames.has(p.name)) {
+      const base = String(p.name).substring(0, 225);
+      let candidate, g = 0;
+      do { candidate = `${base} ${generateDhis2Uid().slice(-4)}`; g++; }
+      while ((nameTaken.has(candidate) || seenNames.has(candidate)) && g < 5);
+      renamed.push({ from: p.name, to: candidate });
+      p.name = candidate;
+    }
+    seenNames.add(p.name);
+  }
+
+  const result = await postMetadataPayload({ programIndicators: validPis }, false);
+  if (!result || !result.success) {
+    return {
+      _error: result?._error || 'Batch program-indicator import failed.',
+      phase: result?.phase,
+      errors: result?.errors,
+      attempted: validPis.map(p => ({ id: p.id, name: p.name })),
+      ...(failed.length ? { validation_rejected: failed } : {}),
+    };
+  }
+
+  return {
+    success: true,
+    action: 'create',
+    created_count: validPis.length,
+    created: validPis.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
+    // Flat UID list so the caller chains straight into visualization/map/dashboard data_items.
+    program_indicator_ids: validPis.map(p => p.id),
+    ...(failed.length ? { failed_count: failed.length, failed } : {}),
+    ...(renamed.length ? { name_auto_disambiguated: renamed } : {}),
+    ...(validAdvisories.length ? { precedence_advisories: validAdvisories } : {}),
+    summary: `Created ${validPis.length} program indicator(s) in one import${failed.length ? `; ${failed.length} rejected by validation (see failed[])` : ''}. Chain program_indicator_ids into visualizations/maps/dashboard data_items.`,
+  };
 }
 
 async function createStandaloneOptionSet(args) {
@@ -7920,11 +9009,11 @@ async function executeArchitectMetadata(args) {
         const objectType = args.object_type;
         const nameFilter = args.name_filter;
         if (!objectType) return { _error: 'Missing object_type for check_existing action.' };
-        if (!nameFilter) return { _error: 'Missing name_filter for check_existing action.' };
-
-        const encodedFilter = encodeURIComponent(nameFilter);
+        // No name_filter → list the first 25 of the type instead of erroring
+        // (a model exploring "what exists" shouldn't hit a hard failure).
+        const filterPart = nameFilter ? `filter=name:ilike:${encodeURIComponent(nameFilter)}&` : '';
         const resp = await safeDhis2Fetch(
-          `${objectType}?filter=name:ilike:${encodedFilter}&fields=id,name,shortName,created,lastUpdated&pageSize=25`
+          `${objectType}?${filterPart}fields=id,name,shortName,created,lastUpdated&pageSize=25`
         );
         if (!resp || resp._error) {
           return { _error: `Failed to search ${objectType}: ${resp?._error || 'unknown error'}` };

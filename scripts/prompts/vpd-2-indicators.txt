@@ -1,0 +1,9 @@
+Now add the program indicators for the VPD Case-Based Surveillance program so the surveillance team can monitor performance:
+
+1. "VPD - Suspected cases" — the number of suspected cases (one per enrollment).
+2. "VPD - Laboratory confirmed cases" — the number of cases whose final case classification is Laboratory confirmed.
+3. "VPD - Cases investigated within 48 hours (%)" — the percentage of suspected cases where the date of case investigation is at most 2 days after the date of onset of rash or fever.
+4. "VPD - Cases with a specimen collected (%)" — the percentage of suspected cases that have a specimen collection date recorded.
+5. "VPD - Measles cases laboratory confirmed" — the number of cases with clinical diagnosis Measles and final case classification Laboratory confirmed.
+
+Then run the analytics tables job so the new program's data becomes queryable.

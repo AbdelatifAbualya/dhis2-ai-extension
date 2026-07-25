@@ -1,0 +1,14 @@
+Now build the analytics outputs for the VPD Case-Based Surveillance program.
+
+1. Create these saved visualizations:
+   - a COLUMN chart "VPD - Suspected cases by month" of "VPD - Suspected cases" by month for the last 12 months,
+   - a PIVOT_TABLE "VPD - Case classification by district" showing "VPD - Suspected cases" and "VPD - Laboratory confirmed cases" by organisation unit for this year,
+   - a SINGLE_VALUE tile "VPD - 48-hour investigation rate" showing "VPD - Cases investigated within 48 hours (%)" for this year.
+
+2. Create a saved line list called "VPD case register" for the program. Make it an enrollment line list showing, per case: the Epid Number, the Clinical diagnosis, the Date of onset of rash or fever, the Vaccination status, the IgM result and the Final case classification, for the last 12 months across the whole org-unit hierarchy.
+
+3. Create a second saved line list called "VPD laboratory register" — an event line list over the Laboratory Result stage showing the Specimen ID, Specimen type, Date specimen collected, IgM result and PCR result for the last 12 months.
+
+4. Create a dashboard called "VPD Case-Based Surveillance" containing all three visualizations and both line lists.
+
+5. Share the dashboard publicly so the whole surveillance team can see it.

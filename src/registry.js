@@ -747,12 +747,15 @@ If user enabled web browsing from UI, this tool should usually be called before 
           },
           program_name: { type: 'string', description: 'Program display name (for create_program)' },
           program_short_name: { type: 'string', description: 'Short name (max 50 chars, auto-derived if omitted)' },
+          program_description: { type: 'string', description: 'Program description shown in Maintenance/Capture (for create_program).' },
+          program_color: { type: 'string', description: 'Program style color hex, e.g. "#E91E63" (for create_program).' },
+          program_icon: { type: 'string', description: 'Program style icon key — MUST be a real DHIS2 icon key; verify with manage_metadata(action=discover_icons, search="…") first (for create_program).' },
           program_type: {
             type: 'string',
             enum: ['WITH_REGISTRATION', 'WITHOUT_REGISTRATION'],
             description: 'WITH_REGISTRATION = Tracker, WITHOUT_REGISTRATION = Event'
           },
-          tracked_entity_type_id: { type: 'string', description: 'For WITH_REGISTRATION (tracker) programs: the TrackedEntityType to use. Prefer the real UID. If you only know the type\'s NAME (e.g. "Person"), pass the exact name string — the tool resolves it to its UID server-side; NEVER invent/guess a UID. If omitted entirely, auto-resolves to the TrackedEntityType named "Person". For a non-Person type (e.g. "Household", "Livestock"), first confirm it exists via architect_metadata(action="check_existing", object_type="trackedEntityTypes") if unsure of the exact name.' },
+          tracked_entity_type_id: { type: 'string', description: 'For WITH_REGISTRATION (tracker) programs: the TrackedEntityType to use. If the user NAMES a type (e.g. "Pregnant Woman", "Household"), pass that EXACT name string — an existing one is reused, a missing one is CREATED for you; NEVER substitute "Person" for a type the user named, and NEVER invent/guess a UID. Prefer a real UID only when you actually have one. If (and only if) the user did not request a specific type, omit this — it auto-resolves to the TrackedEntityType named "Person".' },
           program_attributes: {
             type: 'array',
             items: {
@@ -772,7 +775,11 @@ If user enabled web browsing from UI, this tool should usually be called before 
                 },
                 mandatory: { type: 'boolean' },
                 searchable: { type: 'boolean' },
-                display_in_list: { type: 'boolean' }
+                display_in_list: { type: 'boolean' },
+                description: { type: 'string', description: 'Attribute description (shown in Maintenance).' },
+                unique: { type: 'boolean', description: 'Value must be unique across the instance (IDs, registration numbers).' },
+                generated: { type: 'boolean', description: 'Auto-generated identifier (implies unique). Capture generates the value from the TextPattern.' },
+                pattern: { type: 'string', description: 'TextPattern for generated attributes, e.g. "RANDOM(########)" or \'"PW-"+SEQUENTIAL(######)\'. Default RANDOM(########).' }
               },
               required: ['name']
             },
@@ -856,13 +863,14 @@ If user enabled web browsing from UI, this tool should usually be called before 
                   items: {
                     type: 'object',
                     properties: {
-                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, HIDEOPTION. HIDEOPTION hides ONE option of an option-set field — pass data_element_name + option_name (never leave the option unbound). There is NO complete/close-enrollment action; a completion request becomes a SHOWWARNING prompt. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages). NO SHOW action exists: "show X when C" = ONE HIDEFIELD rule with the NEGATED condition (fields re-appear automatically) — show/hide pairs and HIDEFIELD+SETMANDATORYFIELD on the same field are refused.' },
+                      type: { type: 'string', description: 'e.g. SHOWWARNING, SHOWERROR, WARNINGONCOMPLETE, ERRORONCOMPLETE, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, HIDEOPTION, DISPLAYTEXT (static banner), DISPLAYKEYVALUEPAIR (live label+value in the Feedback widget: content=label, data=expression). HIDEOPTION hides ONE option of an option-set field — pass data_element_name + option_name (never leave the option unbound). There is NO complete/close-enrollment action; a completion request becomes a SHOWWARNING prompt. HIDEALLFIELDS is sugar: pass exclude_data_element_ids:[<trigger DE>] and the tool auto-expands into HIDEFIELDs (trigger stage) + HIDEPROGRAMSTAGEs (other stages). NO SHOW action exists: "show X when C" = ONE HIDEFIELD rule with the NEGATED condition (fields re-appear automatically) — show/hide pairs and HIDEFIELD+SETMANDATORYFIELD on the same field are refused.' },
                       data_element_name: { type: 'string', description: 'Target DE name (resolved to ID automatically)' },
                       tracked_entity_attribute_name: { type: 'string', description: 'Target TEA name for HIDEFIELD on a tracked entity attribute (resolved to ID automatically)' },
                       program_stage_name: { type: 'string', description: 'Target stage NAME (for HIDEPROGRAMSTAGE/CREATEEVENT). In create_program ALWAYS use this — stage IDs are generated during the call and cannot be known in advance; the tool resolves the name to the new stage UID.' },
                       program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE on an EXISTING program, e.g. add_program_rules). During create_program use program_stage_name instead.' },
                       content: { type: 'string', description: 'Static message text for SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/DISPLAYTEXT. Variables in content are shown literally — use the data field for dynamic refs.' },
                       data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: target value. SHOWWARNING/SHOWERROR/etc: dynamic content appended after the static content prefix (e.g. data="#{my_de}" or data="d2:concatenate(\\"X=\\", #{a})").' },
+                      location: { type: 'string', description: 'For DISPLAYTEXT/DISPLAYKEYVALUEPAIR: which widget shows it — "feedback" (default) or "indicators". DISPLAYKEYVALUEPAIR shows content as the key and the evaluated data expression as the value — the right choice for "display X in the Feedback widget".' },
                       exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE).' },
                       option_name: { type: 'string', description: "For HIDEOPTION: exact display name of the option to hide (an option of data_element_name's option set created in THIS call)." },
                       option_code: { type: 'string', description: 'For HIDEOPTION: the option CODE to hide (alternative to option_name).' }
@@ -917,9 +925,21 @@ If user enabled web browsing from UI, this tool should usually be called before 
                   },
                   required: ['name', 'value_type']
                 }
+              },
+              sections: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    data_elements: { type: 'array', items: { type: 'string' }, description: "Names of this stage's data elements to place in this section." }
+                  },
+                  required: ['name', 'data_elements']
+                },
+                description: 'Optional visual sections grouping this stage\'s data elements (same shape as create_program stages[].sections).'
               }
             },
-            description: 'Single stage object (for add_stage)'
+            description: 'Single stage object (for add_stage). Existing data elements and option sets are REUSED by exact name — safe to repeat DEs already used in earlier stages (blood pressure, referral fields, …).'
           },
           data_elements: {
             type: 'array',
@@ -994,7 +1014,9 @@ If user enabled web browsing from UI, this tool should usually be called before 
             type: 'array',
             items: { type: 'string' },
             description: 'IDs of EXISTING data elements to add to the stage (for add_data_elements_to_stage). Use when the data element already exists in DHIS2.'
-          }
+          },
+          section_name: { type: 'string', description: 'For add_data_elements_to_stage: name of the existing section the new data element(s) should appear under. REQUIRED when the stage uses a SECTION form and has more than one section — otherwise the tool stops and lists the sections. Omit for non-sectioned (DEFAULT) stages, or when the stage has exactly one section.' },
+          section_id: { type: 'string', description: 'For add_data_elements_to_stage: id of the target section (alternative to section_name). All OTHER sections are always preserved regardless.' }
         },
         required: ['action']
       }
@@ -1130,8 +1152,8 @@ Actions:
                 items: {
                   type: 'object',
                   properties: {
-                    type: { type: 'string', enum: ['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE', 'SHOWWARNINGINFORMATION', 'HIDEFIELD', 'HIDEPROGRAMSTAGE', 'HIDESECTION', 'HIDEALLFIELDS', 'ASSIGN', 'SETMANDATORYFIELD', 'DISPLAYTEXT', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP', 'CREATEEVENT', 'SENDMESSAGE'], description: 'Action type. HIDEPROGRAMSTAGE hides an entire stage tab (needs program_stage_id). HIDESECTION hides a section within a stage (needs program_stage_section_id). HIDEALLFIELDS = chatbot-internal sugar: pass exclude_data_element_ids: [<trigger DE id>] and the tool auto-expands into HIDEFIELD per DE in the trigger\'s stage + HIDEPROGRAMSTAGE for every other stage. SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/SHOWWARNINGINFORMATION concatenate static content + evaluated data — put #{var}/A{attr} in data, not content. NO SHOW action exists: "show X when C" = ONE hide rule with the NEGATED condition (targets re-appear automatically when it turns false) — show/hide twin rules and HIDEFIELD+SETMANDATORYFIELD on the same field are refused at lint.' },
-                    content: { type: 'string', description: 'Static message text shown by SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/SHOWWARNINGINFORMATION/DISPLAYTEXT. Variables placed here are shown LITERALLY — put dynamic refs in `data` instead.' },
+                    type: { type: 'string', enum: ['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE', 'HIDEFIELD', 'HIDEPROGRAMSTAGE', 'HIDESECTION', 'HIDEALLFIELDS', 'ASSIGN', 'SETMANDATORYFIELD', 'DISPLAYTEXT', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP', 'CREATEEVENT', 'SENDMESSAGE'], description: 'Action type. HIDEPROGRAMSTAGE hides an entire stage tab (needs program_stage_id). HIDESECTION hides a section within a stage (needs program_stage_section_id). HIDEALLFIELDS = chatbot-internal sugar: pass exclude_data_element_ids: [<trigger DE id>] and the tool auto-expands into HIDEFIELD per DE in the trigger\'s stage + HIDEPROGRAMSTAGE for every other stage. SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE concatenate static content + evaluated data — put #{var}/A{attr} in data, not content. NO SHOW action exists: "show X when C" = ONE hide rule with the NEGATED condition (targets re-appear automatically when it turns false) — show/hide twin rules and HIDEFIELD+SETMANDATORYFIELD on the same field are refused at lint.' },
+                    content: { type: 'string', description: 'Static message text shown by SHOWWARNING/SHOWERROR/WARNINGONCOMPLETE/ERRORONCOMPLETE/DISPLAYTEXT. Variables placed here are shown LITERALLY — put dynamic refs in `data` instead.' },
                     data: { type: 'string', description: 'd2 expression evaluated at runtime. ASSIGN: assigned to the target DE/TEA. SHOWWARNING/SHOWERROR/etc: appended after content (e.g. data="#{maternal_risk_factors}" or data="d2:concatenate(\\"prefix \\", #{a}, \\", \\", #{b})"). The tool auto-moves trailing #{var}/A{attr} from content into data when content has variable refs and data is empty.' },
                     exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE referenced in the condition).' },
                     data_element_id: { type: 'string', description: 'Target data element ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD' },
@@ -1165,14 +1187,14 @@ Actions:
     type: 'function',
     function: {
       name: 'manage_program_indicators',
-      description: `CRUD + audit + cross-program discovery + OU ranking for DHIS2 program indicators. Actions: list/get/create/update/delete/audit/bulk_fix/bulk_fix_expressions/discover/rank_ou. expressions reference #{stageId.deId}, A{attrId}, V{event_count|tei_count}, d2:sum/countIfValue/etc. For "find/fix broken indicators" use action=audit (paginates + validates server-side via /expression/description) then bulk_fix or bulk_fix_expressions. For "complex/heavy/big/top/most program indicators" or "indicators with lots of data" ACROSS ALL programs use action=discover — NEVER guess a program ID. For "which OUs/districts/regions/facilities have the most data/events for these indicators" use action=rank_ou with indicator_ids from a prior discover result. NEVER PUT/PATCH programIndicators through dhis2_query. NEVER invent program UIDs — always reuse UIDs from prior tool results (discover/list/get/search_metadata). For metadata-count comparisons ("which program has the most indicators") use search_metadata(object_type="programs").`,
+      description: `CRUD + audit + cross-program discovery + OU ranking for DHIS2 program indicators. Actions: list/get/create/update/delete/audit/bulk_fix/bulk_fix_expressions/discover/rank_ou. **create accepts a BATCH: pass indicators:[…] to build MANY in ONE call/metadata import — always do this for analytics builds (a coverage dashboard needs 10-40 PIs and one-per-call runs out of loop budget before the charts exist).** A coverage/percentage metric is normally ONE program indicator — numerator condition in the expression via d2:condition("…",100,0) with aggregation_type AVERAGE, denominator population in the filter — NOT three separate numerator/denominator/percentage objects. expressions reference #{stageId.deId}, A{attrId}, V{enrollment_count|event_count|tei_count}, d2:count/countIfValue/condition/etc. For "find/fix broken indicators" use action=audit (paginates + validates server-side via /expression/description) then bulk_fix or bulk_fix_expressions. For "complex/heavy/big/top/most program indicators" or "indicators with lots of data" ACROSS ALL programs use action=discover — NEVER guess a program ID. For "which OUs/districts/regions/facilities have the most data/events for these indicators" use action=rank_ou with indicator_ids from a prior discover result. NEVER PUT/PATCH programIndicators through dhis2_query. NEVER invent program UIDs — always reuse UIDs from prior tool results (discover/list/get/search_metadata). For metadata-count comparisons ("which program has the most indicators") use search_metadata(object_type="programs").`,
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
             enum: ['list', 'get', 'create', 'update', 'delete', 'audit', 'bulk_fix', 'bulk_fix_expressions', 'discover', 'rank_ou'],
-            description: 'list=paginated indicator list (needs program_id); get=one indicator; create=new indicator; update=modify single existing; delete=remove; audit=check ALL indicators in a program for issues (references, boundaries, V{}/d2: names, braces, optional server validation); bulk_fix=swap a wrong stage ID across many indicators; bulk_fix_expressions=apply per-indicator expression/filter replacements in one batch; discover=cross-program scan ranking indicators by complexity (#{} refs, A{} refs, d2: funcs, operators, length) and/or per-program event volume — NO program_id required, returns top_n ranked; use for "complex/heavy/biggest/top/most complicated indicators" and "indicators with lots of data" questions. rank_ou=for "which OUs/districts/regions/facilities have the most data/events for these indicators" — pass indicator_ids (from a prior discover/list) OR programs; runs analytics/events/aggregate per distinct program with ou:{root};LEVEL-{N}, sums per-OU across programs, returns top_n OUs with per-program breakdown. Do NOT hand-build analytics URLs for this.'
+            description: 'list=paginated indicator list (needs program_id); get=one indicator; create=new indicator (single `indicator` OR a BATCH via `indicators:[…]` — prefer the batch for any multi-indicator build); update=modify single existing; delete=remove; audit=check ALL indicators in a program for issues (references, boundaries, V{}/d2: names, braces, optional server validation); bulk_fix=swap a wrong stage ID across many indicators; bulk_fix_expressions=apply per-indicator expression/filter replacements in one batch; discover=cross-program scan ranking indicators by complexity (#{} refs, A{} refs, d2: funcs, operators, length) and/or per-program event volume — NO program_id required, returns top_n ranked; use for "complex/heavy/biggest/top/most complicated indicators" and "indicators with lots of data" questions. rank_ou=for "which OUs/districts/regions/facilities have the most data/events for these indicators" — pass indicator_ids (from a prior discover/list) OR programs; runs analytics/events/aggregate per distinct program with ou:{root};LEVEL-{N}, sums per-OU across programs, returns top_n OUs with per-program breakdown. Do NOT hand-build analytics URLs for this.'
           },
           program_id: { type: 'string', description: 'Program ID (required for list, create, audit; ignored by discover)' },
           indicator_id: { type: 'string', description: 'Existing indicator ID (required for get, update, delete)' },
@@ -1199,17 +1221,35 @@ Actions:
           page: { type: 'integer', description: 'Page number for list action (default: 1, 50 per page). Check _has_more in response for more pages.' },
           indicator: {
             type: 'object',
-            description: 'Indicator definition (required for create; provide only changed fields for update)',
+            description: 'ONE indicator definition (create a single indicator, or provide only the changed fields for update). For creating MANY indicators at once, use `indicators` (array) instead — it commits them all in one metadata import.',
             properties: {
               name: { type: 'string' },
               short_name: { type: 'string', description: 'Max 50 chars. Auto-derived from name if omitted.' },
               description: { type: 'string' },
-              expression: { type: 'string', description: 'What to aggregate. Examples: "V{event_count}", "V{tei_count}", "d2:sum(#{stageId.deId})"' },
-              filter: { type: 'string', description: 'Condition restricting which events/enrollments count. Examples: "V{program_stage_id} == \'stageId\'", "#{stageId.deId} == \'value\'"' },
-              analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'], description: 'EVENT=aggregate over events, ENROLLMENT=aggregate over enrollments/TEIs' },
-              aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'], description: 'How to aggregate. Default: COUNT' },
-              decimals: { type: 'integer', description: 'Decimal places in output. Optional.' },
+              expression: { type: 'string', description: 'What to aggregate. Count of enrollments/women → "V{enrollment_count}" (ENROLLMENT) or "V{event_count}" (EVENT). Coverage/PERCENTAGE in ONE indicator → "d2:condition(\\"<numerator condition>\\", 100, 0)" with aggregation_type "AVERAGE" (mean of the 0/100 flag over the filtered population = the %). Also: "d2:sum(#{stageId.deId})", "d2:count(#{stageId.deId})".' },
+              filter: { type: 'string', description: 'Condition selecting which events/enrollments count. For a percentage indicator this is the DENOMINATOR population (e.g. "#{stageId.gestAge} < 999" = women with a valid gestational age). Examples: "#{stageId.deId} == \'value\'", "d2:count(#{stageId.contactNo}) >= 4".' },
+              analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'], description: 'EVENT=aggregate over events, ENROLLMENT=aggregate over enrollments/TEIs. Use ENROLLMENT for "per woman / per pregnancy" counts and coverage so a pregnancy is counted once, not once per visit.' },
+              aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'], description: 'How to aggregate across rows. COUNT/SUM for counts; AVERAGE for a d2:condition(...,100,0) percentage indicator. Default: COUNT.' },
+              decimals: { type: 'integer', description: 'Decimal places in output. Optional (e.g. 1 for a percentage).' },
               display_in_form: { type: 'boolean', description: 'Show this indicator in the right-side "Indicators" widget of Tracker Capture / Capture data entry (DHIS2 displayInForm). Set true when the user wants the indicator visible during data entry. Default false.' }
+            }
+          },
+          indicators: {
+            type: 'array',
+            description: 'BATCH create: an array of indicator objects (same shape as `indicator`) committed in ONE metadata import. USE THIS whenever you need more than one program indicator — a coverage/analytics build needs many, and one-per-call exhausts the loop budget before the charts/dashboard are built. Invalid entries are skipped and returned under failed[]; valid ones are created and their UIDs returned in program_indicator_ids for chaining into visualizations/maps/dashboard data_items. shortName and name collisions (server + intra-batch) are auto-resolved. A percentage metric is normally ONE indicator (numerator condition in the expression, denominator population in the filter) — do NOT emit separate numerator + denominator + percentage objects unless a table explicitly needs those counts as columns.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                short_name: { type: 'string' },
+                description: { type: 'string' },
+                expression: { type: 'string' },
+                filter: { type: 'string' },
+                analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'] },
+                aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'] },
+                decimals: { type: 'integer' },
+                display_in_form: { type: 'boolean' }
+              }
             }
           },
           dry_run_only: { type: 'boolean', description: 'Validate without committing. Default: false.' },
@@ -1320,6 +1360,18 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
           public_access: {
             type: 'string',
             description: 'Public access string for update_sharing. Format: 8 chars, e.g. "rwrw----" (metadata+data rw), "rw------" (metadata only), "r-r-----" (read-only). Positions 1-2=metadata, 3-4=data.'
+          },
+          all_org_units: {
+            type: 'boolean',
+            description: 'For update_program_org_units: assign the program to EVERY organisation unit on the instance. Use this for "add all OUs to this program" — do NOT fetch the hierarchy and pass it yourself, and NEVER pass an empty org_unit_ids array (that would un-assign the program from every OU).'
+          },
+          confirm_remove_all_org_units: {
+            type: 'boolean',
+            description: 'For update_program_org_units: required acknowledgement to replace the org-unit assignment with an EMPTY list (which removes the program from Capture/Tracker everywhere). Only set this when the user explicitly asked to un-assign the program from all org units.'
+          },
+          cascade_to_stages: {
+            type: 'boolean',
+            description: 'For update_sharing on object_type="programs": also apply the same access to every PROGRAM STAGE of that program. Default TRUE — sharing a program always implies sharing its stages, and stage DATA access is what actually allows event capture. Set false only for metadata-visibility-only changes.'
           },
           user_group_accesses: {
             type: 'array',
@@ -2010,7 +2062,7 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
 Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
 - create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (aggregate indicator / AGGREGATE-domain dataElement / programIndicator UIDs — types are auto-resolved AND verified), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed. ⚠ data_items must be AGGREGATE dimensions: a TRACKER data element or a tracked-entity attribute CANNOT be plotted directly (the tile renders an error) — first create a PROGRAM INDICATOR (manage_program_indicators) that aggregates it, then plot that program indicator's UID. The tool refuses a raw tracker data element with this guidance.
 - create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
-- add_items: add chart(s)/map(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
+- add_items: add chart(s)/map(s)/line-list(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, { type:"EVENT_VISUALIZATION", event_visualization_id } to embed a saved line list from manage_line_lists, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
 - remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
 - list / get: list dashboards (optional name filter) / read one dashboard with its items (each item's id, type, and referenced visualization/map).
 Every mutating action is backed up first (undo via manage_backups). For sharing use manage_metadata(action=update_sharing). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
@@ -2062,9 +2114,10 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
             items: {
               type: 'object',
               properties: {
-                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map.' },
+                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'EVENT_VISUALIZATION', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map, EVENT_VISUALIZATION to embed a saved line list (create with manage_line_lists).' },
                 visualization_id: { type: 'string', description: 'UID of an EXISTING visualization to embed (type VISUALIZATION).' },
                 map_id: { type: 'string', description: 'UID of an EXISTING map to embed (type MAP).' },
+                event_visualization_id: { type: 'string', description: 'UID of an EXISTING saved line list / event visualization to embed (type EVENT_VISUALIZATION). line_list_id is accepted as an alias.' },
                 text: { type: 'string', description: 'Tile text (type TEXT).' },
                 new_visualization: {
                   type: 'object',
@@ -2124,6 +2177,72 @@ To place a new map on a dashboard, pass its map_id to manage_dashboards(action="
   {
     type: 'function',
     function: {
+      name: 'manage_line_lists',
+      description: `Author and manage DHIS2 **line lists** — the saved row-per-record tables of the Line Listing app (stored as /api/eventVisualizations with type LINE_LIST). Use this tool for ALL saved-line-list CREATION/UPDATE — NEVER hand-assemble eventVisualizations bodies via dhis2_query (the persisted layout is columns/filters axes + derived dataElementDimensions/attributeDimensions/programIndicatorDimensions/simpleDimensions/repetitions, and a malformed body saves an object the app cannot open). This tool resolves every dimension against the program's REAL metadata, validates filters/repetitions/legends mechanically, and PROVES the layout runs (the same analytics query the app issues) BEFORE saving — a bad spec creates nothing.
+Actions: list / get / create / update / delete / validate.
+- create: one saved line list. Supply name, output_type (EVENT = one row per event of ONE stage; ENROLLMENT = one row per enrollment with cross-stage + repeated-event columns; TRACKED_ENTITY = one row per person), program_id (or exact program_name), program_stage_id for EVENT on multi-stage tracker programs, columns[] and optional filters[] (see column spec below), optional sorting[], legend, completed_only, data_check.
+- update: change an existing list by line_list_id — pass columns/filters to REBUILD the layout (same spec as create), or just name/description/sorting/legend to touch own fields. Auto-backup first.
+- validate: re-run an existing saved list's analytics query → row_count + headers (use after data/analytics changes or to diagnose "the line list shows an error").
+- get / list: readable breakdown (decoded filters, stages, repetitions, legend) / recent line lists.
+- delete: remove a saved line list (refuses while a dashboard still shows it; auto-backup first).
+COLUMN/FILTER SPEC — each entry is a string or object:
+- Org units: { dimension:"ou", org_units:["USER_ORGUNIT" | "LEVEL-4" | "<ouUid>" | "OU_GROUP-<uid>", …] } (required somewhere: every line list needs an org-unit boundary).
+- Time: { dimension:"event_date"|"enrollment_date"|"incident_date"|"scheduled_date"|"last_updated", periods:["LAST_12_MONTHS","2026Q1","202605", …] } (EVENT/ENROLLMENT lists need one; time dims differ per output_type).
+- Data element / attribute / program indicator: pass the UID or EXACT display name — the type and (for DEs) the stage are auto-resolved; add program_stage_id only when a DE lives in several stages. Optional filter: {operator:"IN"|"EQ"|"NE"|"GT"|"GE"|"LT"|"LE"|"LIKE", value | values:[…]} — option-set values are auto-mapped NAME→CODE, booleans to 1/0.
+- Repeated events (ENROLLMENT output + repeatable stage only): add repeated_events:{ most_recent:2, oldest:2 } (or repetition_indexes:[1,2,-1,0]; 1=first, 0=latest, -1=second-latest) to a DE column to show one column per event occurrence.
+- Statuses: { dimension:"event_status"|"program_status", statuses:["ACTIVE","COMPLETED",…] }.
+⚠ Program-indicator columns are evaluated PER ROW: a rate/percentage PI with a division 409s the whole table when any row's denominator is 0 — the tool refuses those and tells you to build a count/flag PI with manage_program_indicators instead. PI analyticsType must match output_type (EVENT↔EVENT, ENROLLMENT↔ENROLLMENT), and count-style PIs need aggregation_type SUM (COUNT renders a constant 1 per row; NONE breaks the query and is refused).
+Legend: legend:{ legend_set_id | legend_set_name, style:"FILL"|"TEXT", strategy:"FIXED"|"BY_DATA_ITEM", show_key } — create the set first with manage_legend_sets.
+Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVENT_VISUALIZATION", event_visualization_id }]. For UI navigation help in the Line Listing app use line_listing_guide; for ad-hoc event/enrollment COUNTS use get_event_analytics — this tool SAVES reusable line lists.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'get', 'create', 'update', 'delete', 'validate'],
+            description: 'list=recent saved line lists (filters: name_filter, program_id); get=readable breakdown of one; create=new saved line list (validated + probed BEFORE saving); update=rebuild layout or touch own fields (auto-backup); delete=remove (refuses while on a dashboard; auto-backup); validate=re-run its analytics query → row_count/headers.'
+          },
+          line_list_id: { type: 'string', description: 'eventVisualization UID (required for get / update / delete / validate).' },
+          name: { type: 'string', description: 'For create (required) / update: the saved line list title.' },
+          description: { type: 'string', description: 'Optional description shown in the app\'s file details.' },
+          output_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT', 'TRACKED_ENTITY'], description: 'EVENT = one row per event of ONE stage (default). ENROLLMENT = one row per enrollment; columns may come from any stage and repeatable-stage columns can show several event occurrences. TRACKED_ENTITY = one row per person (attributes + org unit only).' },
+          program_id: { type: 'string', description: 'The program UID the line list is built on (required for create unless program_name resolves uniquely).' },
+          program_name: { type: 'string', description: 'Exact program name — resolved to program_id when unique.' },
+          program_stage_id: { type: 'string', description: 'For EVENT output on a multi-stage tracker program: the stage whose events become rows. Stage NAME also accepted. Auto-resolved when the program has one stage.' },
+          columns: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                dimension: { type: 'string', description: '"ou" | a time keyword (event_date, enrollment_date, incident_date, scheduled_date, last_updated) | "event_status"/"program_status" | a DE/attribute/program-indicator UID or EXACT display name.' },
+                org_units: { type: 'array', items: { type: 'string' }, description: 'For dimension "ou": UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, LEVEL-<n>, OU_GROUP-<uid>.' },
+                periods: { type: 'array', items: { type: 'string' }, description: 'For a time dimension: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) and/or fixed ISO periods (202605, 2026Q1, 2026).' },
+                statuses: { type: 'array', items: { type: 'string' }, description: 'For event_status (ACTIVE, COMPLETED, SCHEDULE, OVERDUE, SKIPPED) or program_status (ACTIVE, COMPLETED, CANCELLED).' },
+                program_stage_id: { type: 'string', description: 'Stage UID or name — only needed when the data element appears in several stages.' },
+                filter: { description: 'Condition on this dimension: { operator, value | values:[…] } or a raw "OP:value" string. Option-set values auto-map name→code; booleans → true/false.', type: 'object', properties: { operator: { type: 'string' }, value: {}, values: { type: 'array' } } },
+                repeated_events: { type: 'object', properties: { most_recent: { type: 'integer' }, oldest: { type: 'integer' } }, description: 'ENROLLMENT output + repeatable stage only: how many latest/earliest event occurrences of this DE to show as separate columns. Or pass repetition_indexes:[1,2,-1,0].' },
+                repetition_indexes: { type: 'array', items: { type: 'integer' }, description: 'Explicit occurrence indexes: 1=first, 2=second, …; 0=latest, -1=second-latest.' },
+                allow_risky_program_indicator: { type: 'boolean', description: 'Override the division-PI refusal for THIS column — only when certain the per-row denominator can never be 0.' }
+              }
+            },
+            description: 'The table columns, in order. Strings allowed as shorthand for { dimension:"…" }. Must include an org-unit dimension and (for EVENT/ENROLLMENT) a time dimension somewhere in columns+filters.'
+          },
+          filters: { type: 'array', items: { type: 'object', properties: { dimension: { type: 'string' }, org_units: { type: 'array' }, periods: { type: 'array' }, statuses: { type: 'array' }, program_stage_id: { type: 'string' }, filter: { type: 'object' } } }, description: 'Same spec as columns, but the dimension constrains the rows WITHOUT showing as a column.' },
+          sorting: { type: 'array', items: { type: 'object', properties: { dimension: { type: 'string' }, direction: { type: 'string', enum: ['ASC', 'DESC'] } } }, description: 'Sort order; each dimension must be one of the columns (name, UID or time keyword accepted).' },
+          legend: { type: 'object', properties: { legend_set_id: { type: 'string' }, legend_set_name: { type: 'string' }, style: { type: 'string', enum: ['FILL', 'TEXT'] }, strategy: { type: 'string', enum: ['FIXED', 'BY_DATA_ITEM'] }, show_key: { type: 'boolean' } }, description: 'Colour numeric cells: FIXED = one legend set for the whole list (pass legend_set_id/name); BY_DATA_ITEM = each item\'s own legend set. style FILL = cell background.' },
+          completed_only: { type: 'boolean', description: 'Only completed events/enrollments.' },
+          data_check: { type: 'string', enum: ['warn_empty', 'require_rows', 'skip'], description: 'create/update probe policy. warn_empty (default): refuse to save if the query FAILS, warn if it returns 0 rows. require_rows: also refuse on 0 rows. skip: no probe (offline analytics).' },
+          name_filter: { type: 'string', description: 'For list: case-insensitive name filter.' },
+          limit: { type: 'integer', description: 'For list: max results (1–200, default 50).' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -2155,6 +2274,23 @@ Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrateg
     }
   }
 ];
+
+// `rules` (batch create) shares the exact schema of `rule` — attached
+// programmatically so the wire schema and the dispatcher (args.rules) can
+// never drift apart. Without this declaration, grammar-constrained providers
+// could not emit rule fields at all (observed live 2026-07-18: 22 consecutive
+// `rules:[{}]` calls from a constrained decoder that had no spec for `rules`).
+{
+  const _mpr = TOOLS.find(t => t.function.name === 'manage_program_rules');
+  if (_mpr && _mpr.function.parameters?.properties?.rule) {
+    _mpr.function.parameters.properties.rules = {
+      type: 'array',
+      description: 'Batch form of `rule` for action=create: an array of rule objects (same fields as `rule`). Prefer ≤15 rules per call so the payload streams reliably.',
+      items: _mpr.function.parameters.properties.rule,
+    };
+  }
+}
+
 
 const TOOL_ROUTER = Object.freeze({
   dhis2_query: true,
@@ -2188,6 +2324,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_legend_sets: true,
   manage_dashboards: true,
   manage_maps: true,
+  manage_line_lists: true,
   manage_backups: true,
 });
 
@@ -2223,6 +2360,19 @@ const TOOL_ROUTER = Object.freeze({
 // first-call manual gate. Read tools (dhis2_query, search_metadata, counts,
 // analytics, architect_metadata, …) and manage_backups (recovery path must be
 // zero-friction) keep their full definitions on the wire.
+// Tools that can MODIFY the server. Used to decide whether manage_backups
+// travels with the selection, and — the safety-critical use — which tools the
+// read-only save-diagnosis mode withholds. Shared with the agentic loop so a
+// withheld tool can never be late-admitted.
+const WRITE_CAPABLE_TOOL_NAMES = new Set([
+  'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
+  'manage_program_notifications', 'create_metadata', 'manage_datasets',
+  'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
+  'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
+  'manage_dashboards', 'manage_maps', 'manage_line_lists',
+  'manage_custom_translations', 'manage_growth_chart_plugin',
+]);
+
 const MANUAL_TOOLS = new Set([
   'create_metadata',
   'manage_metadata',
@@ -2238,6 +2388,7 @@ const MANUAL_TOOLS = new Set([
   'manage_legend_sets',
   'manage_dashboards',
   'manage_maps',
+  'manage_line_lists',
   'manage_custom_translations',
   'manage_growth_chart_plugin',
 ]);
@@ -2247,7 +2398,7 @@ const MANUAL_TOOLS = new Set([
 // "never do this via dhis2_query" routing rules); HOW to call it lives in the
 // manual.
 const TOOL_SUMMARIES = {
-  create_metadata: 'Create DHIS2 metadata: programs (with stages, data elements, inline option sets, program rules, program indicators — ALL in ONE atomic create_program call), standalone option sets, standalone data elements (+ category combos for disaggregation), or add stages/DEs/rules to an existing program. Handles the full dependency chain and name→ID resolution, and REUSES existing TEAs/DEs/option sets by exact name (never pre-create them, never recreate an attribute that already exists); never create a program\'s components with separate calls.',
+  create_metadata: 'Create DHIS2 metadata: programs (with stages, data elements, inline option sets, program rules, program indicators — ALL in ONE atomic create_program call for small/medium programs; VERY LARGE programs (>2 stages / >40 DEs / >20 rules) are built incrementally: create_program with shell + first stage, then add_stage and add_program_rules in batches so each call fits the output limit), standalone option sets, standalone data elements (+ category combos for disaggregation), or add stages/DEs/rules to an existing program. Handles the full dependency chain and name→ID resolution, and REUSES existing TEAs/DEs/option sets by exact name (never pre-create them, never recreate an attribute that already exists); never pre-create a program\'s DEs/option sets with separate standalone calls.',
   manage_metadata: 'Metadata lifecycle manager: remove DEs from a stage, delete objects with reference checking, check_references, update a program\'s org-unit assignment, update sharing/access, add TEAs to an existing program, set icon/color (discover_icons FIRST, then update_style), convert value types (e.g. to MULTI_TEXT multi-select, cascaded). Use INSTEAD of dhis2_query for all of these — raw sharing/style/TEA/delete writes fail on DHIS2.',
   manage_program_rules: 'CRUD + audit for program rules, rule variables and rule actions on a program. Actions: list, get, create, update, delete, list_variables, audit, bulk_fix_conditions. For "broken / non-working rules" ALWAYS audit first, then bulk_fix_conditions. NEVER PUT/PATCH programRules via dhis2_query (409/415).',
   manage_program_indicators: 'CRUD + audit + cross-program discovery + OU ranking for tracker/event PROGRAM indicators. Actions: list, get, create, update, delete, audit, bulk_fix, bulk_fix_expressions, discover (cross-program "complex/top/heavy indicators", no program_id needed), rank_ou ("which OUs/districts have the most data/events"). NEVER PUT/PATCH programIndicators via dhis2_query; never invent UIDs.',
@@ -2263,6 +2414,7 @@ const TOOL_SUMMARIES = {
   manage_legend_sets: 'Standalone legend-set lifecycle (reusable colour bands for traffic-light / heat-map rendering): list, get, create (explicit legends or auto_bands red→amber→green), add_legends, remove_legends, update (own fields), delete. Attach to an aggregate indicator via manage_indicators(legend_set_id) — never via raw PATCH. NEVER hand-write legendSets bodies via dhis2_query.',
   manage_dashboards: 'Build/inspect analytics dashboards and saved visualizations (charts, pivots, single-value tiles): list, get, create_visualization, create_dashboard (atomic, with inline new visualizations), add_items (the ONLY safe way to add to an EXISTING dashboard — a raw PUT wipes its tiles), remove_item, update, delete. NEVER hand-assemble visualizations/dashboards bodies via dhis2_query (they import as EMPTY charts). render_chart = inline chat preview; this tool SAVES to DHIS2.',
   manage_maps: 'Create/inspect/delete thematic maps (choropleth / bubble): list, get, create (one data_item UID + org_unit_level/org_units + period, optional legend_set_id), delete. NEVER hand-assemble /api/maps bodies via dhis2_query. Place a map on a dashboard via manage_dashboards(action=add_items, items=[{type:"MAP", map_id}]).',
+  manage_line_lists: 'Author SAVED line lists — the row-per-record tables of the Line Listing app (eventVisualizations type LINE_LIST): list, get, create (EVENT / ENROLLMENT with cross-stage + repeated-event columns / TRACKED_ENTITY; dimensions by UID or exact name, auto stage/option-code resolution, filters, sorting, legend; the layout is PROVEN against analytics BEFORE saving), update, delete, validate (re-run its query → row_count). NEVER hand-assemble eventVisualizations bodies via dhis2_query (the app cannot open them). Dashboard placement: manage_dashboards items [{type:"EVENT_VISUALIZATION", event_visualization_id}]. line_listing_guide = app UI help; THIS tool saves the actual line lists.',
 };
 
 // ── Deep how-to KB text that used to live in buildSystemPrompt ──
@@ -2274,12 +2426,13 @@ const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
 - ⚠ **\`A{attr_name}\` IS the correct, canonical way to reference a tracked-entity-attribute program rule variable** in BOTH conditions and ASSIGN/expression \`data\` — this matches DHIS2's own demo rules, e.g. \`d2:yearsBetween(A{born}, V{current_date})\` and \`A{Sex} == 'MALE'\`. \`#{...}\` is for DATA-ELEMENT-sourced variables only. **Do NOT "fix" a working \`A{tea}\` reference into \`#{tea}\`** — for a TEA variable that is a regression, not a fix, and it is NEVER the cause of a rule "not firing". Auto-calc-from-attribute patterns like \`ASSIGN d2:monthsBetween(A{dob}, V{current_date}) → "Age in months"\` are correct as written.
 - 🔎 **When a user says an auto-assign / calculation rule "isn't working", DIAGNOSE from real metadata — never guess a syntax cause.** First \`manage_program_rules(action=get)\` + \`action=list_variables\` and read the ACTUAL condition, the PRV source types, and the target DE's valueType. If the expression already matches a known-good pattern (A{tea} for attributes, V{current_date}, a valid d2: function, ASSIGN target DE that can hold the result), the rule is correct — say so. The real reasons an ASSIGN value looks "missing" are runtime/UX, not syntax: (a) the assigned value only appears once you open the stage event that contains the target DE and the source attribute already has a value; (b) the target field is read-only/auto-filled by design; (c) the target DE valueType cannot hold the computed value (e.g. a number assigned to a TEXT field). Explain the real cause and verify; do NOT invent "the reference doesn't resolve at runtime" without evidence.
 - HIDEFIELD on TEA: use \`tracked_entity_attribute_name\`; on DE: use \`data_element_name\`
-- Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, WARNINGONCOMPLETE, ERRORONCOMPLETE, SHOWWARNINGINFORMATION
+- Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, DISPLAYKEYVALUEPAIR, WARNINGONCOMPLETE, ERRORONCOMPLETE (⚠ SHOWWARNINGINFORMATION is NOT accepted by the server enum — it is auto-aliased to SHOWWARNING)
 - Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
 - ⛔ **There is NO "show field" action — visibility is ONE hide rule, never a show/hide pair.** Fields, sections and stages are visible by default; a HIDE action hides while its condition is TRUE and the engine re-shows AUTOMATICALLY the moment it turns false. Therefore "show X only when Y is Yes" = EXACTLY ONE rule: \`{ name: "Hide X when Y is not Yes", condition: "!d2:hasValue(#{y}) || #{y} != true", actions: [{ type: "HIDEFIELD", data_element_name: "X" }] }\`. NEVER ALSO create a second "Show X when Y is Yes" rule — a complementary twin hides the target in EVERY case (permanently hidden). NEVER put a HIDE action under the positive/"show" condition. NEVER combine HIDEFIELD and SETMANDATORYFIELD on the same field in one rule (hidden-AND-mandatory renders the field broken/un-selectable in Capture — this is exactly what breaks multi-select option sets). If X must be required when visible, that is a SEPARATE rule: \`{ name: "Require X when Y is Yes", condition: "#{y} == true", actions: [{ type: "SETMANDATORYFIELD", data_element_name: "X" }] }\`. The tool hard-refuses all three broken shapes (phase "lint") — emit the one-rule pattern from the start.
 - 🔎 **"Field shows but can't be used / options not selectable / field never appears" → run \`action=audit\` FIRST.** Its \`cross_rule_issues\` detects hide+mandate contradictions and complementary show/hide twins on existing programs. NEVER blame "a DHIS2 rendering issue" without audit evidence — these symptoms are almost always contradictory program rules.
-- **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE / SHOWWARNINGINFORMATION** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
+- **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
 - **DISPLAYTEXT** (instructions banner) takes \`content\` only — keep it static.
+- **DISPLAYKEYVALUEPAIR** shows a live value in the Feedback (default) or Indicators widget: \`content\` = the static label/key, \`data\` = the evaluated expression (e.g. \`{ type: "DISPLAYKEYVALUEPAIR", content: "BMI", data: "#{weight_kg} / ((#{height_cm}/100) * (#{height_cm}/100))" }\`). This is THE action for "display X in the Feedback widget" requests; add \`location: "indicators"\` to target the Indicators widget instead.
 - **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
 - **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
 - **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
@@ -2324,6 +2477,16 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
 - \`analyticsType\`: \`EVENT\` (one row per event) or \`ENROLLMENT\` (one row per enrollment, latest event values per stage).
 - \`aggregationType\`: \`COUNT\` for count-of-rows, \`SUM\`/\`AVERAGE\`/\`MIN\`/\`MAX\` for numeric aggregations.
 - "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{tei_count}\`. \`V{enrollment_count}\` is also valid; \`V{event_count}\` is for EVENT-type PIs.
+
+**PERCENTAGE / COVERAGE = ONE program indicator (NOT three).** A metric like "% of pregnant women whose first ANC was before 12 weeks" is **a SINGLE program indicator**, not a numerator PI + a denominator PI + a percentage object. Build it as:
+- \`analytics_type: "ENROLLMENT"\` (count each woman/pregnancy once, not once per visit),
+- \`filter\`: the **DENOMINATOR** population — who is eligible (e.g. \`#{FIPs4MVhcok.gestAge} < 999\` = women with a valid gestational age),
+- \`expression\`: \`d2:condition("<NUMERATOR condition>", 100, 0)\` — 100 when the woman meets the numerator, else 0 (e.g. \`d2:condition("#{FIPs4MVhcok.gestAge} < 12", 100, 0)\`),
+- \`aggregation_type: "AVERAGE"\` — the mean of a 0/100 flag over the denominator population **is** the percentage,
+- \`decimals: 1\`. Verified live on 2.42/2.43 — the description endpoints accept it and it plots directly on line charts/maps/single-value cards.
+This is the pattern to use whenever the user asks for "the percentage/rate/coverage of …". It contains **no division**, so unlike a numerator/denominator ratio it never 409s on a zero denominator. Do NOT reflexively create separate numerator + denominator count PIs — create them **only** when the user explicitly wants those counts as their own tiles or as separate columns of a table (e.g. "a table showing numerator, denominator, percentage"). In that case: one COUNT PI for the numerator, one COUNT PI for the denominator, and the single AVERAGE percentage PI above — all in ONE batch.
+
+**BATCH every multi-indicator build.** \`manage_program_indicators(action="create", program_id, indicators:[ {…}, {…}, … ])\` validates and commits them all in a SINGLE metadata import and returns \`program_indicator_ids\` (a flat UID list) to chain into visualizations/maps/dashboard \`data_items\`. A coverage dashboard needs 10-40 indicators; creating them one-per-call exhausts the agentic-loop budget before any chart or dashboard is built (the pregnancy-analytics failure). Plan the full indicator set, then create it in one (or a few) batched calls. Invalid entries are skipped and returned under \`failed[]\` — fix just those and re-batch the remainder; the valid ones are already saved.
 
 **Indicators widget during data entry:** when the user wants an indicator visible in the right-side "Indicators" widget of Tracker Capture / Capture (e.g. live gestational age, risk flags), pass \`display_in_form: true\` in the indicator object (create or update). Per-event calculations (EVENT analytics) read most naturally there.
 
@@ -2395,9 +2558,16 @@ create_metadata(action="create_data_elements",
 \`use_category_combo: true\` binds that DE to the inline/named combo; \`use_default_combo: true\` keeps it on the system default. DEs with neither flag inherit from the call's category_combo (or default if none). Attach an option set either inline (\`option_set\` — creates a new set) or by reference (\`option_set_id\` / \`option_set_name\` — reuses an existing set; the DE valueType auto-aligns). Mix freely in one call.
 
 ### Adding to existing programs
-- DEs to an existing stage: create_metadata(action=add_data_elements_to_stage, stage_id=<id>, data_element_ids=[<id>]) — use \`data_elements:[{name, value_type, …}]\` instead to create NEW DEs onto the stage.
+- DEs to an existing stage: create_metadata(action=add_data_elements_to_stage, stage_id=<id>, data_element_ids=[<id>]) — use \`data_elements:[{name, value_type, …}]\` instead to create NEW DEs onto the stage. This action ALWAYS backs the stage up first and preserves the stage's existing sections + form type. If the stage uses a SECTION form with multiple sections, ALSO pass \`section_name\` (the section the new field belongs under) — without it the tool stops and lists the sections rather than guessing. Never revert a sectioned stage to a default form to add a field.
 - A new stage: create_metadata(action=add_stage, program_id=<id>, stage={ name, repeatable, data_elements:[…] }).
-- More rules: create_metadata(action=add_program_rules, program_id=<id>, program_rules=[…]).`;
+- More rules: create_metadata(action=add_program_rules, program_id=<id>, program_rules=[…]).
+
+### ⚠ VERY LARGE programs — split the build so each tool call fits your output budget
+A tool call's arguments must fully fit inside ONE model response. A whole 4–5 stage program with 80–100 data elements, dozens of option sets, and 40+ rules in a single create_program call easily exceeds a typical max-output limit — the streamed JSON gets cut off mid-payload, NOTHING is created, and you are asked to resend. Do not gamble on it: **when a program has more than ~2 stages or ~40 total data elements or ~20 rules, build incrementally from the start:**
+1. \`create_metadata(action=create_program)\` — program shell, ALL program_attributes, and ONLY the first stage with its data_elements/sections. Include NO program_rules yet.
+2. \`create_metadata(action=add_stage, program_id=<id from step 1>, stage={…})\` — one call per remaining stage.
+3. \`create_metadata(action=add_program_rules, program_id=<id>, program_rules=[10–15 rules])\` — repeat until all rules are added. Rules are the wordiest part; never send more than ~15 per call.
+Each call is atomic, reuses existing metadata by name exactly like the one-call form, and the earlier calls' results give you the real stage/DE ids for later ones. A small/medium program (1–2 stages, ≤40 DEs, ≤20 rules) should still use the classic ONE create_program call.`;
 
 const KB_METADATA_DELETE_FLOW = `### Removing / deleting metadata
 ⚠️ **NEVER** use dhis2_query with DELETE method for metadata objects. manage_metadata checks references and verifies deletion.
@@ -2449,6 +2619,13 @@ When a program/object doesn't appear in an app (Capture, Data Entry, etc.) or a 
 4. Also check \`sharing.userGroups\` — user groups can grant data access even if publicAccess doesn't
 5. OU assignment and sharing must both be correct for users to actually use a program in Capture.
 **Fix:** \`manage_metadata(action=update_sharing, object_type="programs", object_id="<id>", public_access="rwrw----")\` (+ user_group_accesses / user_accesses entries as needed)
+
+**Assigning org units.** \`update_program_org_units\` writes the WHOLE program object back (DHIS2 /metadata replaces, it does not patch), so the tool re-sends every property it read — never hand-build a partial program body for this, or you will silently reset the program's sharing and flags. For "add all OUs" pass \`all_org_units: true\`; to add some without disturbing the rest use \`merge_mode:"add"\`. An empty \`org_unit_ids\` with the default \`merge_mode:"replace"\` un-assigns the program from EVERY org unit and makes it vanish from Capture — the tool refuses that unless you pass \`confirm_remove_all_org_units:true\`.
+
+**A program's stages are shared WITH it.** A programStage carries its OWN sharing, and its DATA bits are what actually gate event capture — so a program shared \`"rwrw----"\` whose stages are still \`"rw------"\` looks correctly shared and still blocks enrollment/event entry. \`update_sharing\` on a program therefore cascades the same access to every stage automatically (\`cascade_to_stages\`, default true), and \`create_program\`/\`add_stage\` give new stages the program's sharing. Never share a program and leave its stages behind, and when data entry is blocked ALWAYS check the stages before looking anywhere else.
+
+**Only Program and ProgramStage are DATA-shareable.** DataElement, TrackedEntityAttribute, OptionSet, ProgramIndicator, Dashboard and Visualization have \`dataShareable:false\` in the DHIS2 schema: the server accepts a \`"rwrw----"\` PUT with HTTP 200 and silently stores \`"rw------"\`. \`update_sharing\` compares what you asked for against what was stored: the METADATA half still applies (so sharing a dashboard publicly works exactly as intended), and the reply carries \`_data_sharing_not_applicable\` explaining that the data bits were dropped because that class has no data sharing. Treat that note as DONE, not as a failure — do NOT retry it and do NOT repeat it across sibling objects. If you are chasing a DATA-access problem, it lives in the program, its stages, the tracked entity type, or the user's org units — never in these classes.
+
 ⚠️ **NEVER** use dhis2_query PUT/PATCH to modify sharing — it fails with 405/500. The DHIS2 sharing API is \`PUT /api/sharing?type={singularType}&id={id}\` — update_sharing handles this correctly.`;
 
 const KB_NOTIFICATIONS_DETAILS = `### DHIS2 schema reality (codified in the tool — don't relearn)
@@ -2647,7 +2824,7 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 ### Rules
 - data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped. NEVER invent visualization, map or data-item UIDs.
 - add_items reads the full dashboard, appends below the current tiles, and writes the COMPLETE item set back, snapshotting to backups first. NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} — a dashboard PUT is a whole-object REPLACE that permanently wipes every existing tile (now blocked in code).
-- Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.
+- Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"EVENT_VISUALIZATION", event_visualization_id } (a saved line list from manage_line_lists) | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.
 - To delete a whole dashboard use action="delete" (snapshots first). Sharing/deletion of standalone visualizations/maps → manage_metadata.
 
 ### Examples
@@ -2690,6 +2867,30 @@ configure makes the plugin FUNCTION but does not place the widget. Relay the too
 // Per-tool manual extras: the deep KB text appended to the tool's original
 // description when its manual is delivered. Shared grammar blocks appear in
 // every manual that needs them.
+// ── Line-list KB — deep how-to for manage_line_lists (delivered in its manual) ──
+const KB_LINE_LISTS_DETAILS = `## DHIS2 Line Lists (manage_line_lists)
+A **line list** is a saved row-per-record table (one row per event / enrollment / person) opened in the Line Listing app and embeddable on dashboards. It is stored as an \`eventVisualization\` with \`type: LINE_LIST\` — a DIFFERENT object from the aggregate \`visualizations\` that manage_dashboards creates. Aggregated charts/pivots → manage_dashboards; row-level tables → THIS tool.
+
+**Choosing output_type (the single most important decision):**
+- \`EVENT\` — one row per event of ONE program stage. Needs \`program_stage_id\` on multi-stage tracker programs. Columns: that stage's DEs + program attributes + EVENT-analytics PIs.
+- \`ENROLLMENT\` — one row per enrollment. Columns may come from ANY stage (auto-qualified), attributes, ENROLLMENT-analytics PIs, and repeatable-stage DEs can repeat: \`repeated_events:{ most_recent:2, oldest:2 }\` renders "Adherence [1] [2] [-1] [0]"-style columns. Use for treatment-monitoring / cohort registers.
+- \`TRACKED_ENTITY\` — one row per person (attributes + org unit; the program still anchors the dimensions).
+
+**A senior implementor's workflow for a monitoring register:**
+1. get_program_info → real stage/DE/attribute names + UIDs.
+2. Row-level metrics DON'T exist as columns? Create ENROLLMENT-analytics PIs with manage_program_indicators — per-row-safe patterns: \`d2:count(#{stage.de})\` (visits recorded), \`d2:countIfValue(#{stage.de}, 'CODE')\` (e.g. poor-adherence months), \`d2:daysBetween(V{enrollment_date}, V{event_date})\`, \`d2:condition("…", 1, 0)\` flags. ⚠ NEVER put a rate/percentage PI (any division) in a line list — per-row zero denominators 409 the WHOLE table. The tool refuses them; that refusal is final unless the user insists (allow_risky_program_indicator). ⚠ **aggregation_type matters per row** (verified live on 2.42): give count-style PIs \`aggregation_type:"SUM"\` — with COUNT the line-list cell shows a constant 1 for every row (COUNT counts the one enrollment row, not the events), and with NONE the whole query fails with an SQL error (the tool refuses NONE PIs as columns and warns on COUNT+d2:count).
+3. Colour-coding: manage_legend_sets(action=create) → pass legend:{ legend_set_id, strategy:"FIXED", style:"FILL" }. FILL = cell background (scorecard look). Legends colour NUMERIC columns (PIs, numeric DEs).
+4. create with data_check="require_rows" when the user expects data — an empty register usually means wrong period/org units or analytics tables not yet run (the result tells you which).
+5. Dashboard: manage_dashboards(action="create_dashboard"|"add_items") with items [{ type:"EVENT_VISUALIZATION", event_visualization_id:"<line_list_id>" }].
+
+**Filters** (on columns or the filters axis): option-set dims take option CODES (names auto-map; \`{operator:"IN", values:["CODE_A","CODE_B"]}\`), booleans take true/false, numerics EQ/NE/GT/GE/LT/LE, text LIKE/EQ. Multiple conditions on one dimension: \`{conditions:[{operator:"GE", value:5},{operator:"LT", value:10}]}\`.
+**Periods**: relative keywords (LAST_12_MONTHS, THIS_QUARTER, LAST_4_QUARTERS, THIS_YEAR, …) mix freely with fixed ISO (202605, 2026Q1, 2026). Time dimensions differ per output_type: EVENT has event_date/enrollment_date/incident_date/scheduled_date/last_updated; ENROLLMENT has enrollment_date/incident_date/last_updated.
+**Org units**: USER_ORGUNIT (+_CHILDREN/_GRANDCHILDREN), LEVEL-<n>, OU_GROUP-<uid>, explicit UIDs — combinable (e.g. LEVEL-4 under a parent UID).
+**Sorting**: only by columns of the list; pass the column's name/UID + ASC/DESC.
+
+**Diagnosing "the line list shows an error / is empty"** → action=validate on the saved list: it re-runs the app's exact query and returns row_count or the offending dimension. Division-PI columns and analytics-tables-not-run are the two most common causes.
+**Zero-invention rule**: every dimension resolves against the program's real metadata at call time; a typo'd name returns the valid candidates instead of saving a broken list. Never invent UIDs; never POST/PUT eventVisualizations via dhis2_query.`;
+
 const MANUAL_EXTRAS = {
   create_metadata: [KB_CREATE_PROGRAM_DETAILS, KB_VALUE_TYPE_MAPPING, KB_PROGRAM_RULE_SYNTAX, KB_PI_GRAMMAR].join('\n\n'),
   manage_metadata: [KB_METADATA_DELETE_FLOW, KB_METADATA_TEA_OU, KB_METADATA_ICON_FLOW, KB_METADATA_SHARING].join('\n\n'),
@@ -2704,6 +2905,7 @@ const MANUAL_EXTRAS = {
   manage_option_sets: KB_OPTION_SETS_DETAILS,
   manage_legend_sets: KB_LEGEND_SETS_DETAILS,
   manage_dashboards: KB_DASHBOARDS_DETAILS,
+  manage_line_lists: KB_LINE_LISTS_DETAILS,
   manage_custom_translations: KB_TRANSLATIONS_DETAILS,
   manage_growth_chart_plugin: KB_GROWTH_CHART_DETAILS,
   // manage_maps: full description already covers usage; no extra KB.
@@ -2737,6 +2939,29 @@ function slimSchema(parameters) {
   return out;
 }
 
+// Bare type/enum/structure skeleton of a schema subtree — property names and
+// types WITHOUT descriptions. Nested objects MUST keep their property lists on
+// the wire: providers with grammar-constrained tool-call decoding (observed
+// live 2026-07-18 on Fireworks/MiniMax-M3) cannot emit fields they have no
+// spec for — given `items: {type:'object'}` the constrainer wrapped each item
+// as `{"$text": "<the object as a JSON string>"}`, which reached the tool as
+// objects with no usable fields and dead-looped create_program. The skeleton
+// costs a few hundred tokens and makes every constrained decoder emit real
+// objects. (agent.js also heals $text-style wrapping as a safety net.)
+function schemaSkeleton(def) {
+  if (!def || typeof def !== 'object') return {};
+  const out = {};
+  if (def.type) out.type = def.type;
+  if (Array.isArray(def.enum)) out.enum = [...def.enum];
+  if (def.type === 'array' && def.items && typeof def.items === 'object') out.items = schemaSkeleton(def.items);
+  if (def.properties) {
+    out.properties = {};
+    for (const [k, v] of Object.entries(def.properties)) out.properties[k] = schemaSkeleton(v);
+    if (Array.isArray(def.required) && def.required.length) out.required = [...def.required];
+  }
+  return out;
+}
+
 function slimSchemaProp(def) {
   if (!def || typeof def !== 'object') return def;
   const out = {};
@@ -2746,7 +2971,7 @@ function slimSchemaProp(def) {
   let desc = def.description ? slimDescriptionText(def.description) : '';
   if (def.type === 'array' && def.items && typeof def.items === 'object') {
     if (def.items.properties) {
-      out.items = { type: 'object' };
+      out.items = schemaSkeleton(def.items);
       desc += (desc ? ' ' : '') + 'Item fields: ' + Object.keys(def.items.properties).join(', ') + ' — full spec in the manual.';
     } else {
       out.items = {};
@@ -2754,6 +2979,7 @@ function slimSchemaProp(def) {
       if (Array.isArray(def.items.enum)) out.items.enum = [...def.items.enum];
     }
   } else if (def.properties) {
+    out.properties = schemaSkeleton(def).properties;
     desc += (desc ? ' ' : '') + 'Object fields: ' + Object.keys(def.properties).join(', ') + ' — full spec in the manual.';
   } else if (def.additionalProperties) {
     out.additionalProperties = def.additionalProperties;
@@ -2850,23 +3076,9 @@ function stubToolContentForHistory(content) {
 // Keeping the tool list small prevents context-window overflow and helps
 // the model make better routing decisions.  Every extra tool is wasted
 // context tokens and an invitation for the LLM to pick the wrong one.
-function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
+function getContextualTools(ctx, userText, browseWeb) {
   const appType = (ctx?.appType || '');
-  const lowerText = String(userText || '').toLowerCase();
-  const inspectText = inspectSnapshot?.enabled
-    ? JSON.stringify({
-        insights: inspectSnapshot.insights,
-        sample: (inspectSnapshot.logs || []).slice(-20).map(l => ({
-          level: l.level,
-          source: l.source,
-          kind: l.kind,
-          text: l.text,
-          url: l.url,
-          status: l.status,
-        })),
-      }).toLowerCase()
-    : '';
-  const combinedText = `${lowerText}\n${inspectText}`;
+  const combinedText = String(userText || '').toLowerCase();
   const wantsProgramChangeHistory =
     /\b(recent changes|what changed|changes made|change history|history of changes|recent modifications|modified in the last|updated in the last|changes in the last)\b/.test(combinedText)
     && /\bprogram|stage|data element|metadata|family health file|this program\b/.test(combinedText);
@@ -3036,6 +3248,21 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
       && (/\b(create|build|make|save|design|set\s*up|setup|add|new|choropleth|bubble|thematic|shade[ds]?|colou?r[- ]?cod)\b/.test(combinedText)))
     || /\bchoropleth\b/.test(combinedText)
     || /\bthematic\s+maps?\b/.test(combinedText);
+  // ── Line-list authoring intent ──
+  // Saved row-per-record tables (Line Listing app / eventVisualizations of
+  // type LINE_LIST). Fires on explicit "line list(ing)" wording, on classic
+  // implementor phrasings ("case register", "patient listing", "listing of
+  // enrollments"), or on an authoring verb + row-level-table noun. Reads like
+  // "how do I use the Line Listing app" also match — the tool's list/get/
+  // validate actions are read-only and line_listing_guide travels alongside
+  // when the user is IN the app.
+  const wantsLineListIntent =
+    /\bline[-\s]?list(?:s|ing|ings)?\b/.test(combinedText)
+    || /\bevent\s*visuali[sz]ations?\b/.test(combinedText)
+    || /\b(case|patient|client|person|tei|entity|enrollment|event|cohort|treatment|defaulter|follow[-\s]?up)\s+(register|registry|listing)\b/.test(combinedText)
+    || (/\b(register|listing|row[-\s]?level|record[-\s]?level)\b/.test(combinedText)
+        && /\b(tracker|program|stage|enrollment|event|patient|case|cohort)\b/.test(combinedText)
+        && /\b(create|build|make|design|set\s*up|save|generate|author|update|list)\b/.test(combinedText));
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -3059,9 +3286,6 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     + '|(?:which|what|top)\\s+(?:ous?|org ?units?|districts?|regions?|facilities|facility|provinces?|countries|sites?|health ?facilities)'
     + '|(?:ous?|org ?units?|districts?|regions?|facilities|facility|provinces?|sites?)\\s+(?:with|having|that have|that has)\\s+(?:the most|most|a lot|lots|many|highest|largest))\\b'
   ).test(combinedText);
-  const hasInspectRuleErrors = !!inspectSnapshot?.insights?.rule_errors?.length;
-  const hasInspectNetworkErrors = !!inspectSnapshot?.insights?.network_errors?.length;
-
   // ── Save-failure diagnostic intent ──
   // Triggered by phrasings like "error saving enrollment", "can't save",
   // "failed to save", "409 conflict", or a 409 visible in inspect logs.
@@ -3070,10 +3294,7 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   // diagnose, but cannot "fix" until the user gives explicit authorization on
   // a later turn. This blocks the failure mode where the model edited program
   // rules in response to a save error that had nothing to do with rules.
-  const hasInspect409 = !!inspectSnapshot?.insights?.network_errors?.some(e => Number(e.status) === 409);
-  const wantsSaveErrorDiagnosis = SAVE_FAILURE_RE.test(combinedText) || hasInspect409;
-  const writeAuthScope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
-  const saveDiagnosisReadOnly = wantsSaveErrorDiagnosis && writeAuthScope === 'read_only';
+  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(userText);
 
   // ── Factual context flags — derived from URL/app state only, no NLU ──
   const hasProgram    = !!ctx?.programId;
@@ -3125,6 +3346,24 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
     selected.add('line_listing_guide');
     selected.add('detect_enrollment_abnormalities');
     selected.add('resolve_option_codes');
+  }
+
+  // ── Line-list authoring — saved Line Listing tables ──
+  // Surfaced on explicit line-list intent, or whenever the user is IN the
+  // Line Listing app (where "save this as…", "make me a register of…" are the
+  // obvious next steps). Companions: get_program_info + search_metadata for
+  // dimension resolution, manage_program_indicators for the row-level metric
+  // columns, manage_legend_sets for colour-coding, manage_dashboards for
+  // placement — the canonical register workflow chains all four.
+  if (wantsLineListIntent || isLineListing) {
+    selected.add('manage_line_lists');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
+    if (wantsLineListIntent) {
+      selected.add('manage_program_indicators');
+      selected.add('manage_legend_sets');
+      selected.add('manage_dashboards');
+    }
   }
 
   // ── Tracker / program context ──
@@ -3325,55 +3564,38 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
   // manage_backups is included whenever the user mentions backup/restore/undo
   // OR whenever any other write-capable tool is in the selection — that way
   // the model can always tell the user "the backup key is X" after a write.
-  const writeCapableNames = new Set([
-    'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
-    'manage_program_notifications', 'create_metadata', 'manage_datasets',
-    'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
-    'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
-    'manage_dashboards', 'manage_maps',
-  ]);
   let hasWriteTool = false;
-  for (const n of selected) { if (writeCapableNames.has(n)) { hasWriteTool = true; break; } }
+  for (const n of selected) { if (WRITE_CAPABLE_TOOL_NAMES.has(n)) { hasWriteTool = true; break; } }
   if (wantsBackupIntent || hasWriteTool) {
     selected.add('manage_backups');
-  }
-
-  if (inspectSnapshot?.enabled) {
-    selected.add('dhis2_query');
-    selected.add('search_metadata');
-    selected.add('get_program_info');
-    if (hasInspectRuleErrors) {
-      selected.add('manage_program_rules');
-      selected.add('manage_program_indicators');
-    }
-    if (hasInspectNetworkErrors || hasInspectRuleErrors) {
-      selected.add('resolve_option_codes');
-    }
   }
 
   // ── Web browsing ──
   if (browseWeb) selected.add('browse_web');
 
+  // ── Sticky tools: everything this CONVERSATION has already used ──
+  // A follow-up turn ("now remove it and put it back to how it was") names no
+  // feature, so the keyword rules above cannot re-select the tool that did the
+  // work. Keep it available. This is a relevance union only — the read-only
+  // save-diagnosis strip below still removes destructive tools, and every write
+  // still passes requireWriteAuth. browse_web is excluded: it is gated by an
+  // explicit UI toggle, not by intent.
+  for (const n of getThreadToolNames()) {
+    if (n !== 'browse_web') selected.add(n);
+  }
+
   // ── Save-failure diagnostic mode: strip destructive tools until the user
   //    explicitly authorizes a fix on a future turn. Read-only tools stay so
   //    the model can fully investigate. ──
   if (saveDiagnosisReadOnly) {
-    selected.delete('manage_program_rules');
-    selected.delete('manage_program_indicators');
-    selected.delete('manage_metadata');
-    selected.delete('manage_program_notifications');
-    selected.delete('create_metadata');
-    selected.delete('manage_datasets');
-    selected.delete('manage_custom_forms');
-    selected.delete('manage_validation_rules');
-    selected.delete('manage_org_units');
-    selected.delete('manage_indicators');
-    selected.delete('manage_option_sets');
-    selected.delete('manage_legend_sets');
-    selected.delete('manage_dashboards');
-    selected.delete('manage_maps');
-    // Keep architect_metadata (read-only research) and manage_backups (list/get
-    // are read-only — the executor itself gates restore/delete/purge_old).
+    // Strip from the shared WRITE_CAPABLE_TOOL_NAMES set, never a hand-copied
+    // list: a duplicated list silently goes stale the moment a write tool is
+    // added (manage_custom_translations and manage_growth_chart_plugin were
+    // both missing from the old copy, so they survived the strip).
+    for (const n of WRITE_CAPABLE_TOOL_NAMES) selected.delete(n);
+    // Kept on purpose: architect_metadata (read-only research) and
+    // manage_backups (list/get are read-only — its executor gates
+    // restore/delete/purge_old behind write authorization itself).
   }
 
   return TOOLS.filter(t => selected.has(t.function.name));
@@ -3381,14 +3603,13 @@ function getContextualTools(ctx, userText, browseWeb, inspectSnapshot = null) {
 
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false, inspectSnapshot = null) {
+async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false) {
   const ctx = dhis2.pageContext || {};
   const ou = dhis2.ouContext;
   const prog = dhis2.programMetadata;
 
   // Intent detection — used to conditionally include sections
-  const inspectIntentText = inspectSnapshot?.enabled ? JSON.stringify(inspectSnapshot.insights || {}).toLowerCase() : '';
-  const text = `${(userText || '').toLowerCase()}\n${inspectIntentText}`;
+  const text = (userText || '').toLowerCase();
   const isCreating  = /\b(create|build|design|new program|set up a program|make a program)\b/.test(text)
     || /\badd\b.{0,50}\b(data elements?|fields?|stages?|rules?|option sets?)\b/.test(text)
     || /\b(add|assign)\b.{1,80}\bto\b.{1,50}\bstage\b/.test(text);
@@ -3543,6 +3764,7 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 10.9. For cross-program questions about INDICATOR CONTENT ("complex / heavy / biggest / top / most complicated program indicators", "indicators with lots of data", "find intricate expressions", "which indicators have the most events"), ALWAYS call manage_program_indicators(action="discover"). It needs NO program_id and returns ranked results in one shot. NEVER guess a program ID and NEVER call analytics/events/aggregate/{pid} with a made-up ID — if you don't already have a program UID in context or from a prior tool result, use action="discover" or search_metadata(object_type="programs") first.
 10.9.1. For "which OUs / districts / regions / facilities have the most data (or events, or values) for these indicators / programs" questions, ALWAYS call manage_program_indicators(action="rank_ou", indicator_ids=[...]) — pass the indicator_ids returned by the prior discover call. Do NOT hand-build analytics/events/query or analytics/events/aggregate URLs for this. The tool handles the OU dimension and LEVEL correctly (default level=2; pass level=3 for districts, 4 for facilities).
 10.9.2. HARD RULE — UIDs are NEVER invented. Any 11-char UID you put into a tool argument MUST come from either (a) the "Current Context" section below, or (b) a prior tool result in this conversation (discover, list, search_metadata, get_program_info, etc.). If you do not have a UID, use a tool that does not need one (discover, rank_ou, search_metadata). An analytics call with a guessed UID will be refused before it hits the server.
+10.9.3. HARD RULE — NAMED-TARGET FIDELITY. When the user names a specific program/dataset/object ("Using the X Tracker, create …") and your search finds NO match, that is a FULL STOP, not a licence to improvise: tell the user the named object does not exist on this instance, list the closest existing names you found, and ask whether to (a) create it, (b) build on one specific existing object, or (c) stop. NEVER silently pick "the closest match" and build the request on it — the extension refuses program-bound writes after a failed named-program search until the user decides. (If the user explicitly asked you to CREATE the named object, an empty search is expected — create it and continue.)
 11. ${isLocalProvider(getProviderConfig())
   ? 'Patient-level tracker data IS available because you are running on a LOCAL model (Ollama/localhost). When the user asks about a specific person/patient, their attributes, enrollments, or visits, you MAY use detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), and read tracker/events|enrollments|trackedEntities via dhis2_query. Handle this sensitive data responsibly and never expose more than asked.'
   : 'Patient/TEI data lookup is HARD-BLOCKED on this (remote/cloud) model — the extension refuses every patient-level tracker read IN CODE, so do NOT attempt detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), or tracker/trackedEntities|events|enrollments reads via dhis2_query (even when a TEI ID is in the page URL); they are refused regardless of what you do. If the user asks about "this person/patient", their attributes, enrollments, or visits, explain that patient-level retrieval is permitted ONLY when the assistant runs on a local (Ollama) model, and offer program-level alternatives (count_records, get_event_analytics aggregate, get_program_info).'}
@@ -3553,6 +3775,9 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 14.2. Never claim a tracker create/update/delete succeeded unless the tool result shows no validation errors and stats.created/stats.updated/stats.deleted is greater than 0.
 15. For sharing/access issues (program not appearing, "can't see", no data access): check the access field first, then use manage_metadata(action=update_sharing) to fix. NEVER use dhis2_query PUT/PATCH for sharing — it will fail.
 16. Two-tier tool docs: authoring/write tools carry a short routing description; their FULL usage manual is delivered automatically as the result of your FIRST call to them each turn (that first call does not execute — it is not an error). When you receive a manual, read it, then immediately re-issue the corrected tool call. Never tell the user about manuals or this mechanism.
+19. VERIFY SAVED OUTPUTS WITH THEIR OWN TOOLS, NOT HAND-WRITTEN ANALYTICS URLS. To check that a saved line list returns rows use manage_line_lists(action="validate", …); for a saved visualization use get_visualization_details(include_analytics_preview=true); for a program indicator use manage_program_indicators(action="get"/"audit") or read the values through an existing visualization. Hand-assembling /api/analytics URLs is the single biggest source of 409s: \`;\` separates ITEMS INSIDE one dimension while separate dimensions each need their own \`dimension=\` parameter, \`dx:\` exists only on the aggregate /analytics endpoint (the event/enrollment endpoints take a bare UID), and every query needs a data dimension, a period and an org unit. If you must query analytics directly, send ONE \`dimension=\` per dimension and always include dx, pe and ou.
+18. HARD RULE — PROVE THE CAUSE BEFORE YOU CHANGE ANYTHING. When the user reports that something is broken ("it won't let me enrol", "none of the stages appear"), you are DIAGNOSING, not repairing. A plausible-looking difference is a hypothesis, not a cause. Before ANY write you must be able to state: the symptom, the specific object and field you believe causes it, the tool result that PROVES that field is wrong, and why changing it fixes the symptom. If you cannot, keep reading — or tell the user what you found and ask. Specifically: (a) NEVER fix-and-see; (b) NEVER apply the same speculative change across a whole class of objects (all attributes, all stages, all elements) — verify ONE, confirm the symptom is gone, then extend; (c) if a write reports that nothing actually changed, treat that as disproof of your hypothesis and STOP, do not repeat it on sibling objects; (d) NEVER create, update or delete tracker DATA (enrollments, events, tracked entities) to "test" a configuration — that writes real patient records; verify with reads and tell the user to try the action instead. Changing things you have not proven wrong destroys the user's configuration and hides the real fault.
+17. HARD RULE — SEQUENCE DEPENDENT CALLS. Every tool call you put in ONE message runs against the state that existed BEFORE any of them ran, and you get all their results together afterwards. So a call may NEVER use a value that another call in the SAME message produces. If step B needs an ID that step A creates (e.g. add a line list / visualization / map to a dashboard, attach a legend set to an indicator you are creating), issue A ALONE, read the real UID from its result, then issue B in the NEXT step. NEVER bridge the gap with a placeholder like "__LINE_LIST_ID__", "<viz_id>" or "YOUR_ID_HERE" — such calls are refused before execution. Independent calls (nothing in common) may still be sent together.
 `;
 
   // ── Tracker Write Protocol — only when user wants to create/update/complete tracker data ──
@@ -3663,49 +3888,12 @@ Use importStrategy=CREATE_AND_UPDATE to create new records AND update existing o
 `;
   }
 
-  if (inspectSnapshot?.enabled) {
-    p += `
-## Inspect Mode
-Inspect mode is ENABLED. The user turned on page inspection before asking this question. You have captured browser console, runtime exception, and network error logs for the current active tab only.
-- Treat the [Inspect Logs] block in the user message as first-class diagnostic evidence.
-- First classify each important error: network/API status, JavaScript/runtime exception, DHIS2 program rule/program indicator expression error, permission/session issue, or harmless warning.
-- For DHIS2 program rule errors, the rule ID in the logs is a HYPOTHESIS, not a verified target. First call manage_program_rules(action="get", rule_id=...) — if it returns 404, the ID is stale or from a prior context. STOP and DO NOT proceed with any "fix"; do not invent "stale cache" explanations (DHIS2 has no such cache). Instead, call manage_program_rules(action=list, program_id=Current Program ID) to see the actual current rules, or ask the user which rule.
-- For DHIS2 program indicator expression errors, use manage_program_indicators(action="get" or action="audit") instead of guessing — and apply the same 404-means-stop rule.
-- If a log contains "Failed to coerce value 'null' to Boolean", explain that the condition is evaluating a null/empty value as a Boolean. Recommend wrapping that comparison in d2:hasValue(...) or rewriting the OR group so every nullable value is guarded.
-- If a log contains "Unknown function or constant", explain that the expression uses a function not supported by this DHIS2 expression engine/version or not valid in that expression type. Fetch the rule/indicator metadata before proposing an exact replacement.
-- For 404/409/500 API logs, inspect the endpoint, UID, program, TEI, enrollment, stage, and current context. Use dhis2_query only for safe GET context checks unless the user explicitly asks you to fix metadata.
-- Do not hide browser error details. Summarize the practical meaning and the next concrete fix steps.
-
-### Diagnose BEFORE destroying metadata
-- **Default to read-only.** Inspect mode gives you browser logs — those are symptoms, not proof of a specific metadata defect. Start by *explaining what the logs mean* and listing candidate causes, then ask the user before deleting or PATCH-ing anything.
-- **Benign patterns — DO NOT "fix":**
-  - \`staticContent/logo_banner\` 404 — DHIS2 returns 404 when no custom logo is uploaded; the app falls back to the default logo. This is not a bug. Never POST to staticContent (it's multipart-only and will return 500).
-  - \`dataStore/capture/*\` or \`dataStore/settings/*\` 404 — those keys are app-owned and get created lazily on first use; do NOT write defaults yourself.
-  - Vendor-prefix CSS rejections (\`-moz-\`, \`-ms-\`, \`-webkit-\`) in StyleSheet warnings — browser cosmetic, unrelated to app load.
-  - Favicon / manifest / service-worker 404s — cosmetic, not a cause of app failure.
-  - Mixed-content or extension-CSP warnings from the side panel or other extensions.
-- **Never bulk-delete from Inspect conclusions.** "Orphan program rule variables" reported by audit are a *code-quality* finding, not a guaranteed cause of Capture load failure. Deleting them without confirmation removes authoring work and is rarely the right fix. If you believe deletion is necessary, list the exact IDs you propose to delete and ask "do you want me to delete these N items?" — wait for explicit "yes" before any DELETE / importStrategy=DELETE call.
-- **Escalate to the user, not the DELETE endpoint.** If the Inspect logs show only harmless 404s / CSS warnings and no JS exception with a clear stack, say so: "The logs do not show a metadata defect. The app-load failure is likely <hypothesis>. Want me to gather more details (network waterfall, DHIS2 server logs, permissions) before making changes?"
-- Prefer \`manage_metadata(action=delete, ...)\` or \`manage_program_rules(action=delete, rule_id=...)\` for single-object deletes (they check references first) — not raw \`dhis2_query\` with \`importStrategy=DELETE\`. Bulk delete via dhis2_query now requires \`confirm_bulk_delete:true\` AND is still a last resort.
-
-### Verify before modify (mandatory)
-- Before ANY destructive call (update/delete/bulk_fix on rules, indicators, metadata), the chatbot's tool layer auto-verifies the target ID via GET. **A 404 from that lookup is a STOP — do not proceed, do not invent a "stale cached rule" explanation, do not retry with a different action that performs the same write.**
-- Inspect logs may carry rule IDs from previous app loads or unrelated programs. The DHIS2 rule engine evaluates against the live database; **there is no "stale rule cache"** that returns ghost objects. If a rule ID is in the logs but the live API says 404, the ID is wrong (or already deleted) — full stop.
-- After 2 consecutive 404s on destructive lookups in this turn, ALL further write attempts are hard-blocked. If you hit this, summarize the 404 history to the user and ask which ACTUAL current object should be acted on.
-
-### NEVER recommend cache-clearing as a DHIS2 fix
-- ❌ Do NOT recommend "Hard refresh", "Ctrl+Shift+R", "Cmd+Shift+R", "clear browser cache", "incognito mode", "App Management → resource cache", or "clear DHIS2 cache".
-- DHIS2 server-side errors (404/409/500 from /api/...) have nothing to do with browser cache. Recommending cache-clearing for these is hallucination and wastes the user's time. The only legitimate use of "hard refresh" is when the *Capture/Tracker app bundle itself* fails to load due to a stale service-worker — and even then, ask the user before recommending it.
-`;
-  }
-
   // ── Save / Load failure diagnosis (enrollment, event, TEI, dataset) ──
   // Triggered when the user reports a save/load failure or when inspect logs
   // show a 409 from the tracker API. This is the canonical KB the model must
   // consult BEFORE forming any hypothesis. It blocks the failure mode where
   // "error saving enrollment" was misdiagnosed as a program-rule issue.
-  const saveFailureMode = SAVE_FAILURE_RE.test(text)
-    || (inspectSnapshot?.enabled && /\b409\b|enroll/i.test(JSON.stringify(inspectSnapshot.insights || {})));
+  const saveFailureMode = SAVE_FAILURE_RE.test(text);
   if (saveFailureMode) {
     p += `
 ## Save / Load failure diagnosis — investigate AUTOMATICALLY
@@ -3815,6 +4003,16 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
 3. manage_indicators(action="create", indicator:{ name:"ANC 1st visit coverage", numerator:"#{anc1Uid}", denominator:"#{expectedUid}", indicator_type:"Per cent", legend_set_id:<legend_set_id> }) → the indicator is created AND the legend attached in ONE call; keep \`indicator_id\`.
 4. manage_dashboards(action="create_dashboard", dashboard:{ name:"ANC Coverage" }, items:[ { new_visualization:{ name:"ANC coverage by month", vis_type:"COLUMN", data_items:[<indicator_id>], periods:["LAST_12_MONTHS"], org_units:["<ou>"] } } ]) → keep \`dashboard_id\`.
 5. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, public_access="r-------").
+
+### Worked chain — "build the analytical package (program indicators + charts + maps + dashboard) for a TRACKER program"
+This is the shape of a big coverage/monitoring build. Do it in a HANDFUL of batched calls, never dozens of single ones.
+1. get_program_info(program_id=<the tracker>) → the REAL stage UIDs + data element UIDs. Every #{stage.de} you write must come from here.
+2. PLAN the indicator set. Each "% / rate / coverage" metric = **ONE** program indicator: analytics_type ENROLLMENT, filter = the denominator population, expression = \`d2:condition("<numerator condition>", 100, 0)\`, aggregation_type AVERAGE, decimals 1 (see the manage_program_indicators manual). Add a COUNT/SUM program indicator ONLY for a headline number (e.g. "active pregnancies") or when a table/breakdown explicitly needs the raw numerator, denominator, or category counts as their own columns. Do NOT split every percentage into numerator + denominator + percentage objects.
+3. manage_program_indicators(action="create", program_id, indicators:[ …all of them… ]) — ONE batched call. Keep the returned \`program_indicator_ids\`. (Re-batch only the entries returned under failed[], if any.)
+4. manage_legend_sets(action="create", …) for the map/RAG colour bands → keep each \`legend_set_id\`.
+5. manage_maps(action="create", data_item:<a program_indicator_id>, org_unit_level:2, legend_set_id:<…>) for EACH thematic map → keep each \`map_id\`. (Maps are created one per call; there is no inline-map on a dashboard.)
+6. manage_dashboards(action="create_dashboard", dashboard:{ name }, items:[ …]) — build the WHOLE dashboard in ONE call: each chart/pivot/single-value tile as an inline \`new_visualization\` (data_items = the program_indicator_ids), each map as \`{ type:"MAP", map_id }\`, section headers as \`{ type:"TEXT", text:"## ANC coverage" }\`. Keep \`dashboard_id\`.
+7. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, …) LAST.
 
 ### Worked chain — "create an option set for RDT results, a data element that uses it, and add it to the monthly malaria dataset"
 1. manage_option_sets(action="create", option_set:{ name:"Malaria RDT Result", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INV",name:"Invalid"}] }) → keep the returned \`option_set_id\`.
@@ -4160,7 +4358,6 @@ For "can't see / not appearing / no access" issues: (1) for programs in Capture/
   if (hasVizCtx)  p += `| Explain this chart/table | get_visualization_details |\n`;
   if (hasMapCtx)  p += `| Explain this map | get_map_details |\n`;
   if (browseWeb)  p += `| External / web search | browse_web |\n`;
-  if (inspectSnapshot?.enabled) p += `| Explain captured page errors | inspect logs + DHIS2 tools |\n`;
   if (wantsChart) p += `| Render a chart | render_chart |\n`;
   if (isCreating) p += `| Create program (ONE call, all components) | create_metadata(action=create_program) |\n| Design/verify metadata | architect_metadata |\n`;
   if (isCreating || wantsSharingAccess) p += `| Update program OU assignment | manage_metadata(action=update_program_org_units) |\n`;
@@ -4259,7 +4456,7 @@ The user's image has been analyzed; the description is under [Attached Image Ana
 - Routed block IDs: ${llBlockIds.join(', ')}
 - Use ONLY these blocks for Line Listing UI guidance in this turn.
 - Primary source: ${LINE_LISTING_JSON_PATH}
-- Extra references loaded: ${LINE_LISTING_SYSTEM_PROMPT_PATH}, ${LINE_LISTING_ROUTER_PATH}
+- Extra references loaded: ${LINE_LISTING_SYSTEM_PROMPT_PATH}
 
 ### Line Listing Guidance Rules
 ${compactRules.map(r => `- ${r}`).join('\n')}

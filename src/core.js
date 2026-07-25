@@ -120,7 +120,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
 const TAVILY_SEARCH_URL = 'https://api.tavily.com/search';
 const LINE_LISTING_JSON_PATH = 'line-listing/dhis2_linelisting_tool.json';
 const LINE_LISTING_SYSTEM_PROMPT_PATH = 'line-listing/dhis2_chrome_extension_system_prompt.md';
-const LINE_LISTING_ROUTER_PATH = 'line-listing/dhis2_extension_router.js';
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -188,6 +187,10 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   // save/write/import/register — they dominate problem reports ("the save
   // failed") and would weaken the gate.
   + '|set\\s+(?:a|an|the|this|that|it|up|new|custom|public|sharing)\\b|configure|apply\\s+(?:a|an|the|this|that|it)\\b'
+  // Imperative "run the analytics tables / run a sync job". Constrained to the
+  // article form so problem reports ("the report doesn't run", "it ran badly")
+  // stay read_only.
+  + '|run\\s+(?:a|an|the|this|that)\\b|re-?generate|rebuild|refresh\\s+(?:a|an|the|this)\\b'
   + '|install|uninstall|author|generate|translate|relabel'
   // Form/layout authoring verbs. "Design a custom form for this stage" is the
   // tool's OWN documented trigger phrase, yet was classified read_only and the
@@ -216,6 +219,14 @@ const WRITE_AUTH_DIAG_RE = new RegExp(
 const WRITE_AUTH_PROBLEM_RE = new RegExp(
   '\\b(?:error|fail(?:ed|ing|ure)?|broken|not working|won\'?t (?:save|load|work|enroll|enrol)'
   + '|cannot|can\'?t (?:save|load|work|enroll|enrol)|stuck|issue|problem|bug|crash(?:ed|ing)?'
+  // Generic inability / "nothing shows" complaints. These are symptom reports —
+  // the user is asking WHY, not authorizing a fix — so they must land in
+  // read_only even when a write verb appears inside the complaint (see the
+  // inability guard in classifyWriteAuthorization).
+  + '|not allow(?:ing|ed)?|does\\s?n\'?t allow|won\'?t let|does\\s?n\'?t let|not lett?ing'
+  + '|unable to|not able to|no longer works?|nothing happens'
+  + '|(?:none|non) of (?:the|them)|do(?:es)?\\s?n\'?t (?:appear|show|work|load)'
+  + '|not (?:appearing|showing|visible|available)|something is wrong|somthing is wrong'
   + ')\\b',
   'i'
 );
@@ -256,7 +267,48 @@ function classifyWriteAuthorization(userText) {
     /\b(?:please\s+)?(?:don'?t|do\s+not|never)\s+(?:ever\s+|just\s+|simply\s+)?[\w-]+(?:\s+(?:it|them|this|that|these|those|anything))?/gi,
     ' '
   );
-  const isBroad = WRITE_AUTH_BROAD_RE.test(negStripped);
+  // ── Inability guard ──
+  // A write verb inside an INABILITY clause is the user describing a symptom,
+  // not issuing an instruction: "it's not allowing me to add new enrollment",
+  // "I can't add an enrollment", "it won't let me create an event", "unable to
+  // update the program". The verb is the thing that FAILED, and treating it as
+  // consent is how a pure bug report ("something is wrong … it's not allowing
+  // me to add") was classified `broad` and the assistant started rewriting
+  // sharing on 4 stages and 15 attributes on an unverified theory
+  // (live 2026-07-25). Strip the whole inability span — marker, any "me/us to"
+  // filler, and the verb — then look for a write verb that SURVIVES. A real
+  // instruction alongside a complaint ("I can't add enrollments, fix it") keeps
+  // its own verb and still authorizes.
+  const inabilityStripped = negStripped.replace(
+    new RegExp(
+      '\\b(?:'
+      + "can'?t|cannot|can\\s+not|could\\s?n'?t|couldn'?t"
+      + "|won'?t|will\\s+not|would\\s?n'?t|wouldn'?t"
+      + "|does\\s?n'?t|doesn'?t|do\\s+not|did\\s?n'?t|didn'?t"
+      + "|is\\s+not|isn'?t|are\\s+not|aren'?t|was\\s+not|wasn'?t"
+      + '|un(?:able|willing)\\s+to|not\\s+able\\s+to|no\\s+longer'
+      + '|fail(?:s|ed|ing)?\\s+to|refus(?:es|ed|ing)\\s+to|block(?:s|ed|ing)?\\s+(?:me\\s+)?from'
+      // Bare "not" only counts as an inability marker when an allow/let/permit
+      // verb follows ("its not allowing me to add"), so ordinary "not" never
+      // swallows a real instruction.
+      + '|not(?=\\s+(?:allow|let|permit|enabl))'
+      + ')'
+      // optional filler: "allowing/letting me to", "let us", "permit you to", …
+      + '(?:\\s+(?:allow(?:ing|s|ed)?|let(?:ting|s)?|permit(?:ting|s|ted)?|enabl(?:ing|es|ed)))?'
+      // subject pronoun, either order ("can't I add", "won't let me save")
+      + '(?:\\s+(?:me|us|you|i|we|they|he|she|him|her|them|anyone|users?))?'
+      + '(?:\\s+to)?'
+      + '(?:\\s+(?:ever|even|just|simply|properly|correctly))?'
+      // the verb whose failure is being reported …
+      + '\\s+[\\w-]+'
+      // … plus any verbs coordinated onto it ("doesn't let me save or add
+      // anything"), which are equally part of the complaint.
+      + '(?:\\s+(?:or|nor|and)\\s+[\\w-]+)*',
+      'gi'
+    ),
+    ' '
+  );
+  const isBroad = WRITE_AUTH_BROAD_RE.test(inabilityStripped);
   const isDiag = WRITE_AUTH_DIAG_RE.test(text);
   const isProblem = WRITE_AUTH_PROBLEM_RE.test(text);
   // Hard refusal: an explicit "no, …" decline always wins over any verb match.
@@ -343,14 +395,96 @@ function destructive404StopOrNull(toolName, action) {
   };
 }
 
+// ── Named-target substitution guard ─────────────────────────────────────────
+// Stops the "closest match" disaster: the user names a specific program
+// ("Using the Integrated Pregnancy, Delivery and Postnatal Care Tracker,
+// create these line lists…"), the search for that name returns ZERO matches,
+// and instead of stopping to ask, the model silently picks a lookalike program
+// and builds the entire request on it — observed live 2026-07-19: 9 line lists
+// + a dashboard were created against "Maternal and Child Health (MCH) Program"
+// when the named program did not exist at all. Mechanics:
+//   • A name-filtered program search returning 0 rows ARMS a missing named
+//     target for this turn — only when the query is specific enough to be a
+//     user-named object (≥2 words, or one word of ≥10 chars), so generic
+//     probes like "ANC" or "Maternal" never arm the guard.
+//   • Any later result containing a program whose name matches an armed query
+//     DISARMS it (the object existed under a variant spelling after all).
+//   • While armed, program-bound WRITES targeting a program whose name does
+//     NOT match the missing name are refused with a stop-and-ask message.
+//     Writes against a matching program pass (and disarm) — so the legitimate
+//     "program X doesn't exist yet → user asked me to create it → build on
+//     the new program" flow is never blocked.
+// State is strictly per-turn (reset in the agentic loop): the refusal forces
+// exactly one stop-and-ask, and whatever the user decides next turn proceeds.
+
+function _namedTargetNorm(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function noteMissingNamedTarget(objectType, nameFilter) {
+  if (String(objectType) !== 'programs') return;
+  const norm = _namedTargetNorm(nameFilter);
+  if (!norm) return;
+  const specific = norm.includes(' ') || norm.length >= 10;
+  if (!specific) return;
+  dhis2.missingNamedTargets = dhis2.missingNamedTargets || [];
+  if (dhis2.missingNamedTargets.some(t => t.norm === norm)) return;
+  if (dhis2.missingNamedTargets.length >= 5) return;
+  dhis2.missingNamedTargets.push({ name: String(nameFilter), norm });
+  console.log(`[NamedTarget] armed — program search "${nameFilter}" returned 0 matches this turn`);
+}
+
+function clearNamedTargetsFoundIn(displayNames) {
+  const armed = dhis2.missingNamedTargets;
+  if (!armed || !armed.length || !displayNames) return;
+  const norms = (Array.isArray(displayNames) ? displayNames : [displayNames])
+    .map(_namedTargetNorm).filter(Boolean);
+  if (!norms.length) return;
+  dhis2.missingNamedTargets = armed.filter(t => {
+    const found = norms.some(n => n.includes(t.norm));
+    if (found) console.log(`[NamedTarget] disarmed — an existing program name matches "${t.name}"`);
+    return !found;
+  });
+}
+
+async function namedProgramSubstitutionStop(toolName, action, programUid) {
+  const armed = dhis2.missingNamedTargets;
+  if (!armed || !armed.length) return null;
+  if (typeof programUid !== 'string' || !/^[A-Za-z][A-Za-z0-9]{10}$/.test(programUid)) return null;
+  dhis2._namedTargetProgramNames = dhis2._namedTargetProgramNames || new Map();
+  let progName = dhis2._namedTargetProgramNames.get(programUid);
+  if (progName === undefined) {
+    const resp = await safeDhis2Fetch(`programs/${programUid}?fields=id,displayName`);
+    progName = (resp && !resp._error && resp.displayName) ? String(resp.displayName) : null;
+    dhis2._namedTargetProgramNames.set(programUid, progName);
+  }
+  // Name resolution failed (404/network) — let the tool's own handling report it.
+  if (progName === null) return null;
+  const progNorm = _namedTargetNorm(progName);
+  const matches = armed.some(t =>
+    progNorm.includes(t.norm) || (progNorm.length >= 8 && t.norm.includes(progNorm)));
+  if (matches) {
+    clearNamedTargetsFoundIn([progName]);
+    return null;
+  }
+  const missing = armed.map(t => `"${t.name}"`).join(', ');
+  return {
+    _error: `STOP — silent program substitution blocked. Earlier this turn your search for a program named ${missing} returned ZERO matches, and this ${toolName}(action=${action}) call targets a DIFFERENT program: "${progName}" (${programUid}). The user asked for the named program; building their request on a lookalike without their consent is forbidden. NOTE: ${toolName} itself IS available and working — this is a substitution gate, not a missing tool.`,
+    _hint: `End your turn NOW with a short message to the user: (1) the program ${missing} does NOT exist on this DHIS2 instance, (2) list the closest existing program names you saw, (3) ask whether to (a) create the missing program first, (b) build on one specific existing program instead, or (c) stop. Do NOT retry this write, do NOT route it through dhis2_query, and do NOT pick a substitute program yourself. When the user answers next turn, proceed exactly as they direct.`,
+    _scope: 'named_program_substitution_blocked',
+    _missing_named_programs: armed.map(t => t.name),
+    _attempted_program: { id: programUid, name: progName },
+  };
+}
+
 // ── Per-turn known-IDs registry & verify-before-call gate ───────────────────
 // EVERY API call must derive from verified data. The chatbot must never
 // construct a path/UID from a guess. dhis2.knownIds is seeded each turn from
-// (a) the user message, (b) page context, (c) inspect-snapshot text, (d)
-// already-loaded program/OU/viz/map metadata, (e) the persisted conversation
-// history — every UID the model can literally see in its context window
-// (objects it created or read in PRIOR turns) counts as verified — and is
-// extended by every tool result in the same turn.
+// (a) the user message, (b) page context, (c) already-loaded program/OU/viz/
+// map metadata, (d) the persisted conversation history — every UID the model
+// can literally see in its context window (objects it created or read in PRIOR
+// turns) counts as verified — and is extended by every tool result in the same
+// turn.
 //
 // Pre-flight checks at the dispatch layer use this set to refuse calls that
 // reference a UID not present anywhere in verified sources — that almost
@@ -369,15 +503,10 @@ function harvestUidsInto(set, value, depth = 0) {
   for (const v of Object.values(value)) harvestUidsInto(set, v, depth + 1);
 }
 
-function seedKnownIds(userText, ctx, inspectSnapshot) {
+function seedKnownIds(userText, ctx) {
   const set = new Set();
   harvestUidsInto(set, userText);
   harvestUidsInto(set, ctx || {});
-  if (inspectSnapshot) {
-    harvestUidsInto(set, inspectSnapshot.insights || {});
-    // The raw logs also frequently contain UIDs (rule IDs, program IDs in URLs).
-    harvestUidsInto(set, (inspectSnapshot.logs || []).map(l => `${l.text || ''} ${l.url || ''}`).join('\n'));
-  }
   harvestUidsInto(set, dhis2.programMetadata);
   harvestUidsInto(set, dhis2.ouContext);
   harvestUidsInto(set, dhis2.visualizationContext);
@@ -440,9 +569,8 @@ function harvestIconKeysInto(set, value, depth = 0) {
 }
 
 function seedKnownIcons() {
-  // Fresh empty Set per turn — no static seeding (keys must be proven via API
-  // discovery this turn to count as "known"). Could later seed from the inspect
-  // snapshot if /icons responses showed up there.
+  // Fresh empty Set per turn — no static seeding: a key only counts as "known"
+  // once an API response this turn has proven it exists.
   dhis2.knownIcons = new Set();
 }
 
@@ -505,7 +633,16 @@ function extractUidsFromCallArgs(toolName, args) {
   if (!args) return [...set];
   const addUids = (str) => {
     for (const m of String(str).match(DHIS_UID_RE) || []) {
-      if (!RESERVED_UID_SHAPED_WORDS.has(m)) set.add(m);
+      // Entropy check FIRST: DHIS2 base62 UIDs carry a digit or mixed case after
+      // position 0, so an all-lowercase 11-letter word is never one. Without it
+      // ordinary path segments of exactly 11 characters — "enrollments",
+      // "attributes"… — were read as hallucinated UIDs and legitimate calls
+      // like tracker/enrollments were REFUSED (live 2026-07-25). The
+      // hand-maintained denylist still covers camelCase field names
+      // (displayName, lastUpdated) that DO pass the entropy test.
+      if (!isLikelyDhisUid(m)) continue;
+      if (RESERVED_UID_SHAPED_WORDS.has(m)) continue;
+      set.add(m);
     }
   };
   // Path UIDs: resource-path segments only (drop the query string).
@@ -640,15 +777,20 @@ function isIncompleteCallError(resultOrText) {
 // common failure on weaker / custom OpenAI-compatible models (e.g. MiniMax)
 // under a large payload: the stream truncates mid-object, or leaks provider
 // separator tokens like `]<]minimax[>[` into the buffer. Returns
-// { ok:true, text } with a parseable JSON string when recovered, else
-// { ok:false }. Never throws. Pure — safe to unit test.
+// { ok:true, text, lossy } with a parseable JSON string when recovered, else
+// { ok:false }. `lossy:false` means the payload is intact after stripping leaked
+// tokens — safe to execute. `lossy:true` means braces had to be balanced /
+// strings closed, i.e. THE TAIL OF THE PAYLOAD WAS LOST: executing it would
+// silently run a partial call (e.g. a create_program missing its last stages
+// and rules that then "succeeds"), so callers must treat it as corrupted and
+// ask the model to resend/split instead. Never throws. Pure — safe to unit test.
 function repairToolCallArguments(raw) {
   const s0 = String(raw == null ? '' : raw);
   const tryParse = (t) => { try { JSON.parse(t); return true; } catch { return false; } };
-  if (tryParse(s0)) return { ok: true, text: s0 };
+  if (tryParse(s0)) return { ok: true, text: s0, lossy: false };
   // Strip leaked provider separator tokens ( ]<]word[>[ ) and stray control chars.
   let s = s0.replace(/\]?<\]\w+\[>\[?/g, '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
-  if (tryParse(s)) return { ok: true, text: s };
+  if (tryParse(s)) return { ok: true, text: s, lossy: false };
   // Isolate the outermost object/array of a stream truncated before it closed.
   const start = s.search(/[{[]/);
   if (start === -1) return { ok: false };
@@ -667,7 +809,72 @@ function repairToolCallArguments(raw) {
   if (inStr) s += '"';               // close an unterminated string
   s = s.replace(/,\s*$/, '');
   while (stack.length) s += (stack.pop() === '{' ? '}' : ']');
-  return tryParse(s) ? { ok: true, text: s } : { ok: false };
+  return tryParse(s) ? { ok: true, text: s, lossy: true } : { ok: false };
+}
+
+// ── Tool-call argument shape healing ─────────────────────────────────────────
+// Grammar-constrained providers can mangle NESTED structures in tool-call
+// arguments: given an item schema of bare `{type:'object'}`, Fireworks'
+// constrained decoder (observed live with MiniMax-M3, 2026-07-18) emits each
+// item as `{"$text": "<the intended object serialized as a JSON string>"}` —
+// and some models stringify nested objects/arrays outright ("body": "{…}").
+// Executing those shapes fails validation with misleading "missing required
+// field" errors even though the model's INTENT was complete and correct.
+// Heal generically (any tool, any provider):
+//   • an object whose ONLY key is $text (string) → parse the string as JSON
+//     when possible (else use the raw string);
+//   • an array item / object value that is a string LOOKING like a JSON
+//     object/array and parsing cleanly → parsed value.
+// Plain strings that don't parse as JSON containers are never touched.
+// Returns { value, healed }. Pure — safe to unit test.
+function healToolArgumentShape(value, depth = 0) {
+  if (depth > 12) return { value, healed: false };
+  const tryParseContainer = (s) => {
+    const t = String(s).trim();
+    if (!t.startsWith('{') && !t.startsWith('[')) return undefined;
+    try {
+      const p = JSON.parse(t);
+      return (p && typeof p === 'object') ? p : undefined;
+    } catch { return undefined; }
+  };
+  if (Array.isArray(value)) {
+    let healed = false;
+    const out = value.map(item => {
+      if (typeof item === 'string') {
+        const parsed = tryParseContainer(item);
+        if (parsed !== undefined) {
+          healed = true;
+          const inner = healToolArgumentShape(parsed, depth + 1);
+          return inner.value;
+        }
+        return item;
+      }
+      const r = healToolArgumentShape(item, depth + 1);
+      if (r.healed) healed = true;
+      return r.value;
+    });
+    return { value: out, healed };
+  }
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.length === 1 && keys[0] === '$text' && typeof value.$text === 'string') {
+      const parsed = tryParseContainer(value.$text);
+      if (parsed !== undefined) {
+        const inner = healToolArgumentShape(parsed, depth + 1);
+        return { value: inner.value, healed: true };
+      }
+      return { value: value.$text, healed: true };
+    }
+    let healed = false;
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      const r = healToolArgumentShape(v, depth + 1);
+      if (r.healed) healed = true;
+      out[k] = r.value;
+    }
+    return { value: out, healed };
+  }
+  return { value, healed: false };
 }
 
 // Collapse an error message into a "family" key: same message modulo UIDs,
@@ -727,6 +934,22 @@ function repeatedFailureStopOrNull(toolName, args) {
         // recovery framing and a NON-disabling scope — the model must be free to
         // send a well-formed call next (see isIncompleteCallError).
         if (isIncompleteCallError(prev.error)) {
+          // The non-disabling refusal exists so a CORRECTED retry stays open —
+          // but a model that re-sends the byte-identical empty/partial call
+          // forever must not burn the whole iteration budget on it (observed
+          // live 2026-07-18: 22 identical `rules:[{}]` repeats). After 3
+          // blocked identical repeats, escalate to the disabling scope so the
+          // circuit breaker ends the loop; a retry with DIFFERENT (fixed)
+          // arguments is a different signature and is never affected.
+          if ((prev.blockedAttempts || 0) >= 3) {
+            return {
+              _error: `BLOCKED: ${toolName} has now sent the SAME incomplete arguments ${prev.count + prev.blockedAttempts} times ("${prev.error}"). Re-sending them again will never work.`,
+              _hint: `STOP repeating this exact call. Either send the tool call with COMPLETE, fully-populated arguments (every required field), or give the user your final answer now: what was created (names + IDs), what remains, and what blocked you.`,
+              _scope: 'no_progress_repeat',
+              _previous_error: prev.error,
+              _identical_failures: prev.count,
+            };
+          }
           return {
             _error: `Your last ${toolName} call was refused because it repeated an INCOMPLETE call: "${prev.error}". `,
             _hint: `This is not a doomed operation — it means the arguments did not arrive intact (empty or truncated tool-call JSON). Re-send the COMPLETE ${toolName} call with EVERY required field populated. Do NOT send the same empty/partial arguments again. The tool stays fully available; a well-formed call will run normally.`,
@@ -854,19 +1077,93 @@ function isDiscoveryCall(toolName, args) {
 }
 function discoveryStreakStopOrNull(toolName, args) {
   if (!isDiscoveryCall(toolName, args)) return null;
+  // The guard exists to break "research forever, never act" — but on a turn
+  // with NO write authorization there is nothing to act on: verifying,
+  // explaining or diagnosing is legitimately all reads. Blocking discovery
+  // there strands the model with no legal move (live 2026-07-25: a
+  // "check that the dashboard renders" turn was cut off mid-verification).
+  const scope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
+  if (scope === 'read_only') return null;
   const streak = dhis2.consecutiveDiscoveryCalls || 0;
   if (streak < DISCOVERY_STREAK_LIMIT) return null;
   return {
     _error: `STOP researching: ${streak} read-only/discovery calls in a row this turn with NOTHING created or changed. You already have enough information to act.`,
-    _hint: `Issue the actual write the task needs NOW. To build a program, send ONE create_metadata(action=create_program) call with ALL components — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
+    _hint: `Issue the actual write the task needs NOW. To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
     _scope: 'no_progress_repeat',   // feeds the circuit breaker: if the model ignores this and keeps spinning, the discovery tool is disabled and the loop ends
     _discovery_streak: streak,
+  };
+}
+
+// ── Placeholder-argument guard (unresolved cross-call references) ───────────
+// A model that issues two DEPENDENT tool calls in the SAME assistant message
+// cannot know the first call's output when it composes the second, so it
+// bridges the gap with an invented placeholder token — observed live
+// 2026-07-24: manage_line_lists(create) and manage_dashboards(create_dashboard)
+// were emitted together and the dashboard referenced the not-yet-created list
+// as "__LINE_LIST_ID__". Every tool then reports its own downstream symptom
+// ("these eventVisualization UIDs do not exist"), which reads like a bad UID
+// and sends the model looking for the wrong fix.
+//
+// Detect the placeholder itself and name the real cause: the value comes from a
+// call whose RESULT you do not have yet. NON-disabling — re-issuing the same
+// call with the real UID is exactly what should happen next — but escalated to
+// the circuit-breaker scope if the model keeps sending placeholders anyway.
+const PLACEHOLDER_ARG_RE = new RegExp(
+  '^(?:'
+  + '__[A-Z0-9_]{2,}__'                       // __LINE_LIST_ID__
+  + '|<[A-Za-z0-9_. -]{2,40}>'                // <viz_id>, <program id>
+  + '|\\{\\{[A-Za-z0-9_. -]{2,40}\\}\\}'      // {{dashboardId}}
+  + '|\\$\\{[A-Za-z0-9_. -]{2,40}\\}'         // ${lineListId}
+  + '|(?:YOUR|MY|THE|INSERT|REPLACE|ADD|PUT)[_ -](?:[A-Z0-9]+[_ -])*(?:ID|UID|HERE)'
+  + '|[A-Z0-9]+(?:[_ -][A-Z0-9]+)*[_ -](?:ID|UID)[_ -]HERE'
+  + '|PLACEHOLDER(?:[_ -][A-Z0-9]+)*'
+  + '|(?:TBD|TODO|REPLACE[_ -]?ME|FILL[_ -]?ME[_ -]?IN|UNKNOWN[_ -]ID)'
+  + '|[xX]{8,}'                               // xxxxxxxxxxx
+  + ')$'
+);
+const PLACEHOLDER_BLOCK_LIMIT = 3;
+
+// Walk every string in the arguments and return the placeholder tokens found.
+// Whole-string match only, so real names/expressions/descriptions are never hit.
+function findPlaceholderArgs(value, out = new Set(), depth = 0) {
+  if (value == null || depth > 8 || out.size >= 6) return out;
+  if (typeof value === 'string') {
+    const t = value.trim();
+    if (t.length >= 4 && t.length <= 64 && PLACEHOLDER_ARG_RE.test(t)) out.add(t);
+    return out;
+  }
+  if (typeof value !== 'object') return out;
+  if (Array.isArray(value)) { for (const v of value) findPlaceholderArgs(v, out, depth + 1); return out; }
+  for (const v of Object.values(value)) findPlaceholderArgs(v, out, depth + 1);
+  return out;
+}
+
+function placeholderArgStopOrNull(toolName, args) {
+  const found = [...findPlaceholderArgs(args)];
+  if (!found.length) return null;
+  if (!(dhis2.placeholderBlocks instanceof Map)) dhis2.placeholderBlocks = new Map();
+  const n = (dhis2.placeholderBlocks.get(toolName) || 0) + 1;
+  dhis2.placeholderBlocks.set(toolName, n);
+  const list = found.map(p => `"${p}"`).join(', ');
+  const persistent = n >= PLACEHOLDER_BLOCK_LIMIT;
+  return {
+    _error: `Refused: ${toolName} was called with unresolved placeholder value(s) ${list}. NOTHING was executed — no API call was made.`,
+    _hint: persistent
+      ? `You have now sent a placeholder ${n} times. STOP. Issue ONLY the call that PRODUCES the missing value, read its real UID from the result, and then issue this call in a LATER step. If you cannot obtain it, give the user your final answer listing what was created (names + IDs) and what is still missing.`
+      : `A placeholder like this means you are referencing the output of a tool call you have NOT received a result for yet — usually because you issued both calls in the SAME message. Tool calls in one message all run against the state that existed BEFORE any of them ran, so the second one cannot see the first one's new UID. Fix: issue the calls in SEPARATE steps — send the call that CREATES the object now, wait for its result, take the real UID from that result, then issue this call with it. Never invent, guess, or template a UID.`,
+    _scope: persistent ? 'no_progress_repeat' : 'placeholder_argument',
+    ...(persistent ? {} : { _no_disable: true }),
+    _placeholders: found,
   };
 }
 
 // Pre-flight check called before EVERY tool dispatch. Returns null when the
 // call is safe to proceed; else returns a structured refusal.
 function preflightCheckCall(toolName, args) {
+  // Unresolved placeholder arguments — the most precise diagnosis available,
+  // so it is reported before the generic loop/HTTP counters.
+  const placeholderStop = placeholderArgStopOrNull(toolName, args);
+  if (placeholderStop) return placeholderStop;
   // Hard stop on cumulative HTTP errors — prevents runaway retry loops.
   const stop = httpErrorStopOrNull();
   if (stop) return stop;
@@ -896,7 +1193,7 @@ function preflightCheckCall(toolName, args) {
   if (!unknown.length) return null;
   return {
     _error: `Refused: ${toolName} called with UID(s) that have not appeared in any verified source: ${unknown.join(', ')}.`,
-    _hint: 'Every API call must derive from verified data. The UID(s) above were not in: the user message, page context, inspect logs, the conversation history, or any prior tool result. Possible causes: (a) the UID is hallucinated — call a discovery tool first (search_metadata / list / get_program_info) to find the real UID, (b) the UID came from a stale source — verify it exists. Do NOT construct paths from guesses. IMPORTANT: this refusal is a client-side gate and says NOTHING about server state — never tell the user the object "is already gone", "was deleted", or "does not exist" based on this refusal.',
+    _hint: 'Every API call must derive from verified data. The UID(s) above were not in: the user message, page context, the conversation history, or any prior tool result. Possible causes: (a) the UID is hallucinated — call a discovery tool first (search_metadata / list / get_program_info) to find the real UID, (b) the UID came from a stale source — verify it exists. Do NOT construct paths from guesses. IMPORTANT: this refusal is a client-side gate and says NOTHING about server state — never tell the user the object "is already gone", "was deleted", or "does not exist" based on this refusal.',
     _refused: { tool: toolName, unknown_uids: unknown },
     _known_id_count: dhis2.knownIds.size,
     _scope: 'unknown_uid_in_args',
@@ -931,204 +1228,6 @@ async function verifyTargetExists(resourcePath, id, toolName, action, fields) {
     return { exists: false, refusal: { ...data, _hint: data._hint || `GET ${resourcePath}/${id} failed before the destructive action could proceed.` } };
   }
   return { exists: true, data };
-}
-
-const INSPECT_MAX_LOGS = 250;
-const INSPECT_MAX_REQUESTS = 300;
-const INSPECT_TEXT_LIMIT = 1800;
-const inspectCapture = {
-  active: false,
-  attached: false,
-  tabId: null,
-  url: null,
-  startedAt: null,
-  logs: [],
-  requests: new Map(),
-};
-
-function inspectNow() {
-  return new Date().toISOString();
-}
-
-function clipText(value, limit = INSPECT_TEXT_LIMIT) {
-  const s = String(value ?? '');
-  return s.length > limit ? s.slice(0, limit) + '...[truncated]' : s;
-}
-
-function getArgText(arg) {
-  if (!arg) return '';
-  if (Object.prototype.hasOwnProperty.call(arg, 'value')) {
-    try {
-      return typeof arg.value === 'string' ? arg.value : JSON.stringify(arg.value);
-    } catch {
-      return String(arg.value);
-    }
-  }
-  return arg.description || arg.unserializableValue || arg.className || arg.type || '';
-}
-
-
-function pushInspectLog(entry) {
-  if (!inspectCapture.active || !inspectCapture.tabId) return;
-  const normalized = {
-    time: entry.time || inspectNow(),
-    level: entry.level || 'info',
-    source: entry.source || 'unknown',
-    kind: entry.kind || entry.source || 'log',
-    text: clipText(entry.text || ''),
-    url: entry.url || null,
-    line: entry.line ?? null,
-    column: entry.column ?? null,
-    requestId: entry.requestId || null,
-    method: entry.method || null,
-    status: entry.status ?? null,
-    statusText: entry.statusText || null,
-    stack: entry.stack || null,
-  };
-  inspectCapture.logs.push(normalized);
-  if (inspectCapture.logs.length > INSPECT_MAX_LOGS) {
-    inspectCapture.logs.splice(0, inspectCapture.logs.length - INSPECT_MAX_LOGS);
-  }
-}
-
-function rememberInspectRequest(requestId, data) {
-  if (!requestId) return;
-  inspectCapture.requests.set(requestId, {
-    ...(inspectCapture.requests.get(requestId) || {}),
-    ...data,
-  });
-  if (inspectCapture.requests.size > INSPECT_MAX_REQUESTS) {
-    const firstKey = inspectCapture.requests.keys().next().value;
-    inspectCapture.requests.delete(firstKey);
-  }
-}
-
-function formatStackTrace(stackTrace) {
-  const frames = stackTrace?.callFrames || [];
-  if (!frames.length) return null;
-  return frames.slice(0, 6).map(f => ({
-    functionName: f.functionName || '(anonymous)',
-    url: f.url || null,
-    line: f.lineNumber != null ? f.lineNumber + 1 : null,
-    column: f.columnNumber != null ? f.columnNumber + 1 : null,
-  }));
-}
-
-function parseProgramRuleInsight(text) {
-  const s = String(text || '');
-  if (!/\bRule\b/.test(s) || !/\braised an\b|\braised an unexpected exception\b/.test(s)) return null;
-  const idMatch = s.match(/\bwith id ([A-Za-z][A-Za-z0-9]{10})\b/);
-  const nameMatch = s.match(/^Rule\s+(.+?)\s+with id\s+[A-Za-z][A-Za-z0-9]{10}\s+executed/s);
-  const errorMatch = s.match(/\braised an (?:unexpected exception|error):\s*([\s\S]+)/);
-  const refs = Array.from(new Set(Array.from(s.matchAll(/#\{([^}]+)\}/g)).map(m => m[1]))).slice(0, 60);
-  const functions = Array.from(new Set(Array.from(s.matchAll(/\bd2:[A-Za-z0-9_]+/g)).map(m => m[0]))).slice(0, 30);
-  return {
-    type: 'program_rule_error',
-    rule_id: idMatch?.[1] || null,
-    rule_name: nameMatch?.[1]?.trim() || null,
-    error: clipText(errorMatch?.[1] || s, 1000),
-    referenced_variables: refs,
-    d2_functions: functions,
-  };
-}
-
-// Classifies a log entry as a known-benign pattern that should NOT trigger
-// destructive "fixes". Returns the reason string if benign, else null.
-// Keeping this list tight on purpose: only patterns we know the DHIS2 server
-// returns by design or are unrelated to app functionality.
-function classifyBenignInspectPattern(log) {
-  const txt = String(log?.text || '');
-  const url = String(log?.url || '');
-  const status = Number(log?.status);
-
-  // staticContent/logo_banner|logo_front 404 = no custom logo uploaded (normal).
-  if (/staticContent\/(logo_banner|logo_front)/i.test(url + ' ' + txt) && (status === 404 || /404/.test(txt))) {
-    return 'staticContent logo 404: no custom logo set — DHIS2 falls back to default. Harmless.';
-  }
-  // dataStore namespace keys for app-owned caches 404 = lazy-init, not a defect.
-  if (/dataStore\/(capture|settings|user-settings|userDataStore)\//i.test(url + ' ' + txt) && (status === 404 || /404/.test(txt))) {
-    return 'dataStore namespace key 404: app-owned cache key not yet created. The owning app recreates it on first use. Do NOT write defaults from the assistant.';
-  }
-  // Vendor-prefix CSS warnings from the style injector.
-  if (/stylesheet|css/i.test(log?.kind || '') && /(-moz-|-ms-|-webkit-|vendor prefix|-o-)/i.test(txt)) {
-    return 'Vendor-prefix CSS rejection: cosmetic browser behavior. Unrelated to app load.';
-  }
-  if (/rule was ignored due to bad selector|unknown property name|unreachable code after return statement/i.test(txt)) {
-    return 'Browser CSS/JS style lint: cosmetic. Unrelated to app functionality.';
-  }
-  // Favicons, source maps, and manifest 404s.
-  if (/(favicon\.ico|\.map(\b|$)|site\.webmanifest|apple-touch-icon)/i.test(url + ' ' + txt) && (status === 404 || /404/.test(txt))) {
-    return 'Asset 404 (favicon/sourcemap/manifest): cosmetic. Unrelated to app failure.';
-  }
-  return null;
-}
-
-function parseInspectInsights(logs) {
-  const ruleErrors = [];
-  const missingResources = [];
-  const unknownFunctions = [];
-  const benign = [];
-  for (const log of logs) {
-    const txt = log.text || '';
-    const rule = parseProgramRuleInsight(txt);
-    if (rule) {
-      ruleErrors.push(rule);
-      if (/Unknown function or constant/i.test(txt)) unknownFunctions.push(rule);
-      continue;
-    }
-    const status = Number(log.status);
-    const looksLikeError = status >= 400 || /\bstatus of 4\d\d\b|\bstatus of 5\d\d\b|Failed to load resource/i.test(txt);
-    if (looksLikeError) {
-      const benignReason = classifyBenignInspectPattern(log);
-      if (benignReason) {
-        benign.push({
-          status: status || null,
-          url: log.url || extractUrlFromText(txt),
-          reason: benignReason,
-          text: clipText(txt, 300),
-        });
-      } else {
-        missingResources.push({
-          status: status || null,
-          url: log.url || extractUrlFromText(txt),
-          text: clipText(txt, 600),
-        });
-      }
-    }
-  }
-  return {
-    rule_errors: ruleErrors.slice(-20),
-    network_errors: missingResources.slice(-30),
-    unknown_rule_functions: unknownFunctions.slice(-10),
-    benign_ignored: benign.slice(-20),
-    _diagnostic_policy: 'network_errors and rule_errors may indicate real defects. benign_ignored is the server/browser behaving as designed — do NOT propose fixes for these. If only benign_ignored entries are present, the Inspect logs do not justify destructive metadata changes.',
-  };
-}
-
-function extractUrlFromText(text) {
-  const hit = String(text || '').match(/https?:\/\/\S+|\/api\/\S+|\/[A-Za-z0-9/_?=&.%:-]+/);
-  return hit ? hit[0].replace(/[),.;]+$/, '') : null;
-}
-
-function buildInspectSnapshot() {
-  const logs = inspectCapture.logs.slice(-120);
-  const counts = logs.reduce((acc, l) => {
-    const key = l.level || 'info';
-    acc[key] = (acc[key] || 0) + 1;
-    return acc;
-  }, {});
-  return {
-    enabled: inspectCapture.active,
-    attached: inspectCapture.attached,
-    tabId: inspectCapture.tabId,
-    url: inspectCapture.url,
-    startedAt: inspectCapture.startedAt,
-    captured: inspectCapture.logs.length,
-    included: logs.length,
-    counts,
-    insights: parseInspectInsights(logs),
-    logs,
-  };
 }
 
 
@@ -1392,7 +1491,81 @@ const PER_TURN_DHIS2_FIELDS = new Set([
   'destructive404Count', 'destructive404History',
   'httpErrorCount', 'httpErrorHistory',
   'failedCallSigs', 'toolErrorFamilies', 'toolSuccessCount',
+  // Loop guards that are also strictly per-turn. Persisting them served no
+  // purpose and round-trips a Map through JSON as a bare `{}`, which every
+  // consumer then has to defend against with an `instanceof` rebuild.
+  'executedCallSigs', 'consecutiveDiscoveryCalls', 'corruptedCallCount',
+  'placeholderBlocks', 'missingNamedTargets', '_namedTargetProgramNames',
 ]);
+
+// ── Sticky tool availability across a conversation ──────────────────────────
+// getContextualTools picks tools by matching keywords in the CURRENT user
+// message. That is right for the first turn of a task and WRONG for every
+// follow-up: "now remove it and put it back to how it was" names no feature, so
+// the tool that did the work in the previous turn silently disappears from the
+// wire schema.
+//
+// Why that is catastrophic rather than merely annoying. Both observed live on
+// MiniMax-M3 (2026-07-25) once the needed tool was off the wire:
+//   1. LOOKALIKE SUBSTITUTION — the model narrates "let me use the correct
+//      manage_custom_translations tool" but emits manage_custom_forms
+//      (remove_form), then manage_metadata(delete dataSets …), thrashing
+//      through wrong tools until the circuit breaker ends the turn. The old
+//      "not enabled" refusal actively encouraged this: its hint said "pick the
+//      closest available one for the goal".
+//   2. FABRICATED SUCCESS — worse, and reproduced with a direct provider probe:
+//      with no suitable tool available the model answers "Done — I removed the
+//      custom translation via manage_custom_translations(action='remove')" and
+//      emits NO tool call at all. The user is told the work happened when
+//      nothing was called.
+// A router miss must never be able to cause either. It may cost one extra round
+// trip; it may not make the task impossible.
+//
+// Fix: a tool that has already been used in THIS conversation stays available
+// for the rest of it. Continuity is per-thread, so it is cleared by the
+// new-thread reset. This never widens what a tool may do — every write still
+// passes requireWriteAuth and every other gate — and the read-only
+// save-diagnosis mode still strips destructive tools AFTER this union.
+const STICKY_TOOL_MEMORY_MAX = 24;
+
+function noteToolUsedThisThread(name) {
+  if (!name || !TOOL_ROUTER[name]) return;
+  const list = Array.isArray(dhis2.toolsUsedThisThread) ? dhis2.toolsUsedThisThread : [];
+  if (list.includes(name)) return;
+  list.push(name);
+  // Keep the most recent N so a very long thread cannot grow the wire schema
+  // without bound.
+  dhis2.toolsUsedThisThread = list.slice(-STICKY_TOOL_MEMORY_MAX);
+}
+
+// Every tool this conversation has actually used: the persisted list plus any
+// tool_call still visible in conversationHistory (belt and braces — history is
+// trimmed on a message cap, the list is trimmed on a tool cap, and either one
+// alone can miss a tool the other still remembers).
+function getThreadToolNames() {
+  const out = new Set();
+  for (const n of (Array.isArray(dhis2.toolsUsedThisThread) ? dhis2.toolsUsedThisThread : [])) {
+    if (TOOL_ROUTER[n]) out.add(n);
+  }
+  for (const m of (Array.isArray(conversationHistory) ? conversationHistory : [])) {
+    if (!m || m.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
+    for (const tc of m.tool_calls) {
+      const n = tc?.function?.name;
+      if (n && TOOL_ROUTER[n]) out.add(n);
+    }
+  }
+  return out;
+}
+
+// The ONE case where the contextual set is a safety boundary rather than a
+// relevance filter: the user reported a save/load failure and has not
+// authorized a fix, so every destructive tool is withheld until they do. Shared
+// by getContextualTools (which strips them) and the agentic loop (which must
+// refuse — never late-admit — a withheld tool).
+function isSaveDiagnosisReadOnly(userText) {
+  const scope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
+  return SAVE_FAILURE_RE.test(String(userText || '').toLowerCase()) && scope === 'read_only';
+}
 
 function snapshotDhis2ForPersistence() {
   const out = {};
@@ -1472,7 +1645,7 @@ function buildTurnHistory(messages, persistFromIdx, userContentOverride) {
       out.push(a);
     } else if (m.role === 'user') {
       // Persist the compact user text (override) for the turn's own user
-      // message — the live array may carry large inspect-log/web blocks we do
+      // message — the live array may carry large web-result blocks we do
       // not want to retain across turns.
       const useOverride = k === persistFromIdx && typeof userContentOverride !== 'undefined';
       out.push({ role: 'user', content: useOverride ? userContentOverride : m.content });
@@ -1532,17 +1705,37 @@ async function clearConversationState() {
   // be redeemable by a bare "yes" in the new one.
   dhis2.lastRefusedWrite = null;
   dhis2.turnCounter = 0;
+  // Sticky tool availability is per-conversation: a new thread starts from the
+  // keyword router alone, with no tools carried over from the old task.
+  dhis2.toolsUsedThisThread = [];
 
   await saveState();
 }
 
 // ── DHIS2 API Helpers ────────────────────────────────────────────────────────
 
+// Sentinel message for "the DHIS2 session on this instance isn't authenticated".
+// Thrown/returned instead of letting the browser follow the 302→/dhis-web-login/
+// into a CORS-blocked resource, which spams the service-worker console. Callers
+// that swallow context-load errors (initializeFromUrl) stay quiet; callers that
+// surface tool errors (safeDhis2Fetch) get a clear, actionable message.
+const DHIS2_NOT_SIGNED_IN_MSG =
+  'Not signed in to this DHIS2 instance. Log in to this server in the browser tab, then try again.';
+
 async function dhis2Fetch(url) {
+  // `redirect: 'manual'` so an unauthenticated 302 → /dhis-web-login/ surfaces as
+  // an opaque redirect we can detect, instead of the browser following it into a
+  // cross-origin login page that has no CORS headers (which logs a noisy
+  // "blocked by CORS policy" error). Happens right after switching instances
+  // when the session on the new server hasn't been established yet.
   const resp = await fetch(url, {
     credentials: 'include',
     headers: { Accept: 'application/json' },
+    redirect: 'manual',
   });
+  if (resp.type === 'opaqueredirect' || resp.status === 0) {
+    throw new Error(DHIS2_NOT_SIGNED_IN_MSG);
+  }
   if (!resp.ok) throw new Error(`DHIS2 ${resp.status}: ${resp.statusText}`);
   return resp.json();
 }
@@ -2172,10 +2365,18 @@ async function safeDhis2Fetch(path, options = {}) {
         method,
         credentials: 'include',
         headers,
+        // Catch an unauthenticated 302 → /dhis-web-login/ as an opaque redirect
+        // rather than following it into a CORS-blocked login page (noisy console
+        // error). Common right after switching to an instance you're not logged
+        // into. Turned into a clean auth error below.
+        redirect: 'manual',
       };
       if (bodyStr) fetchOpts.body = bodyStr;
 
       const resp = await fetch(fullUrl, fetchOpts);
+      if (resp.type === 'opaqueredirect' || resp.status === 0) {
+        return { _error: DHIS2_NOT_SIGNED_IN_MSG, _url: fullUrl, _status: 401, _not_signed_in: true };
+      }
       const text = await resp.text().catch(() => '');
       rawResp = { ok: resp.ok, status: resp.status, statusText: resp.statusText, text };
 
@@ -2223,7 +2424,7 @@ async function safeDhis2Fetch(path, options = {}) {
           try {
             let retryResp = await fetchViaTab(metaDeleteUrl, 'POST', postHeaders, deleteBody);
             if (!retryResp) {
-              const r = await fetch(metaDeleteUrl, { method: 'POST', credentials: 'include', headers: postHeaders, body: deleteBody });
+              const r = await fetch(metaDeleteUrl, { method: 'POST', credentials: 'include', headers: postHeaders, body: deleteBody, redirect: 'manual' });
               retryResp = { ok: r.ok, status: r.status, text: await r.text().catch(() => '') };
             }
             if (retryResp.text && retryResp.text.trim()) {
@@ -2448,6 +2649,19 @@ function normalizeTrackerEnrollmentObject(enrollmentObj, metaIndex, conversionNo
   if (!out.program && ctx?.programId) out.program = ctx.programId;
   if (!out.orgUnit && ctx?.orgUnitId) out.orgUnit = ctx.orgUnitId;
   if (!out.trackedEntity && ctx?.teiId) out.trackedEntity = ctx.teiId;
+  // A program with displayIncidentDate=true (the DHIS2 default) REQUIRES the
+  // enrollment's incident date, sent as `occurredAt`. Omitting it fails the
+  // whole bundle with "DisplayIncidentDate is true but occurredAt is null", and
+  // every event nested under that enrollment fails with it (live 2026-07-25).
+  // `enrolledAt` is the only sensible default — for a case-surveillance style
+  // program the incident date IS the enrolment date unless stated otherwise —
+  // so fill it rather than losing the entire import over a missing echo.
+  if (!out.occurredAt && !out.incidentDate && out.enrolledAt) {
+    out.occurredAt = out.enrolledAt;
+    if (Array.isArray(conversionNotes)) {
+      conversionNotes.push(`Enrollment had no occurredAt (incident date); defaulted it to enrolledAt (${out.enrolledAt}). Programs with displayIncidentDate=true reject an enrollment without it.`);
+    }
+  }
   if (Array.isArray(out.events)) {
     out.events = out.events.map(ev => normalizeTrackerEventObject(ev, metaIndex, conversionNotes, ctx));
   }
@@ -2464,10 +2678,156 @@ function normalizeTrackedEntityObject(entityObj, metaIndex, conversionNotes, ctx
   return out;
 }
 
-function normalizeTrackerBundle(bundle, collections, ctx) {
+// ── Client-supplied tracker ids that are not DHIS2 UIDs ─────────────────────
+// When a model seeds sample data it names the records the way a human would —
+// "VPD-CASE-001", "VPDCASE00001", "case1" — and puts those in trackedEntity /
+// enrollment / event. DHIS2 rejects the whole payload with 400 "UID must be an
+// alphanumeric string of 11 characters", and every event that referenced the
+// enrollment then fails too (live 2026-07-25: 8 cases, 0 imported).
+//
+// Those strings are not identity, they are CORRELATION: "this event belongs to
+// that case". So mint a real UID for each invalid id and rewrite every
+// reference to it, preserving the relationships exactly. Ids that already look
+// like UIDs are untouched, so referencing existing server records still works.
+function healTrackerClientIds(bundle) {
+  const remap = new Map();
+  const idFields = ['trackedEntity', 'enrollment', 'event', 'relationship'];
+  const needsHeal = (v) => typeof v === 'string' && v.trim() !== '' && !/^[A-Za-z][A-Za-z0-9]{10}$/.test(v.trim());
+  const mapId = (v) => {
+    const key = String(v).trim();
+    if (!remap.has(key)) remap.set(key, generateDhis2Uid());
+    return remap.get(key);
+  };
+  const walk = (node) => {
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (!node || typeof node !== 'object') return;
+    for (const f of idFields) {
+      // An EMPTY id means "I don't have one — assign it". DHIS2 instead tries to
+      // deserialize "" into a UID and 400s the whole bundle ("UID must be an
+      // alphanumeric string of 11 characters"), so drop the key entirely.
+      if (typeof node[f] === 'string' && node[f].trim() === '') { delete node[f]; continue; }
+      if (needsHeal(node[f])) node[f] = mapId(node[f]);
+    }
+    for (const v of Object.values(node)) {
+      if (v && typeof v === 'object') walk(v);
+    }
+  };
+  walk(bundle);
+  return remap;
+}
+
+// ── Legacy (pre-2.36) tracker field names ───────────────────────────────────
+// The old Tracker API used enrollmentDate / incidentDate / eventDate /
+// dueDate / trackedEntityInstance / trackedEntityAttributes. The new one uses
+// enrolledAt / occurredAt / scheduledAt / trackedEntity / attributes — and it
+// SILENTLY IGNORES the old keys, so a payload written from older docs imports
+// as "Property enrolledAt is null" / "Event occurredAt date is missing" with
+// every nested event failing too (live 2026-07-25). Models trained on the old
+// docs emit these constantly. Rename them; never overwrite a new-style key that
+// is already present. Pure — safe to unit test.
+const TRACKER_LEGACY_FIELDS = Object.freeze({
+  enrollmentDate: 'enrolledAt',
+  incidentDate: 'occurredAt',
+  eventDate: 'occurredAt',
+  occurredDate: 'occurredAt',
+  dueDate: 'scheduledAt',
+  completedDate: 'completedAt',
+  trackedEntityInstance: 'trackedEntity',
+  trackedEntityAttributes: 'attributes',
+  programStageInstance: 'event',
+  orgUnitName: null,   // display-only echoes DHIS2 rejects as unknown properties
+  programName: null,
+});
+
+function normalizeTrackerLegacyFields(node, notes, seen) {
+  if (Array.isArray(node)) { node.forEach(n => normalizeTrackerLegacyFields(n, notes, seen)); return node; }
+  if (!node || typeof node !== 'object') return node;
+  for (const [oldKey, newKey] of Object.entries(TRACKER_LEGACY_FIELDS)) {
+    if (!Object.prototype.hasOwnProperty.call(node, oldKey)) continue;
+    if (newKey === null) { delete node[oldKey]; continue; }
+    if (node[newKey] === undefined || node[newKey] === null || node[newKey] === '') {
+      node[newKey] = node[oldKey];
+      if (seen && !seen.has(oldKey)) { seen.add(oldKey); }
+    }
+    delete node[oldKey];
+  }
+  for (const v of Object.values(node)) {
+    if (v && typeof v === 'object') normalizeTrackerLegacyFields(v, notes, seen);
+  }
+  return node;
+}
+
+function normalizeTrackerBundle(bundle, collections, ctx, importStrategy = 'CREATE') {
   const metaIndex = getTrackerMetadataIndexes();
   const conversionNotes = [];
   const out = cloneJson(bundle) || {};
+
+  const legacySeen = new Set();
+  normalizeTrackerLegacyFields(out, conversionNotes, legacySeen);
+  if (legacySeen.size) {
+    conversionNotes.push(
+      `Renamed ${legacySeen.size} legacy tracker field(s) to the current Tracker API names: `
+      + [...legacySeen].map(k => `${k} → ${TRACKER_LEGACY_FIELDS[k]}`).join(', ')
+      + '. DHIS2 2.36+ ignores the old names, so the values would have been dropped.'
+    );
+  }
+
+  // An event nested under an enrollment inherits that enrollment's person.
+  // DHIS2 does NOT infer it and rejects the whole bundle with "Event <uid> of an
+  // Enrollment does not reference a TrackedEntity" (live 2026-07-25) — one
+  // missing echo costs the entire import.
+  let propagated = 0;
+  for (const te of (Array.isArray(out.trackedEntities) ? out.trackedEntities : [])) {
+    for (const enr of (Array.isArray(te?.enrollments) ? te.enrollments : [])) {
+      if (!enr.trackedEntity && te.trackedEntity) enr.trackedEntity = te.trackedEntity;
+      for (const ev of (Array.isArray(enr?.events) ? enr.events : [])) {
+        if (!ev.trackedEntity && enr.trackedEntity) { ev.trackedEntity = enr.trackedEntity; propagated++; }
+        if (!ev.orgUnit && enr.orgUnit) ev.orgUnit = enr.orgUnit;
+      }
+    }
+  }
+  for (const enr of (Array.isArray(out.enrollments) ? out.enrollments : [])) {
+    for (const ev of (Array.isArray(enr?.events) ? enr.events : [])) {
+      if (!ev.trackedEntity && enr.trackedEntity) { ev.trackedEntity = enr.trackedEntity; propagated++; }
+      if (!ev.orgUnit && enr.orgUnit) ev.orgUnit = enr.orgUnit;
+    }
+  }
+  if (propagated) {
+    conversionNotes.push(`Copied the parent enrollment's trackedEntity (and orgUnit where missing) onto ${propagated} nested event(s) — DHIS2 requires each event to name its tracked entity explicitly.`);
+  }
+
+  // The same object listed twice in one bundle imports the first and reports
+  // "already exists" for the rest, failing the whole atomic import.
+  let deduped = 0;
+  for (const [coll, idKey] of Object.entries(TRACKER_ID_KEYS)) {
+    if (!Array.isArray(out[coll])) continue;
+    const seenIds = new Set();
+    out[coll] = out[coll].filter(item => {
+      const id = item && item[idKey];
+      if (!id) return true;
+      if (seenIds.has(id)) { deduped++; return false; }
+      seenIds.add(id);
+      return true;
+    });
+  }
+  if (deduped) {
+    conversionNotes.push(`Dropped ${deduped} duplicate entr(y/ies) that repeated an id already present in the same bundle — DHIS2 rejects the whole import with "already exists" for repeats.`);
+  }
+
+  // Minting a UID is ONLY safe when creating. On an UPDATE or DELETE the id
+  // names an EXISTING record, so replacing a malformed one with a fresh UID
+  // would silently retarget the write at a random object instead of surfacing
+  // the bad id — turning a clear error into data loss. Create-only.
+  const isCreateStrategy = String(importStrategy || 'CREATE').toUpperCase().startsWith('CREATE');
+  const healed = isCreateStrategy ? healTrackerClientIds(out) : new Map();
+  if (healed.size) {
+    conversionNotes.push(
+      `Replaced ${healed.size} client-supplied identifier(s) that are not DHIS2 UIDs with generated UIDs, keeping every reference consistent: `
+      + [...healed.entries()].slice(0, 8).map(([from, to]) => `"${from}" → ${to}`).join(', ')
+      + (healed.size > 8 ? `, …` : '')
+      + '. DHIS2 ids must be exactly 11 alphanumeric characters starting with a letter — do not invent readable ids; omit the id and let the server assign one.'
+    );
+  }
 
   for (const collection of collections) {
     if (!Array.isArray(out[collection])) continue;
@@ -2480,7 +2840,7 @@ function normalizeTrackerBundle(bundle, collections, ctx) {
     }
   }
 
-  return { bundle: out, conversionNotes };
+  return { bundle: out, conversionNotes, mintedIds: [...healed.values()] };
 }
 
 function wrapTrackerWriteBody(collection, body, id, method) {
@@ -2532,8 +2892,43 @@ function buildTrackerWriteRequest(path, method, body, ctx) {
     return { _error: 'Tracker write body must include one or more of: events, trackedEntities, enrollments, relationships.' };
   }
 
-  const normalized = normalizeTrackerBundle(bundle, collections, ctx);
+  const strategyForNormalize = upperMethod === 'DELETE'
+    ? 'DELETE'
+    : (upperMethod === 'PUT' || upperMethod === 'PATCH' ? 'UPDATE' : 'CREATE');
+  const normalized = normalizeTrackerBundle(bundle, collections, ctx, strategyForNormalize);
   bundle = normalized.bundle;
+
+  // ── Dangling tracked-entity reference ──
+  // "Enrol 8 cases" is naturally written as an enrollments[] array whose
+  // trackedEntity is a made-up label. Healing gives each label a real UID, but
+  // the PERSON still does not exist anywhere — DHIS2 answers E1068 "Could not
+  // find TrackedEntity" and then fails every event under the enrollment too,
+  // so one missing array costs three 409s and a dead turn (live 2026-07-25).
+  // A minted UID cannot exist server-side by construction, so if nothing in
+  // trackedEntities[] declares it, the write is guaranteed to fail: say so
+  // precisely, before sending anything.
+  {
+    const minted = new Set(normalized.mintedIds || []);
+    if (minted.size) {
+      const declared = new Set(
+        (Array.isArray(bundle.trackedEntities) ? bundle.trackedEntities : [])
+          .map(te => te && te.trackedEntity).filter(Boolean)
+      );
+      const dangling = [];
+      for (const enr of (Array.isArray(bundle.enrollments) ? bundle.enrollments : [])) {
+        const te = enr && enr.trackedEntity;
+        if (te && minted.has(te) && !declared.has(te)) dangling.push(te);
+      }
+      if (dangling.length) {
+        return {
+          _error: `Refused: ${dangling.length} enrollment(s) reference a tracked entity that this payload never creates and that does not exist on the server. DHIS2 would reject them with E1068 "Could not find TrackedEntity" and fail every event under them. NOTHING was sent.`,
+          _hint: 'A person must exist before they can be enrolled. Send ONE bundle that creates both, nesting the enrollment inside its tracked entity — {"trackedEntities":[{"trackedEntityType":"<tetUid>","orgUnit":"<ouUid>","attributes":[…],"enrollments":[{"program":"<programUid>","orgUnit":"<ouUid>","enrolledAt":"YYYY-MM-DD","occurredAt":"YYYY-MM-DD","events":[…]}]}]} — so the ids are resolved in one import. Do NOT invent readable ids like "TEI-VPD-001"; omit the id entirely and DHIS2 assigns one.',
+          _scope: 'dangling_tracked_entity',
+          _no_disable: true,
+        };
+      }
+    }
+  }
 
   const importStrategy = upperMethod === 'DELETE'
     ? 'DELETE'
@@ -2695,6 +3090,61 @@ async function executeTrackerWrite(path, method, body, ctx) {
   if (!trackerWrite) return null;
   if (trackerWrite._error) return { _error: trackerWrite._error };
 
+  // ── UNIQUE attribute pre-check ──
+  // A tracked-entity attribute flagged `unique` rejects a repeated value with
+  // 409 "Non-unique attribute value <v> for attribute <uid>" — and takes the
+  // whole atomic import with it. Seeding sample cases is exactly where a model
+  // reuses an identifier (live 2026-07-25: the same Epid Number on two cases).
+  // Catch it here, naming the attribute and the clashing values, so no doomed
+  // request is sent. Checks BOTH duplicates inside the payload and collisions
+  // with values already on the server.
+  if (['CREATE', 'CREATE_AND_UPDATE'].includes(trackerWrite.importStrategy)) {
+    const attrValues = new Map(); // attrUid → [values]
+    const collect = (list) => {
+      for (const a of (Array.isArray(list) ? list : [])) {
+        if (!a || !a.attribute || a.value === undefined || a.value === null || a.value === '') continue;
+        if (!attrValues.has(a.attribute)) attrValues.set(a.attribute, []);
+        attrValues.get(a.attribute).push(String(a.value));
+      }
+    };
+    for (const te of (trackerWrite.bundle.trackedEntities || [])) {
+      collect(te.attributes);
+      for (const enr of (te.enrollments || [])) collect(enr.attributes);
+    }
+    for (const enr of (trackerWrite.bundle.enrollments || [])) collect(enr.attributes);
+
+    if (attrValues.size) {
+      const ids = [...attrValues.keys()];
+      const metaResp = await safeDhis2Fetch(
+        `trackedEntityAttributes?filter=id:in:[${ids.join(',')}]&fields=id,displayName,unique&paging=false`
+      );
+      const uniqueAttrs = (metaResp && !metaResp._error ? (metaResp.trackedEntityAttributes || []) : [])
+        .filter(a => a.unique);
+      const problems = [];
+      for (const attr of uniqueAttrs) {
+        const values = attrValues.get(attr.id) || [];
+        const dupInPayload = values.filter((v, i) => values.indexOf(v) !== i);
+        if (dupInPayload.length) {
+          problems.push(`"${attr.displayName}" is UNIQUE but this payload repeats ${[...new Set(dupInPayload)].map(v => `"${v}"`).join(', ')}`);
+          continue;
+        }
+        // NOTE: only DUPLICATES WITHIN THIS PAYLOAD are checked. A collision
+        // with a value already stored on the server would need a per-value
+        // lookup, and the tracker filter syntax for that varies across 2.40–2.43
+        // — a probe that itself 400s is worse than the check is worth. The
+        // server still reports such a collision clearly on import.
+      }
+      if (problems.length) {
+        return {
+          _error: `Refused: this payload violates a UNIQUE tracked-entity attribute — DHIS2 would reject the whole import with "Non-unique attribute value". NOTHING was sent. ${problems.join('; ')}.`,
+          _hint: 'Give every record its OWN value for each unique attribute (e.g. sequential Epid Numbers), or omit the attribute where you do not have a real value. Then re-send the complete payload.',
+          _scope: 'unique_attribute_violation',
+          _no_disable: true,
+        };
+      }
+    }
+  }
+
   // ── Auto-repair enrollment UPDATEs: fill missing required fields from server ──
   const isUpdateStrategy = ['UPDATE', 'CREATE_AND_UPDATE'].includes(trackerWrite.importStrategy);
   if (isUpdateStrategy && Array.isArray(trackerWrite.bundle.enrollments)) {
@@ -2703,14 +3153,26 @@ async function executeTrackerWrite(path, method, body, ctx) {
     );
     await Promise.all(enrollmentsNeedingFill.map(async (enr) => {
       try {
+        // `attributes` is fetched too: a program's MANDATORY tracked-entity
+        // attributes must be present on every enrollment write, and an update
+        // that only changes `status` does not carry them — DHIS2 then rejects
+        // it with "Attribute <uid> is mandatory in Program <uid> but not
+        // declared in Enrollment <uid>". Echoing the stored values back makes a
+        // partial update behave like the patch the caller intended.
         const existing = await safeDhis2Fetch(
-          `tracker/enrollments/${enr.enrollment}?fields=enrollment,trackedEntity,program,orgUnit,enrolledAt,status`
+          `tracker/enrollments/${enr.enrollment}?fields=enrollment,trackedEntity,program,orgUnit,enrolledAt,occurredAt,status,attributes[attribute,value]`
         );
         if (!existing._error) {
           if (!enr.enrolledAt)     enr.enrolledAt     = existing.enrolledAt;
+          if (!enr.occurredAt)     enr.occurredAt     = existing.occurredAt;
           if (!enr.program)        enr.program        = existing.program;
           if (!enr.orgUnit)        enr.orgUnit        = existing.orgUnit;
           if (!enr.trackedEntity)  enr.trackedEntity   = existing.trackedEntity;
+          if (!Array.isArray(enr.attributes) && Array.isArray(existing.attributes) && existing.attributes.length) {
+            enr.attributes = existing.attributes
+              .filter(a => a && a.attribute && a.value !== null && a.value !== undefined && a.value !== '')
+              .map(a => ({ attribute: a.attribute, value: a.value }));
+          }
           console.log(`[executeTrackerWrite] Auto-filled enrollment ${enr.enrollment} fields from server`);
         }
       } catch (e) {
@@ -2950,6 +3412,114 @@ async function getKnownPrograms() {
 // Returns a structured error object with _hint if the analytics path targets a program UID
 // that does not exist in this instance, otherwise null. Best-effort: if the cache can't be
 // fetched, returns null (let the call through so we don't block real requests on a flaky probe).
+// ── dx: on an event/enrollment analytics endpoint ───────────────────────────
+// `dx` is a dimension of the AGGREGATE endpoint (/api/analytics) only. The
+// event and enrollment analytics endpoints take the data item as a BARE UID:
+//   ✔ /analytics.json?dimension=dx:<piUid>&dimension=pe:…&dimension=ou:…
+//   ✔ /analytics/enrollments/aggregate/<programUid>?dimension=<piUid>&…
+//   ✘ /analytics/events|enrollments/aggregate/<programUid>?dimension=dx:<piUid>
+// The last form ALWAYS fails with 409 "Query failed because of a syntax error
+// (SqlState: 42703) … column ax.dx does not exist" (E7145) — verified live on
+// 2.42.5.1, 2026-07-25. The message names an internal SQL column, so it reads
+// as "my query is malformed" and the model rewrites everything except the one
+// thing that is wrong. The intent is unambiguous, so heal it: drop the `dx:`
+// prefix and let the correct query run. Returns the corrected path, or the
+// original when nothing needed fixing. Pure — safe to unit test.
+// Repeating `dimension=dx:` is the natural way to ask for two data items, and
+// DHIS2 answers 409 "Dimensions cannot be specified more than once: `[dx]`".
+// The correct form puts both items in ONE dx dimension, semicolon-separated:
+//   ✔ dimension=dx:uidA;uidB      ✘ dimension=dx:uidA&dimension=dx:uidB
+// Applies to the aggregate /analytics endpoint (the event/enrollment ones use
+// bare UIDs — see healEventAnalyticsDxDimension). Pure — safe to unit test.
+function healDuplicateDxDimension(path) {
+  const p = String(path || '');
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  const parts = p.slice(qIdx + 1).split('&');
+  const dxItems = [];
+  let firstDxAt = -1;
+  parts.forEach((part, i) => {
+    const m = part.match(/^dimension=dx(?::|%3A)(.*)$/i);
+    if (!m) return;
+    if (firstDxAt === -1) firstDxAt = i;
+    for (const item of m[1].split(';')) if (item) dxItems.push(item);
+  });
+  if (dxItems.length < 2 || firstDxAt === -1) return { path: p, healed: false };
+  const dxCount = parts.filter(x => /^dimension=dx(?::|%3A)/i.test(x)).length;
+  if (dxCount < 2) return { path: p, healed: false };
+  const merged = parts
+    .filter((part, i) => !/^dimension=dx(?::|%3A)/i.test(part) || i === firstDxAt)
+    .map((part, i) => (/^dimension=dx(?::|%3A)/i.test(part) ? `dimension=dx:${[...new Set(dxItems)].join(';')}` : part));
+  return { path: `${p.slice(0, qIdx)}?${merged.join('&')}`, healed: true };
+}
+
+// In an analytics query `;` separates ITEMS INSIDE one dimension; separate
+// dimensions each need their own `dimension=` parameter. Models routinely pack
+// them all into one — `dimension=dx:A;pe:LAST_12_MONTHS;ou:LEVEL-4` — and DHIS2
+// then reports the LATER dimensions as missing ("A end date was not specified
+// in periods, dimensions, filters"), which sends the model adding date params
+// that are already there (live 2026-07-25). Split on the dimension keys and
+// leave bare items attached to the dimension they follow:
+//   dx:A;pe:THIS_YEAR;ou:LEVEL-4;abcdefghij1
+//   → dimension=dx:A & dimension=pe:THIS_YEAR & dimension=ou:LEVEL-4;abcdefghij1
+// Pure — safe to unit test.
+const ANALYTICS_DIM_KEY_RE = /^(dx|pe|ou|co|ao|dy)(:|%3A)/i;
+
+// DHIS2's event/enrollment analytics resources are PLURAL. The singular form is
+// an easy slip and 404s (`analytics/enrollment/query/...`, live 2026-07-25).
+// Pure — safe to unit test.
+function healAnalyticsResourcePlural(path) {
+  const p = String(path || '');
+  const fixed = p.replace(/^analytics\/(event|enrollment)\//, 'analytics/$1s/');
+  return { path: fixed, healed: fixed !== p };
+}
+
+function healPackedAnalyticsDimensions(path) {
+  const p = String(path || '');
+  if (!/^analytics(\.|\/|\?)/.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  let healed = false;
+  const out = [];
+  for (const part of p.slice(qIdx + 1).split('&')) {
+    const m = part.match(/^(dimension|filter)=(.*)$/i);
+    if (!m) { out.push(part); continue; }
+    const key = m[1];
+    const segments = m[2].split(';');
+    const groups = [];
+    for (const seg of segments) {
+      if (ANALYTICS_DIM_KEY_RE.test(seg) && groups.length) { groups.push([seg]); }
+      else if (!groups.length) { groups.push([seg]); }
+      else { groups[groups.length - 1].push(seg); }
+    }
+    if (groups.length > 1) healed = true;
+    for (const g of groups) out.push(`${key}=${g.join(';')}`);
+  }
+  return { path: healed ? `${p.slice(0, qIdx)}?${out.join('&')}` : p, healed };
+}
+
+function healEventAnalyticsDxDimension(path) {
+  const p = String(path || '');
+  if (!/^analytics\/(events|enrollments)\//.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  const head = p.slice(0, qIdx);
+  let healed = false;
+  const query = p.slice(qIdx + 1).split('&').map((part) => {
+    const eq = part.indexOf('=');
+    if (eq === -1) return part;
+    const key = part.slice(0, eq);
+    const val = part.slice(eq + 1);
+    if (!/^dimension$/i.test(key)) return part;
+    // `dx:UID` or the URL-encoded `dx%3AUID`
+    const m = val.match(/^dx(?::|%3A)(.+)$/i);
+    if (!m) return part;
+    healed = true;
+    return `${key}=${m[1]}`;
+  }).join('&');
+  return { path: healed ? `${head}?${query}` : p, healed };
+}
+
 async function validateAnalyticsProgramId(path) {
   // Matches: analytics/events/aggregate/{uid}, analytics/events/query/{uid},
   // analytics/enrollments/aggregate/{uid}, analytics/enrollments/query/{uid}
@@ -3578,12 +4148,6 @@ function getSerializableState() {
     programRulesCount: dhis2.programRulesCount,
     trackedEntityType: dhis2.programMetadata?.trackedEntityType?.displayName,
     connected: dhis2.connected,
-    inspect: {
-      enabled: inspectCapture.active,
-      count: inspectCapture.logs.length,
-      url: inspectCapture.url,
-      startedAt: inspectCapture.startedAt,
-    },
   };
 }
 
@@ -3667,11 +4231,6 @@ const LINE_LISTING_KEYWORD_ROUTES = Object.freeze({
 async function ensureLineListingAssetsLoaded() {
   if (lineListingAssets.loaded && lineListingAssets.toolJson) return true;
   try {
-    // NOTE: line-listing/dhis2_extension_router.js is NOT fetched or executed —
-    // its text was previously read into lineListingAssets.routerSource and never
-    // used. Routing is done by the embedded LINE_LISTING_KEYWORD_ROUTES +
-    // routeLineListingBlocks() below. The external router file is retained only
-    // as a reference artifact whose PATH is still surfaced to the model.
     const [jsonResp, mdResp] = await Promise.all([
       fetch(chrome.runtime.getURL(LINE_LISTING_JSON_PATH)),
       fetch(chrome.runtime.getURL(LINE_LISTING_SYSTEM_PROMPT_PATH)),

@@ -225,7 +225,6 @@ dhis2-AI/
 │   └── panel.js               Chat UI, streaming, tool progress, downloads (~2.5k LOC)
 ├── line-listing/
 │   ├── dhis2_chrome_extension_system_prompt.md
-│   ├── dhis2_extension_router.js
 │   └── dhis2_linelisting_tool.json
 ├── libs/
 │   └── echarts.min.js

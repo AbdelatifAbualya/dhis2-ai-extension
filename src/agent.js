@@ -188,16 +188,16 @@ function summarizeSaveErrorDiagnosis(diag) {
 
 // ── Agentic Loop ─────────────────────────────────────────────────────────────
 
-async function runAgenticLoop(userText, imageBase64, browseWeb = false, inspectMode = false) {
+async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
   acquireKeepalive();
   try {
-    return await _runAgenticLoopInner(userText, imageBase64, browseWeb, inspectMode);
+    return await _runAgenticLoopInner(userText, imageBase64, browseWeb);
   } finally {
     releaseKeepalive();
   }
 }
 
-async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, inspectMode = false) {
+async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   lastUserText = userText || '';
 
   // ── Per-turn write-authorization gate ──
@@ -215,25 +215,27 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   dhis2.executedCallSigs = new Map(); // no-progress guard: identical EXECUTED calls this turn
   dhis2.consecutiveDiscoveryCalls = 0; // no-progress guard: read-only calls since the last write
   dhis2.corruptedCallCount = 0; // truncated/corrupted tool-call arguments seen this turn
+  dhis2.placeholderBlocks = new Map(); // per-tool count of unresolved-placeholder refusals this turn
+  dhis2.missingNamedTargets = []; // named-program substitution guard (core.js) — user-named programs that searches proved absent this turn
+  dhis2._namedTargetProgramNames = new Map(); // per-turn programId → displayName cache for that guard
   console.log(`[AgenticLoop] writeAuth = ${dhis2.writeAuth.scope} (${dhis2.writeAuth.reason})`);
 
   const ctx = dhis2.pageContext || {};
-  const inspectSnapshot = inspectMode ? buildInspectSnapshot() : null;
 
   // Seed the known-IDs registry from every verified source available BEFORE
-  // any tool call: user text, page context, inspect logs, already-loaded
-  // program/OU/viz/map metadata. The registry grows as tools return data.
-  seedKnownIds(userText, ctx, inspectSnapshot);
+  // any tool call: user text, page context, already-loaded program/OU/viz/map
+  // metadata. The registry grows as tools return data.
+  seedKnownIds(userText, ctx);
   seedKnownIcons();
   seedRecentCreations();
   console.log(`[AgenticLoop] knownIds seeded with ${dhis2.knownIds.size} UID(s); knownIcons + recentCreations reset`);
-  const routingText = inspectSnapshot?.enabled
-    ? `${userText || ''}\n\n[Inspect diagnostics]\n${JSON.stringify(inspectSnapshot.insights || {})}`
-    : userText;
-
   // ── Dynamic tool selection — send only tools relevant to this request ──
-  const contextualTools = getContextualTools(ctx, routingText, browseWeb, inspectSnapshot);
+  const contextualTools = getContextualTools(ctx, userText, browseWeb);
   const contextualToolNames = new Set(contextualTools.map(t => t.function.name));
+  // The ONE case where an unselected tool must stay unavailable: the user
+  // reported a save failure and has not authorized a fix, so destructive tools
+  // are withheld for the whole turn (see the late-admission branch below).
+  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(userText);
   console.log(`[AgenticLoop] Using ${contextualTools.length}/${TOOLS.length} tools:`,
     [...contextualToolNames].join(', '));
 
@@ -244,7 +246,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   const wireTools = toWireTools(contextualTools);
   const deliveredManuals = new Set();
 
-  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb, inspectSnapshot);
+  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb);
 
   // If image is attached, analyze with a vision model first, then include description
   let userContent;
@@ -269,25 +271,6 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     userContent = browseWeb
       ? `${userText}\n\n[Web Browsing Enabled]\nUse browse_web tool if external/current web info is needed.`
       : userText;
-  }
-
-  if (inspectSnapshot?.enabled) {
-    const inspectBlock =
-      `\n\n[Inspect Logs]\n` +
-      `Captured ${inspectSnapshot.captured} console/runtime/network entries for the active tab since ${inspectSnapshot.startedAt}.\n` +
-      `Active tab URL: ${inspectSnapshot.url || 'unknown'}\n` +
-      `${JSON.stringify({
-        counts: inspectSnapshot.counts,
-        insights: inspectSnapshot.insights,
-        logs: inspectSnapshot.logs,
-      })}`;
-    if (typeof userContent === 'string') {
-      userContent += inspectBlock;
-      historyText += `\n\n[Inspect Logs attached: ${inspectSnapshot.captured} entries]`;
-    } else if (Array.isArray(userContent) && userContent[0]?.type === 'text') {
-      userContent[0].text += inspectBlock;
-      historyText += `\n\n[Inspect Logs attached: ${inspectSnapshot.captured} entries]`;
-    }
   }
 
   if (browseWeb) {
@@ -479,10 +462,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
   // any existing enrollments for the TEI in context. Inject the bundle as a
   // system message so the model can identify the likely cause WITHOUT asking
   // the user for the error code — the chatbot has tools, it should use them.
-  const saveDiagText = (userText || '').toLowerCase();
-  const saveDiagInspect = inspectSnapshot?.enabled ? JSON.stringify(inspectSnapshot.insights || {}).toLowerCase() : '';
-  const saveDiagDetected = SAVE_FAILURE_RE.test(saveDiagText + '\n' + saveDiagInspect)
-    || (inspectSnapshot?.enabled && /\b409\b/.test(saveDiagInspect));
+  const saveDiagDetected = SAVE_FAILURE_RE.test((userText || '').toLowerCase());
   if (saveDiagDetected && ctx.programId) {
     broadcast({ type: 'AI_THINKING', iteration: 0, label: 'Diagnosing save error' });
     try {
@@ -497,9 +477,13 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           args: { program_id: ctx.programId, tei_id: ctx.teiId || null },
           summary: summary.headline,
         });
+        // AI_TOOL_DONE (not AI_TOOL_RESULT): the side panel only closes a tool
+        // card on AI_TOOL_DONE, so the old event left this card spinning
+        // "running" for the rest of the turn.
         broadcast({
-          type: 'AI_TOOL_RESULT',
+          type: 'AI_TOOL_DONE',
           tool: 'diagnose_save_error',
+          success: true,
           summary: summary.headline,
           apiPath: `programs/${ctx.programId}?fields=...`,
         });
@@ -541,6 +525,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     manage_program_rules: 'Processing program rules',
     manage_program_indicators: 'Processing program indicators',
     manage_metadata: 'Processing metadata changes',
+    manage_line_lists: 'Working on line lists',
   };
   const thinkingLabels = [
     'Analyzing your question',
@@ -551,7 +536,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     'Cross-referencing data',
   ];
   let lastToolName = null;
-  let emptyResponseCount = 0; // Guard against infinite think-only loops
+  let emptyResponseCount = 0;
+  let leakedToolCallCount = 0; // tool calls emitted as plain text instead of native calls // Guard against infinite think-only loops
   let providerStallRetries = 0; // Transparent retries for mid-stream stalls (nothing shown to the user yet)
 
   // ── Mechanical circuit breaker for deterministic retry loops ────────────────
@@ -640,6 +626,11 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
     }
 
     const msg = result.choices[0].message;
+    // 'length' = the response was cut off by the max output token limit. The
+    // empty-response and corrupted-arguments paths below use this to give the
+    // model DETERMINISTIC-failure guidance (a same-size retry will be cut at
+    // the same point) instead of generic "try again" nudges.
+    const finishReason = result.choices[0].finish_reason || null;
     messages.push(msg);
 
     // EVERY tool_call the model emits gets a tool result — even ones we cannot
@@ -659,8 +650,13 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         let args;
         // Provider may have flagged the streamed arguments as unrecoverable
         // (truncated/corrupted tool-call JSON). Track it so we can return an
-        // honest "resend" instead of executing the empty {} fallback.
+        // honest "resend" instead of executing the empty {} fallback. Consume
+        // the marker immediately: this msg object lives on in `messages` and
+        // conversationHistory, and any internal field left on a tool_call is
+        // rejected by strict providers (Moonshot/Kimi 400 "Extra inputs are
+        // not permitted") on the very next request — killing the whole turn.
         let argsCorrupted = tc._argsCorrupted || null;
+        if (argsCorrupted) delete tc._argsCorrupted;
         try {
           const rawArgs = tc.function.arguments;
           if (typeof rawArgs === 'object' && rawArgs !== null) {
@@ -675,6 +671,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           args = {};
           const rawLen = String(tc.function?.arguments == null ? '' : tc.function.arguments).trim().length;
           if (rawLen > 0) argsCorrupted = argsCorrupted || { rawLength: rawLen, sample: String(tc.function.arguments).slice(0, 120) };
+        }
+        // Heal provider-mangled nested shapes ($text-wrapped / stringified
+        // objects from grammar-constrained decoders) before validation sees
+        // them — the model's intent is complete; only the encoding is off.
+        if (args && typeof args === 'object') {
+          const healedShape = healToolArgumentShape(args);
+          if (healedShape.healed) {
+            console.warn(`[AgenticLoop] Healed provider-mangled argument shapes for ${toolName} ($text/stringified nesting)`);
+            args = healedShape.value;
+          }
         }
 
         // ── Unknown tool (hallucinated name) — answer, do not execute ──
@@ -692,24 +698,45 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
           continue;
         }
 
-        // ── Real tool, but not enabled for this request — answer, do not run ──
-        // The contextual set is sometimes a deliberate safety boundary (e.g. the
-        // read-only save-failure diagnostic mode strips every destructive tool),
-        // so we must NOT execute an unselected tool. Return actionable feedback
-        // instead of silently dropping the call, so the model switches to an
-        // available tool or tells the user — never loops on a vanished call.
+        // ── Real tool the keyword router did not select for this request ──
+        // getContextualTools is a RELEVANCE filter (it keeps the wire schema
+        // small), not a permission system — with exactly one exception: the
+        // read-only save-failure diagnostic mode deliberately withholds every
+        // destructive tool until the user authorizes a fix. So:
+        //   • a withheld WRITE tool in diagnosis mode → refuse, as before;
+        //   • anything else → ADMIT it for the rest of the turn and run it.
+        // Refusing a merely-unselected tool was its own failure mode: the model
+        // knows the right tool (it used it last turn), gets told "not enabled",
+        // and has no legal way to finish the task — so it thrashes through
+        // wrong tools until the circuit breaker ends the turn. The router
+        // guessing wrong must degrade to "one extra round trip", never to
+        // "the task is impossible".
         if (!contextualToolNames.has(toolName)) {
-          console.warn(`[AgenticLoop] Out-of-context tool call: "${toolName}" (not enabled for this request)`);
-          const feedback = {
-            _error: `${toolName} is not enabled for this request and was NOT executed.`,
-            _hint: `Tools available this turn: ${[...contextualToolNames].join(', ')}. Pick the closest available one for the goal — e.g. tracker/enrollment PROGRAM indicators are created with manage_program_indicators, aggregate indicators with manage_indicators — or, if nothing here can do it, tell the user plainly what is missing. Do NOT re-issue ${toolName}; it will keep being refused.`,
-            _scope: 'tool_not_enabled',
-          };
-          broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args });
-          broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: feedback._error, details: { scope: 'tool_not_enabled' } });
-          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
-          lastToolName = toolName;
-          continue;
+          const withheldForSafety = saveDiagnosisReadOnly && WRITE_CAPABLE_TOOL_NAMES.has(toolName);
+          if (withheldForSafety) {
+            console.warn(`[AgenticLoop] Withheld tool call: "${toolName}" (read-only save-diagnosis mode)`);
+            const feedback = {
+              _error: `${toolName} is a destructive tool and is withheld while diagnosing a save failure. It was NOT executed.`,
+              _hint: `The user reported a save/load error and has not authorized any change. Finish the DIAGNOSIS with the read-only tools available this turn (${[...contextualToolNames].join(', ')}), tell the user the cause you found, and ask them to confirm the fix. If they reply "yes" / "fix it" on the next turn, ${toolName} becomes available again.`,
+              _scope: 'tool_withheld_diagnostic_mode',
+            };
+            broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args });
+            broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: feedback._error, details: { scope: 'tool_withheld_diagnostic_mode' } });
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
+            lastToolName = toolName;
+            continue;
+          }
+          const admitted = TOOLS.find(t => t.function.name === toolName);
+          if (admitted) {
+            console.log(`[AgenticLoop] Late-admitting "${toolName}" — the router did not select it, but the model needs it`);
+            contextualToolNames.add(toolName);
+            // Put it on the wire too, so a grammar-constrained decoder can name
+            // it again next iteration instead of snapping to a lookalike.
+            wireTools.push(...toWireTools([admitted]));
+            noteToolUsedThisThread(toolName);
+            // Falls through and executes normally — including the manual gate,
+            // which still delivers the full usage manual before the first run.
+          }
         }
 
         // ── Corrupted / truncated tool-call arguments — resend, do not execute ──
@@ -721,11 +748,20 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
         // steer the model to split the work into smaller calls.
         if (argsCorrupted) {
           dhis2.corruptedCallCount = (dhis2.corruptedCallCount || 0) + 1;
-          const persistent = dhis2.corruptedCallCount >= 3;
+          // A max_tokens cut ('length') is DETERMINISTIC: at the same
+          // temperature the same whole-payload retry truncates at the same
+          // point every time — so steer to smaller calls IMMEDIATELY instead
+          // of burning 3 doomed resends. Transport glitches (no 'length')
+          // still get one "resend the same call" pass before split advice.
+          const hitTokenLimit = argsCorrupted.finishReason === 'length';
+          const persistent = hitTokenLimit || dhis2.corruptedCallCount >= 3;
+          const splitHint = `Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.`;
           const feedback = {
-            _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON). NOTHING was executed.`,
+            _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was ${hitTokenLimit ? `cut off by the response token limit after ${argsCorrupted.rawLength} characters` : `truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON)`}. NOTHING was executed.`,
             _hint: persistent
-              ? `This is the ${dhis2.corruptedCallCount}rd time your arguments arrived corrupted — the payload is too large to stream in one tool call reliably. STOP sending it whole. Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably.`
+              ? (hitTokenLimit
+                ? `Your tool call hit the maximum response length before the arguments finished streaming. Re-sending the SAME whole payload WILL be cut off again at the same point — do NOT resend it whole. ${splitHint}`
+                : `Your arguments have now arrived corrupted ${dhis2.corruptedCallCount} times — the payload is too large to stream in one tool call reliably. STOP sending it whole. ${splitHint}`)
               : `This is a transport/serialisation glitch, not a flaw in your plan. Re-send the SAME ${toolName} call with the COMPLETE arguments. If it keeps truncating, split a very large program into smaller calls (create the shell + first stage, then add_stage / add_program_rules for the rest). This does NOT count against you and the tool stays available.`,
             _scope: 'incomplete_call',
             _no_disable: true,
@@ -819,6 +855,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
             // Record this dispatch so the no-progress guard can refuse a model
             // that keeps re-issuing the SAME call and getting the same result.
             noteExecutedCall(tc.function.name, args);
+            // Remember the tool for the rest of the CONVERSATION, so a
+            // follow-up turn that names no feature ("now put it back the way it
+            // was") still has it on the wire. See noteToolUsedThisThread.
+            noteToolUsedThisThread(tc.function.name);
             // Discovery-streak guard: count consecutive read-only calls, and
             // reset the moment a WRITE succeeds — a long run of reads with no
             // write is the "research forever, never act" loop.
@@ -1035,13 +1075,52 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false, in
       // Final text response (already streamed to UI if streaming was active)
       const text = msg.content || '';
 
+      // A model under stress can emit its tool call as PLAIN TEXT (XML-ish
+      // <tool_call>/<invoke> markup, sometimes with leaked provider separator
+      // tokens) instead of using the native tool-calling interface. Treating
+      // that as the final answer silently ABANDONS the task mid-flight
+      // (observed live 2026-07-19: MiniMax ended a dashboard build with an
+      // unexecuted <invoke name="search_metadata"> in its reply). Detect it,
+      // tell the model nothing was executed, and demand a native call.
+      if (/<tool_call>|<invoke\s+name=|<function_call[\s>]|<tool\s+name=/i.test(text)) {
+        leakedToolCallCount++;
+        if (leakedToolCallCount <= 3) {
+          console.warn(`[AgenticLoop] Tool call emitted as plain text (${leakedToolCallCount}/3) — asking for a native call`);
+          messages.push({
+            role: 'system',
+            content: 'Your last message contained a tool call written as plain text/XML — it was NOT executed; nothing happened. Re-issue it now using the NATIVE tool-calling interface (a real tool call, not markup in your reply). If you are actually finished with the task, reply with a plain-text summary that contains no tool-call markup.',
+          });
+          continue;
+        }
+      }
+
       // If content is empty (e.g., think block stripped) and nothing streamed,
       // nudge the model to produce a real response or tool call.
       if (!text.trim() && !streamStartBroadcast) {
         emptyResponseCount++;
+        // Reasoning models (GLM, DeepSeek-R1 style) can burn the ENTIRE output
+        // token budget on internal reasoning when facing a huge task — the
+        // visible response is empty with finish_reason='length'. That failure
+        // is deterministic: an identical retry reasons identically and dies
+        // identically (observed live: GLM planning a 5-stage/100-DE program in
+        // one atomic call → 3 empty responses → turn abandoned). The cure is
+        // to SHRINK THE TASK the model is reasoning about, so nudge it to take
+        // one small concrete step now and build the rest incrementally.
+        if (finishReason === 'length') {
+          console.warn(`[AgenticLoop] Empty response cut by token limit (finish_reason=length), nudge ${emptyResponseCount}/3`);
+          if (emptyResponseCount < 3) {
+            messages.push({
+              role: 'system',
+              content: 'Your last response hit the maximum output length before any visible answer or tool call was produced — the entire budget went to internal reasoning. Repeating the same approach will fail the same way. Do NOT plan the whole task; take the SMALLEST next concrete step immediately: emit ONE tool call now (for a large program: create_metadata(action=create_program) with the shell + attributes + first stage only, then add_stage / add_program_rules in later steps). Output the tool call directly with no deliberation.',
+            });
+            continue;
+          }
+        }
         if (emptyResponseCount >= 3) {
           // Too many empty responses — bail out with a helpful message
-          const fallback = 'I was unable to produce a response. Please try rephrasing your question.';
+          const fallback = finishReason === 'length'
+            ? 'The model kept exhausting its output token budget on internal reasoning before producing a response (3 attempts). This usually happens when a smaller/reasoning model plans a very large task in one step. Try: (1) raise "Max tokens" in the extension settings, (2) split the request into smaller steps (e.g. "create the program with its first stage", then add the remaining stages one by one), or (3) switch to a stronger model for this task. Any work already completed above has been saved.'
+            : 'I was unable to produce a response. Please try rephrasing your question.';
           broadcast({ type: 'AI_STREAM_START' });
           broadcast({ type: 'AI_STREAM_END', text: fallback });
           // Persist the full action trail for this turn (tool calls + results),
@@ -1435,7 +1514,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }
           }
         } catch {}
-        return runAgenticLoop(msg.payload.text, msg.payload.imageBase64, !!msg.payload.browseWeb, !!msg.payload.inspect);
+        return runAgenticLoop(msg.payload.text, msg.payload.imageBase64, !!msg.payload.browseWeb);
       })()
         .then(r => {
           // If response was already streamed, only send AI_RESPONSE for non-text cleanup (charts, state reset)

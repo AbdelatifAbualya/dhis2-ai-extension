@@ -22,3 +22,4 @@ desktop.ini
 npm-debug.log*
 yarn-debug.log*
 node_modules/
+.llm-session.json

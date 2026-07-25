@@ -2518,3 +2518,418 @@ turning a recoverable model glitch into an unrecoverable loop. Four fixes:
 failed calls (was 3+409); heal path creates the auto-named rule (server read-back); the exact
 `]<]minimax[>[` corruption is repaired and imports; integrated cascade simulation recovers (tool
 never disabled, streak guard fires). `npm run verify` green; instance left exactly as found.
+
+---
+
+## 20. v2.8.15 — `manage_line_lists`: Line Listing authoring + EVENT_VISUALIZATION dashboard tiles
+
+**Files:** `src/tools-linelists.js` (NEW, the tool), `src/registry.js` (schema, router, manual
+gate, `KB_LINE_LISTS_DETAILS`, `wantsLineListIntent` selection), `src/tools-metadata.js`
+(dispatch; `manage_dashboards` accepts `{type:"EVENT_VISUALIZATION", event_visualization_id}`
+items in create_dashboard/add_items), `src/tools-programs.js` (legend-set reference check fixed:
+`visualizations?filter=legend.set.id:…` — the old `legendSet.id` path 400s on 2.40+; line lists
+now checked too), `background.js` (7th module), `src/agent.js` (progress label),
+`scripts/scenario-line-lists.js` (NEW deep test). Details: `CHANGES_line_listing_tool.md`.
+
+The tool authors the saved line lists of the Line Listing app (`/api/eventVisualizations`,
+type LINE_LIST): EVENT / ENROLLMENT (cross-stage + repeated-event columns) / TRACKED_ENTITY
+output, dimensions by UID or exact name with auto stage/option-code resolution, per-valueType
+filter validation, legend wiring, sorting, and a pre-save analytics probe that proves the layout
+runs (row_count + headers ONLY — never row-level values). Refuses the traps that silently break
+line lists: division PIs (per-row zero denominator 409s the whole table), PI analyticsType ≠
+output type, aggregationType NONE (invalid SQL), COUNT+d2:count (constant 1 per row — warns with
+the exact SUM fix), repetition on non-repeatable stages, missing time/org-unit dimensions,
+invented UIDs/option values, duplicate names.
+
+**Verified live on DHIS2 2.42.5.1:** full senior-implementor TB package (2 row-safe PIs →
+legend set → 3 line lists incl. repeated adherence columns [1,2,-1,0] and FIXED FILL legend →
+dashboard with 3 EVENT_VISUALIZATION tiles → validate/update/delete-guard → cleanup) — final
+scenario run **104 API calls, 0 failed, 38/38 assertions**; 8 negative paths refuse with zero
+failing HTTP. Rendering verified visually in the Line Listing + Dashboard apps. `npm run verify`
+green. Version 2.8.14 → 2.8.15.
+
+---
+
+## 21. v2.8.16 — Weak-LLM reliability: zero failed turns / zero failed API calls on giant builds
+
+**Files:** `src/providers.js` (wire-message sanitizer, lossy-repair refusal, content
+separator-token strip), `src/core.js` (`healToolArgumentShape`, lossy flag on
+`repairToolCallArguments`, incomplete-repeat escalation, split-doctrine hints),
+`src/agent.js` (finish_reason plumbing, `$text`-shape healing, leaked-XML-tool-call
+recovery, `_argsCorrupted` consumption), `src/registry.js` (schema skeleton for
+constrained decoders, `rules` batch param, DISPLAYKEYVALUEPAIR/location docs,
+SHOWWARNINGINFORMATION removal, incremental-build doctrine, TEA unique/generated/
+pattern/description, program description/style), `src/tools-programs.js` (add_stage
+parity: name reuse + ci pass + sections + stage-name probe; reuse-compatibility gate
+for DEs/TEAs/option sets; TET auto-create; PI `#{stage.de}` grounding; `or`/`and`
+keyword lint fix; unknown-d2-function counting recipe; precedence advisories;
+failed-import phantom-id guard; action-type normalization in every rule path),
+`src/tools-metadata.js` (legend-set idempotent reuse, aggregate-indicator expression
+healing `#{piUid}`→`I{uid}` + name resolution, data_items name aliasing,
+stage_details membership grounding), `src/tools-linelists.js` (analytics-freshness
+gate for pre-save probes), `scripts/llm-harness.js` + `scripts/llm-run.js` (NEW:
+real runAgenticLoop driven by a real env-configured LLM), `scripts/
+scenario-pregnancy-p1.js` + `scripts/verify-pregnancy-p1.js` +
+`scripts/verify-pregnancy-llm.js` + `scripts/cleanup-pregnancy.js` (NEW deep tests).
+Details: `CHANGES_weak_llm_reliability.md`.
+
+**Verified live on DHIS2 2.42.5.1 with real weak LLMs (MiniMax-M3, Kimi-K2.6 via
+Fireworks) driving the REAL agentic loop end-to-end:** the full 3-prompt maternal-
+continuum acceptance (5-stage/100-DE/126-rule tracker → 52 PIs + 11 indicators + 26
+visualizations + 4 maps + 35-tile dashboard → 10 line lists + case-management
+dashboard) completes with **zero failed API calls**; scripted tool-level scenario:
+387 calls, 0 failed, every prompt detail verified. Version 2.8.15 → 2.8.16.
+
+---
+
+## 22. v2.8.17 — Named-program substitution guard: a missing named program is a STOP, not a silent lookalike
+
+**Files:** `src/core.js` (NEW named-target guard: `noteMissingNamedTarget`,
+`clearNamedTargetsFoundIn`, `namedProgramSubstitutionStop`, `_namedTargetNorm`),
+`src/tools-metadata.js` (dispatcher gate before every program-bound write;
+`search_metadata` + raw `dhis2_query` GET arm/disarm bookkeeping + empty-result
+hint), `src/agent.js` (per-turn state reset), `src/registry.js` (system-prompt
+rule 10.9.3 — Named-target fidelity), `scripts/verify.js` (regression tests +
+async-aware verdict). Details: `CHANGES_named_program_substitution_guard.md`.
+
+**The disaster this fixes (observed live 2026-07-19):** the user asked, *"Using the
+Integrated Pregnancy, Delivery and Postnatal Care Tracker, create and save the
+following complex line-listing tables…"* That program did not exist on the instance.
+The model searched, got zero matches, then **silently picked a lookalike** — the
+"Maternal and Child Health (MCH) Program" — and built **9 line lists + a dashboard +
+6 legend sets** on the wrong program, burying the missing-program fact at the bottom
+of a long summary. The user's whole request was executed against data they never
+asked about.
+
+**The fix (mechanical, not just prompt):**
+- A **specific** name-filtered program search returning **0 rows** arms a "missing
+  named target" for the turn. "Specific" = ≥2 words or one word ≥10 chars, so generic
+  probes ("ANC", "Maternal") never arm it. Works on both `search_metadata` and raw
+  `dhis2_query` program searches.
+- Any later result containing a program whose name matches an armed query **disarms**
+  it (the object existed under a variant spelling).
+- While armed, the tool dispatcher **refuses** program-bound writes
+  (`manage_line_lists` create/update, `manage_program_rules`, `manage_program_indicators`,
+  `manage_program_notifications`, `create_metadata` add_stage/add_DEs/add_rules) whose
+  target program name does **not** match the missing name — with a stop-and-ask message.
+  A write on a program whose name **does** match passes and disarms, so the legitimate
+  "the named program doesn't exist → user asked me to create it → build on the new one"
+  flow is never blocked.
+- State is strictly per-turn: the refusal forces exactly one stop-and-ask; whatever the
+  user decides next turn proceeds normally.
+
+**Verified:** `npm run verify` green, including new tests proving generic/wrong-type
+searches don't arm the guard, a lookalike write is blocked, a matching-name write passes
+and disarms, and a later variant-spelling match disarms. Version 2.8.16 → 2.8.17.
+
+## 23. v2.8.18 — Batch program-indicator create + single-PI percentage: the 47-PI analytics disaster fixed
+
+**Files:** `src/tools-programs.js` (`manage_program_indicators` create now accepts
+`indicators:[…]`; NEW `_prepareProgramIndicatorObject` extracted from
+`_buildAndPostProgramIndicator` + NEW `_buildAndPostProgramIndicatorsBatch`),
+`src/registry.js` (tool schema gains the `indicators` array; description + create
+action-enum steer to batch; `KB_PI_GRAMMAR` gains the single-PI percentage pattern +
+"batch every multi-indicator build" section; a new tracker-analytics worked chain),
+`src/tools-metadata.js` (`buildVisualizationObject` now returns a map-specific `_hint`
+when refused a `vis_type:"MAP"`), `scripts/verify.js` (regression assertions),
+`scripts/scenario-pregnancy-analytics.js` (NEW Tier-2 live scenario).
+Details: `CHANGES_batch_program_indicators.md`.
+
+**The disaster this fixes (observed live):** asked to build the analytical package for
+the Integrated Pregnancy, Delivery and Postnatal Care Tracker — ~12 metrics with
+numerator/denominator/percentage indicators, legends, tables, charts, maps and a
+dashboard — the model created **47 program indicators, one per tool call**, exhausted the
+50-iteration agentic-loop budget on PI creation alone, and **never produced a single
+percentage, legend, visualization, map or the dashboard.** Root causes: (1)
+`manage_program_indicators` create only accepted ONE `indicator` per call, so a big build
+could never fit the budget; (2) nothing taught the model that a coverage **percentage is
+ONE program indicator**, so it split every metric into separate numerator + denominator +
+percentage objects.
+
+**The fix:**
+- **Batch create.** `manage_program_indicators(action="create", program_id, indicators:[…])`
+  validates every indicator (lint + `/expression|filter/description` + structure grounding)
+  with bounded concurrency, sharing ONE program-structure + category-combo fetch across the
+  whole batch, then commits the valid ones in a SINGLE `/metadata` import. Invalid entries
+  are **skipped** (never disable the tool) and returned under `failed[]`; valid ones are
+  saved and their UIDs returned as a flat `program_indicator_ids` list to chain into
+  visualization/map/dashboard `data_items`. shortName + name collisions are auto-resolved
+  against the server AND intra-batch. The single-`indicator` path is unchanged (delegates to
+  the same new `_prepareProgramIndicatorObject`).
+- **Single-PI percentage pattern (KB).** A coverage/rate metric is ONE program indicator:
+  `analytics_type=ENROLLMENT`, `filter` = the denominator population, `expression =
+  d2:condition("<numerator condition>", 100, 0)`, `aggregation_type=AVERAGE`, `decimals=1`.
+  The mean of the 0/100 flag over the denominator IS the percentage; it contains no division
+  so it never 409s on a zero denominator (unlike a numerator/denominator ratio). Separate
+  count PIs only when a table/breakdown explicitly needs them as columns. Verified live on
+  2.42 (`/expression/description` + `/filter/description` accept it).
+- **Map-tile refusal hint.** Refusing `vis_type:"MAP"` now tells the model to create the map
+  with `manage_maps` and add it as `{ type:"MAP", map_id }` — one-step recovery.
+
+**Verified — Tier 1:** `npm run verify` green, with new assertions that the schema exposes
+`indicators[]`, the description teaches batch + the AVERAGE percentage pattern, and a
+`vis_type:"MAP"` is refused with a `manage_maps` hint.
+**Tier 2 (deterministic, `scripts/scenario-pregnancy-analytics.js`):** batch-created 16 PIs
+(8 AVERAGE percentages + 8 counts) in ONE call, plus a legend, 2 maps and a dashboard with
+9 inline visualizations + map tiles + text headers, verified all persisted, then deleted
+everything — **60 build API calls, 0 failed, 0 leftovers.**
+**Tier 2 (real LLM — Kimi K2P7-code via Fireworks, live localhost:8081):** the exact
+disaster prompt now completes end-to-end — **78 program indicators created in 2 batched
+calls** (16 single-PI AVERAGE percentages + 62 requested supporting/breakdown counts), 4
+legend sets, 4 district maps, and the full "Maternal and Newborn Continuum Dashboard" (35
+tiles: 7 text sections, 24 charts, 4 maps, 0 dangling references), with sharing — **120
+DHIS2 API calls, 0 failed.** All test objects were cleaned up; the instance was left exactly
+as found. Version 2.8.17 → 2.8.18.
+
+---
+
+## Dead option-literal hardening in program-rule generation (2026-07-20)
+
+**File:** `src/tools-programs.js`
+**Functions:** `rewriteOptionLiteralsGeneric` (~line 5850), `createProgram` result (~line 2385), `addProgramRules` result (~line 4271)
+
+**Type of change:** Modified + new result field
+
+**What & why:** Rule conditions / ASSIGN data that referenced an option value which
+was neither a code nor an exact option name were left as **dead comparisons** and
+only flagged via a soft advisory, so they shipped silently non-firing — the root
+cause of "many program rules are not working" on reuse-heavy builds. Added (1)
+normalized (case + punctuation/whitespace-insensitive) matching so wording and
+punctuation variants like `'1 +'`↔`'1+'` resolve to the real option code, and
+(2) a structured `dead_option_literals` + `dead_option_literals_action` result
+field on both `create_program` and `add_program_rules` so a genuinely-unmatchable
+literal is reported prominently and actionably instead of buried. Reuse superset
+guard and `useCodeForOptionSet=true` were already correct and are untouched.
+
+**Verification:** `npm run verify` all pass; standalone `test-rewrite.js` 10/10.
+See `CHANGES_dead_option_literals.md`.
+
+---
+
+## Generalize duplicate-rule lint beyond HIDE actions (2026-07-20)
+
+**File:** `src/tools-programs.js`
+**Function:** `lintRuleVisibilitySemantics` (step 3, ~line 5786)
+
+**Type of change:** Modified (broadened duplicate detection)
+
+**Symptom found during verification of the rebuilt maternal tracker:** the program
+shipped 3 EXACT-duplicate rule pairs that both fire at program scope —
+two "severe BP" SHOWWARNINGs, two "elevated BP" SHOWWARNINGs, and two
+SETMANDATORYFIELD-on-"Referral destination" rules. Root cause: the spec repeats
+BP/referral behaviour across stages; the LLM authored one rule per stage but did
+not stage-scope them, so they collapse into redundant twins. The existing dedup
+lint only inspected HIDE actions, so these were never caught.
+
+**Fix:** the equivalent-condition duplicate check now also covers
+`SETMANDATORYFIELD` (targeted, same DE/TEA) and UNTARGETED `SHOWWARNING` /
+`SHOWERROR` / `WARNINGONCOMPLETE` / `ERRORONCOMPLETE` (same effect under an
+equivalent condition = redundant twin). `ASSIGN` and `DISPLAY*` are deliberately
+excluded (ASSIGN-same-target-different-value is a conflict, not a duplicate;
+feedback DISPLAY may legitimately repeat). The HIDE complementary-pair logic is
+unchanged. Applies batch-internally and new-vs-existing, so a duplicate is caught
+whether both twins arrive together or one already exists on the program.
+
+**Verification:** `npm run verify` all pass; targeted test (`test-dedup.js`)
+against the actual rebuilt program flags exactly the 3 duplicate pairs and
+over-flags none of the legitimate same-condition/different-action rules
+(EDD-mandatory vs hide-LMP-date; GA-at-visit vs GA-at-delivery ASSIGNs).
+The 3 redundant rules were also removed from the live program on 8081.
+
+---
+
+## Stop substituting "Person" for a user-named tracked entity type (2026-07-20)
+
+**File:** `src/tools-programs.js` (TET resolution hints ~line 1291, 1299), `src/registry.js` (tracked_entity_type_id description ~line 758)
+
+**Type of change:** Modified (guidance/hints)
+
+**Symptom found during verification:** the spec said "Use Pregnant Woman as the
+tracked entity type", a "Pregnant Woman" TET existed on the instance, yet the
+rebuilt program used "person". The name-resolution code is correct (it reuses an
+existing type by exact/ci name and CREATES a missing named type), but when the
+model first passed a guessed UID it hit the unresolved-UID error whose hint
+offered "omit it to use a Person type" — so the model abandoned the user's named
+type and fell back to Person.
+
+**Fix:** the unresolved-TET hints and the `tracked_entity_type_id` schema
+description now explicitly instruct: if the user NAMES a tracked entity type, pass
+that exact NAME (reused if present, created if missing) and NEVER substitute
+"Person"; only omit it (defaulting to Person) when no specific type was requested.
+No behavioural code change — the resolver already handled names correctly; this
+removes the nudge that made the model discard the requirement.
+
+**Live fix:** the rebuilt program (DtrybmSigv0) was switched from "person" to the
+existing "Pregnant Woman" TET (P17V7707oMl) via PATCH (no enrollments, safe).
+
+**Verification:** `npm run verify` all pass.
+
+---
+
+## Section-safe stage edits: backup + preserve sections when adding/removing stage data elements (2026-07-20)
+
+**Files:** `src/tools-programs.js` (`addDataElementsToExistingStage` ~line 2750; `executeManageMetadata` → `remove_from_stage` ~line 3029), `src/registry.js` (`create_metadata` schema `section_name`/`section_id` ~line 1012; guidance in `KB_CREATE_PROGRAM_DETAILS` ~line 2536)
+
+**Type of change:** Bug fix (data-loss) + new params
+
+**Symptom reported:** asking the chatbot to add a data element to a stage very
+often flipped the stage's form from SECTION to DEFAULT and deleted every section.
+Re-adding the sections created them with NEW ids (originals were never backed up),
+breaking any program rules / layout that referenced the old section ids.
+
+**Root cause:** a `PUT /programStages/{id}` REPLACES the whole object. Both the add
+path and the `remove_from_stage` path sent only `name, program, sortOrder,
+repeatable, programStageDataElements` — omitting `formType` and
+`programStageSections`. DHIS2 therefore wiped all sections and reset the form to
+DEFAULT. The add path also created no backup at all.
+
+**Fix (add path — `addDataElementsToExistingStage`):**
+1. **Backup first.** Now calls `ensureBackupOrBail` before the PUT (snapshotting
+   the stage + the target section), matching the guarantee `remove_from_stage`
+   already had. Bypassable only with `skip_backup:true`.
+2. **Preserve the form.** Fetches `formType` + `programStageSections[...]` and
+   echoes `formType` and the section id-refs back in the PUT, so sections are
+   never deleted and the form stays SECTION.
+3. **Route the new field to the right section.** New `section_name` / `section_id`
+   params. On a sectioned stage the newly-added DE is PUT into the chosen section
+   (its other DEs preserved via a `:owner` fetch). Exactly one section → auto-used.
+   Multiple sections and none specified → the tool STOPS and returns the section
+   list (`_requires_user_confirmation`) instead of orphaning the field or wiping
+   sections. Non-sectioned (DEFAULT) stages behave as before.
+
+**Fix (`remove_from_stage`):** same section/`formType` preservation, plus it now
+strips the removed DE from any section that referenced it (a section may not point
+at a DE that is no longer a stage PSDE), and backs up every affected section too.
+
+**Model guidance:** `create_metadata`'s manual now states the action always backs
+up and preserves sections, and that a multi-section SECTION stage needs
+`section_name`. Response objects now report `form_type`, `sections_preserved`, and
+`section_placement`.
+
+**Verification:** `npm run verify` all pass; a dedicated harness
+(`test-add-de-sections.js`, sandboxed bundle + mocked `safeDhis2Fetch`/snapshot)
+asserts across 4 cases: sectioned add preserves both sections + formType + routes
+the DE into the named section + backs up first; ambiguous-section add makes ZERO
+writes; DEFAULT stage still backs up; `remove_from_stage` keeps the sectioned form
+and strips the DE from its section. 31/31 checks pass.
+
+---
+
+## Silence the CORS console error when switching to a not-signed-in DHIS2 instance (2026-07-20)
+
+**Files:** `src/core.js` (`dhis2Fetch` ~line 1709; `safeDhis2Fetch` direct fetch ~line 2346; DELETE-retry POST ~line 2394; new `DHIS2_NOT_SIGNED_IN_MSG` const), `src/tools-programs.js` (`validateProgramRuleCondition` ~line 4909; `validateProgramIndicatorExpression` ~line 7196)
+
+**Type of change:** Bug fix (noisy console error)
+
+**Symptom reported:** after switching from one DHIS2 instance to another, opening
+the extension logged a red error in the service-worker console (visible on the
+`chrome://extensions` page):
+
+```
+Access to fetch at 'http://hmis.moh.ps/tr-family-migration/dhis-web-login/'
+(redirected from '.../api/42/programs/vj5cpA2OOfZ?fields=...') from origin
+'chrome-extension://...' has been blocked by CORS policy: No
+'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+**Root cause:** the just-switched-to instance had no authenticated session yet, so
+DHIS2 answered the context-load GET (`programs/{id}?fields=...`) with a **302
+redirect to `/dhis-web-login/`**. The default `fetch()` follows redirects, so the
+browser chased the 302 into the cross-origin login page — which carries no
+`Access-Control-Allow-Origin` header — and logged a CORS error before our
+try/catch ever saw it. `initializeFromUrl`'s `/api/system/info` probe already
+guarded against this with `redirect: 'manual'`, but the two transport helpers
+(`dhis2Fetch`, `safeDhis2Fetch`) and the two PI/rule validation POSTs did not.
+
+**Fix:** every service-worker-context DHIS2 fetch now uses `redirect: 'manual'`.
+An unauthenticated 302 comes back as an *opaque redirect* (`resp.type ===
+'opaqueredirect'` / `status 0`) that we detect **before** the browser follows it,
+so no cross-origin login page is ever fetched and no CORS error is logged.
+Instead the call resolves cleanly:
+- `dhis2Fetch` throws `DHIS2_NOT_SIGNED_IN_MSG` (swallowed by `initializeFromUrl`'s
+  context-load `try/catch` → a quiet `console.warn`, not a red CORS error).
+- `safeDhis2Fetch` and the two validation POSTs return
+  `{ _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true }`, an
+  actionable "log in to this server in the tab, then try again" message.
+
+Writes routed through the active tab (`fetchViaTab`) were never affected — they run
+same-origin inside the DHIS2 page. Legitimate DHIS2 metadata GETs return 200
+directly and never 3xx, so `redirect: 'manual'` changes nothing for them.
+
+**Verification:** `npm run verify` — all checks pass. `node --check` clean on both
+edited files.
+
+---
+
+## Tool-router continuity, write discipline, dead-code removal, and API-shape healing (2026-07-25)
+
+Three user-reported failures, a dead-code sweep, and a long tail of API-shape defects
+found by driving MiniMax-M3 (Fireworks) through a complete DHIS2 build end-to-end.
+Full write-up with root causes, before/after tables and live evidence:
+**`CHANGES_router_and_write_discipline.md`**.
+
+**Files:** `src/core.js`, `src/registry.js`, `src/agent.js`, `src/tools-metadata.js`,
+`src/tools-programs.js`, `src/tools-linelists.js`, `scripts/verify.js`,
+`scripts/live-harness.js`, `scripts/seed-vpd-data.js` (new),
+`scripts/prompts/*.txt` (new), `ARCHITECTURE.md`, `README.md`.
+
+### What changed
+
+1. **Tool router lost the tool on follow-up turns.** `getContextualTools` matched only
+   the CURRENT message, so "now remove it and put it back" dropped the tool used a
+   moment earlier. The model then either called a lookalike tool (`manage_custom_forms`
+   for `manage_custom_translations`) or — worse, reproduced with a provider probe —
+   claimed success with no tool call at all. Fixed with per-conversation sticky tools
+   (`noteToolUsedThisThread` / `getThreadToolNames`) plus **late admission** of any tool
+   the router missed. The one real boundary — destructive tools during read-only
+   save-diagnosis — is preserved and now driven by the shared
+   `WRITE_CAPABLE_TOOL_NAMES` instead of a stale hand-copied list.
+
+2. **Bug reports authorised writes.** A write verb inside an inability clause
+   ("it's not allowing me to **add**", "I can't **add**", "unable to **update**") made
+   `classifyWriteAuthorization` return `broad` — so a symptom report licensed rewriting
+   sharing on 4 stages and 15 attributes on an unverified theory. An inability guard now
+   strips those clauses before looking for a surviving write verb; a complaint that also
+   carries an instruction still authorises. Backed by system-prompt rules 18 (prove the
+   cause before changing anything; never fix-and-see; never test config by writing
+   tracker data) and 19 (verify saved outputs with their own tools).
+
+3. **"Add all OUs + fix sharing" deleted the program from Capture.**
+   `update_program_org_units` accepted an empty `org_unit_ids` (un-assigning every OU)
+   and sent a PARTIAL program object — and DHIS2 `/metadata` defaults to REPLACE, so it
+   silently reset sharing. Now: full `?fields=:owner` round-trip, empty replace refused,
+   new `all_org_units:true`, sharing cascades program → stages (`cascade_to_stages`),
+   `add_stage` inherits the program's sharing, and `update_sharing` reports honestly when
+   the server drops data bits on a `dataShareable:false` class.
+
+4. **Dead code removed (~600 lines).** The orphaned inspect subsystem (`chrome.debugger`
+   was dropped for the Web Store, leaving the consumer half unreachable), the duplicate
+   `line-listing/dhis2_extension_router.js`, and `getDhis2MinorVersion()`. Also fixed a
+   latent UI bug: the save-error diagnostic broadcast `AI_TOOL_RESULT`, which the panel
+   does not handle, leaving its tool card spinning forever.
+
+5. **API-shape healing.** Twelve classes of guaranteed-failed call are now healed or
+   refused before sending — packed/duplicated/`dx:`-prefixed analytics dimensions,
+   singular `analytics/enrollment/`, invented analytics-run endpoints, GET on the
+   POST-only PI description validator, empty-expression 500s, a transient validator 500
+   aborting a whole indicator batch, a healthy analytics run misread as FAILED, and
+   `enrollments` (11 chars) being mistaken for a hallucinated UID. The analytics-run POST
+   now **waits** for the job and returns a definitive status instead of leaving the model
+   to invent a polling loop.
+
+6. **Program-rule and program-indicator correctness.** The option-literal rewrite now
+   scans `A{…}` as well as `#{…}` — an attribute compared to a display name previously
+   saved clean and never fired. And `A{Display Name}` inside a PROGRAM INDICATOR is now
+   rejected: DHIS2's validator returns OK for it, so the indicator saved and only
+   detonated at dashboard render time with HTTP 500 `ctx.uid0 is null`.
+
+7. **Tracker write path** hardened (legacy field renaming, incident-date default, nested
+   events inheriting their entity, empty/duplicate id handling, dangling-entity and
+   unique-attribute pre-checks). Confirmed against the pristine code to be a strict
+   improvement: CREATE went from failing to succeeding, UPDATE behaviour is unchanged.
+   ID minting is CREATE-only so an update can never be retargeted.
+
+**Verification:** `npm run verify` — 199 assertions, all passing. Live acceptance against
+DHIS2 2.42.5.1 driven by MiniMax-M3: program + indicators + dashboard build, analytics
+verification, and the sharing diagnose-then-fix scenario all complete with **0 failed API
+calls**; all 11 analytics outputs independently confirmed to return real data.

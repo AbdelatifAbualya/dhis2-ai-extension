@@ -1,0 +1,1 @@
+Create a legend set called "VPD Alert Levels" with three colour bands: 0 to 5 green, 5 to 20 amber, and 20 and above red.
