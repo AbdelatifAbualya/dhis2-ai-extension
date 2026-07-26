@@ -2469,16 +2469,47 @@ async function safeDhis2Fetch(path, options = {}) {
       return { _error: `DHIS2 returned non-JSON response (HTTP ${rawResp.status}): ${preview}`, _url: fullUrl };
     }
 
+    // `_apiPath` / `_pagerInfo` are OUR bookkeeping, stamped on the parsed body
+    // so the panel can show which endpoint answered. They are defined
+    // non-enumerable because so many tools are read-modify-write: they GET an
+    // object and PUT it straight back, or merge it into a dataStore value. An
+    // enumerable marker rides along into that body — it turned up verbatim
+    // inside the growth-chart plugin's stored config. Property access still
+    // works everywhere; only JSON.stringify and spread stop carrying them.
+    const stamp = (key, value) => Object.defineProperty(data, key, { value, enumerable: false, writable: true, configurable: true });
     if (data.pager) {
-      data._pagerInfo = { page: data.pager.page, pageSize: data.pager.pageSize, total: data.pager.total };
+      stamp('_pagerInfo', { page: data.pager.page, pageSize: data.pager.pageSize, total: data.pager.total });
     }
-    data._apiPath = fullUrl.replace(dhis2.baseUrl, '');
+    stamp('_apiPath', fullUrl.replace(dhis2.baseUrl, ''));
 
-    // Truncate large responses unless an internal tool explicitly needs the
-    // complete metadata payload to make a correct decision.
+    // ── Large-response truncation ────────────────────────────────────────────
+    // Truncation protects the MODEL's context for responses that are relayed
+    // verbatim (dhis2_query). It must NEVER fire for a response the extension
+    // itself parses to make a decision: dropping the payload turns real fields
+    // into `undefined`, and the tool then reports a confident lie the model can
+    // never retry its way out of. That is exactly how a growth-chart configure
+    // against a program carrying a few-thousand-option "School" option set
+    // (446 KB) came back as `Program "undefined" is not a tracker program`.
+    //
+    // Three categories are therefore always returned WHOLE:
+    //   • callers that opt out explicitly (noTruncate:true);
+    //   • every write response — import/validate `typeReports` carry the import
+    //     errors, and a truncated report reads as a clean success;
+    //   • `fields=:owner` / `:all` reads, which are always read-modify-write
+    //     (the object is PUT straight back — a truncated body would wipe it).
+    const isOwnerRead = /fields=[^&]*(?::owner|:all)\b/.test(cleanPath);
     const json = JSON.stringify(data);
-    if (options.noTruncate !== true && json.length > 80000) {
+    if (options.noTruncate !== true && !isWrite && !isOwnerRead && json.length > 80000) {
+      // Shape-preserving: carry over every top-level scalar (id, displayName,
+      // programType, valueType, formType, code, status, …) so a caller that only
+      // needs an identity field still gets the truth, then slice the arrays that
+      // actually made the payload big and name them in _truncated_fields.
       const truncated = { _apiPath: data._apiPath, _pagerInfo: data._pagerInfo, _truncated: true, _originalSize: json.length };
+      for (const [k, v] of Object.entries(data)) {
+        if (k.startsWith('_')) continue;
+        if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') truncated[k] = v;
+      }
+      const droppedFields = [];
       if (data.rows) {
         truncated.headers = data.headers;
         truncated.rows = data.rows.slice(0, 200);
@@ -2500,7 +2531,17 @@ async function safeDhis2Fetch(path, options = {}) {
         truncated._totalIndicators = data.programIndicators.length;
         truncated._note = `Large response sliced to 50 of ${data.programIndicators.length} indicators. Use manage_program_indicators(action=audit) to check all indicators for issues, or request a specific page.`;
       } else {
-        truncated._note = `Response too large (${json.length} chars). Use more specific filters or fields.`;
+        // Generic object (a single program, stage, …): keep the object's shape
+        // and record exactly which nested collections were withheld, so the
+        // caller can tell "absent" apart from "too big to send".
+        for (const [k, v] of Object.entries(data)) {
+          if (k.startsWith('_') || k in truncated) continue;
+          droppedFields.push(Array.isArray(v) ? `${k}[${v.length}]` : k);
+        }
+      }
+      if (droppedFields.length) truncated._truncated_fields = droppedFields;
+      if (!truncated._note) {
+        truncated._note = `Response too large (${json.length} chars); nested collections were withheld${droppedFields.length ? ` (${droppedFields.join(', ')})` : ''}. Request narrower fields, filter, or page.`;
       }
       return truncated;
     }

@@ -2933,3 +2933,65 @@ Full write-up with root causes, before/after tables and live evidence:
 DHIS2 2.42.5.1 driven by MiniMax-M3: program + indicators + dashboard build, analytics
 verification, and the sharing diagnose-then-fix scenario all complete with **0 failed API
 calls**; all 11 analytics outputs independently confirmed to return real data.
+
+---
+
+## v2.8.21 — Growth chart plugin: the 80 KB truncation that reported `Program "undefined"`
+
+**Files:** `src/core.js`, `src/tools-programs.js`, `src/registry.js`,
+`scripts/scenario-growth-chart.js` (new), `scripts/verify.js`
+**Full write-up:** `CHANGES_growth_chart_truncation.md`
+
+Setting up the WHO Capture Growth Chart plugin on a real tracker program failed on
+every attempt with `Program "undefined" is not a tracker (WITH_REGISTRATION)
+program` — about a program that IS a tracker program, in the same turn as a
+`dhis2_query` that had just returned `WITH_REGISTRATION` for it.
+
+1. **`safeDhis2Fetch` truncation gutted the object it was asked to read.**
+   `gcFetchProgram` expanded every attribute's option set in one request; the
+   program carries a few-thousand-option "School" list, so the response was 446 KB.
+   Over 80 KB the truncation branch returned `{_apiPath, _truncated, _originalSize,
+   _note}` and **discarded everything else** — `programType` and `displayName`
+   became `undefined` and the next line reported the program was not a tracker.
+   Truncation protects the model's context; it must never fire on a response the
+   extension itself parses. It is now skipped for `noTruncate` callers, for **all
+   write responses** (a truncated import report reads as a clean success), and for
+   **`fields=:owner`/`:all`** reads (always read-modify-write — a truncated body
+   PUT back would wipe the object). When it does fire it is now shape-preserving:
+   top-level scalars always survive and the withheld collections are named in
+   `_truncated_fields`. `gcFetchProgram` also stopped asking for 446 KB, and
+   `configure` refuses to draw conclusions from an incomplete read.
+
+2. **The wrong data elements were being chosen, silently.** The stage lists
+   "Height status" (TEXT) and "Weight Status" (TEXT) *before* "Height (cm)" and
+   "Weight (Kg)", so first-match-wins name detection picked the TEXT
+   classification fields. The plugin's own validator only checks that a UID
+   belongs to the stage, so the config would have been accepted and the chart
+   would have plotted nothing, with no error anywhere. Measurements must now be
+   **numeric**, derived lookalikes (z-score, birth weight, gain, status, MUAC…)
+   are excluded, and candidates are **ranked** — a unit-carrying name beats a bare
+   one — instead of first-match-wins.
+
+3. **The same bug in a much more common call.** Stress-testing the new truncation
+   path against the largest program on the test instance (1352 stage data elements)
+   showed `get_program_info(stage_details, target_id)` returning **zero data
+   elements** on 4 of 6 stages — it expands every data element's option set, blew
+   the budget, and handed the model a stub telling it to "request narrower fields",
+   which it cannot do. New `fetchStageDetails()` narrows the query itself: full →
+   without option lists → a minimal projection summarised locally with an honest
+   `total_data_elements` count. All 6 stages now return their data elements.
+
+4. **Hygiene:** `_apiPath`/`_pagerInfo` are now non-enumerable, so they stop riding
+   into PUT bodies and stored dataStore values (one had been written verbatim into
+   the plugin's config); existence is probed via `GET /api/dataStore` and the right
+   dataStore verb is used first, removing two 404s and a 409 from every run; the
+   written config is read back and verified; and `configure` returns the **name**
+   of every object it chose, since nothing downstream will ever complain about a
+   plausible-but-wrong UID.
+
+**Verification:** `npm run verify` — all checks passing, including a new offline
+regression for the measurement picker. Live against the reported instance
+(DHIS2 2.42.5.1): `scripts/scenario-growth-chart.js` — 24 API calls, **0 failed**,
+all checks green, with the chosen data elements re-confirmed against DHIS2 rather
+than against the tool's own answer. `scripts/scenario-line-lists.js` re-run as a
+regression on the `safeDhis2Fetch` change: 110 API calls, **0 failed**.

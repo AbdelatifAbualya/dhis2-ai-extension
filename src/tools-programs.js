@@ -329,17 +329,38 @@ function gcPath(key) {
 }
 
 // Read captureGrowthChart/config. Returns { exists, value } or { _error }.
+//
+// Asking for the key directly answers "is it there?" with a 404, which lands in
+// the user's call log as a failed API call on a run where nothing went wrong.
+// /api/dataStore lists the namespaces and always answers 200, so the common
+// "not set up yet" path costs one clean call and no 404.
 async function gcReadConfig() {
+  const namespaces = await safeDhis2Fetch('dataStore');
+  if (Array.isArray(namespaces) && !namespaces.includes(GROWTH_CHART_NS)) {
+    return { exists: false, value: null };
+  }
   const resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY));
   if (resp?._status === 404) return { exists: false, value: null };
   if (resp?._error) return { _error: `Could not read ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}: ${resp._error}` };
-  return { exists: true, value: isPlainObject(resp) ? resp : null };
+  if (!isPlainObject(resp)) return { exists: true, value: null };
+  // configure merges this value into the config it writes back, so drop any
+  // underscore-prefixed key: our own response bookkeeping, or the remains of an
+  // earlier write that stored some. The plugin reads `metadata`/`settings` only.
+  const value = {};
+  for (const [k, v] of Object.entries(resp)) if (!k.startsWith('_')) value[k] = v;
+  return { exists: true, value };
 }
 
-async function gcWriteConfig(value) {
-  let resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'POST', body: value });
-  if (resp?._status === 409) {
-    resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: 'PUT', body: value });
+// DHIS2 dataStore needs POST to create a key and PUT to replace one; the wrong
+// verb 409s. Callers already know which case they are in (they just read the
+// config to merge into it), so pass it in and the 409 never happens. The
+// opposite verb is still tried as a safety net for a racing writer.
+async function gcWriteConfig(value, exists) {
+  const first = exists ? 'PUT' : 'POST';
+  const second = exists ? 'POST' : 'PUT';
+  let resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: first, body: value });
+  if (resp?._status === 409 || resp?._status === 404) {
+    resp = await safeDhis2Fetch(gcPath(GROWTH_CHART_KEY), { method: second, body: value });
   }
   if (resp?._error) return { _error: `Could not write ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}: ${resp._error}` };
   return { ok: true };
@@ -410,13 +431,34 @@ function gcDashboardAttachBlock(pluginUrl, programId) {
   };
 }
 
-// Fetch a program with the attributes + stage data elements needed for detection.
+// Fetch the program header + its attributes, WITHOUT expanding option sets.
+//
+// This used to be one request that also pulled `optionSet[id,options[code,displayName]]`
+// for every attribute and every stage's data elements. On a real program that
+// carries a large lookup option set (a "School" list of a few thousand options)
+// that single response is ~450 KB, which tripped safeDhis2Fetch's 80 KB
+// truncation and handed this function back a stub with no `programType` and no
+// `displayName` — reported to the user as `Program "undefined" is not a tracker
+// program`, forever, on a program that IS a tracker program. Options are now
+// fetched only for the ONE attribute that needs them (gender), and stage data
+// elements come from a separate, bounded request.
 async function gcFetchProgram(programId) {
   return await safeDhis2Fetch(
     `programs/${programId}?fields=id,displayName,programType,` +
-    `programTrackedEntityAttributes[mandatory,trackedEntityAttribute[id,displayName,valueType,optionSet[id,options[code,displayName]]]],` +
-    `programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`
+    `programTrackedEntityAttributes[mandatory,trackedEntityAttribute[id,displayName,valueType,optionSet[id]]],` +
+    `programStages[id,displayName]`,
+    { noTruncate: true }
   );
+}
+
+// Data elements of one stage (or of every stage in a program) — bounded fields.
+async function gcFetchStageDataElements(programId, stageId) {
+  const fields = 'id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]';
+  const resp = stageId
+    ? await safeDhis2Fetch(`programStages/${stageId}?fields=${fields}`, { noTruncate: true })
+    : await safeDhis2Fetch(`programStages?filter=program.id:eq:${programId}&fields=${fields}&paging=false`, { noTruncate: true });
+  if (resp?._error) return resp;
+  return stageId ? [resp] : (resp?.programStages || []);
 }
 
 function gcMatch(list, getName, patterns, extra) {
@@ -427,19 +469,76 @@ function gcMatch(list, getName, patterns, extra) {
   return null;
 }
 
+// ── Measurement data-element detection ───────────────────────────────────────
+// Name matching alone is not safe. A real examination stage carries, in this
+// order: "Height status" (TEXT), "Weight Status" (TEXT), … then "Height (cm)"
+// (NUMBER), "Weight (Kg)" (NUMBER). A first-match-wins `/\bheight\b/` picks the
+// TEXT classification field, the config is written and accepted by the plugin's
+// own validator (it only checks that the UID belongs to the stage), and the
+// chart then silently plots nothing. So: the measurement MUST be numeric,
+// derived/classification fields are excluded outright, and remaining candidates
+// are ranked so a unit-carrying name ("Weight (Kg)") beats a bare one.
+const GC_NUMERIC_VALUE_TYPES = new Set(['NUMBER', 'INTEGER', 'INTEGER_POSITIVE', 'INTEGER_ZERO_OR_POSITIVE']);
+
+// Tokens that mark a field as a derived/annotation field rather than the raw
+// measurement: statuses, classifications, z-scores, notes, targets, birth
+// weight, gain/change deltas, and the -for-age indicators.
+const GC_DERIVED_TOKENS = /\b(status|classification|categor|class|z[\s_-]?score|zscore|sd\b|percentile|centile|note|notes|comment|target|type|types|code|gain|change|diff|difference|delta|previous|last|prior|at\s*birth|birth\s*(weight|length|height)|for[\s-]?age|for[\s-]?length|for[\s-]?height|malnutrition|stunt|wast|underweight|obes|overweight)\b/i;
+
+const GC_MEASURES = {
+  weight: { match: [/\bweight\b/i, /\bwt\b/i], units: /\(\s*(kg|kgs|g|gm|gms|grams?|kilograms?)\s*\)|\b(kg|kilograms?|grams?)\b/i },
+  height: { match: [/\bheight\b/i, /\blength\b/i, /\bstature\b/i], units: /\(\s*(cm|cms|centimet\w*|m)\s*\)|\b(cm|centimet\w*)\b/i },
+  headCircumference: { match: [/head\s*circ\w*/i, /\bhc\b/i, /circumference/i], units: /\(\s*(cm|cms|centimet\w*)\s*\)|\b(cm|centimet\w*)\b/i },
+};
+
+// Rank the numeric, non-derived data elements whose name matches a measure.
+// Returns the best candidate, or null. `pos` preserves the stage's own order as
+// the final tie-break so the result is deterministic.
+function gcPickMeasurement(dataElements, measureKey) {
+  const spec = GC_MEASURES[measureKey];
+  if (!spec) return null;
+  const scored = [];
+  dataElements.forEach((de, pos) => {
+    const name = de.displayName || de.name || '';
+    if (!GC_NUMERIC_VALUE_TYPES.has(de.valueType)) return;
+    if (GC_DERIVED_TOKENS.test(name)) return;
+    const patternRank = spec.match.findIndex(re => re.test(name));
+    if (patternRank === -1) return;
+    // Head circumference must not be satisfied by an unrelated "circumference"
+    // (MUAC, waist, chest) when a real head-circumference field exists.
+    if (measureKey === 'headCircumference' && !/head/i.test(name) && !/\bhc\b/i.test(name)) {
+      if (/\b(muac|mid[\s-]?upper|arm|waist|chest|abdom|hip)\b/i.test(name)) return;
+    }
+    scored.push({ de, patternRank, hasUnit: spec.units.test(name) ? 0 : 1, len: name.length, pos });
+  });
+  if (!scored.length) return null;
+  scored.sort((a, b) =>
+    a.patternRank - b.patternRank || a.hasUnit - b.hasUnit || a.len - b.len || a.pos - b.pos);
+  return scored[0].de;
+}
+
 async function growthChartConfigure(args) {
   const programId = args.program_id;
   if (!programId) return { _error: 'program_id is required for configure.' };
   const prog = await gcFetchProgram(programId);
   if (prog?._error) return { _error: `Could not load program ${programId}: ${prog._error}`, _hint: 'Pass a valid tracker program UID.' };
+  // Never judge the program from a payload that came back incomplete — that is
+  // how "is not a tracker program" was reported for a tracker program.
+  if (prog?._truncated || !prog?.id) {
+    return {
+      _error: `Could not read program ${programId} completely (the metadata response came back ${prog?._truncated ? 'truncated' : 'empty'}), so its type and attributes could not be verified.`,
+      _hint: 'This is a read problem, not a metadata problem — retrying the same call will not help. Report it rather than concluding anything about the program.',
+    };
+  }
   if (prog.programType !== 'WITH_REGISTRATION') {
-    return { _error: `Program "${prog.displayName}" is not a tracker (WITH_REGISTRATION) program. The growth chart plugin only works on tracker programs.` };
+    return { _error: `Program "${prog.displayName || programId}" is not a tracker (WITH_REGISTRATION) program (programType=${prog.programType || 'unknown'}). The growth chart plugin only works on tracker programs.` };
   }
 
   const teas = (prog.programTrackedEntityAttributes || []).map(p => p.trackedEntityAttribute).filter(Boolean);
   const teaName = t => t.displayName || '';
   const ov = args.attribute_ids || {};
   const byId = (id) => teas.find(t => t.id === id);
+  const warnings = [];
 
   // ── Attribute detection (explicit override wins) ──
   const dobTea = (ov.dateOfBirth && byId(ov.dateOfBirth))
@@ -450,65 +549,138 @@ async function growthChartConfigure(args) {
     || gcMatch(teas, teaName, [/first\s*name/i, /given\s*name/i]);
   const lastNameTea = (ov.lastName && byId(ov.lastName))
     || gcMatch(teas, teaName, [/last\s*name/i, /surname/i, /family\s*name/i]);
-
-  // ── Stage + data-element detection ──
-  const stages = prog.programStages || [];
-  let stage = args.program_stage_id ? stages.find(s => s.id === args.program_stage_id) : null;
-  if (args.program_stage_id && !stage) {
-    return { _error: `Program stage ${args.program_stage_id} is not part of program ${programId}.` };
+  if (ov.dateOfBirth && !byId(ov.dateOfBirth)) return { _error: `attribute_ids.dateOfBirth "${ov.dateOfBirth}" is not an attribute of program ${programId}.` };
+  if (ov.gender && !byId(ov.gender)) return { _error: `attribute_ids.gender "${ov.gender}" is not an attribute of program ${programId}.` };
+  if (dobTea && dobTea.valueType !== 'DATE') {
+    return { _error: `The date-of-birth attribute "${dobTea.displayName}" has valueType ${dobTea.valueType}, not DATE. The plugin computes age from a DATE attribute and cannot use this one.` };
   }
+
+  // ── Stage selection ──
+  const stages = prog.programStages || [];
+  if (!stages.length) return { _error: `Program "${prog.displayName}" has no program stages.` };
+  if (args.program_stage_id && !stages.some(s => s.id === args.program_stage_id)) {
+    return {
+      _error: `Program stage ${args.program_stage_id} is not part of program ${programId}.`,
+      stages_in_program: stages.map(s => ({ id: s.id, name: s.displayName })),
+    };
+  }
+  const stagesWithDes = await gcFetchStageDataElements(programId, args.program_stage_id || null);
+  if (stagesWithDes?._error) return { _error: `Could not load the stage data elements for program ${programId}: ${stagesWithDes._error}` };
+
   const deOv = args.data_element_ids || {};
   const detectInStage = (s) => {
     const des = (s.programStageDataElements || []).map(p => p.dataElement).filter(Boolean);
-    const dn = d => d.displayName || '';
-    const weight = (deOv.weight && des.find(d => d.id === deOv.weight)) || gcMatch(des, dn, [/\bweight\b/i, /\bwt\b/i]);
-    const height = (deOv.height && des.find(d => d.id === deOv.height)) || gcMatch(des, dn, [/\bheight\b/i, /\blength\b/i, /\bstature\b/i]);
-    const headCircumference = (deOv.headCircumference && des.find(d => d.id === deOv.headCircumference)) || gcMatch(des, dn, [/head\s*circ/i, /circumference/i, /\bhc\b/i]);
-    return { weight, height, headCircumference, count: [weight, height, headCircumference].filter(Boolean).length };
+    const pick = (key) => {
+      const forced = deOv[key];
+      if (forced) {
+        const hit = des.find(d => d.id === forced);
+        return hit ? { de: hit, forced: true } : { de: null, forced: true, notOnStage: forced };
+      }
+      const auto = gcPickMeasurement(des, key);
+      return auto ? { de: auto, forced: false } : { de: null, forced: false };
+    };
+    const weight = pick('weight');
+    const height = pick('height');
+    const headCircumference = pick('headCircumference');
+    return {
+      weight, height, headCircumference,
+      count: [weight.de, height.de, headCircumference.de].filter(Boolean).length,
+      dataElements: des,
+    };
   };
-  let de;
-  if (stage) {
+
+  let stage = null;
+  let de = null;
+  if (args.program_stage_id) {
+    stage = stagesWithDes[0];
     de = detectInStage(stage);
   } else {
-    // pick the stage that contains the most of the three measurements
+    // Pick the stage that contains the most of the three measurements.
     let best = null;
-    for (const s of stages) {
+    for (const s of stagesWithDes) {
       const d = detectInStage(s);
       if (!best || d.count > best.de.count) best = { stage: s, de: d };
     }
     if (best) { stage = best.stage; de = best.de; }
   }
-  if (!stage) return { _error: `Program "${prog.displayName}" has no program stages.` };
+  if (!stage || !de) return { _error: `Program "${prog.displayName}" has no program stages with measurement data elements.` };
+
+  // An explicit override that is not on the stage is a caller error worth naming
+  // precisely — silently falling back to auto-detection would write a config the
+  // user did not ask for.
+  for (const key of ['weight', 'height', 'headCircumference']) {
+    if (de[key].notOnStage) {
+      return {
+        _error: `data_element_ids.${key} "${de[key].notOnStage}" is not a data element of stage ${stage.id} ("${stage.displayName}").`,
+        _hint: 'Add it to the stage first (add_data_elements_to_stage), or pass the UID of one that is already there.',
+        numeric_data_elements_on_stage: de.dataElements
+          .filter(d => GC_NUMERIC_VALUE_TYPES.has(d.valueType))
+          .map(d => ({ id: d.id, name: d.displayName })),
+      };
+    }
+    // A forced non-numeric measurement is accepted (the caller may know better)
+    // but flagged — the plugin's own validator will not catch it and the chart
+    // would just render empty.
+    if (de[key].forced && de[key].de && !GC_NUMERIC_VALUE_TYPES.has(de[key].de.valueType)) {
+      warnings.push(`data_element_ids.${key} points at "${de[key].de.displayName}" (valueType ${de[key].de.valueType}). The plugin plots numeric values only — this chart will render empty.`);
+    }
+  }
 
   // ── Gender option codes ──
-  const genderOptions = genderTea?.optionSet?.options || [];
+  // Options are fetched for this ONE attribute; expanding every attribute's
+  // option set is what made the program response too large to read.
+  let genderOptions = [];
+  if (genderTea?.optionSet?.id) {
+    const osResp = await safeDhis2Fetch(`optionSets/${genderTea.optionSet.id}?fields=id,displayName,options[code,displayName]`, { noTruncate: true });
+    if (osResp?._error) return { _error: `Could not read the gender option set ${genderTea.optionSet.id}: ${osResp._error}` };
+    genderOptions = osResp?.options || [];
+  }
+  const codeOf = o => String(o.code || '');
+  const nameOf = o => String(o.displayName || '');
   let femaleCode = args.female_option_code
-    || (genderOptions.find(o => /female/i.test(o.code) || /female/i.test(o.displayName)) || {}).code;
+    || (genderOptions.find(o => /female|\bf\b/i.test(codeOf(o)) || /female/i.test(nameOf(o))) || {}).code;
   let maleCode = args.male_option_code
-    || (genderOptions.find(o => (/male/i.test(o.code) || /male/i.test(o.displayName)) && !/female/i.test(o.code) && !/female/i.test(o.displayName)) || {}).code;
+    || (genderOptions.find(o => (/male|\bm\b/i.test(codeOf(o)) || /male/i.test(nameOf(o))) && !/female/i.test(codeOf(o)) && !/female/i.test(nameOf(o))) || {}).code;
+  // An explicitly passed code must actually exist on the option set, or the
+  // plugin silently classifies every child as the other sex.
+  if (genderOptions.length) {
+    for (const [label, code] of [['female_option_code', femaleCode], ['male_option_code', maleCode]]) {
+      if (code && !genderOptions.some(o => codeOf(o) === String(code))) {
+        return {
+          _error: `${label} "${code}" is not a code on the gender option set "${genderTea.displayName}".`,
+          available_codes: genderOptions.map(o => ({ code: o.code, name: o.displayName })),
+        };
+      }
+    }
+  }
 
   // ── Validate hard requirements ──
   const missing = [];
   if (!dobTea) missing.push('a Date-of-birth (DATE) tracked-entity attribute');
   if (!genderTea) missing.push('a Gender/sex attribute with an option set');
   if (genderTea && (!femaleCode || !maleCode)) missing.push('female/male option codes on the gender option set (pass female_option_code / male_option_code)');
-  if (!de || !de.weight) missing.push('a Weight data element on the stage');
-  if (!de || !de.height) missing.push('a Height/Length data element on the stage');
-  if (!de || !de.headCircumference) missing.push('a Head-circumference data element on the stage');
+  if (!de.weight.de) missing.push('a numeric Weight data element on the stage');
+  if (!de.height.de) missing.push('a numeric Height/Length data element on the stage');
+  if (!de.headCircumference.de) missing.push('a numeric Head-circumference data element on the stage');
   if (missing.length) {
     return {
       _error: `Program "${prog.displayName}" is missing required growth-chart metadata: ${missing.join('; ')}.`,
-      _hint: 'The plugin will not render unless all three data elements (weight, height, head circumference) and the date-of-birth + gender attributes exist. Pass explicit ids via attribute_ids / data_element_ids, or run action="scaffold_program" to create a ready-to-use program.',
+      _hint: 'The plugin will not render unless all three data elements (weight, height, head circumference) and the date-of-birth + gender attributes exist. Add the missing data element(s) to the stage (add_data_elements_to_stage, valueType NUMBER), pass explicit ids via attribute_ids / data_element_ids, or run action="scaffold_program" to create a ready-to-use program.',
       detected: {
         dateOfBirth: dobTea ? { id: dobTea.id, name: dobTea.displayName } : null,
         gender: genderTea ? { id: genderTea.id, name: genderTea.displayName, femaleCode, maleCode } : null,
-        stage: stage ? { id: stage.id, name: stage.displayName } : null,
-        weight: de?.weight ? { id: de.weight.id, name: de.weight.displayName } : null,
-        height: de?.height ? { id: de.height.id, name: de.height.displayName } : null,
-        headCircumference: de?.headCircumference ? { id: de.headCircumference.id, name: de.headCircumference.displayName } : null,
+        stage: { id: stage.id, name: stage.displayName },
+        weight: de.weight.de ? { id: de.weight.de.id, name: de.weight.de.displayName } : null,
+        height: de.height.de ? { id: de.height.de.id, name: de.height.de.displayName } : null,
+        headCircumference: de.headCircumference.de ? { id: de.headCircumference.de.id, name: de.headCircumference.de.displayName } : null,
       },
+      numeric_data_elements_on_stage: de.dataElements
+        .filter(d => GC_NUMERIC_VALUE_TYPES.has(d.valueType))
+        .map(d => ({ id: d.id, name: d.displayName })),
     };
   }
+  // Collapse to the plain data elements the rest of the function expects.
+  de = { weight: de.weight.de, height: de.height.de, headCircumference: de.headCircumference.de };
 
   // weightInGrams: explicit setting wins, else infer from the weight DE name.
   const weightName = de.weight.displayName || '';
@@ -558,14 +730,30 @@ async function growthChartConfigure(args) {
     config.settings.weightInGrams = inferGrams;
   }
 
-  const wrote = await gcWriteConfig(config);
+  const wrote = await gcWriteConfig(config, cfgRead.exists);
   if (wrote._error) return wrote;
+
+  // Read the key back: a dataStore POST/PUT that reports OK but stores nothing
+  // would otherwise be relayed to the user as a working setup.
+  const verify = await gcReadConfig();
+  if (verify._error || !verify.exists) {
+    return { _error: `Wrote ${GROWTH_CHART_NS}/${GROWTH_CHART_KEY} but could not read it back${verify._error ? `: ${verify._error}` : ''}.` };
+  }
+  const storedStage = verify.value?.metadata?.programStageForGrowthChart?.[programId];
+  if (storedStage !== stage.id) {
+    return { _error: `Config written but the stored mapping for program ${programId} is "${storedStage || 'missing'}" instead of "${stage.id}". The dataStore key may be held by another writer.` };
+  }
 
   const appStatus = await gcAppStatus();
   const hints = [];
   if (appStatus.installed === false) hints.push('The Capture Growth Chart app is NOT installed yet — run action="install" (or install it via App Management) or the dashboard widget cannot load.');
   if (!firstNameTea || !lastNameTea) hints.push('First/last name attributes were not found; they are optional (used for printed charts) so configuration still proceeded.');
 
+  // Name every resolved object. The plugin's own validator only checks that a
+  // UID belongs to the stage, so a plausible-but-wrong pick would never surface
+  // as an error — the chart would just be empty. Showing what was chosen is the
+  // only thing that lets the user catch it.
+  const named = (o) => (o ? { id: o.id, name: o.displayName } : null);
   return {
     success: true,
     program: { id: prog.id, name: prog.displayName },
@@ -573,11 +761,22 @@ async function growthChartConfigure(args) {
     resolved: {
       attributes: config.metadata.attributes,
       dataElements: config.metadata.dataElements,
+      named: {
+        dateOfBirth: named(dobTea),
+        gender: genderTea ? { id: genderTea.id, name: genderTea.displayName, femaleOptionCode: femaleCode, maleOptionCode: maleCode } : null,
+        firstName: named(firstNameTea),
+        lastName: named(lastNameTea),
+        weight: named(de.weight),
+        height: named(de.height),
+        headCircumference: named(de.headCircumference),
+      },
     },
     settings: config.settings,
     config_key: `${GROWTH_CHART_NS}/${GROWTH_CHART_KEY}`,
+    config_verified: true,
     plugin_installed: appStatus.installed,
     dashboard_attach: gcDashboardAttachBlock(appStatus.plugin_launch_url, programId),
+    _warnings: warnings.length ? warnings : undefined,
     _hints: hints.length ? hints : undefined,
   };
 }
@@ -726,7 +925,7 @@ async function growthChartRemove(args) {
   const previous = JSON.parse(JSON.stringify(cfg));
   delete map[programId];
   cfg.metadata.programStageForGrowthChart = map;
-  const wrote = await gcWriteConfig(cfg);
+  const wrote = await gcWriteConfig(cfg, true);
   if (wrote._error) return wrote;
   return { success: true, removed_program: programId, remaining_programs: Object.keys(map), previous_value: previous };
 }

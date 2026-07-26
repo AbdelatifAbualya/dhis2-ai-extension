@@ -19,6 +19,67 @@ const PROGRAM_BOUND_WRITE_ACTIONS = {
   manage_metadata: ['add_program_attributes'],
 };
 
+// ── get_program_info(stage_details, target_id) ───────────────────────────────
+// The full stage detail expands every data element's option set. On a large
+// stage (hundreds of DEs, or a few DEs on a thousand-option lookup list) that
+// blows past safeDhis2Fetch's 80 KB context budget, and the model — which asked
+// precisely for the data elements — used to get back a stub with none of them
+// and a note telling it to "request narrower fields", which it cannot do: it
+// does not build this query. So narrow it here instead, in two steps, and always
+// return the data-element list.
+const STAGE_DETAIL_FIELDS_FULL =
+  'id,displayName,description,executionDateLabel,formType,sortOrder,' +
+  'programStageSections[id,displayName,sortOrder,dataElements[id]],' +
+  'programStageDataElements[compulsory,displayInReports,dataElement[id,displayName,displayFormName,valueType,description,optionSetValue,optionSet[id,displayName,options[id,displayName,code]]]]';
+// Step 2 — keep the option set's identity, drop its options (usually the bulk).
+const STAGE_DETAIL_FIELDS_NO_OPTIONS =
+  'id,displayName,description,executionDateLabel,formType,sortOrder,' +
+  'programStageSections[id,displayName,sortOrder,dataElements[id]],' +
+  'programStageDataElements[compulsory,displayInReports,dataElement[id,displayName,displayFormName,valueType,description,optionSetValue,optionSet[id,displayName]]]';
+// Step 3 — the irreducible answer: which data elements are on this stage.
+const STAGE_DETAIL_FIELDS_MINIMAL =
+  'id,displayName,formType,sortOrder,programStageSections[id,displayName,sortOrder],' +
+  'programStageDataElements[compulsory,dataElement[id,displayName,valueType,optionSetValue,optionSet[id]]]';
+const STAGE_DETAIL_DE_CAP = 400;
+
+async function fetchStageDetails(stageId) {
+  let result = await safeDhis2Fetch(`programStages/${stageId}?fields=${STAGE_DETAIL_FIELDS_FULL}`);
+  if (result?._error || !result?._truncated) return result;
+
+  result = await safeDhis2Fetch(`programStages/${stageId}?fields=${STAGE_DETAIL_FIELDS_NO_OPTIONS}`);
+  if (result?._error) return result;
+  if (!result._truncated) {
+    result._options_omitted = true;
+    result._hint = 'Option lists were omitted because the full stage detail exceeded the response budget. Fetch a specific one with get_program_info(info_type="option_set", target_id=<optionSet id>).';
+    return result;
+  }
+
+  // Still too large: take the minimal projection whole and summarise it here, so
+  // the caller gets the data elements rather than a note about not getting them.
+  const minimal = await safeDhis2Fetch(`programStages/${stageId}?fields=${STAGE_DETAIL_FIELDS_MINIMAL}`, { noTruncate: true });
+  if (minimal?._error) return minimal;
+  const psdes = minimal.programStageDataElements || [];
+  return {
+    id: minimal.id,
+    displayName: minimal.displayName,
+    formType: minimal.formType,
+    sortOrder: minimal.sortOrder,
+    programStageSections: minimal.programStageSections || [],
+    total_data_elements: psdes.length,
+    data_elements: psdes.slice(0, STAGE_DETAIL_DE_CAP).map(p => ({
+      id: p.dataElement?.id,
+      name: p.dataElement?.displayName,
+      valueType: p.dataElement?.valueType,
+      compulsory: p.compulsory || false,
+      optionSetId: p.dataElement?.optionSet?.id || undefined,
+    })),
+    _options_omitted: true,
+    _truncated: psdes.length > STAGE_DETAIL_DE_CAP,
+    _note: `This stage is too large to return in full. Descriptions and option lists were omitted${psdes.length > STAGE_DETAIL_DE_CAP ? `, and ${psdes.length - STAGE_DETAIL_DE_CAP} of ${psdes.length} data elements are not listed` : ''}.`,
+    _hint: 'Every data element above is real and usable. For a specific option list use get_program_info(info_type="option_set", target_id=<optionSetId>); to find a data element not listed here use search_metadata.',
+  };
+}
+
 async function executeTool(name, args) {
   if (!TOOL_ROUTER[name]) {
     return { _error: `Unknown tool: ${name}` };
@@ -1040,9 +1101,7 @@ async function executeTool(name, args) {
           const ctxStage = dhis2.pageContext?.stageId;
           const stageList = knownStages.map(s => `${s.displayName} (${s.id})`).join(', ');
           // Still attempt the fetch — the ID might be from a different program — but warn
-          const result = await safeDhis2Fetch(
-            `programStages/${args.target_id}?fields=id,displayName,description,executionDateLabel,formType,sortOrder,programStageSections[id,displayName,sortOrder,dataElements[id]],programStageDataElements[compulsory,displayInReports,dataElement[id,displayName,displayFormName,valueType,description,optionSetValue,optionSet[id,displayName,options[id,displayName,code]]]]`
-          );
+          const result = await fetchStageDetails(args.target_id);
           if (result._error) {
             return {
               _error: result._error,
@@ -1068,10 +1127,7 @@ async function executeTool(name, args) {
             valid_stages: members,
           };
         }
-        const result = await safeDhis2Fetch(
-          `programStages/${args.target_id}?fields=id,displayName,description,executionDateLabel,formType,sortOrder,programStageSections[id,displayName,sortOrder,dataElements[id]],programStageDataElements[compulsory,displayInReports,dataElement[id,displayName,displayFormName,valueType,description,optionSetValue,optionSet[id,displayName,options[id,displayName,code]]]]`
-        );
-        return result;
+        return await fetchStageDetails(args.target_id);
       }
       // No target_id: list all stages for this program
       const result = await safeDhis2Fetch(

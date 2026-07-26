@@ -966,6 +966,52 @@ if (loaded) {
         names(MAINT, 'yes, fix it').has('manage_custom_translations'));
     }
   }
+
+  // ── Growth-chart measurement detection ────────────────────────────────────
+  // Regression for the 2026-07-25 report. A real examination stage lists the
+  // TEXT classification fields BEFORE the numeric measurements, so first-match
+  // -wins name detection wrote "Height status" as the height data element. The
+  // plugin's own validator only checks that a UID belongs to the stage, so the
+  // config was accepted and the chart silently plotted nothing.
+  console.log('\nGrowth-chart measurement detection:');
+  const pick = fn('gcPickMeasurement');
+  if (!pick) bad('gcPickMeasurement — missing');
+  else {
+    const stage = [
+      { id: 'stageDe0001', displayName: 'Hemoglobin', valueType: 'NUMBER' },
+      { id: 'stageDe0002', displayName: 'Height status', valueType: 'TEXT' },
+      { id: 'stageDe0003', displayName: 'Weight Status', valueType: 'TEXT' },
+      { id: 'stageDe0004', displayName: 'Acute Malnutrition', valueType: 'TEXT' },
+      { id: 'stageDe0005', displayName: 'Height (cm)', valueType: 'NUMBER' },
+      { id: 'stageDe0006', displayName: 'Weight (Kg)', valueType: 'NUMBER' },
+      { id: 'stageDe0007', displayName: 'BMI', valueType: 'NUMBER' },
+      { id: 'stageDe0008', displayName: 'Head Circumference (cm)', valueType: 'NUMBER' },
+    ];
+    eq('height skips the TEXT "Height status"', pick(stage, 'height')?.id, 'stageDe0005');
+    eq('weight skips the TEXT "Weight Status"', pick(stage, 'weight')?.id, 'stageDe0006');
+    eq('head circumference resolves', pick(stage, 'headCircumference')?.id, 'stageDe0008');
+
+    // Derived fields never stand in for the raw measurement.
+    const derived = [
+      { id: 'aaaaaaaaaa1', displayName: 'Weight-for-age z-score', valueType: 'NUMBER' },
+      { id: 'aaaaaaaaaa2', displayName: 'Birth weight (Kg)', valueType: 'NUMBER' },
+      { id: 'aaaaaaaaaa3', displayName: 'Weight gain', valueType: 'NUMBER' },
+    ];
+    eq('z-score / birth weight / weight gain are not the weight', pick(derived, 'weight'), null);
+
+    // A unit-carrying name wins over a bare one, whatever the stage order.
+    const bare = [
+      { id: 'bbbbbbbbbb1', displayName: 'Weight', valueType: 'NUMBER' },
+      { id: 'bbbbbbbbbb2', displayName: 'Weight (kg)', valueType: 'NUMBER' },
+    ];
+    eq('a unit-carrying name outranks a bare one', pick(bare, 'weight')?.id, 'bbbbbbbbbb2');
+
+    // MUAC is a circumference but never a head circumference.
+    const muac = [{ id: 'cccccccccc1', displayName: 'MUAC circumference (cm)', valueType: 'NUMBER' }];
+    eq('MUAC is not head circumference', pick(muac, 'headCircumference'), null);
+    eq('a non-numeric measurement is never chosen',
+      pick([{ id: 'dddddddddd1', displayName: 'Weight (Kg)', valueType: 'TEXT' }], 'weight'), null);
+  }
 }
 
 // setImmediate: a few checks are async (promise-returning safety gates); they

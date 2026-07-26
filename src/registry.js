@@ -2857,6 +2857,11 @@ status (run this first) → install (if needed) → configure(program_id) → re
 ### Hard requirements (the tool validates and refuses with a list if unmet)
 The program MUST have a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If any of the three DEs is missing the chart will not display. If configure reports missing metadata, offer scaffold_program or ask the user for the exact attribute/DE ids.
 
+**The three measurements must be NUMERIC** (valueType NUMBER/INTEGER…). When you add a missing one with add_data_elements_to_stage, give it valueType NUMBER — a TEXT "Head circumference" is accepted by the plugin's own validator and then plots nothing. configure ignores non-numeric candidates and also skips derived lookalikes on the same stage ("Height status", "Weight-for-age z-score", "Birth weight", "MUAC circumference"), so on a busy examination stage it picks "Height (cm)" over "Height status".
+
+### Reading the result
+configure returns \`resolved.named\` — the actual NAME of every attribute and data element it chose. Relay those names to the user. The plugin only validates that a UID belongs to the stage, so a plausible-but-wrong pick produces an empty chart with no error anywhere; the names are the only chance to catch it.
+
 ### Making it visible
 configure makes the plugin FUNCTION but does not place the widget. Relay the tool's \`dashboard_attach\` block: the plugin must be added to the enrollment dashboard via the Tracker Plugin Configurator app (or Capture's "Add plugin" with the returned plugin source URL). The tool deliberately does NOT write dataStore/capture (Capture-owned; risk of cache corruption).
 
