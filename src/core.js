@@ -1290,6 +1290,32 @@ function hasUidShape(v) {
   return /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(v || ''));
 }
 
+// Detects an assistant reply that ANNOUNCES imminent tool work instead of
+// reporting completed work — e.g. "Creating the program shell with
+// registration attributes and Form 1 first, then adding the remaining
+// stages." A turn that ENDS on such a promise has silently abandoned the
+// task: nothing after the text ever executes, the panel goes idle, and the
+// user sees no error (observed live 2026-07-26, W4W Clinic build).
+// Heuristic by design — the agent loop caps how often it acts on this, so a
+// false positive costs one extra round trip, after which the text is
+// accepted as the final answer. Rules:
+//   • a reply that asks the user something is a legitimate stop → false;
+//   • long replies are reports, not announcements → false over 2000 chars;
+//   • otherwise look for future-intent phrasing near the end: a sentence
+//     starting with an action gerund ("Creating…", "Now adding…") or an
+//     explicit first-person promise ("I'll create…", "let me add…").
+function looksLikeUnfinishedAnnouncement(text) {
+  const t = String(text || '').trim();
+  if (!t || t.length > 2000) return false;
+  if (/\?\s*$/.test(t)) return false;
+  const tail = t.slice(-400);
+  const gerundSentenceStart =
+    /(^|[.!:]\s+|\n\s*)(now\s+|next[,:]?\s+|first[,:]?\s+)?(creating|adding|building|setting\s+up|configuring|generating|updating|proceeding|starting)\b/i;
+  const firstPersonPromise =
+    /\b(i(?:'|’)ll|i\s+will|let\s+me|i(?:'|’)m\s+(?:now\s+)?going\s+to|about\s+to|proceeding\s+to)\s+(?:now\s+)?(?:start|begin|create|add|build|set\s+up|configure|generate|update|proceed|continue)\b/i;
+  return gerundSentenceStart.test(tail) || firstPersonPromise.test(tail);
+}
+
 function extractVisualizationIdFromInput(input) {
   const raw = String(input || '').trim();
   if (!raw) return null;

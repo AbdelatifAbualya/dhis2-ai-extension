@@ -539,6 +539,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   let emptyResponseCount = 0;
   let leakedToolCallCount = 0; // tool calls emitted as plain text instead of native calls // Guard against infinite think-only loops
   let providerStallRetries = 0; // Transparent retries for mid-stream stalls (nothing shown to the user yet)
+  let unfinishedTextNudges = 0; // text-only replies that are provably not a finished answer (cut by token limit / announcement-only)
+  let anyToolCallThisTurn = false; // at least one tool call was emitted this turn (marks the turn as mid-task)
 
   // ── Mechanical circuit breaker for deterministic retry loops ────────────────
   // The repeated-failure guard (preflightCheckCall) only ASKS the model to stop
@@ -645,6 +647,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     const allToolCalls = msg.tool_calls || [];
 
     if (allToolCalls.length > 0) {
+      anyToolCallThisTurn = true;
       for (const tc of allToolCalls) {
         const toolName = tc.function?.name;
         let args;
@@ -1145,6 +1148,33 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
 
       // Reset counter on any real content
       emptyResponseCount = 0;
+
+      // ── Unfinished-turn guard: text that is provably NOT a finished answer ──
+      // Two silent task-abandonment shapes end a turn here with no error and
+      // no further tool calls (observed live 2026-07-26: the W4W Clinic build
+      // stopped forever after "Creating the program shell …, then adding the
+      // remaining stages." — panel idle, nothing created, no error anywhere):
+      //   a) finish_reason='length' — the reply was CUT by the output token
+      //      limit after the visible text but before a tool call streamed;
+      //   b) an announcement-only reply — the model states what it is about
+      //      to do and stops without calling any tool (fast/weak models under
+      //      a huge task). Heuristic, so it only fires mid-task (a tool
+      //      already ran this turn) and is capped: a false positive costs one
+      //      extra round trip, after which the text is accepted as final.
+      const textCutByTokenLimit = finishReason === 'length';
+      if ((textCutByTokenLimit || (anyToolCallThisTurn && looksLikeUnfinishedAnnouncement(text)))
+          && unfinishedTextNudges < 3) {
+        unfinishedTextNudges++;
+        console.warn(`[AgenticLoop] ${textCutByTokenLimit ? 'Reply cut by the output token limit after visible text' : 'Announcement-only reply (no tool call)'} — nudging the model to continue (${unfinishedTextNudges}/3)`);
+        broadcast({ type: 'AI_THINKING', iteration: i + 1, label: 'Continuing the task' });
+        messages.push({
+          role: 'system',
+          content: textCutByTokenLimit
+            ? 'Your reply was cut off by the maximum output length before any tool call was emitted — the task did NOT finish and nothing was executed after your text. Do NOT re-plan or repeat yourself. If tool work remains, emit the next tool call NOW and keep each call SMALL enough to stream: for a large program, create_metadata(action=create_program) with the shell + attributes + first stage only, then ONE add_stage call per remaining stage, then add_program_rules in batches of 10–15 rules. If you were writing the final summary, send the COMPLETE summary now, shorter.'
+            : `Your reply announced what you are about to do but contained NO tool call — nothing was executed and the task is NOT finished. Never end a reply with a promise of future work. Emit the announced tool call NOW; when the whole task is genuinely done, end with a past-tense summary of what was created (names + IDs).`,
+        });
+        continue;
+      }
 
       if (streamStartBroadcast) {
         broadcast({ type: 'AI_STREAM_END', text });

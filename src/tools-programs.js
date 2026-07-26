@@ -2263,6 +2263,11 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       let ruleSkip = null;
 
       for (const act of (rule.actions || [])) {
+        // Forgive case/whitespace drift in target names ("Allergy Details" vs
+        // the DE created as "Allergy details") by rewriting them to the
+        // canonical keys before any exact-key lookup below.
+        const targetFixes = canonicalizeActionTargetNames(act, Object.keys(deUidMap), Object.keys(teaUidMap));
+        for (const f of targetFixes) ruleActionFixes.push({ rule: rule.name, action_type: act.type, outcome: 'target name resolved', detail: `${f.field} "${f.from}" → "${f.to}"` });
         // Guard the action type FIRST: an invalid enum (e.g. model-invented
         // COMPLETEENROLLMENT) 409s the whole atomic import at deserialization,
         // before validation — so it must never reach the server. Aliases map to
@@ -2336,6 +2341,19 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
             rule: rule.name,
             reason: 'unresolved_section',
             detail: 'HIDESECTION needs a program_stage_section_id. Pass sections in the stage (create_program now builds them) and target the section by program_stage_section_id, or use HIDEFIELD per data element / HIDEPROGRAMSTAGE.',
+          };
+          break;
+        }
+        // Field-targeting actions with no resolved DE/TEA make the server
+        // reject the WHOLE atomic import ("ProgramRuleAction: DataElement or
+        // TrackedEntityAttribute cannot be null") — after the loose name
+        // resolution above, anything still unresolved skips the RULE so a
+        // targetless action never reaches the server.
+        if (actionMissingFieldTarget(norm.type, pra)) {
+          ruleSkip = {
+            rule: rule.name,
+            reason: 'unresolved_action_target',
+            detail: `${norm.type} action's target could not be resolved${act.data_element_name || act.tracked_entity_attribute_name ? ` from "${act.data_element_name || act.tracked_entity_attribute_name}"` : ' (no data_element_name / tracked_entity_attribute_name given)'} — no data element or attribute in THIS call matches. ${norm.type === 'ASSIGN' ? 'ASSIGN needs a resolvable target field or content:"#{variable}". ' : ''}Use the exact name of a data element or attribute defined in this call.`,
           };
           break;
         }
@@ -4570,8 +4588,12 @@ async function addProgramRules(args) {
     }
 
     // Action-target DEs/TEAs also get a PRV under their sanitized name
-    // (pre-existing behavior).
+    // (pre-existing behavior). Loose-resolve target names first so a
+    // case/spacing drift ("Allergy Details" vs the program's "Allergy
+    // details") lands on the canonical key instead of silently missing.
     for (const act of (rule.actions || [])) {
+      const targetFixes = canonicalizeActionTargetNames(act, Object.keys(deNameToId), Object.keys(teaNameToId));
+      for (const f of targetFixes) actionTypeFixes.push({ rule: rule.name, action_type: act.type, outcome: 'target name resolved', detail: `${f.field} "${f.from}" → "${f.to}"` });
       if (act.data_element_name && deNameToId[act.data_element_name]) {
         pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name);
       }
@@ -4614,10 +4636,41 @@ async function addProgramRules(args) {
       } else if (act.tracked_entity_attribute_name && teaNameToId[act.tracked_entity_attribute_name]) {
         pra.trackedEntityAttribute = { id: teaNameToId[act.tracked_entity_attribute_name] };
       }
+      // HIDEOPTION / SHOW-HIDEOPTIONGROUP need the specific option (group)
+      // UID or the server rejects the bundle — accept explicit ids here; the
+      // missing-target lint below refuses anything unresolved.
+      if (act.option_id && hasUidShape(act.option_id)) pra.option = { id: act.option_id };
+      if (act.option_group_id && hasUidShape(act.option_group_id)) pra.optionGroup = { id: act.option_group_id };
       const stageId = resolveStageRefForAction(act);
       if (stageId) pra.programStage = { id: stageId };
       if (act.program_stage_section_id) pra.programStageSection = { id: act.program_stage_section_id };
 
+      // Fail fast on field-targeting actions with no resolved DE/TEA (or
+      // missing option / option group) — the server rejects the whole bundle
+      // with "DataElement or TrackedEntityAttribute cannot be null" (observed
+      // live 2026-07-26: HIDEFIELD "Allergy Details" vs the DE "Allergy
+      // details" 409'd the entire batch at VALIDATE). Loose name resolution
+      // already ran; anything still unresolved must never reach the server.
+      if (actionMissingFieldTarget(act.type, pra)) {
+        const wanted = act.data_element_name || act.tracked_entity_attribute_name || '';
+        const words = String(wanted).toLowerCase().split(/\s+/).filter(w => w.length > 3);
+        const near = wanted
+          ? [...Object.keys(deNameToId), ...Object.keys(teaNameToId)].filter(n => { const l = n.toLowerCase(); return words.some(w => l.includes(w)); }).slice(0, 8)
+          : [];
+        const optionProblem = (act.type === 'HIDEOPTION' && !pra.option)
+          || ((act.type === 'SHOWOPTIONGROUP' || act.type === 'HIDEOPTIONGROUP') && !pra.optionGroup);
+        return {
+          success: false,
+          phase: 'lint',
+          _error: `Program rule "${rule.name}" has a ${act.type} action ${optionProblem && (pra.dataElement || pra.trackedEntityAttribute)
+            ? `with no resolvable ${act.type === 'HIDEOPTION' ? 'option — pass option_id (the option’s UID)' : 'option group — pass option_group_id'}; the server rejects it otherwise`
+            : `whose target could not be resolved${wanted ? ` from "${wanted}"` : ' (no data_element_name / tracked_entity_attribute_name given)'} — no data element or attribute of this program matches exactly or loosely`}. Nothing was imported.`,
+          ...(near.length ? { closest_matches: near } : {}),
+          _hint: act.type === 'ASSIGN'
+            ? 'ASSIGN needs a resolvable target: data_element_name / tracked_entity_attribute_name of this program, or content:"#{variable}" for a program rule variable. Fix the action and retry.'
+            : 'Use the exact display name of a data element in this program’s stages (or a program attribute) as the action target. Fix the action and retry.',
+        };
+      }
       // Fail fast on stage-targeting actions with no resolvable stage — the
       // server rejects the whole bundle with "ProgramStage cannot be null".
       if ((act.type === 'HIDEPROGRAMSTAGE' || act.type === 'CREATEEVENT') && !pra.programStage) {
@@ -6328,6 +6381,69 @@ function autoGuardNumericComparisons(condition) {
     return `(d2:hasValue(${token}) && ${token} ${op} ${num})`;
   });
   return { condition: rewritten, guarded };
+}
+
+// ── Loose canonical-name resolution for rule-action targets ─────────────────
+// Shared by the create_program embedded-rules path and add_program_rules.
+// The model writes action targets by display name, and a case/spacing drift
+// ("Allergy Details" vs the DE actually created as "Allergy details") made the
+// exact-key lookup miss — the action then shipped with NO dataElement and the
+// server rejected the import with "ProgramRuleAction: DataElement or
+// TrackedEntityAttribute cannot be null" (observed live 2026-07-26, W4W
+// Clinic). Resolution order: exact key; then a case/whitespace-folded match;
+// then a unique startsWith / includes match. Ambiguity returns null — never a
+// guess between two candidates. Returns the CANONICAL key of the map so every
+// downstream exact-key lookup (UID maps, option-set maps, PRV pushes) works
+// unchanged.
+function resolveLooseNameKey(name, keys) {
+  const raw = String(name || '').trim();
+  if (!raw || !Array.isArray(keys) || !keys.length) return null;
+  if (keys.includes(raw)) return raw;
+  const fold = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+  const want = fold(raw);
+  if (!want) return null;
+  const folded = keys.filter(k => fold(k) === want);
+  if (folded.length === 1) return folded[0];
+  if (folded.length > 1) return null;
+  const starts = keys.filter(k => fold(k).startsWith(want));
+  if (starts.length === 1) return starts[0];
+  if (starts.length > 1) return null;
+  const contains = keys.filter(k => fold(k).includes(want));
+  return contains.length === 1 ? contains[0] : null;
+}
+
+// Rewrite an action's target-name fields to the canonical map keys when a
+// loose match resolves them. Mutates the action in place; returns a list of
+// { field, from, to } rewrites for reporting.
+function canonicalizeActionTargetNames(act, deKeys, teaKeys) {
+  const fixes = [];
+  if (act && act.data_element_name && !deKeys.includes(act.data_element_name)) {
+    const k = resolveLooseNameKey(act.data_element_name, deKeys);
+    if (k) { fixes.push({ field: 'data_element_name', from: act.data_element_name, to: k }); act.data_element_name = k; }
+  }
+  if (act && act.tracked_entity_attribute_name && !teaKeys.includes(act.tracked_entity_attribute_name)) {
+    const k = resolveLooseNameKey(act.tracked_entity_attribute_name, teaKeys);
+    if (k) { fixes.push({ field: 'tracked_entity_attribute_name', from: act.tracked_entity_attribute_name, to: k }); act.tracked_entity_attribute_name = k; }
+  }
+  return fixes;
+}
+
+// Field-targeting action types that the server rejects when neither a
+// dataElement nor a trackedEntityAttribute resolved ("DataElement or
+// TrackedEntityAttribute cannot be null"). ASSIGN is validated separately —
+// it may legally target a program rule variable via `content` instead.
+const FIELD_TARGET_ACTION_TYPES = new Set(['HIDEFIELD', 'SETMANDATORYFIELD', 'HIDEOPTION', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP']);
+function actionMissingFieldTarget(type, pra) {
+  if (FIELD_TARGET_ACTION_TYPES.has(type)) {
+    if (!pra.dataElement && !pra.trackedEntityAttribute) return true;
+    // The server additionally rejects these with "Option cannot be null" /
+    // "OptionGroup cannot be null" when the specific option (group) is absent.
+    if (type === 'HIDEOPTION' && !pra.option) return true;
+    if ((type === 'SHOWOPTIONGROUP' || type === 'HIDEOPTIONGROUP') && !pra.optionGroup) return true;
+    return false;
+  }
+  if (type === 'ASSIGN') return !pra.content && !pra.dataElement && !pra.trackedEntityAttribute;
+  return false;
 }
 
 // ── Rewrite option NAMES → CODES in rule conditions and ASSIGN data ──

@@ -1012,6 +1012,53 @@ if (loaded) {
     eq('a non-numeric measurement is never chosen',
       pick([{ id: 'dddddddddd1', displayName: 'Weight (Kg)', valueType: 'TEXT' }], 'weight'), null);
   }
+
+  // ── Unfinished-turn guard: announcement-only replies (2026-07-26) ─────────
+  // A turn that ends on "Creating the program shell …, then adding the
+  // remaining stages." with no tool call silently abandons the task — the
+  // panel goes idle with no error (the W4W Clinic stall). The loop nudges the
+  // model to continue when this fires mid-task.
+  console.log('\nUnfinished-turn announcement detection:');
+  const ann = need('looksLikeUnfinishedAnnouncement');
+  if (ann) {
+    eq('the live W4W announcement is detected',
+      ann('Creating the program shell with registration attributes and Form 1 first, then adding the remaining stages.'), true);
+    eq('a first-person promise is detected',
+      ann("I'll now create the remaining stages and program rules."), true);
+    eq('a past-tense completion summary is NOT flagged',
+      ann('Done. Created the W4W Clinic program with 8 stages, 30 rules and 12 attributes.'), false);
+    eq('a question to the user is NOT flagged',
+      ann('Two programs match "W4W". Which one should I extend?'), false);
+    eq('a long final report is NOT flagged', ann('Creating summary: ' + 'x'.repeat(2100)), false);
+    eq('empty text is NOT flagged', ann(''), false);
+  }
+
+  // ── Rule-action target resolution (the "Allergy Details" 409) ─────────────
+  // HIDEFIELD targeting "Allergy Details" while the DE was created as
+  // "Allergy details" shipped a targetless action and 409'd the whole batch
+  // at VALIDATE (live 2026-07-26). Loose resolution forgives case/spacing;
+  // the missing-target lint refuses anything still unresolved client-side.
+  console.log('\nRule-action target resolution:');
+  const loose = need('resolveLooseNameKey');
+  if (loose) {
+    const keys = ['Allergy', 'Allergy details', 'Chronic Disease Type'];
+    eq('exact key wins', loose('Allergy', keys), 'Allergy');
+    eq('case drift resolves to the canonical key', loose('Allergy Details', keys), 'Allergy details');
+    eq('whitespace drift resolves', loose('  chronic disease   type ', keys), 'Chronic Disease Type');
+    eq('an ambiguous prefix is NOT guessed', loose('Aller', keys), null);
+    eq('an unknown name returns null', loose('Blood Group', keys), null);
+  }
+  const missingTarget = need('actionMissingFieldTarget');
+  if (missingTarget) {
+    eq('HIDEFIELD with no target is refused', missingTarget('HIDEFIELD', {}), true);
+    eq('HIDEFIELD with a DE passes', missingTarget('HIDEFIELD', { dataElement: { id: 'x' } }), false);
+    eq('SETMANDATORYFIELD with a TEA passes', missingTarget('SETMANDATORYFIELD', { trackedEntityAttribute: { id: 'x' } }), false);
+    eq('ASSIGN to a variable via content passes', missingTarget('ASSIGN', { content: '#{v}' }), false);
+    eq('ASSIGN with no target and no content is refused', missingTarget('ASSIGN', {}), true);
+    eq('HIDEOPTION without the option is refused', missingTarget('HIDEOPTION', { dataElement: { id: 'x' } }), true);
+    eq('HIDEOPTION with option + DE passes', missingTarget('HIDEOPTION', { dataElement: { id: 'x' }, option: { id: 'o' } }), false);
+    eq('SHOWWARNING without a DE still passes (legal)', missingTarget('SHOWWARNING', {}), false);
+  }
 }
 
 // setImmediate: a few checks are async (promise-returning safety gates); they

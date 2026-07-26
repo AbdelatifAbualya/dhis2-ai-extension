@@ -2995,3 +2995,38 @@ regression for the measurement picker. Live against the reported instance
 all checks green, with the chosen data elements re-confirmed against DHIS2 rather
 than against the tool's own answer. `scripts/scenario-line-lists.js` re-run as a
 regression on the `safeDhis2Fetch` change: 110 API calls, **0 failed**.
+
+## v2.8.22 — The silent mid-task stall + rule actions shipped without their target
+
+**Files:** `src/agent.js`, `src/core.js`, `src/tools-programs.js`, `scripts/verify.js`
+**Full write-up:** `CHANGES_unfinished_turn_and_action_targets.md`
+
+A live W4W Clinic build (8 stages, ~30 rules) ran its discovery calls, streamed
+*"Creating the program shell …, then adding the remaining stages."* — and then
+stopped forever. No error, no failed call, nothing created.
+
+1. **Unfinished-turn guard (`src/agent.js`).** The loop treated any non-empty
+   text without tool calls as the final answer. A reply cut by the output token
+   limit after its visible text (`finish_reason='length'`), or an
+   announcement-only reply promising imminent work, silently ended the turn
+   mid-task. Both now trigger a bounded corrective nudge (max 3/turn): emit the
+   next tool call now, split large programs into shell + per-stage + rule
+   batches. `looksLikeUnfinishedAnnouncement()` (new, `src/core.js`) is
+   conservative — questions and long reports never fire it, and it only acts
+   mid-task (a tool already ran this turn).
+
+2. **Rule-action target resolution (`src/tools-programs.js`).** Action targets
+   resolved by EXACT name only; `"Allergy Details"` vs the DE created as
+   `"Allergy details"` shipped a HIDEFIELD with **no target**, and the server
+   409'd the whole batch at VALIDATE (`DataElement or TrackedEntityAttribute
+   cannot be null`). Both rule paths now loose-resolve names (case/whitespace
+   fold, unique prefix — never a guess between two candidates) and **refuse
+   client-side** any action the server would reject: field actions with no
+   DE/TEA, ASSIGN with no target and no content variable, HIDEOPTION without
+   its option, option-group actions without their group. `add_program_rules`
+   also gained `option_id`/`option_group_id` pass-throughs — HIDEOPTION via
+   that path previously always died at VALIDATE.
+
+**Verification:** `npm run verify` all green (new regressions for both fixes);
+live acceptance run against localhost:8081 with Fireworks `glm-5p2` recorded in
+the full write-up.
