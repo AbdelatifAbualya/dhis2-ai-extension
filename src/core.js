@@ -613,6 +613,10 @@ const RESERVED_UID_SHAPED_WORDS = new Set([
   'displayName', 'lastUpdated', 'description', 'dataElement', 'accessLevel',
   'coordinates', 'phoneNumber', 'optionGroup', 'programRule', 'inheritable',
   'aggregation', 'completedBy', 'programName', 'trackedName',
+  // API path segments that pass the entropy test (11-char camelCase) but are
+  // endpoint names, not UIDs — e.g. POST maintenance/dataPruning was refused
+  // as a "hallucinated UID" (live 2026-07-28).
+  'dataPruning',
 ]);
 
 // Pulls UIDs out of every arg position that is operationally a target
@@ -2428,8 +2432,32 @@ async function safeDhis2Fetch(path, options = {}) {
       } catch {
         if (rawResp.text && rawResp.text.length < 300) errMsg += `: ${rawResp.text}`;
       }
-      // Include parsed body so callers (like postMetadataPayload) can extract detailed errors
-      return { _error: errMsg, _url: fullUrl, _status: rawResp.status, ...(errBody ? { _body: errBody } : {}) };
+      // Metadata import 409s say only "please see full details in import report"
+      // — pull the actual per-object errors out so the model sees WHY, instead
+      // of guessing at alternative endpoints (live 2026-07-28).
+      const importErrors = [];
+      for (const tr of (errBody?.response?.typeReports || errBody?.typeReports || [])) {
+        for (const or of (tr.objectReports || [])) {
+          for (const er of (or.errorReports || [])) {
+            if (er.message && importErrors.length < 8) importErrors.push(er.message);
+          }
+        }
+      }
+      if (importErrors.length) errMsg += ` — ${importErrors.join('; ')}`;
+      // E4030 "associated with another object: Event" after the user already
+      // deleted the events in Capture: events are only SOFT-deleted, and the
+      // soft-deleted rows still block metadata deletion. Name the exact fix so
+      // the model doesn't flail through analytics/tracker probes.
+      const blockedByEvent = importErrors.some(m => /associated with another object.*Event/i.test(m))
+        || /associated with another object.*Event/i.test(errMsg);
+      return {
+        _error: errMsg, _url: fullUrl, _status: rawResp.status,
+        ...(errBody ? { _body: errBody } : {}),
+        ...(importErrors.length ? { error_details: importErrors } : {}),
+        ...(blockedByEvent ? {
+          _hint: 'This object still has event data values referencing it. If the user says the events were already deleted in the Capture UI, they are only SOFT-deleted and still block deletion: run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry this SAME delete once. If real (non-deleted) events still hold values, tell the user which events must be deleted first. Do NOT probe analytics, tracker reads, or count_records — they cannot remove the association.',
+        } : {}),
+      };
     }
 
     if (rawResp.status === 204) return { success: true, message: 'Deleted successfully.' };
@@ -2476,12 +2504,18 @@ async function safeDhis2Fetch(path, options = {}) {
         if (!rawText || !rawText.trim()) {
           return { _error: `DELETE failed for ${cleanPath.split('?')[0]}. Server returned empty response and POST-based fallback also failed. Use manage_metadata(action=delete) for reliable deletion.`, _url: fullUrl };
         }
-      } else if (options.allowEmptyBody) {
-        // Caller explicitly opted in: DHIS2 collection-add / link endpoints
-        // (e.g. POST /programs/{pid}/notificationTemplates/{tid}) idiomatically
-        // return HTTP 200 with an empty body on success. Treat as success and
-        // let the caller verify via GET if it needs to be sure.
-        return { success: true, message: 'OK', _status: rawResp.status, _url: fullUrl, _emptyBody: true };
+      } else if (options.allowEmptyBody || method === 'POST' || method === 'PUT') {
+        // DHIS2 idiomatically returns HTTP 2xx with an EMPTY body on success for
+        // many write endpoints: collection-add / link endpoints, and the whole
+        // /maintenance family (softDeletedEventRemoval, periodPruning, …).
+        // Reporting these as errors sent the model hunting for alternative
+        // endpoints after operations that had actually succeeded (live
+        // 2026-07-28: four successful maintenance POSTs each surfaced as ✗).
+        return {
+          success: true,
+          message: `OK — DHIS2 accepted the ${method} (HTTP ${rawResp.status}, empty body is this endpoint's normal success response).`,
+          _status: rawResp.status, _url: fullUrl, _emptyBody: true,
+        };
       } else {
         return { _error: `DHIS2 returned empty response (HTTP ${rawResp.status}) for ${method} ${cleanPath.split('?')[0]}`, _url: fullUrl };
       }
@@ -3943,6 +3977,37 @@ async function hasHostPermissionForUrl(url) {
   } catch { return false; }
 }
 
+// Carry resolved/sticky context from the previous pageContext onto a freshly
+// URL-parsed one, WITHOUT any network fetches. Used on the cheap refresh paths
+// (tab activation, chat-turn re-sync) where a raw URL re-parse must never
+// downgrade context that a full initializeFromUrl already resolved for this
+// same flow: event/enrollment-scoped Capture routes carry no programId, and
+// the enrollment dashboard carries no stageId.
+function carryStickyContext(freshCtx, prevCtx) {
+  const ctx = { ...freshCtx };
+  if (!prevCtx || typeof prevCtx !== 'object') return ctx;
+  // Event/enrollment sub-pages of a program flow: keep the resolved identity.
+  if (!ctx.programId && (ctx.eventId || ctx.enrollmentId) && prevCtx.programId) {
+    ctx.programId = prevCtx.programId;
+    if (!ctx.orgUnitId && prevCtx.orgUnitId) ctx.orgUnitId = prevCtx.orgUnitId;
+    if (!ctx.teiId && prevCtx.teiId) ctx.teiId = prevCtx.teiId;
+    if (!ctx.enrollmentId && prevCtx.enrollmentId) ctx.enrollmentId = prevCtx.enrollmentId;
+    // The previous stage stays valid only while the event is the same one it
+    // was resolved from — a different eventId may belong to a different stage.
+    if (!ctx.stageId && prevCtx.stageId && (!ctx.eventId || ctx.eventId === prevCtx.eventId)) {
+      ctx.stageId = prevCtx.stageId;
+    }
+  }
+  // Same program, stage missing from the fresh URL → keep the known stage.
+  // A different eventId voids the carry: that event may live in another stage,
+  // and the full initializeFromUrl will resolve its real stage from the API.
+  if (!ctx.stageId && prevCtx.stageId && ctx.programId && ctx.programId === prevCtx.programId
+      && (!ctx.eventId || ctx.eventId === prevCtx.eventId)) {
+    ctx.stageId = prevCtx.stageId;
+  }
+  return ctx;
+}
+
 async function initializeFromUrl(url) {
   const baseUrl = extractBaseUrl(url);
   if (!baseUrl) return { error: 'Not a DHIS2 page' };
@@ -4010,19 +4075,13 @@ async function initializeFromUrl(url) {
     console.log(`[initializeFromUrl] Server switched: ${previousBaseUrl} → ${baseUrl}. Cleared server-tied caches.`);
   }
 
+  const prevCtx = dhis2.pageContext || {};
   const ctx = extractContext(url);
-  dhis2.pageContext = ctx;
 
-  // Clear stale metadata when navigating away from a program or org unit
-  if (!ctx.programId) {
-    dhis2.programMetadata = null;
-    dhis2.programRulesCount = null;
-  }
-  if (!ctx.orgUnitId) {
-    dhis2.ouContext = null;
-  }
-
-  // Resolve event context if needed (also resolve stageId when missing)
+  // Resolve event context if needed (also resolve stageId when missing).
+  // Capture's event-edit route is `#/enrollmentEventEdit?eventId=...&orgUnitId=...`
+  // — no programId/stageId in the URL at all — so this fetch is the only way to
+  // know which stage the user is actually working in.
   if (ctx.eventId && (!ctx.programId || !ctx.stageId)) {
     try {
       const ev = await dhis2Fetch(apiUrl(
@@ -4033,6 +4092,39 @@ async function initializeFromUrl(url) {
       if (!ctx.enrollmentId) ctx.enrollmentId = ev.enrollment;
       if (!ctx.teiId)        ctx.teiId = ev.trackedEntity;
     } catch {}
+  }
+
+  // Some Capture routes carry only enrollmentId — resolve it so program/OU/TEI
+  // context survives those pages instead of being cleared.
+  if (ctx.enrollmentId && !ctx.programId) {
+    try {
+      const en = await dhis2Fetch(apiUrl(
+        `tracker/enrollments/${ctx.enrollmentId}?fields=program,orgUnit,trackedEntity`
+      ));
+      if (en?.program)                    ctx.programId = en.program;
+      if (!ctx.orgUnitId && en?.orgUnit)  ctx.orgUnitId = en.orgUnit;
+      if (!ctx.teiId && en?.trackedEntity) ctx.teiId = en.trackedEntity;
+    } catch {}
+  }
+
+  // Sticky stage: the active stage is often known only from a DOM detection or
+  // an event URL the user has since navigated away from. Every hashchange, tab
+  // switch, and chat turn rebuilds pageContext through here, and the plain
+  // enrollment-dashboard URL has no stageId — so a URL re-parse must never
+  // erase the stage while the user is still in the same program.
+  if (!ctx.stageId && prevCtx.stageId && ctx.programId && ctx.programId === prevCtx.programId) {
+    ctx.stageId = prevCtx.stageId;
+  }
+
+  dhis2.pageContext = ctx;
+
+  // Clear stale metadata when navigating away from a program or org unit
+  if (!ctx.programId) {
+    dhis2.programMetadata = null;
+    dhis2.programRulesCount = null;
+  }
+  if (!ctx.orgUnitId) {
+    dhis2.ouContext = null;
   }
 
   // Fetch program metadata

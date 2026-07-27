@@ -783,7 +783,13 @@
     }
     if (state.visualizationName) chips.push({ label: 'Viz', value: state.visualizationName });
     if (state.ouName) chips.push({ label: 'OU', value: state.ouName });
-    if (state.stagesCount) chips.push({ label: 'Stages', value: state.stagesCount });
+    if (state.stageName || state.stageId) {
+      // Active stage detected — show it by name (falls back to the UID only
+      // when program metadata hasn't resolved yet). More useful than the count.
+      chips.push({ label: 'Stage', value: state.stageName || state.stageId });
+    } else if (state.stagesCount) {
+      chips.push({ label: 'Stages', value: state.stagesCount });
+    }
     if (state.trackedEntityType) chips.push({ label: 'TE', value: state.trackedEntityType });
 
     if (chips.length === 0) {

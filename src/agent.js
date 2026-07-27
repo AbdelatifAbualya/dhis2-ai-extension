@@ -1499,20 +1499,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (tab?.url && dhis2.baseUrl) {
             const freshBaseUrl = extractBaseUrl(tab.url);
-            const freshCtx = extractContext(tab.url);
             const oldProgramId = dhis2.pageContext?.programId;
             const oldOrgUnitId = dhis2.pageContext?.orgUnitId;
             const oldAppType = dhis2.pageContext?.appType;
-            const oldStageId = dhis2.pageContext?.stageId;
             const oldVisualizationId = dhis2.pageContext?.visualizationId;
             const oldMapId = dhis2.pageContext?.mapId;
 
-            // Rebuild pageContext from the current URL instead of merging onto stale state.
-            // Preserve a DOM-detected stage only when staying in the same tracker program.
+            // Rebuild pageContext from the current URL instead of merging onto stale
+            // state, but carry sticky context (resolved program on event/enrollment
+            // routes, detected stage within the same program) so a chat turn never
+            // downgrades what initializeFromUrl already resolved.
+            const freshCtx = carryStickyContext(extractContext(tab.url), dhis2.pageContext);
             dhis2.pageContext = { ...freshCtx };
-            if (!freshCtx.stageId && freshCtx.programId && freshCtx.programId === oldProgramId && oldStageId) {
-              dhis2.pageContext.stageId = oldStageId;
-            }
 
             // Re-run full initialization whenever page type or top-level context changes.
             // This clears stale app-specific state when navigating away from Data Visualizer/Maps.
@@ -1772,7 +1770,10 @@ async function syncFromTab(tabId) {
     if (!candidateBase) return;
     if (candidateBase === dhis2.baseUrl && dhis2.connected) {
       // Same server — only refresh page context (cheap), don't re-fetch system info.
-      const ctx = extractContext(tab.url);
+      // carryStickyContext keeps the resolved program/stage that a full
+      // initializeFromUrl already computed: without it, every tab/window focus
+      // change wiped the detected stage (and, on event-edit routes, the program).
+      const ctx = carryStickyContext(extractContext(tab.url), dhis2.pageContext);
       dhis2.pageContext = ctx;
       broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
       return;

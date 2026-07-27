@@ -75,7 +75,9 @@ const chrome = {
   storage: { local: store(), session: store(), onChanged: evt() },
   tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve([]) },
   action: { onClicked: evt() },
-  permissions: { onAdded: evt(), onRemoved: evt(), getAll: () => Promise.resolve({ origins: [] }) },
+  // `contains: true` — the harness stands in for a user who has granted host
+  // access; initializeFromUrl gates on it before touching the server.
+  permissions: { onAdded: evt(), onRemoved: evt(), getAll: () => Promise.resolve({ origins: [] }), contains: () => Promise.resolve(true) },
   scripting: { getRegisteredContentScripts: () => Promise.resolve([]), executeScript: () => Promise.resolve([]) },
   sidePanel: { setOptions: noop, open: () => Promise.resolve() },
 };

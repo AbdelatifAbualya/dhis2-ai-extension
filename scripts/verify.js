@@ -1048,6 +1048,40 @@ if (loaded) {
     eq('an ambiguous prefix is NOT guessed', loose('Aller', keys), null);
     eq('an unknown name returns null', loose('Blood Group', keys), null);
   }
+  // ── Sticky page context (the "can't see what stage I'm in" wipe) ──────────
+  // Every hashchange/tab switch/chat turn rebuilds pageContext from the raw
+  // URL; Capture's enrollment dashboard has no stageId and its event-edit
+  // route has no programId, so a plain re-parse silently erased the detected
+  // stage (and program) the model needed for "this stage" (live 2026-07-28).
+  console.log('\nSticky page context:');
+  const carry = need('carryStickyContext');
+  if (carry) {
+    eq('dashboard URL keeps detected stage within same program',
+      carry({ programId: 'P1' }, { programId: 'P1', stageId: 'S1' }).stageId, 'S1');
+    eq('different program drops the stage',
+      carry({ programId: 'P2' }, { programId: 'P1', stageId: 'S1' }).stageId, undefined);
+    eq('event-edit URL (eventId only) keeps resolved program',
+      carry({ eventId: 'E1' }, { programId: 'P1', stageId: 'S1', eventId: 'E1' }).programId, 'P1');
+    eq('same event keeps its stage',
+      carry({ eventId: 'E1' }, { programId: 'P1', stageId: 'S1', eventId: 'E1' }).stageId, 'S1');
+    eq('a DIFFERENT event voids the stage carry',
+      carry({ eventId: 'E2' }, { programId: 'P1', stageId: 'S1', eventId: 'E1' }).stageId, undefined);
+    eq('a stage in the fresh URL always wins',
+      carry({ programId: 'P1', stageId: 'S9' }, { programId: 'P1', stageId: 'S1' }).stageId, 'S9');
+    eq('leaving the program flow entirely carries nothing',
+      carry({ appType: 'Dashboard' }, { programId: 'P1', stageId: 'S1' }).stageId, undefined);
+  }
+
+  // Endpoint path segments that look like UIDs must stay exempt from the
+  // unknown-UID refusal (maintenance/dataPruning was refused live 2026-07-28).
+  const extractUids = need('extractUidsFromCallArgs');
+  if (extractUids) {
+    eq('maintenance/dataPruning path yields no UID candidates',
+      extractUids('dhis2_query', { path: 'maintenance/dataPruning' }), []);
+    eq('a real UID in a path is still extracted',
+      extractUids('dhis2_query', { path: 'programs/a3kGcGpz8FJ' }), ['a3kGcGpz8FJ']);
+  }
+
   const missingTarget = need('actionMissingFieldTarget');
   if (missingTarget) {
     eq('HIDEFIELD with no target is refused', missingTarget('HIDEFIELD', {}), true);

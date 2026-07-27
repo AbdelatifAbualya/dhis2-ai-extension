@@ -1277,6 +1277,7 @@ Use this tool instead of dhis2_query for metadata removal/deletion, program OU a
 Workflow for "remove DE from program + delete it":
 1. manage_metadata(action=remove_from_stage, stage_id=<id>, data_element_ids=[<deId>])
 2. manage_metadata(action=delete, object_type=dataElements, object_id=<deId>)
+If step 2 fails with E4030 "associated with another object: Event" even after the user deleted the events in Capture: events are only SOFT-deleted and still block deletion — run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry the SAME delete once. Never probe analytics/tracker/count tools to investigate a blocked delete.
 Program OU assignment (which OUs can use the program in Capture/Tracker):
 - manage_metadata(action=update_program_org_units, program_id="<id>", org_unit_ids=["<ou1>","<ou2>"], merge_mode="replace")
 Sharing update (e.g., program not appearing in Capture due to missing data access):

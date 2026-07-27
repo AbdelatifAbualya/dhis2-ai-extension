@@ -3467,7 +3467,15 @@ async function executeManageMetadata(args) {
     });
 
     if (delResp._error) {
-      return { _error: `Deletion failed: ${delResp._error}`, backup: backup.block, ...(cascade_deleted.length ? { cascade_deleted } : {}) };
+      return {
+        _error: `Deletion failed: ${delResp._error}`,
+        // safeDhis2Fetch attaches the actionable recovery for E4030
+        // "associated with: Event" (soft-deleted events) — keep it visible.
+        ...(delResp._hint ? { _hint: delResp._hint } : {}),
+        ...(delResp.error_details ? { error_details: delResp.error_details } : {}),
+        backup: backup.block,
+        ...(cascade_deleted.length ? { cascade_deleted } : {}),
+      };
     }
 
     const stats = delResp?.response?.stats || delResp?.stats || {};
@@ -3498,7 +3506,7 @@ async function executeManageMetadata(args) {
         _error: `Cannot delete ${objName}: ${errorMessages.join('; ')}`,
         error_details: errorMessages,
         _hint: hasEventData
-          ? `This data element has been used in submitted events — DHIS2 prevents deletion to preserve data integrity. Options:\n(a) Keep as unused metadata (recommended — preserves historical data)\n(b) Remove all event data values referencing this DE first, then retry deletion`
+          ? `This data element has been used in submitted events — DHIS2 prevents deletion to preserve data integrity. Options:\n(a) Keep as unused metadata (recommended — preserves historical data)\n(b) If the user already deleted the referencing events in the Capture UI: those events are only SOFT-deleted and still block deletion. Run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry this SAME delete once.\n(c) If real (non-deleted) events still hold values, tell the user which events must be deleted first.\nDo NOT probe analytics, tracker reads, or count_records to investigate — they cannot remove the association.`
           : 'Resolve the reported conflicts above, then retry deletion.',
         backup: backup.block,
       };

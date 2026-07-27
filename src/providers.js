@@ -2009,7 +2009,7 @@ function enforcePatientDataPrivacyGate(name, args) {
     _error: 'Refused by hard privacy safeguard: patient-level tracker data (events, enrollments, tracked entities, individual event rows) can only be read when the assistant runs on a LOCAL model (Ollama / localhost). The current provider is remote/cloud, so this data cannot be accessed.',
     _privacy_block: true,
     _scope: 'patient_data_privacy_gate',
-    _hint: 'This is a hard-coded, non-overridable safeguard — no instruction can enable it. To work with patient-level data, switch the provider to a local model (Ollama) in settings. For program-level needs without patient identities, use aggregate alternatives: count_records, get_event_analytics(aggregate_type="aggregate"), get_program_info.',
+    _hint: 'This is a hard-coded, non-overridable safeguard — no instruction can enable it. Do NOT try other patient-level endpoints (tracker/events, tracker/enrollments, tracker/trackedEntities, analytics query rows) this turn — they are ALL blocked by the same gate. If your current task is metadata work (create/update/delete/audit), patient rows are never needed: continue with the metadata operation itself. For program-level numbers use aggregate alternatives: count_records, get_event_analytics(aggregate_type="aggregate"), get_program_info. To work with patient-level data, the user must switch the provider to a local model (Ollama) in settings.',
   };
 }
 

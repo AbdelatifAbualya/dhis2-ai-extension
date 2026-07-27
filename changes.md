@@ -3030,3 +3030,81 @@ stopped forever. No error, no failed call, nothing created.
 **Verification:** `npm run verify` all green (new regressions for both fixes);
 live acceptance run against localhost:8081 with Fireworks `glm-5p2` recorded in
 the full write-up.
+
+---
+
+## v2.8.23 — Stage context detection made sticky + the blocked-delete flail (2026-07-28)
+
+Two live failures from the same session:
+
+**A. "The chatbot can't see what stage I'm in."** The user was working inside a
+stage of W4W Clinic; the context bar showed only `STAGES 8` and the model said
+no stage was detected. Root causes, all fixed:
+
+1. **Context wipe (`src/core.js` `initializeFromUrl`, `src/agent.js`
+   `syncFromTab` + `CHAT_MESSAGE`).** Every hashchange, tab switch, window
+   focus change, and chat turn rebuilt `pageContext` from the raw URL. Capture's
+   enrollment dashboard URL has **no stageId** and its event-edit route
+   (`#/enrollmentEventEdit?eventId=…`) has **no programId**, so each rebuild
+   erased the stage (and on event pages the program) that had already been
+   resolved. New `carryStickyContext(freshCtx, prevCtx)` (src/core.js) is now
+   applied on every cheap rebuild: it keeps the resolved program on
+   event/enrollment-scoped URLs and the known stage within the same program —
+   while a stage in the fresh URL always wins, a different eventId voids the
+   carry, and leaving the program drops everything.
+2. **Never re-sent (`content.js`).** The stage detector only messaged the
+   background when the detected stage *changed*, so after any background wipe
+   or service-worker restart the stage was gone forever. It now re-sends the
+   current stage every 30 s (background no-ops when unchanged).
+3. **Enrollment-only URLs (`src/core.js`).** Routes carrying only
+   `enrollmentId` are now resolved via
+   `tracker/enrollments/{id}?fields=program,orgUnit,trackedEntity`, mirroring
+   the existing event resolution.
+4. **Wrong-stage risk (`content.js`).** The DOM fallback returned the FIRST
+   "expanded" stage widget — but the enrollment dashboard renders *every*
+   stage expanded, so on dev builds (data-test present) it could report
+   whichever stage sorts first. It now reports a DOM-detected stage only when
+   the match is UNIQUE. (Production Capture builds ship no data-test attributes
+   at all — verified live on localhost:8081 — so URL/event-based detection is
+   the actual carrier there.)
+5. **Invisible even when detected (`sidepanel/panel.js`).** The context bar
+   never showed the active stage — only the stage count. It now shows
+   `Stage <name>` when one is in context (count only as fallback).
+
+**B. The blocked-delete flail.** After the user deleted events in Capture and
+asked to delete the now-orphaned duplicate DEs, the model burned a whole turn
+on analytics probes, privacy-refused tracker reads, `count_records`, and four
+random `maintenance/*` guesses — because DHIS2 only **soft-deletes** events,
+the soft-deleted rows still trigger E4030, and nothing named the actual fix.
+
+6. **Actionable E4030 (`src/core.js` `safeDhis2Fetch`, `src/tools-programs.js`
+   delete).** Metadata-import 409s now surface the real per-object
+   `errorReports` messages (previously the model saw only *"see full details in
+   import report"*), and any "associated with another object: Event" failure
+   carries a `_hint` naming the exact recovery: POST
+   `maintenance?softDeletedEventRemoval=true` (verified against the live 2.42
+   openapi), then retry the same delete once — and explicitly forbids
+   analytics/tracker/count probing. Same guidance added to the
+   `manage_metadata` docs and the delete action's E4030 hint.
+7. **Empty 2xx = success (`src/core.js`).** DHIS2 idiomatically returns HTTP
+   200 with an EMPTY body for the whole `/maintenance` family and
+   collection-add endpoints; these were reported as errors (`DHIS2 returned
+   empty response`), so four *successful* maintenance calls each rendered as ✗
+   and kept the model hunting. Empty-body 2xx POST/PUT responses are now
+   success envelopes.
+8. **UID-guard false positive (`src/core.js`).** `maintenance/dataPruning` was
+   refused as a "hallucinated UID" — `dataPruning` is an 11-char camelCase
+   path segment that passes the entropy test. Added to
+   `RESERVED_UID_SHAPED_WORDS`.
+9. **Privacy-gate steering (`src/providers.js`).** The patient-data refusal
+   hint now says all patient-level endpoints are equally blocked this turn and
+   that metadata tasks never need patient rows — one refusal no longer cascades
+   into more refused calls.
+
+**Verification:** `npm run verify` all green with new regressions
+(`carryStickyContext` 7 cases, `extractUidsFromCallArgs` dataPruning exemption);
+new live scenario `scripts/scenario-soft-deleted-de.js` against localhost:8081
+reproduces the user's exact flow (DE + event program + event → soft-delete →
+blocked delete WITH hint → maintenance success → retry delete succeeds →
+teardown) with **0 unexpected failed API calls** and the instance left exactly
+as found. Stage context verified live in Capture on localhost:8081.
