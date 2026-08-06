@@ -811,7 +811,7 @@ If user enabled web browsing from UI, this tool should usually be called before 
               type: 'object',
               properties: {
                 name: { type: 'string' },
-                repeatable: { type: 'boolean' },
+                repeatable: { type: 'boolean', description: 'TRUE when this stage can hold MANY events per enrollment (follow-up visits, repeat lab tests, treatment courses). Defaults to false — so if the user described the stage as repeatable/recurring/"one per visit", you MUST pass repeatable:true HERE. Setting it afterwards needs a separate stage update.' },
                 data_elements: {
                   type: 'array',
                   items: {
@@ -905,7 +905,7 @@ If user enabled web browsing from UI, this tool should usually be called before 
             type: 'object',
             properties: {
               name: { type: 'string' },
-              repeatable: { type: 'boolean' },
+              repeatable: { type: 'boolean', description: 'TRUE when this stage can hold MANY events per enrollment (follow-up visits, repeat lab tests, treatment courses). Defaults to false — so if the user described the stage as repeatable/recurring/"one per visit", you MUST pass repeatable:true HERE. Setting it afterwards needs a separate stage update.' },
               data_elements: {
                 type: 'array',
                 items: {
@@ -1277,6 +1277,7 @@ Use this tool instead of dhis2_query for metadata removal/deletion, program OU a
 Workflow for "remove DE from program + delete it":
 1. manage_metadata(action=remove_from_stage, stage_id=<id>, data_element_ids=[<deId>])
 2. manage_metadata(action=delete, object_type=dataElements, object_id=<deId>)
+If step 2 fails with E4030 "associated with another object: Event" even after the user deleted the events in Capture: events are only SOFT-deleted and still block deletion — run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry the SAME delete once. Never probe analytics/tracker/count tools to investigate a blocked delete.
 Program OU assignment (which OUs can use the program in Capture/Tracker):
 - manage_metadata(action=update_program_org_units, program_id="<id>", org_unit_ids=["<ou1>","<ou2>"], merge_mode="replace")
 Sharing update (e.g., program not appearing in Capture due to missing data access):
@@ -2856,6 +2857,11 @@ status (run this first) → install (if needed) → configure(program_id) → re
 
 ### Hard requirements (the tool validates and refuses with a list if unmet)
 The program MUST have a Date-of-birth (DATE) attribute and a Gender/sex attribute with an option set, and the stage MUST have weight + height + head-circumference data elements. If any of the three DEs is missing the chart will not display. If configure reports missing metadata, offer scaffold_program or ask the user for the exact attribute/DE ids.
+
+**The three measurements must be NUMERIC** (valueType NUMBER/INTEGER…). When you add a missing one with add_data_elements_to_stage, give it valueType NUMBER — a TEXT "Head circumference" is accepted by the plugin's own validator and then plots nothing. configure ignores non-numeric candidates and also skips derived lookalikes on the same stage ("Height status", "Weight-for-age z-score", "Birth weight", "MUAC circumference"), so on a busy examination stage it picks "Height (cm)" over "Height status".
+
+### Reading the result
+configure returns \`resolved.named\` — the actual NAME of every attribute and data element it chose. Relay those names to the user. The plugin only validates that a UID belongs to the stage, so a plausible-but-wrong pick produces an empty chart with no error anywhere; the names are the only chance to catch it.
 
 ### Making it visible
 configure makes the plugin FUNCTION but does not place the widget. Relay the tool's \`dashboard_attach\` block: the plugin must be added to the enrollment dashboard via the Tracker Plugin Configurator app (or Capture's "Add plugin" with the returned plugin source URL). The tool deliberately does NOT write dataStore/capture (Capture-owned; risk of cache corruption).

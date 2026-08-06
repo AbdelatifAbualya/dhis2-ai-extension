@@ -783,7 +783,13 @@
     }
     if (state.visualizationName) chips.push({ label: 'Viz', value: state.visualizationName });
     if (state.ouName) chips.push({ label: 'OU', value: state.ouName });
-    if (state.stagesCount) chips.push({ label: 'Stages', value: state.stagesCount });
+    if (state.stageName || state.stageId) {
+      // Active stage detected — show it by name (falls back to the UID only
+      // when program metadata hasn't resolved yet). More useful than the count.
+      chips.push({ label: 'Stage', value: state.stageName || state.stageId });
+    } else if (state.stagesCount) {
+      chips.push({ label: 'Stages', value: state.stagesCount });
+    }
     if (state.trackedEntityType) chips.push({ label: 'TE', value: state.trackedEntityType });
 
     if (chips.length === 0) {
@@ -1644,10 +1650,11 @@ ${turnXml}
       manage_legend_sets: { cls: 'tool-icon-create', icon: '\u{1F3A8}' },
       manage_dashboards: { cls: 'tool-icon-create', icon: '\u{1F4CA}' },
       manage_maps: { cls: 'tool-icon-create', icon: '\u{1F5FA}' },
+      manage_line_lists: { cls: 'tool-icon-create', icon: '\u{1F4CB}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
-    const iconInfo = iconMap[tool] || { cls: 'tool-icon-api', icon: '\u{1F50D}' };
+    const iconInfo = iconMap[tool] || { cls: 'tool-icon-api', icon: '\u{1F6E0}️' };
 
     const toolLabels = {
       render_chart: 'Rendering chart',
@@ -1681,10 +1688,17 @@ ${turnXml}
       manage_legend_sets: 'Managing legend sets',
       manage_dashboards: 'Building dashboards',
       manage_maps: 'Building maps',
+      manage_line_lists: 'Building line lists',
       manage_backups: 'Managing backups',
       diagnose_save_error: 'Diagnosing save error',
     };
-    const label = toolLabels[tool] || 'Querying DHIS2';
+    // Fallback must never claim a specific tool. Labelling an unmapped tool
+    // "Querying DHIS2" made manage_line_lists look like a raw dhis2_query and
+    // read as a tool-router bug (reported live 2026-08-02). Humanize the real
+    // tool name instead, so a future unmapped tool is self-describing.
+    const label = toolLabels[tool] || (tool
+      ? String(tool).replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())
+      : 'Working');
 
     // Build detailed info showing actual API call
     let detail = '';
@@ -1713,6 +1727,12 @@ ${turnXml}
     } else if (tool === 'dhis2_query') {
       const method = args.method && args.method !== 'GET' ? `${args.method} ` : '';
       detail = method + (args.path || '').slice(0, 120);
+    } else if (tool === 'resolve_option_codes') {
+      const parts = [];
+      if (args.option_codes?.length) parts.push(`${args.option_codes.length} code(s)`);
+      if (args.data_element_ids?.length) parts.push(`${args.data_element_ids.length} DE(s)`);
+      if (args.org_unit_ids?.length) parts.push(`${args.org_unit_ids.length} OU(s)`);
+      detail = parts.join(', ') || 'nothing to resolve';
     } else if (tool === 'detect_enrollment_abnormalities') {
       const parts = ['enrollments'];
       if (args.status) parts.push(`status=${args.status}`);
@@ -1923,6 +1943,21 @@ ${turnXml}
       if (args.data_item) parts.push(`dx: ${String(args.data_item).slice(0, 11)}`);
       if (args.org_unit_level != null) parts.push(`level ${args.org_unit_level}`);
       if (args.thematic_map_type) parts.push(String(args.thematic_map_type));
+      if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_line_lists') {
+      const parts = [args.action || 'list'];
+      if (args.name) parts.push(`"${String(args.name).slice(0, 40)}"`);
+      if (args.line_list_id) parts.push(`id: ${String(args.line_list_id).slice(0, 11)}`);
+      if (args.output_type) parts.push(String(args.output_type));
+      if (args.program_name) parts.push(`program: "${String(args.program_name).slice(0, 30)}"`);
+      else if (args.program_id) parts.push(`program: ${String(args.program_id).slice(0, 11)}`);
+      if (args.program_stage_id) parts.push(`stage: ${String(args.program_stage_id).slice(0, 11)}`);
+      if (Array.isArray(args.columns) && args.columns.length) parts.push(`${args.columns.length} column(s)`);
+      if (Array.isArray(args.filters) && args.filters.length) parts.push(`${args.filters.length} filter(s)`);
+      if (Array.isArray(args.sorting) && args.sorting.length) parts.push(`sort ${args.sorting.length}`);
+      if (args.legend) parts.push('legend');
+      if (args.completed_only) parts.push('completed only');
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
       detail = parts.join(', ');
     } else if (tool === 'manage_backups') {

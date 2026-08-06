@@ -2933,3 +2933,244 @@ Full write-up with root causes, before/after tables and live evidence:
 DHIS2 2.42.5.1 driven by MiniMax-M3: program + indicators + dashboard build, analytics
 verification, and the sharing diagnose-then-fix scenario all complete with **0 failed API
 calls**; all 11 analytics outputs independently confirmed to return real data.
+
+---
+
+## v2.8.21 — Growth chart plugin: the 80 KB truncation that reported `Program "undefined"`
+
+**Files:** `src/core.js`, `src/tools-programs.js`, `src/registry.js`,
+`scripts/scenario-growth-chart.js` (new), `scripts/verify.js`
+**Full write-up:** `CHANGES_growth_chart_truncation.md`
+
+Setting up the WHO Capture Growth Chart plugin on a real tracker program failed on
+every attempt with `Program "undefined" is not a tracker (WITH_REGISTRATION)
+program` — about a program that IS a tracker program, in the same turn as a
+`dhis2_query` that had just returned `WITH_REGISTRATION` for it.
+
+1. **`safeDhis2Fetch` truncation gutted the object it was asked to read.**
+   `gcFetchProgram` expanded every attribute's option set in one request; the
+   program carries a few-thousand-option "School" list, so the response was 446 KB.
+   Over 80 KB the truncation branch returned `{_apiPath, _truncated, _originalSize,
+   _note}` and **discarded everything else** — `programType` and `displayName`
+   became `undefined` and the next line reported the program was not a tracker.
+   Truncation protects the model's context; it must never fire on a response the
+   extension itself parses. It is now skipped for `noTruncate` callers, for **all
+   write responses** (a truncated import report reads as a clean success), and for
+   **`fields=:owner`/`:all`** reads (always read-modify-write — a truncated body
+   PUT back would wipe the object). When it does fire it is now shape-preserving:
+   top-level scalars always survive and the withheld collections are named in
+   `_truncated_fields`. `gcFetchProgram` also stopped asking for 446 KB, and
+   `configure` refuses to draw conclusions from an incomplete read.
+
+2. **The wrong data elements were being chosen, silently.** The stage lists
+   "Height status" (TEXT) and "Weight Status" (TEXT) *before* "Height (cm)" and
+   "Weight (Kg)", so first-match-wins name detection picked the TEXT
+   classification fields. The plugin's own validator only checks that a UID
+   belongs to the stage, so the config would have been accepted and the chart
+   would have plotted nothing, with no error anywhere. Measurements must now be
+   **numeric**, derived lookalikes (z-score, birth weight, gain, status, MUAC…)
+   are excluded, and candidates are **ranked** — a unit-carrying name beats a bare
+   one — instead of first-match-wins.
+
+3. **The same bug in a much more common call.** Stress-testing the new truncation
+   path against the largest program on the test instance (1352 stage data elements)
+   showed `get_program_info(stage_details, target_id)` returning **zero data
+   elements** on 4 of 6 stages — it expands every data element's option set, blew
+   the budget, and handed the model a stub telling it to "request narrower fields",
+   which it cannot do. New `fetchStageDetails()` narrows the query itself: full →
+   without option lists → a minimal projection summarised locally with an honest
+   `total_data_elements` count. All 6 stages now return their data elements.
+
+4. **Hygiene:** `_apiPath`/`_pagerInfo` are now non-enumerable, so they stop riding
+   into PUT bodies and stored dataStore values (one had been written verbatim into
+   the plugin's config); existence is probed via `GET /api/dataStore` and the right
+   dataStore verb is used first, removing two 404s and a 409 from every run; the
+   written config is read back and verified; and `configure` returns the **name**
+   of every object it chose, since nothing downstream will ever complain about a
+   plausible-but-wrong UID.
+
+**Verification:** `npm run verify` — all checks passing, including a new offline
+regression for the measurement picker. Live against the reported instance
+(DHIS2 2.42.5.1): `scripts/scenario-growth-chart.js` — 24 API calls, **0 failed**,
+all checks green, with the chosen data elements re-confirmed against DHIS2 rather
+than against the tool's own answer. `scripts/scenario-line-lists.js` re-run as a
+regression on the `safeDhis2Fetch` change: 110 API calls, **0 failed**.
+
+## v2.8.22 — The silent mid-task stall + rule actions shipped without their target
+
+**Files:** `src/agent.js`, `src/core.js`, `src/tools-programs.js`, `scripts/verify.js`
+**Full write-up:** `CHANGES_unfinished_turn_and_action_targets.md`
+
+A live W4W Clinic build (8 stages, ~30 rules) ran its discovery calls, streamed
+*"Creating the program shell …, then adding the remaining stages."* — and then
+stopped forever. No error, no failed call, nothing created.
+
+1. **Unfinished-turn guard (`src/agent.js`).** The loop treated any non-empty
+   text without tool calls as the final answer. A reply cut by the output token
+   limit after its visible text (`finish_reason='length'`), or an
+   announcement-only reply promising imminent work, silently ended the turn
+   mid-task. Both now trigger a bounded corrective nudge (max 3/turn): emit the
+   next tool call now, split large programs into shell + per-stage + rule
+   batches. `looksLikeUnfinishedAnnouncement()` (new, `src/core.js`) is
+   conservative — questions and long reports never fire it, and it only acts
+   mid-task (a tool already ran this turn).
+
+2. **Rule-action target resolution (`src/tools-programs.js`).** Action targets
+   resolved by EXACT name only; `"Allergy Details"` vs the DE created as
+   `"Allergy details"` shipped a HIDEFIELD with **no target**, and the server
+   409'd the whole batch at VALIDATE (`DataElement or TrackedEntityAttribute
+   cannot be null`). Both rule paths now loose-resolve names (case/whitespace
+   fold, unique prefix — never a guess between two candidates) and **refuse
+   client-side** any action the server would reject: field actions with no
+   DE/TEA, ASSIGN with no target and no content variable, HIDEOPTION without
+   its option, option-group actions without their group. `add_program_rules`
+   also gained `option_id`/`option_group_id` pass-throughs — HIDEOPTION via
+   that path previously always died at VALIDATE.
+
+**Verification:** `npm run verify` all green (new regressions for both fixes);
+live acceptance run against localhost:8081 with Fireworks `glm-5p2` recorded in
+the full write-up.
+
+---
+
+## v2.8.23 — Stage context detection made sticky + the blocked-delete flail (2026-07-28)
+
+Two live failures from the same session:
+
+**A. "The chatbot can't see what stage I'm in."** The user was working inside a
+stage of W4W Clinic; the context bar showed only `STAGES 8` and the model said
+no stage was detected. Root causes, all fixed:
+
+1. **Context wipe (`src/core.js` `initializeFromUrl`, `src/agent.js`
+   `syncFromTab` + `CHAT_MESSAGE`).** Every hashchange, tab switch, window
+   focus change, and chat turn rebuilt `pageContext` from the raw URL. Capture's
+   enrollment dashboard URL has **no stageId** and its event-edit route
+   (`#/enrollmentEventEdit?eventId=…`) has **no programId**, so each rebuild
+   erased the stage (and on event pages the program) that had already been
+   resolved. New `carryStickyContext(freshCtx, prevCtx)` (src/core.js) is now
+   applied on every cheap rebuild: it keeps the resolved program on
+   event/enrollment-scoped URLs and the known stage within the same program —
+   while a stage in the fresh URL always wins, a different eventId voids the
+   carry, and leaving the program drops everything.
+2. **Never re-sent (`content.js`).** The stage detector only messaged the
+   background when the detected stage *changed*, so after any background wipe
+   or service-worker restart the stage was gone forever. It now re-sends the
+   current stage every 30 s (background no-ops when unchanged).
+3. **Enrollment-only URLs (`src/core.js`).** Routes carrying only
+   `enrollmentId` are now resolved via
+   `tracker/enrollments/{id}?fields=program,orgUnit,trackedEntity`, mirroring
+   the existing event resolution.
+4. **Wrong-stage risk (`content.js`).** The DOM fallback returned the FIRST
+   "expanded" stage widget — but the enrollment dashboard renders *every*
+   stage expanded, so on dev builds (data-test present) it could report
+   whichever stage sorts first. It now reports a DOM-detected stage only when
+   the match is UNIQUE. (Production Capture builds ship no data-test attributes
+   at all — verified live on localhost:8081 — so URL/event-based detection is
+   the actual carrier there.)
+5. **Invisible even when detected (`sidepanel/panel.js`).** The context bar
+   never showed the active stage — only the stage count. It now shows
+   `Stage <name>` when one is in context (count only as fallback).
+
+**B. The blocked-delete flail.** After the user deleted events in Capture and
+asked to delete the now-orphaned duplicate DEs, the model burned a whole turn
+on analytics probes, privacy-refused tracker reads, `count_records`, and four
+random `maintenance/*` guesses — because DHIS2 only **soft-deletes** events,
+the soft-deleted rows still trigger E4030, and nothing named the actual fix.
+
+6. **Actionable E4030 (`src/core.js` `safeDhis2Fetch`, `src/tools-programs.js`
+   delete).** Metadata-import 409s now surface the real per-object
+   `errorReports` messages (previously the model saw only *"see full details in
+   import report"*), and any "associated with another object: Event" failure
+   carries a `_hint` naming the exact recovery: POST
+   `maintenance?softDeletedEventRemoval=true` (verified against the live 2.42
+   openapi), then retry the same delete once — and explicitly forbids
+   analytics/tracker/count probing. Same guidance added to the
+   `manage_metadata` docs and the delete action's E4030 hint.
+7. **Empty 2xx = success (`src/core.js`).** DHIS2 idiomatically returns HTTP
+   200 with an EMPTY body for the whole `/maintenance` family and
+   collection-add endpoints; these were reported as errors (`DHIS2 returned
+   empty response`), so four *successful* maintenance calls each rendered as ✗
+   and kept the model hunting. Empty-body 2xx POST/PUT responses are now
+   success envelopes.
+8. **UID-guard false positive (`src/core.js`).** `maintenance/dataPruning` was
+   refused as a "hallucinated UID" — `dataPruning` is an 11-char camelCase
+   path segment that passes the entropy test. Added to
+   `RESERVED_UID_SHAPED_WORDS`.
+9. **Privacy-gate steering (`src/providers.js`).** The patient-data refusal
+   hint now says all patient-level endpoints are equally blocked this turn and
+   that metadata tasks never need patient rows — one refusal no longer cascades
+   into more refused calls.
+
+**Verification:** `npm run verify` all green with new regressions
+(`carryStickyContext` 7 cases, `extractUidsFromCallArgs` dataPruning exemption);
+new live scenario `scripts/scenario-soft-deleted-de.js` against localhost:8081
+reproduces the user's exact flow (DE + event program + event → soft-delete →
+blocked delete WITH hint → maintenance success → retry delete succeeds →
+teardown) with **0 unexpected failed API calls** and the instance left exactly
+as found. Stage context verified live in Capture on localhost:8081.
+
+---
+
+## v2.8.24 — line-list tool visibility, two silent-wrong-data defects, and sticky context
+
+Triggered by a live report that "create a line listing" routed to the wrong
+tool. **The router was never wrong** — the side panel simply had no label for
+`manage_line_lists`, so its cards rendered with the generic fallback
+`"Querying DHIS2"` and read exactly like raw `dhis2_query` calls. Replaying the
+user's turn through `getContextualTools` offers `manage_line_lists` in every
+page context.
+
+Full write-up: `CHANGES_line_list_router_and_405_heal.md`.
+
+1. **`manage_line_lists` was invisible to the panel** (`sidepanel/panel.js`) —
+   added its icon, label ("Building line lists") and detail formatter, plus a
+   missing `resolve_option_codes` formatter. The fallback label no longer names
+   a specific tool (it humanizes the real tool name), so a missing map entry can
+   never again masquerade as a different tool. `npm run verify` now pins all
+   three panel maps to `TOOL_ROUTER` — 33/33 tools covered.
+2. **A stage the user called "repeatable" shipped one-event-only**
+   (`src/registry.js`, `src/tools-programs.js`) — `repeatable` had no schema
+   description (so it never reached the model through either docs tier) and
+   defaults to `false`, making an omitted flag indistinguishable from a
+   deliberate one. Added the description **and** made `create_program` echo the
+   resolved per-stage value with a verify instruction, so the omission is
+   visible in the model's own tool result. A direct executor probe proved the
+   tool itself always passed the flag through correctly.
+3. **`GET /api/optionSets/A,B,C` → HTTP 405** (`src/core.js`,
+   `src/tools-metadata.js`) — new `healMultiUidPath()` rewrites a
+   comma-separated UID path to `?filter=id:in:[…]&paging=false`, turning one
+   failed call plus three recovery fetches into a single 200. Fires only when
+   every token is a real 11-char UID and the list is the whole second path
+   segment; 10 boundary cases pinned in `npm run verify`.
+4. **"It finds the stage for a bit, then loses it"** (`src/agent.js`) —
+   `carryStickyContext` (v2.8.23) computed the right context but three sites
+   wrote it to memory only. Chrome kills the MV3 worker after ~30 s idle and
+   restores `dhis2` from session storage, so the content script's stage
+   detection — which no URL re-parse can rebuild — was reliably lost.
+   `saveState()` added at all three sites; new `npm run sticky`
+   (`scripts/scenario-sticky-context.js`) boots the real background bundle
+   twice against one shared session store and proves the stage survives.
+
+**Live acceptance** — `accounts/fireworks/models/deepseek-v4-flash-0731`
+(Fireworks) driven through the real agentic loop against DHIS2 2.42 at
+`localhost:8081`, four persisted conversation turns deliberately shaped like the
+original report:
+
+| Turn | Task | DHIS2 calls | Failed |
+|---|---|---|---|
+| 1 | Build a tracker program: 6 attributes, 3 stages, 14 DEs, 6 option sets, 5 rules | 48 | **0** |
+| 2 | 8 program indicators (5 counts + 3 single-PI percentages) | 23 | **0** |
+| 3 | 3 saved visualizations + a shared dashboard | 10 | **0** |
+| 4 | *"instead of a visualization, create a line listing … add it to the same dashboard"* | 22 | **0** |
+| | **Total** | **103** | **0** |
+
+Verified on the server afterwards, not just from the model's summary:
+program `WITH_REGISTRATION` / person TET / `rwrw----` / all 6 org units; stages
+`repeatable` = false/**true**/false exactly as requested; all 5 rules correct
+(`A{}` for attribute-sourced conditions, option **codes** not labels); all 8
+program indicators structurally right and **all 16 expressions/filters
+`status: OK`** against the live `/programIndicators/{expression,filter}/description`
+parser; dashboard holding the 3 original tiles **plus** both line lists
+(the turn-3 tiles were not destroyed) — the ENROLLMENT register spanning all
+three stages and the EVENT register scoped to the Treatment stage, both
+`LAST_12_MONTHS`.

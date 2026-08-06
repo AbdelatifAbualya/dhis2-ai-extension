@@ -90,7 +90,8 @@ try {
     .join('\n');
   // `dhis2` is a bundle-lexical `let`, so expose a reader for the few checks
   // that need to drive per-turn counters (the loop guards).
-  vm.runInContext(bundle + '\n;globalThis.__dhis2 = () => dhis2;',
+  vm.runInContext(bundle + '\n;globalThis.__dhis2 = () => dhis2;'
+    + '\n;globalThis.__TOOL_ROUTER = TOOL_ROUTER;',
     ctx, { filename: 'background.bundle.js' });
   loaded = true;
   ok(`loaded ${modules.length} modules: ${modules.map((m) => m.replace('src/', '')).join(', ')}`);
@@ -965,6 +966,225 @@ if (loaded) {
       truthy('an authorized turn restores the sticky tool',
         names(MAINT, 'yes, fix it').has('manage_custom_translations'));
     }
+  }
+
+  // ── Growth-chart measurement detection ────────────────────────────────────
+  // Regression for the 2026-07-25 report. A real examination stage lists the
+  // TEXT classification fields BEFORE the numeric measurements, so first-match
+  // -wins name detection wrote "Height status" as the height data element. The
+  // plugin's own validator only checks that a UID belongs to the stage, so the
+  // config was accepted and the chart silently plotted nothing.
+  console.log('\nGrowth-chart measurement detection:');
+  const pick = fn('gcPickMeasurement');
+  if (!pick) bad('gcPickMeasurement — missing');
+  else {
+    const stage = [
+      { id: 'stageDe0001', displayName: 'Hemoglobin', valueType: 'NUMBER' },
+      { id: 'stageDe0002', displayName: 'Height status', valueType: 'TEXT' },
+      { id: 'stageDe0003', displayName: 'Weight Status', valueType: 'TEXT' },
+      { id: 'stageDe0004', displayName: 'Acute Malnutrition', valueType: 'TEXT' },
+      { id: 'stageDe0005', displayName: 'Height (cm)', valueType: 'NUMBER' },
+      { id: 'stageDe0006', displayName: 'Weight (Kg)', valueType: 'NUMBER' },
+      { id: 'stageDe0007', displayName: 'BMI', valueType: 'NUMBER' },
+      { id: 'stageDe0008', displayName: 'Head Circumference (cm)', valueType: 'NUMBER' },
+    ];
+    eq('height skips the TEXT "Height status"', pick(stage, 'height')?.id, 'stageDe0005');
+    eq('weight skips the TEXT "Weight Status"', pick(stage, 'weight')?.id, 'stageDe0006');
+    eq('head circumference resolves', pick(stage, 'headCircumference')?.id, 'stageDe0008');
+
+    // Derived fields never stand in for the raw measurement.
+    const derived = [
+      { id: 'aaaaaaaaaa1', displayName: 'Weight-for-age z-score', valueType: 'NUMBER' },
+      { id: 'aaaaaaaaaa2', displayName: 'Birth weight (Kg)', valueType: 'NUMBER' },
+      { id: 'aaaaaaaaaa3', displayName: 'Weight gain', valueType: 'NUMBER' },
+    ];
+    eq('z-score / birth weight / weight gain are not the weight', pick(derived, 'weight'), null);
+
+    // A unit-carrying name wins over a bare one, whatever the stage order.
+    const bare = [
+      { id: 'bbbbbbbbbb1', displayName: 'Weight', valueType: 'NUMBER' },
+      { id: 'bbbbbbbbbb2', displayName: 'Weight (kg)', valueType: 'NUMBER' },
+    ];
+    eq('a unit-carrying name outranks a bare one', pick(bare, 'weight')?.id, 'bbbbbbbbbb2');
+
+    // MUAC is a circumference but never a head circumference.
+    const muac = [{ id: 'cccccccccc1', displayName: 'MUAC circumference (cm)', valueType: 'NUMBER' }];
+    eq('MUAC is not head circumference', pick(muac, 'headCircumference'), null);
+    eq('a non-numeric measurement is never chosen',
+      pick([{ id: 'dddddddddd1', displayName: 'Weight (Kg)', valueType: 'TEXT' }], 'weight'), null);
+  }
+
+  // ── Unfinished-turn guard: announcement-only replies (2026-07-26) ─────────
+  // A turn that ends on "Creating the program shell …, then adding the
+  // remaining stages." with no tool call silently abandons the task — the
+  // panel goes idle with no error (the W4W Clinic stall). The loop nudges the
+  // model to continue when this fires mid-task.
+  console.log('\nUnfinished-turn announcement detection:');
+  const ann = need('looksLikeUnfinishedAnnouncement');
+  if (ann) {
+    eq('the live W4W announcement is detected',
+      ann('Creating the program shell with registration attributes and Form 1 first, then adding the remaining stages.'), true);
+    eq('a first-person promise is detected',
+      ann("I'll now create the remaining stages and program rules."), true);
+    eq('a past-tense completion summary is NOT flagged',
+      ann('Done. Created the W4W Clinic program with 8 stages, 30 rules and 12 attributes.'), false);
+    eq('a question to the user is NOT flagged',
+      ann('Two programs match "W4W". Which one should I extend?'), false);
+    eq('a long final report is NOT flagged', ann('Creating summary: ' + 'x'.repeat(2100)), false);
+    eq('empty text is NOT flagged', ann(''), false);
+  }
+
+  // ── Rule-action target resolution (the "Allergy Details" 409) ─────────────
+  // HIDEFIELD targeting "Allergy Details" while the DE was created as
+  // "Allergy details" shipped a targetless action and 409'd the whole batch
+  // at VALIDATE (live 2026-07-26). Loose resolution forgives case/spacing;
+  // the missing-target lint refuses anything still unresolved client-side.
+  console.log('\nRule-action target resolution:');
+  const loose = need('resolveLooseNameKey');
+  if (loose) {
+    const keys = ['Allergy', 'Allergy details', 'Chronic Disease Type'];
+    eq('exact key wins', loose('Allergy', keys), 'Allergy');
+    eq('case drift resolves to the canonical key', loose('Allergy Details', keys), 'Allergy details');
+    eq('whitespace drift resolves', loose('  chronic disease   type ', keys), 'Chronic Disease Type');
+    eq('an ambiguous prefix is NOT guessed', loose('Aller', keys), null);
+    eq('an unknown name returns null', loose('Blood Group', keys), null);
+  }
+  // ── Sticky page context (the "can't see what stage I'm in" wipe) ──────────
+  // Every hashchange/tab switch/chat turn rebuilds pageContext from the raw
+  // URL; Capture's enrollment dashboard has no stageId and its event-edit
+  // route has no programId, so a plain re-parse silently erased the detected
+  // stage (and program) the model needed for "this stage" (live 2026-07-28).
+  console.log('\nSticky page context:');
+  const carry = need('carryStickyContext');
+  if (carry) {
+    eq('dashboard URL keeps detected stage within same program',
+      carry({ programId: 'P1' }, { programId: 'P1', stageId: 'S1' }).stageId, 'S1');
+    eq('different program drops the stage',
+      carry({ programId: 'P2' }, { programId: 'P1', stageId: 'S1' }).stageId, undefined);
+    eq('event-edit URL (eventId only) keeps resolved program',
+      carry({ eventId: 'E1' }, { programId: 'P1', stageId: 'S1', eventId: 'E1' }).programId, 'P1');
+    eq('same event keeps its stage',
+      carry({ eventId: 'E1' }, { programId: 'P1', stageId: 'S1', eventId: 'E1' }).stageId, 'S1');
+    eq('a DIFFERENT event voids the stage carry',
+      carry({ eventId: 'E2' }, { programId: 'P1', stageId: 'S1', eventId: 'E1' }).stageId, undefined);
+    eq('a stage in the fresh URL always wins',
+      carry({ programId: 'P1', stageId: 'S9' }, { programId: 'P1', stageId: 'S1' }).stageId, 'S9');
+    eq('leaving the program flow entirely carries nothing',
+      carry({ appType: 'Dashboard' }, { programId: 'P1', stageId: 'S1' }).stageId, undefined);
+  }
+
+  // Endpoint path segments that look like UIDs must stay exempt from the
+  // unknown-UID refusal (maintenance/dataPruning was refused live 2026-07-28).
+  const extractUids = need('extractUidsFromCallArgs');
+  if (extractUids) {
+    eq('maintenance/dataPruning path yields no UID candidates',
+      extractUids('dhis2_query', { path: 'maintenance/dataPruning' }), []);
+    eq('a real UID in a path is still extracted',
+      extractUids('dhis2_query', { path: 'programs/a3kGcGpz8FJ' }), ['a3kGcGpz8FJ']);
+  }
+
+  // ── Detected context must be PERSISTED, not just held in memory ──────────
+  // Chrome kills the MV3 worker after ~30 s idle and rebuilds `dhis2` from
+  // chrome.storage.session. carryStickyContext computes the right sticky
+  // context, but three sites wrote it to memory only — so the stage was known
+  // "for a bit" and then permanently gone (reported live 2026-08-06). The
+  // sticky carry cannot be re-derived from the URL, so every site that assigns
+  // pageContext outside initializeFromUrl MUST call saveState().
+  console.log('\nPage-context persistence:');
+  {
+    const agentSrc = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+    const blockAfter = (marker, len) => {
+      const i = agentSrc.indexOf(marker);
+      return i === -1 ? null : agentSrc.slice(i, i + len);
+    };
+    const cases = [
+      ["case 'DHIS2_STAGE_DETECTED'", 2000, 'detected stage is persisted'],
+      ['async function syncFromTab', 1200, 'tab-switch context carry is persisted'],
+    ];
+    for (const [marker, len, label] of cases) {
+      const blk = blockAfter(marker, len);
+      if (!blk) { bad(`${label} — could not locate ${marker} in src/agent.js`); continue; }
+      if (!/\bsaveState\s*\(/.test(blk)) bad(`${label} — no saveState() call; a worker restart will lose it`);
+      else ok(label);
+    }
+    // The chat-turn rebuild must persist on EVERY branch, including the
+    // "nothing else changed" one.
+    const chatBlk = blockAfter('const freshCtx = carryStickyContext', 2600);
+    if (!chatBlk) bad('chat-turn context rebuild — could not locate it in src/agent.js');
+    else if ((chatBlk.match(/\bsaveState\s*\(/g) || []).length < 3) {
+      bad('chat-turn context rebuild — a branch assigns pageContext without saveState()');
+    } else ok('chat-turn context rebuild is persisted on every branch');
+  }
+
+  // ── Multi-UID path heal (the DHIS2 405 that looks like a working URL) ────
+  // GET /api/optionSets/A,B,C is what models reach for and DHIS2 answers 405.
+  console.log('\nMulti-UID path heal:');
+  const heal = need('healMultiUidPath');
+  if (heal) {
+    const healed = heal('optionSets/qP6eFxS2QfQ,G26Oi8VjeXV,sSgEHRhCkjR?fields=id,displayName', 'GET');
+    truthy('three UIDs become a collection query', healed.startsWith('optionSets?'));
+    truthy('ids land in filter=id:in:[…]', decodeURIComponent(healed).includes('filter=id:in:[qP6eFxS2QfQ,G26Oi8VjeXV,sSgEHRhCkjR]'));
+    truthy('fields are preserved', decodeURIComponent(healed).includes('fields=id,displayName'));
+    truthy('paging is disabled so all ids come back', healed.includes('paging=false'));
+    eq('a single UID is left alone', heal('optionSets/qP6eFxS2QfQ?fields=id', 'GET'), 'optionSets/qP6eFxS2QfQ?fields=id');
+    eq('a non-UID comma list is left alone', heal('dataValueSets/a,b?x=1', 'GET'), 'dataValueSets/a,b?x=1');
+    eq('a sub-resource path is left alone', heal('programs/aGaF9TXsyTp,zGa7MSw6vwt/metadata', 'GET'), 'programs/aGaF9TXsyTp,zGa7MSw6vwt/metadata');
+    eq('non-GET is never rewritten', heal('optionSets/qP6eFxS2QfQ,G26Oi8VjeXV', 'POST'), 'optionSets/qP6eFxS2QfQ,G26Oi8VjeXV');
+    eq('a plain collection path is untouched', heal('optionSets?fields=id', 'GET'), 'optionSets?fields=id');
+    truthy('an existing filter is kept alongside the id filter',
+      (decodeURIComponent(heal('dataElements/aGaF9TXsyTp,zGa7MSw6vwt?filter=name:like:x', 'GET')).match(/filter=/g) || []).length === 2);
+  }
+
+  // ── Every routable tool must be presentable in the side panel ─────────────
+  // The panel renders a tool card from two lookup tables plus a detail
+  // formatter. A tool missing from them fell through to a generic fallback
+  // that read "Querying DHIS2" — so manage_line_lists rendered exactly like a
+  // raw dhis2_query call and looked like a tool-router misroute (live
+  // 2026-08-02). The maps are hand-maintained, so pin them to TOOL_ROUTER.
+  console.log('\nSide-panel tool presentation:');
+  {
+    const router = ctx.__TOOL_ROUTER;
+    const panelSrc = fs.readFileSync(path.join(ROOT, 'sidepanel/panel.js'), 'utf8');
+    const block = (re, what) => {
+      const m = panelSrc.match(re);
+      if (!m) { bad(`sidepanel/panel.js — could not locate ${what}`); return null; }
+      return new Set([...m[1].matchAll(/^\s*(\w+)\s*:/gm)].map((x) => x[1]));
+    };
+    const iconKeys = block(/const iconMap = \{([\s\S]*?)\n\s*\};/, 'iconMap');
+    const labelKeys = block(/const toolLabels = \{([\s\S]*?)\n\s*\};/, 'toolLabels');
+    const detailKeys = new Set(
+      [...panelSrc.matchAll(/tool === '(\w+)'/g)].map((m) => m[1]));
+    if (!router || typeof router !== 'object') {
+      bad('TOOL_ROUTER not exposed to the verifier');
+    } else {
+      const names = Object.keys(router);
+      const missing = (set, what) => {
+        if (!set) return;
+        const gaps = names.filter((n) => !set.has(n));
+        if (gaps.length) bad(`${what} is missing: ${gaps.join(', ')}`);
+        else ok(`${what} covers all ${names.length} routable tools`);
+      };
+      missing(iconKeys, 'panel iconMap');
+      missing(labelKeys, 'panel toolLabels');
+      // render_chart is matched via an `isChart` flag, not a `tool ===` test,
+      // and dhis2_query's args.path fallback is already meaningful.
+      const detailExempt = new Set(['render_chart']);
+      const detailGaps = names.filter((n) => !detailKeys.has(n) && !detailExempt.has(n));
+      if (detailGaps.length) bad(`panel detail formatter has no branch for: ${detailGaps.join(', ')}`);
+      else ok(`panel detail formatter covers all ${names.length} routable tools`);
+    }
+  }
+
+  const missingTarget = need('actionMissingFieldTarget');
+  if (missingTarget) {
+    eq('HIDEFIELD with no target is refused', missingTarget('HIDEFIELD', {}), true);
+    eq('HIDEFIELD with a DE passes', missingTarget('HIDEFIELD', { dataElement: { id: 'x' } }), false);
+    eq('SETMANDATORYFIELD with a TEA passes', missingTarget('SETMANDATORYFIELD', { trackedEntityAttribute: { id: 'x' } }), false);
+    eq('ASSIGN to a variable via content passes', missingTarget('ASSIGN', { content: '#{v}' }), false);
+    eq('ASSIGN with no target and no content is refused', missingTarget('ASSIGN', {}), true);
+    eq('HIDEOPTION without the option is refused', missingTarget('HIDEOPTION', { dataElement: { id: 'x' } }), true);
+    eq('HIDEOPTION with option + DE passes', missingTarget('HIDEOPTION', { dataElement: { id: 'x' }, option: { id: 'o' } }), false);
+    eq('SHOWWARNING without a DE still passes (legal)', missingTarget('SHOWWARNING', {}), false);
   }
 }
 

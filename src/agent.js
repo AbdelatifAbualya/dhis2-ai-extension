@@ -539,6 +539,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   let emptyResponseCount = 0;
   let leakedToolCallCount = 0; // tool calls emitted as plain text instead of native calls // Guard against infinite think-only loops
   let providerStallRetries = 0; // Transparent retries for mid-stream stalls (nothing shown to the user yet)
+  let unfinishedTextNudges = 0; // text-only replies that are provably not a finished answer (cut by token limit / announcement-only)
+  let anyToolCallThisTurn = false; // at least one tool call was emitted this turn (marks the turn as mid-task)
 
   // ── Mechanical circuit breaker for deterministic retry loops ────────────────
   // The repeated-failure guard (preflightCheckCall) only ASKS the model to stop
@@ -645,6 +647,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     const allToolCalls = msg.tool_calls || [];
 
     if (allToolCalls.length > 0) {
+      anyToolCallThisTurn = true;
       for (const tc of allToolCalls) {
         const toolName = tc.function?.name;
         let args;
@@ -1146,6 +1149,33 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
       // Reset counter on any real content
       emptyResponseCount = 0;
 
+      // ── Unfinished-turn guard: text that is provably NOT a finished answer ──
+      // Two silent task-abandonment shapes end a turn here with no error and
+      // no further tool calls (observed live 2026-07-26: the W4W Clinic build
+      // stopped forever after "Creating the program shell …, then adding the
+      // remaining stages." — panel idle, nothing created, no error anywhere):
+      //   a) finish_reason='length' — the reply was CUT by the output token
+      //      limit after the visible text but before a tool call streamed;
+      //   b) an announcement-only reply — the model states what it is about
+      //      to do and stops without calling any tool (fast/weak models under
+      //      a huge task). Heuristic, so it only fires mid-task (a tool
+      //      already ran this turn) and is capped: a false positive costs one
+      //      extra round trip, after which the text is accepted as final.
+      const textCutByTokenLimit = finishReason === 'length';
+      if ((textCutByTokenLimit || (anyToolCallThisTurn && looksLikeUnfinishedAnnouncement(text)))
+          && unfinishedTextNudges < 3) {
+        unfinishedTextNudges++;
+        console.warn(`[AgenticLoop] ${textCutByTokenLimit ? 'Reply cut by the output token limit after visible text' : 'Announcement-only reply (no tool call)'} — nudging the model to continue (${unfinishedTextNudges}/3)`);
+        broadcast({ type: 'AI_THINKING', iteration: i + 1, label: 'Continuing the task' });
+        messages.push({
+          role: 'system',
+          content: textCutByTokenLimit
+            ? 'Your reply was cut off by the maximum output length before any tool call was emitted — the task did NOT finish and nothing was executed after your text. Do NOT re-plan or repeat yourself. If tool work remains, emit the next tool call NOW and keep each call SMALL enough to stream: for a large program, create_metadata(action=create_program) with the shell + attributes + first stage only, then ONE add_stage call per remaining stage, then add_program_rules in batches of 10–15 rules. If you were writing the final summary, send the COMPLETE summary now, shorter.'
+            : `Your reply announced what you are about to do but contained NO tool call — nothing was executed and the task is NOT finished. Never end a reply with a promise of future work. Emit the announced tool call NOW; when the whole task is genuinely done, end with a past-tense summary of what was created (names + IDs).`,
+        });
+        continue;
+      }
+
       if (streamStartBroadcast) {
         broadcast({ type: 'AI_STREAM_END', text });
       }
@@ -1425,6 +1455,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (!dhis2.pageContext) dhis2.pageContext = {};
             dhis2.pageContext.stageId = detectedStageId;
             console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${msg.payload?.source || 'unknown'})`);
+            // PERSIST. The detected stage exists ONLY here — no URL re-parse can
+            // recover it on the enrollment dashboard. Chrome kills the MV3
+            // worker after ~30 s idle and restores dhis2 from session storage,
+            // so an in-memory-only write meant the stage was reliably known for
+            // a short while and then gone ("the chatbot finds it for a bit then
+            // loses it", reported live 2026-08-06).
+            saveState();
             broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
           }
         }
@@ -1469,20 +1506,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (tab?.url && dhis2.baseUrl) {
             const freshBaseUrl = extractBaseUrl(tab.url);
-            const freshCtx = extractContext(tab.url);
             const oldProgramId = dhis2.pageContext?.programId;
             const oldOrgUnitId = dhis2.pageContext?.orgUnitId;
             const oldAppType = dhis2.pageContext?.appType;
-            const oldStageId = dhis2.pageContext?.stageId;
             const oldVisualizationId = dhis2.pageContext?.visualizationId;
             const oldMapId = dhis2.pageContext?.mapId;
 
-            // Rebuild pageContext from the current URL instead of merging onto stale state.
-            // Preserve a DOM-detected stage only when staying in the same tracker program.
+            // Rebuild pageContext from the current URL instead of merging onto stale
+            // state, but carry sticky context (resolved program on event/enrollment
+            // routes, detected stage within the same program) so a chat turn never
+            // downgrades what initializeFromUrl already resolved.
+            const freshCtx = carryStickyContext(extractContext(tab.url), dhis2.pageContext);
             dhis2.pageContext = { ...freshCtx };
-            if (!freshCtx.stageId && freshCtx.programId && freshCtx.programId === oldProgramId && oldStageId) {
-              dhis2.pageContext.stageId = oldStageId;
-            }
 
             // Re-run full initialization whenever page type or top-level context changes.
             // This clears stale app-specific state when navigating away from Data Visualizer/Maps.
@@ -1510,6 +1545,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               } catch {}
             } else if (!freshCtx.orgUnitId && oldOrgUnitId) {
               dhis2.ouContext = null;
+              await saveState();
+            } else {
+              // No full refresh and no org-unit change — but pageContext was
+              // still rebuilt above, and its sticky carry (program/stage) is
+              // not recoverable from the URL. Persist it so the worker can die
+              // between this turn and the next without losing the stage.
               await saveState();
             }
           }
@@ -1742,8 +1783,15 @@ async function syncFromTab(tabId) {
     if (!candidateBase) return;
     if (candidateBase === dhis2.baseUrl && dhis2.connected) {
       // Same server — only refresh page context (cheap), don't re-fetch system info.
-      const ctx = extractContext(tab.url);
+      // carryStickyContext keeps the resolved program/stage that a full
+      // initializeFromUrl already computed: without it, every tab/window focus
+      // change wiped the detected stage (and, on event-edit routes, the program).
+      const ctx = carryStickyContext(extractContext(tab.url), dhis2.pageContext);
       dhis2.pageContext = ctx;
+      // The CARRIED half of this context (resolved program on event/enrollment
+      // routes, the detected stage) cannot be re-derived from the URL, so it
+      // must be persisted or the next service-worker restart loses it.
+      saveState();
       broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
       return;
     }

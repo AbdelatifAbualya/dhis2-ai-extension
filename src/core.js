@@ -613,6 +613,10 @@ const RESERVED_UID_SHAPED_WORDS = new Set([
   'displayName', 'lastUpdated', 'description', 'dataElement', 'accessLevel',
   'coordinates', 'phoneNumber', 'optionGroup', 'programRule', 'inheritable',
   'aggregation', 'completedBy', 'programName', 'trackedName',
+  // API path segments that pass the entropy test (11-char camelCase) but are
+  // endpoint names, not UIDs — e.g. POST maintenance/dataPruning was refused
+  // as a "hallucinated UID" (live 2026-07-28).
+  'dataPruning',
 ]);
 
 // Pulls UIDs out of every arg position that is operationally a target
@@ -1290,6 +1294,32 @@ function hasUidShape(v) {
   return /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(v || ''));
 }
 
+// Detects an assistant reply that ANNOUNCES imminent tool work instead of
+// reporting completed work — e.g. "Creating the program shell with
+// registration attributes and Form 1 first, then adding the remaining
+// stages." A turn that ENDS on such a promise has silently abandoned the
+// task: nothing after the text ever executes, the panel goes idle, and the
+// user sees no error (observed live 2026-07-26, W4W Clinic build).
+// Heuristic by design — the agent loop caps how often it acts on this, so a
+// false positive costs one extra round trip, after which the text is
+// accepted as the final answer. Rules:
+//   • a reply that asks the user something is a legitimate stop → false;
+//   • long replies are reports, not announcements → false over 2000 chars;
+//   • otherwise look for future-intent phrasing near the end: a sentence
+//     starting with an action gerund ("Creating…", "Now adding…") or an
+//     explicit first-person promise ("I'll create…", "let me add…").
+function looksLikeUnfinishedAnnouncement(text) {
+  const t = String(text || '').trim();
+  if (!t || t.length > 2000) return false;
+  if (/\?\s*$/.test(t)) return false;
+  const tail = t.slice(-400);
+  const gerundSentenceStart =
+    /(^|[.!:]\s+|\n\s*)(now\s+|next[,:]?\s+|first[,:]?\s+)?(creating|adding|building|setting\s+up|configuring|generating|updating|proceeding|starting)\b/i;
+  const firstPersonPromise =
+    /\b(i(?:'|’)ll|i\s+will|let\s+me|i(?:'|’)m\s+(?:now\s+)?going\s+to|about\s+to|proceeding\s+to)\s+(?:now\s+)?(?:start|begin|create|add|build|set\s+up|configure|generate|update|proceed|continue)\b/i;
+  return gerundSentenceStart.test(tail) || firstPersonPromise.test(tail);
+}
+
 function extractVisualizationIdFromInput(input) {
   const raw = String(input || '').trim();
   if (!raw) return null;
@@ -1766,6 +1796,30 @@ function appendQueryParamsToPath(path, queryParams) {
   }
   const qs = usp.toString();
   return qs ? `${base}?${qs}` : base;
+}
+
+// `GET /api/optionSets/A,B,C?fields=…` is the intuitive "fetch these three"
+// shape and is what models reach for (live 2026-08-03, deepseek-v4-flash), but
+// DHIS2 routes /{resource}/{id} to a single-object handler and answers HTTP 405
+// "Request method 'GET' is not supported". The intent is unambiguous, so
+// rewrite it to the collection query DHIS2 does support rather than burning an
+// iteration on a 405 and three follow-up single fetches.
+// Fires ONLY when the comma list is the whole second path segment and every
+// token is a real 11-char UID, so paths with a legitimate comma (fields lists,
+// `dataValueSets`, sub-resources) are never touched. Returns the path
+// unchanged when it does not apply.
+function healMultiUidPath(path, method) {
+  if ((method || 'GET').toUpperCase() !== 'GET') return path;
+  const s = String(path || '');
+  const [p, q] = s.split('?');
+  const segs = p.replace(/^\//, '').split('/');
+  if (segs.length !== 2 || !segs[1].includes(',')) return s;
+  const ids = segs[1].split(',').map((x) => x.trim()).filter(Boolean);
+  if (ids.length < 2 || !ids.every((id) => /^[a-zA-Z][a-zA-Z0-9]{10}$/.test(id))) return s;
+  const params = new URLSearchParams(q || '');
+  params.append('filter', `id:in:[${ids.join(',')}]`);
+  if (!params.has('paging')) params.set('paging', 'false');
+  return `${segs[0]}?${params.toString()}`;
 }
 
 function generateDhis2Uid() {
@@ -2402,8 +2456,32 @@ async function safeDhis2Fetch(path, options = {}) {
       } catch {
         if (rawResp.text && rawResp.text.length < 300) errMsg += `: ${rawResp.text}`;
       }
-      // Include parsed body so callers (like postMetadataPayload) can extract detailed errors
-      return { _error: errMsg, _url: fullUrl, _status: rawResp.status, ...(errBody ? { _body: errBody } : {}) };
+      // Metadata import 409s say only "please see full details in import report"
+      // — pull the actual per-object errors out so the model sees WHY, instead
+      // of guessing at alternative endpoints (live 2026-07-28).
+      const importErrors = [];
+      for (const tr of (errBody?.response?.typeReports || errBody?.typeReports || [])) {
+        for (const or of (tr.objectReports || [])) {
+          for (const er of (or.errorReports || [])) {
+            if (er.message && importErrors.length < 8) importErrors.push(er.message);
+          }
+        }
+      }
+      if (importErrors.length) errMsg += ` — ${importErrors.join('; ')}`;
+      // E4030 "associated with another object: Event" after the user already
+      // deleted the events in Capture: events are only SOFT-deleted, and the
+      // soft-deleted rows still block metadata deletion. Name the exact fix so
+      // the model doesn't flail through analytics/tracker probes.
+      const blockedByEvent = importErrors.some(m => /associated with another object.*Event/i.test(m))
+        || /associated with another object.*Event/i.test(errMsg);
+      return {
+        _error: errMsg, _url: fullUrl, _status: rawResp.status,
+        ...(errBody ? { _body: errBody } : {}),
+        ...(importErrors.length ? { error_details: importErrors } : {}),
+        ...(blockedByEvent ? {
+          _hint: 'This object still has event data values referencing it. If the user says the events were already deleted in the Capture UI, they are only SOFT-deleted and still block deletion: run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry this SAME delete once. If real (non-deleted) events still hold values, tell the user which events must be deleted first. Do NOT probe analytics, tracker reads, or count_records — they cannot remove the association.',
+        } : {}),
+      };
     }
 
     if (rawResp.status === 204) return { success: true, message: 'Deleted successfully.' };
@@ -2450,12 +2528,18 @@ async function safeDhis2Fetch(path, options = {}) {
         if (!rawText || !rawText.trim()) {
           return { _error: `DELETE failed for ${cleanPath.split('?')[0]}. Server returned empty response and POST-based fallback also failed. Use manage_metadata(action=delete) for reliable deletion.`, _url: fullUrl };
         }
-      } else if (options.allowEmptyBody) {
-        // Caller explicitly opted in: DHIS2 collection-add / link endpoints
-        // (e.g. POST /programs/{pid}/notificationTemplates/{tid}) idiomatically
-        // return HTTP 200 with an empty body on success. Treat as success and
-        // let the caller verify via GET if it needs to be sure.
-        return { success: true, message: 'OK', _status: rawResp.status, _url: fullUrl, _emptyBody: true };
+      } else if (options.allowEmptyBody || method === 'POST' || method === 'PUT') {
+        // DHIS2 idiomatically returns HTTP 2xx with an EMPTY body on success for
+        // many write endpoints: collection-add / link endpoints, and the whole
+        // /maintenance family (softDeletedEventRemoval, periodPruning, …).
+        // Reporting these as errors sent the model hunting for alternative
+        // endpoints after operations that had actually succeeded (live
+        // 2026-07-28: four successful maintenance POSTs each surfaced as ✗).
+        return {
+          success: true,
+          message: `OK — DHIS2 accepted the ${method} (HTTP ${rawResp.status}, empty body is this endpoint's normal success response).`,
+          _status: rawResp.status, _url: fullUrl, _emptyBody: true,
+        };
       } else {
         return { _error: `DHIS2 returned empty response (HTTP ${rawResp.status}) for ${method} ${cleanPath.split('?')[0]}`, _url: fullUrl };
       }
@@ -2469,16 +2553,47 @@ async function safeDhis2Fetch(path, options = {}) {
       return { _error: `DHIS2 returned non-JSON response (HTTP ${rawResp.status}): ${preview}`, _url: fullUrl };
     }
 
+    // `_apiPath` / `_pagerInfo` are OUR bookkeeping, stamped on the parsed body
+    // so the panel can show which endpoint answered. They are defined
+    // non-enumerable because so many tools are read-modify-write: they GET an
+    // object and PUT it straight back, or merge it into a dataStore value. An
+    // enumerable marker rides along into that body — it turned up verbatim
+    // inside the growth-chart plugin's stored config. Property access still
+    // works everywhere; only JSON.stringify and spread stop carrying them.
+    const stamp = (key, value) => Object.defineProperty(data, key, { value, enumerable: false, writable: true, configurable: true });
     if (data.pager) {
-      data._pagerInfo = { page: data.pager.page, pageSize: data.pager.pageSize, total: data.pager.total };
+      stamp('_pagerInfo', { page: data.pager.page, pageSize: data.pager.pageSize, total: data.pager.total });
     }
-    data._apiPath = fullUrl.replace(dhis2.baseUrl, '');
+    stamp('_apiPath', fullUrl.replace(dhis2.baseUrl, ''));
 
-    // Truncate large responses unless an internal tool explicitly needs the
-    // complete metadata payload to make a correct decision.
+    // ── Large-response truncation ────────────────────────────────────────────
+    // Truncation protects the MODEL's context for responses that are relayed
+    // verbatim (dhis2_query). It must NEVER fire for a response the extension
+    // itself parses to make a decision: dropping the payload turns real fields
+    // into `undefined`, and the tool then reports a confident lie the model can
+    // never retry its way out of. That is exactly how a growth-chart configure
+    // against a program carrying a few-thousand-option "School" option set
+    // (446 KB) came back as `Program "undefined" is not a tracker program`.
+    //
+    // Three categories are therefore always returned WHOLE:
+    //   • callers that opt out explicitly (noTruncate:true);
+    //   • every write response — import/validate `typeReports` carry the import
+    //     errors, and a truncated report reads as a clean success;
+    //   • `fields=:owner` / `:all` reads, which are always read-modify-write
+    //     (the object is PUT straight back — a truncated body would wipe it).
+    const isOwnerRead = /fields=[^&]*(?::owner|:all)\b/.test(cleanPath);
     const json = JSON.stringify(data);
-    if (options.noTruncate !== true && json.length > 80000) {
+    if (options.noTruncate !== true && !isWrite && !isOwnerRead && json.length > 80000) {
+      // Shape-preserving: carry over every top-level scalar (id, displayName,
+      // programType, valueType, formType, code, status, …) so a caller that only
+      // needs an identity field still gets the truth, then slice the arrays that
+      // actually made the payload big and name them in _truncated_fields.
       const truncated = { _apiPath: data._apiPath, _pagerInfo: data._pagerInfo, _truncated: true, _originalSize: json.length };
+      for (const [k, v] of Object.entries(data)) {
+        if (k.startsWith('_')) continue;
+        if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') truncated[k] = v;
+      }
+      const droppedFields = [];
       if (data.rows) {
         truncated.headers = data.headers;
         truncated.rows = data.rows.slice(0, 200);
@@ -2500,7 +2615,17 @@ async function safeDhis2Fetch(path, options = {}) {
         truncated._totalIndicators = data.programIndicators.length;
         truncated._note = `Large response sliced to 50 of ${data.programIndicators.length} indicators. Use manage_program_indicators(action=audit) to check all indicators for issues, or request a specific page.`;
       } else {
-        truncated._note = `Response too large (${json.length} chars). Use more specific filters or fields.`;
+        // Generic object (a single program, stage, …): keep the object's shape
+        // and record exactly which nested collections were withheld, so the
+        // caller can tell "absent" apart from "too big to send".
+        for (const [k, v] of Object.entries(data)) {
+          if (k.startsWith('_') || k in truncated) continue;
+          droppedFields.push(Array.isArray(v) ? `${k}[${v.length}]` : k);
+        }
+      }
+      if (droppedFields.length) truncated._truncated_fields = droppedFields;
+      if (!truncated._note) {
+        truncated._note = `Response too large (${json.length} chars); nested collections were withheld${droppedFields.length ? ` (${droppedFields.join(', ')})` : ''}. Request narrower fields, filter, or page.`;
       }
       return truncated;
     }
@@ -3876,6 +4001,37 @@ async function hasHostPermissionForUrl(url) {
   } catch { return false; }
 }
 
+// Carry resolved/sticky context from the previous pageContext onto a freshly
+// URL-parsed one, WITHOUT any network fetches. Used on the cheap refresh paths
+// (tab activation, chat-turn re-sync) where a raw URL re-parse must never
+// downgrade context that a full initializeFromUrl already resolved for this
+// same flow: event/enrollment-scoped Capture routes carry no programId, and
+// the enrollment dashboard carries no stageId.
+function carryStickyContext(freshCtx, prevCtx) {
+  const ctx = { ...freshCtx };
+  if (!prevCtx || typeof prevCtx !== 'object') return ctx;
+  // Event/enrollment sub-pages of a program flow: keep the resolved identity.
+  if (!ctx.programId && (ctx.eventId || ctx.enrollmentId) && prevCtx.programId) {
+    ctx.programId = prevCtx.programId;
+    if (!ctx.orgUnitId && prevCtx.orgUnitId) ctx.orgUnitId = prevCtx.orgUnitId;
+    if (!ctx.teiId && prevCtx.teiId) ctx.teiId = prevCtx.teiId;
+    if (!ctx.enrollmentId && prevCtx.enrollmentId) ctx.enrollmentId = prevCtx.enrollmentId;
+    // The previous stage stays valid only while the event is the same one it
+    // was resolved from — a different eventId may belong to a different stage.
+    if (!ctx.stageId && prevCtx.stageId && (!ctx.eventId || ctx.eventId === prevCtx.eventId)) {
+      ctx.stageId = prevCtx.stageId;
+    }
+  }
+  // Same program, stage missing from the fresh URL → keep the known stage.
+  // A different eventId voids the carry: that event may live in another stage,
+  // and the full initializeFromUrl will resolve its real stage from the API.
+  if (!ctx.stageId && prevCtx.stageId && ctx.programId && ctx.programId === prevCtx.programId
+      && (!ctx.eventId || ctx.eventId === prevCtx.eventId)) {
+    ctx.stageId = prevCtx.stageId;
+  }
+  return ctx;
+}
+
 async function initializeFromUrl(url) {
   const baseUrl = extractBaseUrl(url);
   if (!baseUrl) return { error: 'Not a DHIS2 page' };
@@ -3943,19 +4099,13 @@ async function initializeFromUrl(url) {
     console.log(`[initializeFromUrl] Server switched: ${previousBaseUrl} → ${baseUrl}. Cleared server-tied caches.`);
   }
 
+  const prevCtx = dhis2.pageContext || {};
   const ctx = extractContext(url);
-  dhis2.pageContext = ctx;
 
-  // Clear stale metadata when navigating away from a program or org unit
-  if (!ctx.programId) {
-    dhis2.programMetadata = null;
-    dhis2.programRulesCount = null;
-  }
-  if (!ctx.orgUnitId) {
-    dhis2.ouContext = null;
-  }
-
-  // Resolve event context if needed (also resolve stageId when missing)
+  // Resolve event context if needed (also resolve stageId when missing).
+  // Capture's event-edit route is `#/enrollmentEventEdit?eventId=...&orgUnitId=...`
+  // — no programId/stageId in the URL at all — so this fetch is the only way to
+  // know which stage the user is actually working in.
   if (ctx.eventId && (!ctx.programId || !ctx.stageId)) {
     try {
       const ev = await dhis2Fetch(apiUrl(
@@ -3966,6 +4116,39 @@ async function initializeFromUrl(url) {
       if (!ctx.enrollmentId) ctx.enrollmentId = ev.enrollment;
       if (!ctx.teiId)        ctx.teiId = ev.trackedEntity;
     } catch {}
+  }
+
+  // Some Capture routes carry only enrollmentId — resolve it so program/OU/TEI
+  // context survives those pages instead of being cleared.
+  if (ctx.enrollmentId && !ctx.programId) {
+    try {
+      const en = await dhis2Fetch(apiUrl(
+        `tracker/enrollments/${ctx.enrollmentId}?fields=program,orgUnit,trackedEntity`
+      ));
+      if (en?.program)                    ctx.programId = en.program;
+      if (!ctx.orgUnitId && en?.orgUnit)  ctx.orgUnitId = en.orgUnit;
+      if (!ctx.teiId && en?.trackedEntity) ctx.teiId = en.trackedEntity;
+    } catch {}
+  }
+
+  // Sticky stage: the active stage is often known only from a DOM detection or
+  // an event URL the user has since navigated away from. Every hashchange, tab
+  // switch, and chat turn rebuilds pageContext through here, and the plain
+  // enrollment-dashboard URL has no stageId — so a URL re-parse must never
+  // erase the stage while the user is still in the same program.
+  if (!ctx.stageId && prevCtx.stageId && ctx.programId && ctx.programId === prevCtx.programId) {
+    ctx.stageId = prevCtx.stageId;
+  }
+
+  dhis2.pageContext = ctx;
+
+  // Clear stale metadata when navigating away from a program or org unit
+  if (!ctx.programId) {
+    dhis2.programMetadata = null;
+    dhis2.programRulesCount = null;
+  }
+  if (!ctx.orgUnitId) {
+    dhis2.ouContext = null;
   }
 
   // Fetch program metadata
