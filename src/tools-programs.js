@@ -2586,6 +2586,13 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       id: stageUids[i],
       name: resolvedStageNames[i],
       originalName: s.name,
+      // Echo the flag that was actually imported. `repeatable` defaults to
+      // false, so an omitted flag is indistinguishable from a deliberate
+      // false — and a stage the user described as repeatable silently
+      // shipped one-event-only (live 2026-08-03: "MCSR Treatment
+      // (repeatable)" imported non-repeatable and nothing surfaced it).
+      // Reporting the resolved value makes the omission visible.
+      repeatable: !!s.repeatable,
       dataElements: (s.data_elements || []).length,
     })),
     stageRenames: stageRenames.length ? stageRenames : undefined,
@@ -2659,9 +2666,20 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     };
   }
 
+  // Repeatability is the one stage property with a silent, wrong default:
+  // omit it and DHIS2 accepts a one-event-only stage with no error anywhere.
+  // Surfacing the resolved value per stage turns "the model forgot the flag"
+  // from an undetectable data-model bug into something the model reads in its
+  // own tool result while it still has the user's request in context.
+  const repeatCheck = {
+    _stage_repeatability: summary.stages.map(s => `${s.name}: repeatable=${s.repeatable}`).join('; '),
+    _verify_repeatability: `CHECK NOW against what the user asked for. Any stage the user described as repeatable / recurring / "one per visit" / "multiple times" MUST show repeatable=true above. Every stage defaults to FALSE, so a forgotten flag looks exactly like a deliberate choice and DHIS2 reports no error — it just refuses the second event later. If one is wrong, fix it immediately with dhis2_query(path="programStages/<the stage id>", method="PATCH", body:{ repeatable:true }) — a PATCH is safe because it touches only that field (a PUT would wipe the stage's sections). Do NOT re-run create_program.`,
+  };
+
   return {
     ...result,
     ...skipInfo,
+    ...repeatCheck,
     ...(args._input_heals && args._input_heals.length ? { _input_heals: args._input_heals } : {}),
     program_id: programUid,
     stage_ids,

@@ -3108,3 +3108,69 @@ reproduces the user's exact flow (DE + event program + event → soft-delete →
 blocked delete WITH hint → maintenance success → retry delete succeeds →
 teardown) with **0 unexpected failed API calls** and the instance left exactly
 as found. Stage context verified live in Capture on localhost:8081.
+
+---
+
+## v2.8.24 — line-list tool visibility, two silent-wrong-data defects, and sticky context
+
+Triggered by a live report that "create a line listing" routed to the wrong
+tool. **The router was never wrong** — the side panel simply had no label for
+`manage_line_lists`, so its cards rendered with the generic fallback
+`"Querying DHIS2"` and read exactly like raw `dhis2_query` calls. Replaying the
+user's turn through `getContextualTools` offers `manage_line_lists` in every
+page context.
+
+Full write-up: `CHANGES_line_list_router_and_405_heal.md`.
+
+1. **`manage_line_lists` was invisible to the panel** (`sidepanel/panel.js`) —
+   added its icon, label ("Building line lists") and detail formatter, plus a
+   missing `resolve_option_codes` formatter. The fallback label no longer names
+   a specific tool (it humanizes the real tool name), so a missing map entry can
+   never again masquerade as a different tool. `npm run verify` now pins all
+   three panel maps to `TOOL_ROUTER` — 33/33 tools covered.
+2. **A stage the user called "repeatable" shipped one-event-only**
+   (`src/registry.js`, `src/tools-programs.js`) — `repeatable` had no schema
+   description (so it never reached the model through either docs tier) and
+   defaults to `false`, making an omitted flag indistinguishable from a
+   deliberate one. Added the description **and** made `create_program` echo the
+   resolved per-stage value with a verify instruction, so the omission is
+   visible in the model's own tool result. A direct executor probe proved the
+   tool itself always passed the flag through correctly.
+3. **`GET /api/optionSets/A,B,C` → HTTP 405** (`src/core.js`,
+   `src/tools-metadata.js`) — new `healMultiUidPath()` rewrites a
+   comma-separated UID path to `?filter=id:in:[…]&paging=false`, turning one
+   failed call plus three recovery fetches into a single 200. Fires only when
+   every token is a real 11-char UID and the list is the whole second path
+   segment; 10 boundary cases pinned in `npm run verify`.
+4. **"It finds the stage for a bit, then loses it"** (`src/agent.js`) —
+   `carryStickyContext` (v2.8.23) computed the right context but three sites
+   wrote it to memory only. Chrome kills the MV3 worker after ~30 s idle and
+   restores `dhis2` from session storage, so the content script's stage
+   detection — which no URL re-parse can rebuild — was reliably lost.
+   `saveState()` added at all three sites; new `npm run sticky`
+   (`scripts/scenario-sticky-context.js`) boots the real background bundle
+   twice against one shared session store and proves the stage survives.
+
+**Live acceptance** — `accounts/fireworks/models/deepseek-v4-flash-0731`
+(Fireworks) driven through the real agentic loop against DHIS2 2.42 at
+`localhost:8081`, four persisted conversation turns deliberately shaped like the
+original report:
+
+| Turn | Task | DHIS2 calls | Failed |
+|---|---|---|---|
+| 1 | Build a tracker program: 6 attributes, 3 stages, 14 DEs, 6 option sets, 5 rules | 48 | **0** |
+| 2 | 8 program indicators (5 counts + 3 single-PI percentages) | 23 | **0** |
+| 3 | 3 saved visualizations + a shared dashboard | 10 | **0** |
+| 4 | *"instead of a visualization, create a line listing … add it to the same dashboard"* | 22 | **0** |
+| | **Total** | **103** | **0** |
+
+Verified on the server afterwards, not just from the model's summary:
+program `WITH_REGISTRATION` / person TET / `rwrw----` / all 6 org units; stages
+`repeatable` = false/**true**/false exactly as requested; all 5 rules correct
+(`A{}` for attribute-sourced conditions, option **codes** not labels); all 8
+program indicators structurally right and **all 16 expressions/filters
+`status: OK`** against the live `/programIndicators/{expression,filter}/description`
+parser; dashboard holding the 3 original tiles **plus** both line lists
+(the turn-3 tiles were not destroyed) — the ENROLLMENT register spanning all
+three stages and the EVENT register scoped to the Treatment stage, both
+`LAST_12_MONTHS`.

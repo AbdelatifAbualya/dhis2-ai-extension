@@ -1455,6 +1455,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (!dhis2.pageContext) dhis2.pageContext = {};
             dhis2.pageContext.stageId = detectedStageId;
             console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${msg.payload?.source || 'unknown'})`);
+            // PERSIST. The detected stage exists ONLY here — no URL re-parse can
+            // recover it on the enrollment dashboard. Chrome kills the MV3
+            // worker after ~30 s idle and restores dhis2 from session storage,
+            // so an in-memory-only write meant the stage was reliably known for
+            // a short while and then gone ("the chatbot finds it for a bit then
+            // loses it", reported live 2026-08-06).
+            saveState();
             broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
           }
         }
@@ -1538,6 +1545,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               } catch {}
             } else if (!freshCtx.orgUnitId && oldOrgUnitId) {
               dhis2.ouContext = null;
+              await saveState();
+            } else {
+              // No full refresh and no org-unit change — but pageContext was
+              // still rebuilt above, and its sticky carry (program/stage) is
+              // not recoverable from the URL. Persist it so the worker can die
+              // between this turn and the next without losing the stage.
               await saveState();
             }
           }
@@ -1775,6 +1788,10 @@ async function syncFromTab(tabId) {
       // change wiped the detected stage (and, on event-edit routes, the program).
       const ctx = carryStickyContext(extractContext(tab.url), dhis2.pageContext);
       dhis2.pageContext = ctx;
+      // The CARRIED half of this context (resolved program on event/enrollment
+      // routes, the detected stage) cannot be re-derived from the URL, so it
+      // must be persisted or the next service-worker restart loses it.
+      saveState();
       broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
       return;
     }

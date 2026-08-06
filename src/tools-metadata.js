@@ -258,6 +258,15 @@ async function executeTool(name, args) {
       };
     }
 
+    // ── Comma-separated UID list in the path → filter=id:in[…] (405 heal) ──
+    {
+      const _healed = healMultiUidPath(safePath, method);
+      if (_healed !== safePath) {
+        console.log(`[dhis2_query] healed multi-UID path → ${_healed}`);
+        safePath = _healed;
+      }
+    }
+
     // ── Analytics-tables run: ONE call that waits for the job to finish ──
     // Analytics generation is asynchronous, and every analytics-dependent step
     // of a build (line lists, dashboards, PI values) is blocked until it ends —

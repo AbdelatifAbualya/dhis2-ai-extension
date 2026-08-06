@@ -90,7 +90,8 @@ try {
     .join('\n');
   // `dhis2` is a bundle-lexical `let`, so expose a reader for the few checks
   // that need to drive per-turn counters (the loop guards).
-  vm.runInContext(bundle + '\n;globalThis.__dhis2 = () => dhis2;',
+  vm.runInContext(bundle + '\n;globalThis.__dhis2 = () => dhis2;'
+    + '\n;globalThis.__TOOL_ROUTER = TOOL_ROUTER;',
     ctx, { filename: 'background.bundle.js' });
   loaded = true;
   ok(`loaded ${modules.length} modules: ${modules.map((m) => m.replace('src/', '')).join(', ')}`);
@@ -1080,6 +1081,98 @@ if (loaded) {
       extractUids('dhis2_query', { path: 'maintenance/dataPruning' }), []);
     eq('a real UID in a path is still extracted',
       extractUids('dhis2_query', { path: 'programs/a3kGcGpz8FJ' }), ['a3kGcGpz8FJ']);
+  }
+
+  // ── Detected context must be PERSISTED, not just held in memory ──────────
+  // Chrome kills the MV3 worker after ~30 s idle and rebuilds `dhis2` from
+  // chrome.storage.session. carryStickyContext computes the right sticky
+  // context, but three sites wrote it to memory only — so the stage was known
+  // "for a bit" and then permanently gone (reported live 2026-08-06). The
+  // sticky carry cannot be re-derived from the URL, so every site that assigns
+  // pageContext outside initializeFromUrl MUST call saveState().
+  console.log('\nPage-context persistence:');
+  {
+    const agentSrc = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+    const blockAfter = (marker, len) => {
+      const i = agentSrc.indexOf(marker);
+      return i === -1 ? null : agentSrc.slice(i, i + len);
+    };
+    const cases = [
+      ["case 'DHIS2_STAGE_DETECTED'", 2000, 'detected stage is persisted'],
+      ['async function syncFromTab', 1200, 'tab-switch context carry is persisted'],
+    ];
+    for (const [marker, len, label] of cases) {
+      const blk = blockAfter(marker, len);
+      if (!blk) { bad(`${label} — could not locate ${marker} in src/agent.js`); continue; }
+      if (!/\bsaveState\s*\(/.test(blk)) bad(`${label} — no saveState() call; a worker restart will lose it`);
+      else ok(label);
+    }
+    // The chat-turn rebuild must persist on EVERY branch, including the
+    // "nothing else changed" one.
+    const chatBlk = blockAfter('const freshCtx = carryStickyContext', 2600);
+    if (!chatBlk) bad('chat-turn context rebuild — could not locate it in src/agent.js');
+    else if ((chatBlk.match(/\bsaveState\s*\(/g) || []).length < 3) {
+      bad('chat-turn context rebuild — a branch assigns pageContext without saveState()');
+    } else ok('chat-turn context rebuild is persisted on every branch');
+  }
+
+  // ── Multi-UID path heal (the DHIS2 405 that looks like a working URL) ────
+  // GET /api/optionSets/A,B,C is what models reach for and DHIS2 answers 405.
+  console.log('\nMulti-UID path heal:');
+  const heal = need('healMultiUidPath');
+  if (heal) {
+    const healed = heal('optionSets/qP6eFxS2QfQ,G26Oi8VjeXV,sSgEHRhCkjR?fields=id,displayName', 'GET');
+    truthy('three UIDs become a collection query', healed.startsWith('optionSets?'));
+    truthy('ids land in filter=id:in:[…]', decodeURIComponent(healed).includes('filter=id:in:[qP6eFxS2QfQ,G26Oi8VjeXV,sSgEHRhCkjR]'));
+    truthy('fields are preserved', decodeURIComponent(healed).includes('fields=id,displayName'));
+    truthy('paging is disabled so all ids come back', healed.includes('paging=false'));
+    eq('a single UID is left alone', heal('optionSets/qP6eFxS2QfQ?fields=id', 'GET'), 'optionSets/qP6eFxS2QfQ?fields=id');
+    eq('a non-UID comma list is left alone', heal('dataValueSets/a,b?x=1', 'GET'), 'dataValueSets/a,b?x=1');
+    eq('a sub-resource path is left alone', heal('programs/aGaF9TXsyTp,zGa7MSw6vwt/metadata', 'GET'), 'programs/aGaF9TXsyTp,zGa7MSw6vwt/metadata');
+    eq('non-GET is never rewritten', heal('optionSets/qP6eFxS2QfQ,G26Oi8VjeXV', 'POST'), 'optionSets/qP6eFxS2QfQ,G26Oi8VjeXV');
+    eq('a plain collection path is untouched', heal('optionSets?fields=id', 'GET'), 'optionSets?fields=id');
+    truthy('an existing filter is kept alongside the id filter',
+      (decodeURIComponent(heal('dataElements/aGaF9TXsyTp,zGa7MSw6vwt?filter=name:like:x', 'GET')).match(/filter=/g) || []).length === 2);
+  }
+
+  // ── Every routable tool must be presentable in the side panel ─────────────
+  // The panel renders a tool card from two lookup tables plus a detail
+  // formatter. A tool missing from them fell through to a generic fallback
+  // that read "Querying DHIS2" — so manage_line_lists rendered exactly like a
+  // raw dhis2_query call and looked like a tool-router misroute (live
+  // 2026-08-02). The maps are hand-maintained, so pin them to TOOL_ROUTER.
+  console.log('\nSide-panel tool presentation:');
+  {
+    const router = ctx.__TOOL_ROUTER;
+    const panelSrc = fs.readFileSync(path.join(ROOT, 'sidepanel/panel.js'), 'utf8');
+    const block = (re, what) => {
+      const m = panelSrc.match(re);
+      if (!m) { bad(`sidepanel/panel.js — could not locate ${what}`); return null; }
+      return new Set([...m[1].matchAll(/^\s*(\w+)\s*:/gm)].map((x) => x[1]));
+    };
+    const iconKeys = block(/const iconMap = \{([\s\S]*?)\n\s*\};/, 'iconMap');
+    const labelKeys = block(/const toolLabels = \{([\s\S]*?)\n\s*\};/, 'toolLabels');
+    const detailKeys = new Set(
+      [...panelSrc.matchAll(/tool === '(\w+)'/g)].map((m) => m[1]));
+    if (!router || typeof router !== 'object') {
+      bad('TOOL_ROUTER not exposed to the verifier');
+    } else {
+      const names = Object.keys(router);
+      const missing = (set, what) => {
+        if (!set) return;
+        const gaps = names.filter((n) => !set.has(n));
+        if (gaps.length) bad(`${what} is missing: ${gaps.join(', ')}`);
+        else ok(`${what} covers all ${names.length} routable tools`);
+      };
+      missing(iconKeys, 'panel iconMap');
+      missing(labelKeys, 'panel toolLabels');
+      // render_chart is matched via an `isChart` flag, not a `tool ===` test,
+      // and dhis2_query's args.path fallback is already meaningful.
+      const detailExempt = new Set(['render_chart']);
+      const detailGaps = names.filter((n) => !detailKeys.has(n) && !detailExempt.has(n));
+      if (detailGaps.length) bad(`panel detail formatter has no branch for: ${detailGaps.join(', ')}`);
+      else ok(`panel detail formatter covers all ${names.length} routable tools`);
+    }
   }
 
   const missingTarget = need('actionMissingFieldTarget');

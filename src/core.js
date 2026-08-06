@@ -1798,6 +1798,30 @@ function appendQueryParamsToPath(path, queryParams) {
   return qs ? `${base}?${qs}` : base;
 }
 
+// `GET /api/optionSets/A,B,C?fields=…` is the intuitive "fetch these three"
+// shape and is what models reach for (live 2026-08-03, deepseek-v4-flash), but
+// DHIS2 routes /{resource}/{id} to a single-object handler and answers HTTP 405
+// "Request method 'GET' is not supported". The intent is unambiguous, so
+// rewrite it to the collection query DHIS2 does support rather than burning an
+// iteration on a 405 and three follow-up single fetches.
+// Fires ONLY when the comma list is the whole second path segment and every
+// token is a real 11-char UID, so paths with a legitimate comma (fields lists,
+// `dataValueSets`, sub-resources) are never touched. Returns the path
+// unchanged when it does not apply.
+function healMultiUidPath(path, method) {
+  if ((method || 'GET').toUpperCase() !== 'GET') return path;
+  const s = String(path || '');
+  const [p, q] = s.split('?');
+  const segs = p.replace(/^\//, '').split('/');
+  if (segs.length !== 2 || !segs[1].includes(',')) return s;
+  const ids = segs[1].split(',').map((x) => x.trim()).filter(Boolean);
+  if (ids.length < 2 || !ids.every((id) => /^[a-zA-Z][a-zA-Z0-9]{10}$/.test(id))) return s;
+  const params = new URLSearchParams(q || '');
+  params.append('filter', `id:in:[${ids.join(',')}]`);
+  if (!params.has('paging')) params.set('paging', 'false');
+  return `${segs[0]}?${params.toString()}`;
+}
+
 function generateDhis2Uid() {
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
   const alphanum = letters + '0123456789';

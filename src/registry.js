@@ -811,7 +811,7 @@ If user enabled web browsing from UI, this tool should usually be called before 
               type: 'object',
               properties: {
                 name: { type: 'string' },
-                repeatable: { type: 'boolean' },
+                repeatable: { type: 'boolean', description: 'TRUE when this stage can hold MANY events per enrollment (follow-up visits, repeat lab tests, treatment courses). Defaults to false — so if the user described the stage as repeatable/recurring/"one per visit", you MUST pass repeatable:true HERE. Setting it afterwards needs a separate stage update.' },
                 data_elements: {
                   type: 'array',
                   items: {
@@ -905,7 +905,7 @@ If user enabled web browsing from UI, this tool should usually be called before 
             type: 'object',
             properties: {
               name: { type: 'string' },
-              repeatable: { type: 'boolean' },
+              repeatable: { type: 'boolean', description: 'TRUE when this stage can hold MANY events per enrollment (follow-up visits, repeat lab tests, treatment courses). Defaults to false — so if the user described the stage as repeatable/recurring/"one per visit", you MUST pass repeatable:true HERE. Setting it afterwards needs a separate stage update.' },
               data_elements: {
                 type: 'array',
                 items: {
