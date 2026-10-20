@@ -20,7 +20,7 @@
 
 ---
 
-## The 32 tools
+## The 37 tools
 
 Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → panel.js iconMap + toolLabels → CSS`. The model is given only the subset relevant to the current page and request — usually 6–12 of them.
 
@@ -58,6 +58,11 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 | 30 | `manage_legend_sets` | Colour-coded legend sets; `auto_bands` generates equal-width red→green ramps. |
 | 31 | `manage_dashboards` | Dashboards + visualizations: list/get/create, safe `add_items`/`remove_item`/`update`/`delete` with pre-write snapshots. |
 | 32 | `manage_maps` | **Thematic map authoring** (choropleth / bubble): `list`/`get`/`create`/`delete`. Assembles a thematic mapView from a friendly spec — data item on `columns[dx]` (type auto-resolved, program auto-attached for a program indicator), org units on `rows[ou]` with `organisationUnitLevels`, period on `filters[pe]`, optional legend set — the exact `/api/maps` structure DHIS2 needs (there is no simple "create map" object). Returns `map_id` to embed on a dashboard via `manage_dashboards(add_items, { type:"MAP", map_id })`. Auto-backup on delete. |
+| 33 | `manage_line_lists` | Saved Line Listing tables (eventVisualizations LINE_LIST) — EVENT / ENROLLMENT / TRACKED_ENTITY, dimensions by name, layout proven against analytics before saving. |
+| 34 | `manage_users` | Users, user roles and user groups: create/update/disable/enable/delete accounts (password policy, org-unit scopes, names → UIDs), roles with authorities validated against `/api/authorities` (DHIS2 silently stores misspelled ones), group membership through the group endpoint. |
+| 35 | `manage_data_values` | Aggregate data entry for one dataset × period × org-unit form: get / set / delete / complete / incomplete / validate. Values by data-element and disaggregation NAME; refuses the wrong-period-type, unassigned-org-unit and missing-disaggregation values DHIS2 would silently store invisibly; returns previous values as an undo record. |
+| 36 | `manage_metadata_translations` | Translate names / short names / form names / descriptions of any metadata object into a database locale — merges (a raw PUT wipes other locales), validates locale + property keys, bulk up to 100 objects. |
+| 37 | `manage_memory` | The assistant's **learning memory**: `search` / `record` / `list` lessons about DHIS2 and API behaviour (what failed and the exact fix). Relevant lessons are also injected automatically — in the system prompt, with a tool's manual, and on a failed call. Stored only in this browser; never patient data (see below). |
 
 ### Page-context auto-detection
 
@@ -79,12 +84,12 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 ```
 ┌──────────────────────┐    ┌────────────────────────────┐    ┌──────────────────────┐
 │   Content Script      │   │  Background Service Worker  │   │    Side Panel         │
-│   (content.js)        │──▶│  (background.js, 6 modules)│──▶│  (sidepanel/)         │
+│   (content.js)        │──▶│  (background.js, 9 modules)│──▶│  (sidepanel/)         │
 │                       │   │                             │   │                       │
 │ • URL change monitor  │   │ • DHIS2 detection & session │   │ • Chat interface      │
 │ • hashchange/popstate │   │ • Page-context extraction   │   │ • Streaming display   │
 │ • 2s polling fallback │   │ • Universal LLM streaming   │   │ • Tool progress UI    │
-│ • Sends ctx updates   │   │ • 31-tool agentic loop      │   │ • Chart rendering     │
+│ • Sends ctx updates   │   │ • 37-tool agentic loop      │   │ • Chart rendering     │
 │ • Self-heal on        │   │ • Tracker write pipeline    │   │ • Image attachments   │
 │   "context invalid"   │   │ • Atomic metadata bundles   │   │ • Settings modal      │
 │   after extension     │   │ • Auto-backup + restore     │   │ • Theme switching     │
@@ -98,7 +103,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 1. **Context extraction** — read URL of active DHIS2 tab → app type, program, stage, dataset, OU, TEI, viz, map.
 2. **System prompt assembly** — base rules + only the conditional blocks the request needs.
 3. **Reliability prefetch** — TEI details / visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
-4. **Tool selection** — `getContextualTools()` filters the 32 tools down to the 6–12 relevant for the request.
+4. **Tool selection** — `getContextualTools()` filters the 37 tools down to the 6–12 relevant for the request.
 5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 50 iterations per turn, 3 consecutive empty responses trigger bailout.
 6. **Persistence** — per-turn state (`knownIds`, `knownIcons`, `recentCreations`, `writeAuth`, …) survives service-worker restarts via stripped JSON snapshots.
 
@@ -129,9 +134,20 @@ These are the silent-failure traps that this codebase has hit and codified, so y
 - **Custom (HTML) data-entry forms can't be created inline.** A `dataEntryForm` embedded in a dataSet/programStage payload — via `/api/metadata` OR a direct object PUT — bounces with E5002 "Invalid reference (DataEntryForm)". It must be `POST`ed standalone to `/api/dataEntryForms` first, then referenced by id. Input ids bind by `<dataElementUID>-<categoryOptionComboUID>-val` (datasets) vs `<programStageUID>-<dataElementUID>-val` (stages). Linking to a program stage needs a full PUT that **re-attaches `program:{id}`** — a PATCH/naive PUT drops it ("Program stage must reference a program") because `?fields=:owner` omits `program`. All encoded in `manage_custom_forms`.
 - **The WHO Growth Chart plugin is driven by a dataStore key + an enrollment-dashboard widget.** Functioning needs (1) the app installed (`capture-growth-chart`), and (2) `dataStore/captureGrowthChart/config` mapping the program's DOB/gender attributes, female/male option codes, and weight/height/head-circumference data elements (all three required or the chart hides), plus `programStageForGrowthChart: { "<programId>": "<stageId>" }`. The plugin *widget* must additionally be placed on the enrollment dashboard via the Tracker Plugin Configurator / Capture's "Add plugin" — that layout lives in the Capture-owned `dataStore/capture`, which `manage_growth_chart_plugin` deliberately does **not** overwrite (cache-corruption risk). All the safe/documented parts are automated; the widget step is surfaced as instructions.
 - **Custom app translations live in a dataStore namespace (DHIS2 2.43+).** `custom-translations/controller` maps each app slug → registered locales (`{ "capture": ["ar"] }`); `custom-translations/<slug>__<locale>` (double underscore, slug lowercased) holds a `{ "<exact source string>": "<replacement>" }` map. An app/locale pair NOT listed in `controller` is never loaded — so `manage_custom_translations` always writes both keys together. The value can be another language (translation) or the same one (re-labelling). Confirmed on play 2.43.0.1: the Capture app fetches `controller` then `capture__ar` (both 200) at startup and renders the translated strings in the live app.
+- **Aggregate imports store invisible values without strict flags.** A weekly period on a monthly dataset, an org unit the dataset is not assigned to, or a disaggregated data element without its category option combo all return `SUCCESS` and land where no Data Entry form shows them. `manage_data_values` refuses them client-side and `dhis2_query` adds `strictPeriods/strictOrganisationUnits/strictCategoryOptionCombos/strictAttributeOptionCombos/strictDataElements` to raw `dataValueSets` imports. A partial import answers HTTP 409 while some values *were* saved; a DELETE row without its `value` crashes the importer for option-set data elements.
+- **`PUT {type}/{id}/translations` replaces the whole set.** One French write wipes every other locale; unknown locales/properties are stored and never render. `manage_metadata_translations` merges and validates.
+- **`POST /api/users` ignores `dryRun`** (the user is really created), rejects the legacy `userCredentials` shape, and a role saved with a misspelled authority is accepted (201) but grants nothing. Group membership can only be changed through `userGroups/{g}/users/{u}`.
 - **HIDEFIELD on a compulsory program-stage data element** doesn't visually hide it in New Tracker Capture. The chatbot now auto-PUTs `compulsory:false` on affected PSDEs and pairs the rule with a `SETMANDATORYFIELD` rule keyed to the inverse condition, so compulsion is restored when the field shows again.
 
 ---
+
+## Learning memory
+
+The assistant learns from its own mistakes so it does not repeat them. Settings → **Learning memory** (on by default) has an on/off switch and a **View memories** screen (search, filter by area, delete, export, add your own note, clear all).
+
+- **How lessons are made.** (1) *Automatically*: when a tool call fails and a later call in the same request succeeds, the loop records the error and the exact change that fixed it (tool, action, endpoint pattern, parameter names and configuration values only). A failure the tool explained but that was not fixed is kept as a "known issue". (2) *By the assistant*: right after it recovers from an error it is nudged to write a clean lesson with `manage_memory(action="record")`. (3) *By you*: "remember for the future …" or a note in the viewer.
+- **How lessons are used.** Every request is matched to task areas (programs, rules, indicators, dashboards, maps, data values, users, translations, …) through the tools selected for it plus its wording; the best-matching lessons (max 8) are put in the system prompt. A tool's own lessons arrive with its manual on first use, and a failed call gets the lessons for that tool/endpoint attached to its result. Near-duplicates merge (seen count), the store is capped at 400 with least-valuable eviction, and "instance" lessons only apply on their own server.
+- **Privacy, enforced in code.** Stored in `chrome.storage.local` only. No memory write at all in a request that read or wrote individual tracker records or ran on a patient's record page; all text is scrubbed (UIDs, e-mails, phone/ID numbers, dates, filter values) and anything that still reads like personal data is refused.
 
 ## Model providers
 

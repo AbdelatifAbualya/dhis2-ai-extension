@@ -208,6 +208,19 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   + ')\\b',
   'i'
 );
+// Imperative-only write verbs. These are ordinary words in problem reports
+// ("the form I submitted", "reset happens", "after I enter data it fails"), so
+// they only count as an INSTRUCTION at the start of a sentence or after a
+// request marker (please / and / then / can you …), and never when the same
+// message is a problem report (see classifyWriteAuthorization). "Enter 12
+// malaria cases for January", "Reset Jane's password", "Mark the September
+// form complete", "Register three new clinics" were all classified read_only
+// and refused (verified 2026-10-20) although nothing in them is a complaint.
+const WRITE_AUTH_IMPERATIVE_RE = new RegExp(
+  '(?:^|[.!?;:\\n]\\s*|\\b(?:please|pls|kindly|and|then|also|now|next|can\\s+you|could\\s+you|would\\s+you|i\\s+want\\s+you\\s+to|i\\s+need\\s+you\\s+to)\\s+)'
+  + '(?:enter|record|submit|input|key\\s+in|fill\\s+in|type\\s+in|mark|reset|lock|unlock|deactivate|reactivate|onboard|invite|register|enrol+|import)\\b',
+  'i'
+);
 const WRITE_AUTH_DIAG_RE = new RegExp(
   '\\b(?:diagnose|check|inspect|investigate|debug|troubleshoot|review'
   + '|why(?:\\s+(?:am|is|are|do|does|did|can\'?t|won\'?t))?'
@@ -308,9 +321,14 @@ function classifyWriteAuthorization(userText) {
     ),
     ' '
   );
-  const isBroad = WRITE_AUTH_BROAD_RE.test(inabilityStripped);
   const isDiag = WRITE_AUTH_DIAG_RE.test(text);
   const isProblem = WRITE_AUTH_PROBLEM_RE.test(text);
+  // Narrative clauses ("when I enter data and then submit it…") describe what
+  // the user DID, so their verbs are never instructions.
+  const isNarrative = /\b(?:when|whenever|if|after|before|while|once|every\s+time)\s+(?:i|we|they|he|she|users?|someone|the\s+user)\b/i.test(text)
+    || /\bfails?\b|\berrors?\b/i.test(text);
+  const isBroad = WRITE_AUTH_BROAD_RE.test(inabilityStripped)
+    || (!isProblem && !isNarrative && WRITE_AUTH_IMPERATIVE_RE.test(inabilityStripped.trim()));
   // Hard refusal: an explicit "no, …" decline always wins over any verb match.
   const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text);
   if (isBroad && !isRefusal) {
@@ -2338,6 +2356,15 @@ function encodeStrictQueryChars(query) {
   );
 }
 
+// E4030 on a data element / category option combo that holds AGGREGATE data.
+const AGGREGATE_DATA_BLOCK_RE = /associated with another object:?\s*`?(?:DataValue(?:Audit)?|DataValueAudit)\b/i;
+function aggregateDataBlockHint(pathOrId) {
+  const src = String(pathOrId || '');
+  const uid = (src.match(/"id"\s*:\s*"([A-Za-z][A-Za-z0-9]{10})"/) || [])[1]
+    || (src.match(/[A-Za-z][A-Za-z0-9]{10}(?=$|[/?\s])/) || [])[0] || '<data element UID>';
+  return `This data element holds (or once held) AGGREGATE data values — their audit history keeps blocking deletion even after the values are cleared. Recommended: keep it as unused metadata. ONLY if the user explicitly confirms that ALL of its data and audit history may be destroyed permanently: dhis2_query(method="POST", path="maintenance/dataPruning/dataElements/${uid}"), then retry this SAME delete once. Never prune without that explicit confirmation.`;
+}
+
 async function safeDhis2Fetch(path, options = {}) {
   if (!dhis2.baseUrl || !dhis2.apiVersion) {
     const ok = await ensureConnected();
@@ -2445,6 +2472,43 @@ async function safeDhis2Fetch(path, options = {}) {
       }
     }
 
+    // ── Post-commit 5xx on a DELETE ────────────────────────────────────────
+    // DHIS2 2.42 deletes a dataSet whose data elements use an option set, then
+    // fails in a post-commit Hibernate callback and answers HTTP 500 "Unable to
+    // perform afterTransactionCompletion callback: could not initialize proxy
+    // [OptionSet#…] - no Session" — the object IS gone (verified 2026-10-20,
+    // both DELETE dataSets/{id} and POST metadata?importStrategy=DELETE). Every
+    // delete site would report that success as a failure, so re-check the
+    // targets and report what actually happened.
+    if (!rawResp.ok && rawResp.status >= 500 && /afterTransactionCompletion/i.test(rawResp.text || '')) {
+      const targets = [];
+      const pOnly = cleanPath.split('?')[0];
+      const dm = method === 'DELETE' && pOnly.match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
+      if (dm) targets.push({ type: dm[1], id: dm[2] });
+      if (method === 'POST' && /^metadata\b/.test(pOnly) && /importStrategy=DELETE/i.test(cleanPath) && bodyStr) {
+        try {
+          for (const [type, arr] of Object.entries(JSON.parse(bodyStr))) {
+            if (Array.isArray(arr)) for (const o of arr) if (o && typeof o.id === 'string') targets.push({ type, id: o.id });
+          }
+        } catch { /* not JSON — leave as error */ }
+      }
+      if (targets.length && targets.length <= 50) {
+        let allGone = true;
+        for (const t of targets) {
+          const chk = await safeDhis2Fetch(`${t.type}/${t.id}?fields=id`);
+          if (chk?._status !== 404) { allGone = false; break; }
+        }
+        if (allGone) {
+          const stats = { created: 0, updated: 0, deleted: targets.length, ignored: 0, total: targets.length };
+          return {
+            httpStatus: 'OK', status: 'OK', stats, response: { status: 'OK', stats, typeReports: [] },
+            message: `Deleted ${targets.length} object(s).`,
+            _post_commit_server_error: `DHIS2 answered HTTP ${rawResp.status} (post-commit callback error) but the deletion WAS committed — verified each object now returns 404.`,
+          };
+        }
+      }
+    }
+
     // ── Process response ───────────────────────────────────────────────────
     if (!rawResp.ok) {
       let errMsg = `DHIS2 API ${rawResp.status}`;
@@ -2474,10 +2538,17 @@ async function safeDhis2Fetch(path, options = {}) {
       // the model doesn't flail through analytics/tracker probes.
       const blockedByEvent = importErrors.some(m => /associated with another object.*Event/i.test(m))
         || /associated with another object.*Event/i.test(errMsg);
+      // Same family, aggregate side: a data element that ever held aggregate
+      // values keeps DataValueAudit rows (and soft-deleted DataValue rows) after
+      // its values are cleared, and they block deletion forever (verified
+      // 2.42.5.1, 2026-10-20). Only data pruning removes them — destructive, so
+      // the hint demands explicit confirmation.
+      const blockedByAggregate = !blockedByEvent && (importErrors.some(m => AGGREGATE_DATA_BLOCK_RE.test(m)) || AGGREGATE_DATA_BLOCK_RE.test(errMsg));
       return {
         _error: errMsg, _url: fullUrl, _status: rawResp.status,
         ...(errBody ? { _body: errBody } : {}),
         ...(importErrors.length ? { error_details: importErrors } : {}),
+        ...(blockedByAggregate ? { _hint: aggregateDataBlockHint(`${cleanPath} ${bodyStr || ''}`) } : {}),
         ...(blockedByEvent ? {
           _hint: 'This object still has event data values referencing it. If the user says the events were already deleted in the Capture UI, they are only SOFT-deleted and still block deletion: run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry this SAME delete once. If real (non-deleted) events still hold values, tell the user which events must be deleted first. Do NOT probe analytics, tracker reads, or count_records — they cannot remove the association.',
         } : {}),

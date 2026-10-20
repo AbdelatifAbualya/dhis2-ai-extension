@@ -2291,9 +2291,13 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         else if (pra.programRuleActionType === 'DISPLAYTEXT' || pra.programRuleActionType === 'DISPLAYKEYVALUEPAIR') pra.location = 'feedback';
         if (act.data_element_name && deUidMap[act.data_element_name]) {
           pra.dataElement = { id: deUidMap[act.data_element_name] };
+        } else if (act.data_element_id && Object.values(deUidMap).includes(act.data_element_id)) {
+          pra.dataElement = { id: act.data_element_id };
         }
         if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) {
           pra.trackedEntityAttribute = { id: teaUidMap[act.tracked_entity_attribute_name] };
+        } else if (act.tei_attribute_id && Object.values(teaUidMap).includes(act.tei_attribute_id)) {
+          pra.trackedEntityAttribute = { id: act.tei_attribute_id };
         }
         const stageId = resolveStageRefForAction(act);
         if (stageId) pra.programStage = { id: stageId };
@@ -3520,10 +3524,11 @@ async function executeManageMetadata(args) {
 
     if (errorMessages.length > 0) {
       const hasEventData = errorMessages.some(e => /associated with another object.*Event/i.test(e));
+      const hasAggregateData = !hasEventData && errorMessages.some(e => AGGREGATE_DATA_BLOCK_RE.test(e));
       return {
         _error: `Cannot delete ${objName}: ${errorMessages.join('; ')}`,
         error_details: errorMessages,
-        _hint: hasEventData
+        _hint: hasAggregateData ? aggregateDataBlockHint(args.object_id) : hasEventData
           ? `This data element has been used in submitted events — DHIS2 prevents deletion to preserve data integrity. Options:\n(a) Keep as unused metadata (recommended — preserves historical data)\n(b) If the user already deleted the referencing events in the Capture UI: those events are only SOFT-deleted and still block deletion. Run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry this SAME delete once.\n(c) If real (non-deleted) events still hold values, tell the user which events must be deleted first.\nDo NOT probe analytics, tracker reads, or count_records to investigate — they cannot remove the association.`
           : 'Resolve the reported conflicts above, then retry deletion.',
         backup: backup.block,
@@ -6446,12 +6451,87 @@ function canonicalizeActionTargetNames(act, deKeys, teaKeys) {
   if (act && act.data_element_name && !deKeys.includes(act.data_element_name)) {
     const k = resolveLooseNameKey(act.data_element_name, deKeys);
     if (k) { fixes.push({ field: 'data_element_name', from: act.data_element_name, to: k }); act.data_element_name = k; }
+    else if (!act.tracked_entity_attribute_name) {
+      // Cross-kind: the name is an ATTRIBUTE of this program (a generic
+      // `target`/`field` alias, or a TEA written into data_element_name).
+      const t = teaKeys.includes(act.data_element_name) ? act.data_element_name : resolveLooseNameKey(act.data_element_name, teaKeys);
+      if (t) { fixes.push({ field: 'data_element_name → tracked_entity_attribute_name', from: act.data_element_name, to: t }); act.tracked_entity_attribute_name = t; delete act.data_element_name; }
+    }
   }
   if (act && act.tracked_entity_attribute_name && !teaKeys.includes(act.tracked_entity_attribute_name)) {
     const k = resolveLooseNameKey(act.tracked_entity_attribute_name, teaKeys);
     if (k) { fixes.push({ field: 'tracked_entity_attribute_name', from: act.tracked_entity_attribute_name, to: k }); act.tracked_entity_attribute_name = k; }
+    else if (!act.data_element_name) {
+      const d = deKeys.includes(act.tracked_entity_attribute_name) ? act.tracked_entity_attribute_name : resolveLooseNameKey(act.tracked_entity_attribute_name, deKeys);
+      if (d) { fixes.push({ field: 'tracked_entity_attribute_name → data_element_name', from: act.tracked_entity_attribute_name, to: d }); act.data_element_name = d; delete act.tracked_entity_attribute_name; }
+    }
   }
   return fixes;
+}
+
+// ── Rule-action key aliases ──────────────────────────────────────────────────
+// The rule tools read data_element_name / data_element_id,
+// tracked_entity_attribute_name / tei_attribute_id, program_stage_name /
+// program_stage_id and program_stage_section_id. Models routinely write the
+// natural variants instead — `data_element: "Sample ID"`, `dataElement:{id}`,
+// `attribute`, `field`, `target`, `stage`, `message` — and every one of those
+// was silently IGNORED: a HIDEFIELD rule was skipped as "unresolved", and a
+// SHOWWARNING (legal without a field) was saved with NO field, so the warning
+// floated at the top of the form instead of sitting on the field (verified
+// live 2026-10-20 on 2.42.5.1). Map them onto the canonical keys — UID-shaped
+// values to *_id, anything else to *_name — without overwriting a canonical
+// key the caller already set.
+const RULE_ACTION_ALIASES = {
+  de: ['data_element', 'dataElement', 'dataElementId', 'data_element_uid', 'de', 'de_id', 'de_name', 'data_element_display_name', 'target_data_element'],
+  tea: ['attribute', 'attribute_name', 'attribute_id', 'tea', 'tea_id', 'tea_name', 'tracked_entity_attribute', 'trackedEntityAttribute', 'trackedEntityAttributeId', 'tracked_entity_attribute_id', 'tei_attribute', 'tei_attribute_name', 'target_attribute'],
+  any: ['target', 'target_name', 'target_field', 'field', 'field_name'],
+  stage: ['stage', 'stage_name', 'stage_id', 'programStage', 'programStageId', 'program_stage'],
+  section: ['section', 'section_id', 'programStageSection', 'programStageSectionId', 'program_stage_section'],
+};
+function _aliasValue(v) {
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v.id || v.name || v.displayName || null;
+  return (typeof v === 'string' && v.trim()) ? v.trim() : null;
+}
+const _isRuleUid = (v) => typeof v === 'string' && /^[A-Za-z][A-Za-z0-9]{10}$/.test(v) && isLikelyDhisUid(v);
+function normalizeRuleActionAliases(act) {
+  if (!act || typeof act !== 'object') return act;
+  if (!act.type && (act.action_type || act.actionType || act.programRuleActionType)) {
+    act.type = act.action_type || act.actionType || act.programRuleActionType;
+  }
+  if (act.content == null && typeof (act.message ?? act.text) === 'string') act.content = act.message ?? act.text;
+  const hasDe = act.data_element_name || act.data_element_id;
+  const hasTea = act.tracked_entity_attribute_name || act.tei_attribute_id;
+  const take = (keys) => { for (const k of keys) { const v = _aliasValue(act[k]); if (v) return v; } return null; };
+  if (!hasDe) {
+    const v = take(RULE_ACTION_ALIASES.de) || (!hasTea ? take(RULE_ACTION_ALIASES.any) : null);
+    if (v) { if (_isRuleUid(v)) act.data_element_id = v; else act.data_element_name = v; }
+  }
+  if (!hasTea) {
+    const v = take(RULE_ACTION_ALIASES.tea);
+    if (v) { if (_isRuleUid(v)) act.tei_attribute_id = v; else act.tracked_entity_attribute_name = v; }
+  }
+  if (!act.program_stage_name && !act.program_stage_id) {
+    const v = take(RULE_ACTION_ALIASES.stage);
+    if (v) { if (_isRuleUid(v)) act.program_stage_id = v; else act.program_stage_name = v; }
+  }
+  if (!act.program_stage_section_id) {
+    const v = take(RULE_ACTION_ALIASES.section);
+    if (v && _isRuleUid(v)) act.program_stage_section_id = v;
+  }
+  return act;
+}
+// Apply to every rule a create_metadata / manage_program_rules call carries.
+function normalizeRuleActionAliasesInArgs(args) {
+  if (!args || typeof args !== 'object') return;
+  const rules = [];
+  for (const k of ['program_rules', 'rules']) if (Array.isArray(args[k])) rules.push(...args[k]);
+  if (args.rule && typeof args.rule === 'object') rules.push(args.rule);
+  for (const st of (Array.isArray(args.stages) ? args.stages : [])) {
+    if (st && Array.isArray(st.program_rules)) rules.push(...st.program_rules);
+  }
+  for (const r of rules) {
+    if (r && Array.isArray(r.actions)) r.actions.forEach(normalizeRuleActionAliases);
+  }
 }
 
 // Field-targeting action types that the server rejects when neither a

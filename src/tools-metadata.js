@@ -125,6 +125,15 @@ async function executeTool(name, args) {
       };
     }
     const method = (args.method || 'GET').toString().toUpperCase();
+    // A literal undefined / null / NaN path segment is a value the model failed
+    // to fill in (an unset variable or a missing id) — guaranteed 404, never a
+    // real object. Refuse it before it costs a failed call.
+    if (/(?:^|\/)(?:undefined|null|NaN|None)(?:\/|\?|$)/.test(args.path.split('?')[0])) {
+      return {
+        _error: `Refused: the path "${args.path}" contains a literal "undefined"/"null" segment — an id was never filled in.`,
+        _hint: 'Take the real UID from an earlier tool result (or look it up with search_metadata / a list call) and re-issue the call. Never send placeholders.',
+      };
+    }
     // dhis2_query write methods (POST/PUT/PATCH/DELETE) are destructive — gate on
     // write authorization the same way as the dedicated manage_* tools, so the
     // model cannot route around the gates by sending a raw API call.
@@ -357,6 +366,60 @@ async function executeTool(name, args) {
       };
     }
 
+    // ── Administration redirects / hardening (see src/tools-admin.js) ──
+    // Metadata translations: a PUT replaces the object's WHOLE translation set,
+    // so a raw PUT carrying one locale silently wipes every other one.
+    if ((method === 'PUT' || method === 'POST' || method === 'PATCH') && /^[a-zA-Z]+\/[A-Za-z][A-Za-z0-9]{10}\/translations(\?|$)/.test(safePath)) {
+      const [tType, tId] = safePath.split('/');
+      return {
+        _error: `Blocked: ${method} ${tType}/${tId}/translations REPLACES the object's entire translation set — writing one locale this way silently deletes every other locale's translations (verified on 2.42).`,
+        _hint: `Use manage_metadata_translations(action="set", object_type="${tType}", object_id="${tId}", locale="<locale>", translations={ NAME:"…", SHORT_NAME:"…" }) — it merges with the existing translations, validates the locale and property keys, and verifies the result.`,
+        _redirect: 'manage_metadata_translations',
+      };
+    }
+    // Users: POST /users ignores dryRun (it really creates the user), rejects the
+    // legacy userCredentials shape, enforces a password policy, and needs ≥1 role.
+    if (method === 'POST' && /^users(\?|$)/.test(safePath)) {
+      return {
+        _error: 'Blocked: create users with manage_users(action="create") instead of a raw POST /users (which ignores dryRun, rejects the legacy userCredentials shape with E4049, and fails on the password policy).',
+        _hint: 'manage_users(action="create", username, first_name, surname, password | generate_password:true, roles:[names or UIDs], org_units:[…], groups:[…]) — it validates everything first and resolves names to UIDs.',
+        _redirect: 'manage_users',
+      };
+    }
+    // Roles: DHIS2 stores unknown authority strings verbatim (HTTP 201) and they grant nothing.
+    if ((method === 'POST' || method === 'PUT') && /^userRoles(\/[A-Za-z][A-Za-z0-9]{10})?(\?|$)/.test(safePath)
+        && /"authorities"\s*:/.test(typeof args.body === 'string' ? args.body : JSON.stringify(args.body || {}))) {
+      return {
+        _error: 'Blocked: write user-role authorities with manage_users(action="create_role" | "update_role") — DHIS2 silently accepts misspelled authority strings (HTTP 201) that then grant NOTHING.',
+        _hint: 'manage_users validates every authority against /api/authorities and suggests the exact ids. Find ids with manage_users(action="list_authorities", query="…").',
+        _redirect: 'manage_users',
+      };
+    }
+    // Raw aggregate imports: turn DHIS2's silent wrong-period / unassigned-OU /
+    // missing-disaggregation stores into explicit conflicts.
+    if (method === 'POST' && /^dataValueSets(\?|$)/.test(safePath)) {
+      const hardened = hardenDataValueSetsPath(safePath);
+      if (hardened !== safePath) {
+        console.log(`[dhis2_query] dataValueSets import hardened with strict* flags → ${hardened}`);
+        safePath = hardened;
+      }
+      const dvResp = await safeDhis2Fetch(safePath, opts);
+      const dvSum = summarizeDataValueImport(dvResp);
+      if (dvSum) {
+        const ic = dvSum.importCount || {};
+        const written = (ic.imported || 0) + (ic.updated || 0) + (ic.deleted || 0);
+        return {
+          success: !dvSum.conflicts.length,
+          ...(dvSum.conflicts.length && written ? { partial: true } : {}),
+          import_count: ic,
+          ...(dvSum.conflicts.length ? { conflicts: dvSum.conflicts } : {}),
+          _hint: dvSum.conflicts.length
+            ? `${written} value(s) WERE saved and ${ic.ignored || 0} were rejected (listed in conflicts by index). The HTTP 409 does NOT mean nothing was saved. For single-form entry prefer manage_data_values(action="set"), which validates every cell before sending.`
+            : 'All values imported.',
+        };
+      }
+      return dvResp;
+    }
     const trackerWriteResult = await executeTrackerWrite(safePath, method, args.body, ctx);
     if (trackerWriteResult) return trackerWriteResult;
 
@@ -628,6 +691,14 @@ async function executeTool(name, args) {
         console.log(`[dhis2_query] Merged repeated dx dimensions → ${dupHeal.path}`);
         safePath = dupHeal.path;
       }
+    }
+
+    // Schema pre-check for item-level PATCH: an unknown property or bad enum
+    // value is a guaranteed 400. Runs AFTER every tool-specific redirect guard
+    // above, so those keep their more specific "use tool X" guidance.
+    if (method === 'PATCH') {
+      const patchProblem = await precheckPatchAgainstSchema(safePath, args.body);
+      if (patchProblem) return patchProblem;
     }
 
     // ── Auto-snapshot before any item-level metadata mutation routed through
@@ -2208,6 +2279,7 @@ async function executeTool(name, args) {
 
   // ── create_metadata ──
   if (name === 'create_metadata') {
+    normalizeRuleActionAliasesInArgs(args);
     return await executeCreateMetadata(args, orgUnitId);
   }
 
@@ -2228,6 +2300,7 @@ async function executeTool(name, args) {
 
   // ── manage_program_rules ──
   if (name === 'manage_program_rules') {
+    normalizeRuleActionAliasesInArgs(args);
     return await executeManageProgramRules(args, programId);
   }
 
@@ -2304,6 +2377,21 @@ async function executeTool(name, args) {
   // ── manage_backups ──
   if (name === 'manage_backups') {
     return await executeManageBackups(args);
+  }
+
+  // ── administration tools (src/tools-admin.js) ──
+  if (name === 'manage_users') {
+    return await executeManageUsers(args);
+  }
+  if (name === 'manage_data_values') {
+    return await executeManageDataValues(args);
+  }
+  if (name === 'manage_metadata_translations') {
+    return await executeManageMetadataTranslations(args);
+  }
+  // ── learning memory (src/memory.js) ──
+  if (name === 'manage_memory') {
+    return await executeManageMemory(args);
   }
 
   return { _error: `Unhandled tool route: ${name}` };
@@ -3000,7 +3088,32 @@ async function createOrgUnit(args) {
 // is modified.
 
 // Resolve an indicatorType by UID or exact name → { id, name, factor } or { _error }.
-async function resolveIndicatorType(idOrName) {
+// Indicator-type NAMES are instance-specific ("Per cent" on Sierra Leone,
+// "Percentage" on many national instances, a translated name elsewhere), while
+// what the user means is a FACTOR. So after the exact-name lookup, a name that
+// implies a factor ("per cent", "percent", "%", "per thousand", "number") is
+// matched to the instance's type with that factor. Only when the instance has
+// NO type with that factor — and the caller is about to write anyway
+// (allowCreate) — is the standard type created. Verified 2026-10-20: the 8081
+// instance has "Percentage" (factor 100) but no "Per cent", and
+// manage_indicators(create, indicator_type:"Per cent") used to fail outright.
+const INDICATOR_TYPE_STANDARD = [
+  { factor: 1, name: 'Number (Factor 1)', number: true, re: /\b(?:number|numbers|factor\s*1|count|counts|raw|plain|absolute|ratio|factor\s*one)\b/ },
+  { factor: 100, name: 'Per cent', number: false, re: /(?:\bper\s*cent\b|\bpercent(?:age)?\b|%|\bpct\b|\bfactor\s*100\b)/ },
+  { factor: 1000, name: 'Per thousand', number: false, re: /\bper\s*(?:one\s*)?(?:thousand|1,?000)\b|‰|\bfactor\s*1,?000\b/ },
+  { factor: 10000, name: 'Per ten thousand', number: false, re: /\bper\s*(?:ten\s*thousand|10,?000)\b|\bfactor\s*10,?000\b/ },
+  { factor: 100000, name: 'Per hundred thousand', number: false, re: /\bper\s*(?:(?:one\s*)?hundred\s*thousand|100,?000)\b|\bfactor\s*100,?000\b/ },
+];
+function impliedIndicatorFactor(name) {
+  const t = String(name || '').toLowerCase();
+  // Most specific first (100000 before 1000 before 1).
+  for (const f of [100000, 10000, 1000, 100, 1]) {
+    const std = INDICATOR_TYPE_STANDARD.find(x => x.factor === f);
+    if (std.re.test(t)) return std;
+  }
+  return null;
+}
+async function resolveIndicatorType(idOrName, { allowCreate = false } = {}) {
   const v = String(idOrName ?? '').trim();
   if (!v) return { _error: 'indicator_type is required (an indicatorType UID or exact name, e.g. "Number (Factor 1)" or "Per cent").' };
   if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(v)) {
@@ -3012,8 +3125,33 @@ async function resolveIndicatorType(idOrName) {
   const resp = await safeDhis2Fetch(`indicatorTypes?filter=name:eq:${encodeURIComponent(v)}&fields=id,name,factor&paging=false`);
   if (resp?._error) return { _error: `Could not look up indicatorType "${v}": ${resp._error}` };
   const types = resp.indicatorTypes || [];
-  if (types.length === 0) return { _error: `No indicatorType named "${v}".`, _hint: 'Common types: "Number (Factor 1)", "Per cent", "Per thousand", "Per ten thousand", "Per hundred thousand". List all with dhis2_query GET indicatorTypes.' };
-  return { id: types[0].id, name: types[0].name, factor: types[0].factor };
+  if (types.length) return { id: types[0].id, name: types[0].name, factor: types[0].factor };
+
+  const all = await safeDhis2Fetch('indicatorTypes?fields=id,name,factor,number&paging=false');
+  if (all?._error) return { _error: `Could not list indicatorTypes: ${all._error}` };
+  const list = all.indicatorTypes || [];
+  const ci = list.find(t => String(t.name).trim().toLowerCase() === v.toLowerCase());
+  if (ci) return { id: ci.id, name: ci.name, factor: ci.factor };
+  const std = impliedIndicatorFactor(v);
+  const available = list.map(t => `"${t.name}" (factor ${t.factor})`).join(', ') || 'none';
+  if (!std) {
+    return { _error: `No indicatorType named "${v}".`, available_types: list.map(t => ({ id: t.id, name: t.name, factor: t.factor })), _hint: `Use one of this instance's types: ${available}.` };
+  }
+  const sameFactor = list.filter(t => Number(t.factor) === std.factor);
+  if (sameFactor.length) {
+    // Prefer the type whose name shares the most words with the request.
+    const words = v.toLowerCase().split(/[^a-z0-9%]+/).filter(Boolean);
+    const score = (t) => words.filter(w => String(t.name).toLowerCase().includes(w)).length;
+    const pick = sameFactor.slice().sort((a, b) => score(b) - score(a))[0];
+    return { id: pick.id, name: pick.name, factor: pick.factor, _matched_by_factor: `"${v}" → "${pick.name}" (factor ${pick.factor}) — this instance names its factor-${std.factor} type "${pick.name}".` };
+  }
+  if (!allowCreate) {
+    return { _error: `This instance has no indicatorType with factor ${std.factor} ("${v}").`, available_types: list.map(t => ({ id: t.id, name: t.name, factor: t.factor })), _hint: `Creating the indicator will add the standard "${std.name}" type automatically, or use one of: ${available}.` };
+  }
+  const newId = generateDhis2Uid();
+  const created = await postMetadataPayload({ indicatorTypes: [{ id: newId, name: std.name, factor: std.factor, number: std.number }] }, false);
+  if (!created.success) return { _error: `No factor-${std.factor} indicatorType exists and creating "${std.name}" failed: ${created._error}`, _hint: `Use one of this instance's types: ${available}.` };
+  return { id: newId, name: std.name, factor: std.factor, _auto_created: `This instance had no factor-${std.factor} indicator type, so the standard "${std.name}" type was created (${newId}).` };
 }
 
 async function executeManageIndicators(args) {
@@ -3113,7 +3251,7 @@ async function executeManageIndicators(args) {
     const ind = args.indicator;
     let resolvedType = null;
     if (ind.indicator_type !== undefined) {
-      resolvedType = await resolveIndicatorType(ind.indicator_type);
+      resolvedType = await resolveIndicatorType(ind.indicator_type, { allowCreate: true });
       if (resolvedType._error) return resolvedType;
     }
     if (ind.decimals !== undefined && ind.decimals !== null) {
@@ -3302,7 +3440,7 @@ async function createIndicator(args) {
 
   // Resolve + verify the indicatorType BEFORE any expression work, so a bad
   // type gives a clean error rather than a deep import-report failure.
-  const itype = await resolveIndicatorType(ind.indicator_type);
+  const itype = await resolveIndicatorType(ind.indicator_type, { allowCreate: args.dry_run_only !== true });
   if (itype._error) return itype;
 
   // Heal common reference mistakes BEFORE validation (all advisory-reported):
@@ -3412,6 +3550,8 @@ async function createIndicator(args) {
     legend_sets: legendRefs.ids.length ? legendRefs.ids.map((lid, i) => ({ id: lid, name: legendRefs.names[i] })) : undefined,
     numerator_meaning: numChk.description,
     denominator_meaning: denChk.description,
+    ...(itype._matched_by_factor ? { indicator_type_note: itype._matched_by_factor } : {}),
+    ...(itype._auto_created ? { indicator_type_note: itype._auto_created } : {}),
     message: `Created indicator "${name}" (${id}) of type "${itype.name}" (factor ${itype.factor})${legendRefs.ids.length ? ` with legend set "${legendRefs.names[0]}"${legendRefs.ids.length > 1 ? ` (+${legendRefs.ids.length - 1} more)` : ''}` : ''}.`,
   };
 }
@@ -5101,6 +5241,24 @@ async function executeManageDatasets(args) {
       _error: 'Missing required parameter: action',
       _hint: 'One of: list, get, create, update, delete, add_data_elements, remove_data_elements, assign_org_units, update_sharing, create_section, update_section, delete_section.',
     };
+  }
+
+  // Every action except list/create targets an EXISTING dataset. Models
+  // naturally pass its name (dataset_name, or a name in dataset_id) — that used
+  // to fail with "dataset_id required" and cost a list round-trip (the most
+  // frequent automatic lesson in the 2026-10-20 LLM acceptance run). Resolve
+  // the name to the UID here, once, for every action.
+  if (action !== 'list' && action !== 'create') {
+    const given = args.dataset_id || args.object_id;
+    const nameIn = (!given && args.dataset_name)
+      || (given && !/^[A-Za-z][A-Za-z0-9]{10}$/.test(String(given).trim()) ? given : null);
+    if (nameIn) {
+      const r = await resolveIdsOrNames('dataSets', [String(nameIn)]);
+      const err = _resolutionError('dataset', r);
+      if (err) return err;
+      args.dataset_id = r.items[0].id;
+      args._resolved_dataset = { name: r.items[0].name, id: r.items[0].id };
+    }
   }
 
   // ── list ──────────────────────────────────────────────────────────────

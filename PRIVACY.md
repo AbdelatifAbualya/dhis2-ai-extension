@@ -1,6 +1,6 @@
 # Privacy Policy — DHIS2 AI Assistant
 
-**Effective date:** 29 May 2026
+**Effective date:** 29 May 2026 · **Last updated:** 20 October 2026 (learning memory)
 **Extension:** DHIS2 AI Assistant (Chrome extension)
 **Contact:** abdelatif.abualya@gmail.com
 
@@ -36,9 +36,17 @@ The extension uses Chrome's local storage to save, **only on your device**:
 
 - your interface preferences (e.g. theme),
 - your AI provider configuration (endpoint URL, model name, and any API key you enter),
-- the current conversation state, so it survives the browser closing the extension's background worker.
+- the current conversation state, so it survives the browser closing the extension's background worker,
+- the **learning memory** (if switched on — see below).
 
 This information is **never transmitted to the developer** and is removed if you remove the extension or clear its data.
+
+### Learning memory
+The optional learning memory (Settings → Learning memory, **on** by default, switchable off at any time) stores short **lessons about how DHIS2 and its API behave** — for example "a dashboard PUT wipes its tiles; add tiles with add_items", or "on this server the percent indicator type is called Percentage" — so the assistant does not repeat a mistake it has already solved. You can view, search, export, delete individual lessons, add your own notes, or clear everything from the same settings screen.
+
+- Lessons are stored **only in this browser's local storage**. They are never written to your DHIS2 server and never sent to the developer. Lessons relevant to a request are included in the prompt sent to the AI provider you configured, like any other instructions.
+- **Patient and personal data are never stored, enforced in code:** nothing is written to memory during any request that read or wrote individual tracker records or that ran on a patient's record page; automatically captured lessons contain only tool names, parameter *names*, configuration values (such as a value type or period type) and endpoint patterns — never record values; every lesson is scrubbed of identifiers (record/metadata IDs, e-mail addresses, phone and ID numbers, dates, search/filter values), and a lesson that still looks like information about a person is refused.
+- Switching the memory off stops both learning and the use of stored lessons immediately; the stored lessons are kept until you clear them.
 
 ## Health and personal information
 

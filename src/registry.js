@@ -2244,6 +2244,184 @@ Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVEN
   {
     type: 'function',
     function: {
+      name: 'manage_users',
+      description: `Administer DHIS2 USERS, USER ROLES, USER GROUPS and AUTHORITIES. Use this for every "create a user / add a data clerk account / reset a password / disable an account / give X access to the Capture app / put these users in a group / create a role that can enter data" request — NEVER raw dhis2_query POST /users or /userRoles.
+
+Users — list (query, role, group, org_unit, disabled filters), get, create, update, disable, enable, delete:
+- create needs username (4–255 chars, no spaces), first_name, surname, ≥1 role (roles:[names or UIDs]), and a password that meets the server policy (8–72 chars, upper + lower case, a digit, a special character) — OR generate_password:true to create a strong random one that is returned ONCE. Pass org_units (capture/data-entry org units — without them the user can do nothing), optional data_view_org_units (analytics), search_org_units (tracker search), groups, email, phone_number. Names resolve to UIDs automatically; duplicates are refused before sending. The tool validates via /metadata VALIDATE because POST /users IGNORES ?dryRun and would really create the account.
+- update: first_name / surname / email / phone_number / password / disabled, roles (replace) or add_roles / remove_roles, org_units (replace) or add_org_units / remove_org_units, data_view_org_units, search_org_units, add_groups / remove_groups. Group membership is written through the group endpoint — PATCHing /userGroups on a user is a 500 / silent no-op in DHIS2.
+- disable / enable: toggle the account (preferred over delete — a restored user has no password).
+Roles — list_roles, get_role (flags authority strings DHIS2 does not recognise), create_role (name + authorities), update_role (authorities replace / add_authorities / remove_authorities, name, description), delete_role (refused while assigned). Authorities are validated against /api/authorities: pass exact ids ("F_DATAVALUE_ADD"), human names ("Add data value"), or app names ("Capture" → M_dhis-web-capture). DHIS2 itself silently stores misspelled authorities that grant nothing — this tool refuses them with suggestions.
+Groups — list_groups, create_group (name + members), update_group (add_members / remove_members / name), delete_group.
+list_authorities (query="data value") finds authority ids.
+Every update/delete auto-snapshots a backup first.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'get', 'create', 'update', 'disable', 'enable', 'delete', 'list_roles', 'get_role', 'create_role', 'update_role', 'delete_role', 'list_groups', 'create_group', 'update_group', 'delete_group', 'list_authorities'], description: 'Which user-administration operation to perform.' },
+          user_id: { type: 'string', description: 'User UID (get/update/disable/enable/delete). A username is also accepted here.' },
+          username: { type: 'string', description: 'For create: the login name. For get/update/…: alternative to user_id.' },
+          first_name: { type: 'string' },
+          surname: { type: 'string' },
+          email: { type: 'string' },
+          phone_number: { type: 'string' },
+          password: { type: 'string', description: 'Initial (create) or new (update) password. Must satisfy the server password policy.' },
+          generate_password: { type: 'boolean', description: 'For create without a password: generate a strong random one (returned once).' },
+          disabled: { type: 'boolean', description: 'For create/update: account disabled flag. For list: filter.' },
+          account_expiry: { type: 'string', description: 'Optional ISO date after which the account expires.' },
+          roles: { type: 'array', items: { type: 'string' }, description: 'User role names or UIDs. For create: required (≥1). For update: REPLACES all roles.' },
+          add_roles: { type: 'array', items: { type: 'string' } },
+          remove_roles: { type: 'array', items: { type: 'string' } },
+          groups: { type: 'array', items: { type: 'string' }, description: 'For create: user groups to join (names or UIDs).' },
+          add_groups: { type: 'array', items: { type: 'string' } },
+          remove_groups: { type: 'array', items: { type: 'string' } },
+          org_units: { type: 'array', items: { type: 'string' }, description: 'Capture / data-entry org units (names or UIDs). For update: REPLACES them.' },
+          add_org_units: { type: 'array', items: { type: 'string' } },
+          remove_org_units: { type: 'array', items: { type: 'string' } },
+          data_view_org_units: { type: 'array', items: { type: 'string' }, description: 'Analytics (data view) org units.' },
+          search_org_units: { type: 'array', items: { type: 'string' }, description: 'Tracker search org units.' },
+          query: { type: 'string', description: 'For list / list_roles / list_groups / list_authorities: free-text filter.' },
+          role: { type: 'string', description: 'For list: only users holding this role (name or UID).' },
+          group: { type: 'string', description: 'For list: only members of this group (name or UID).' },
+          org_unit: { type: 'string', description: 'For list: only users assigned to this org unit (name or UID).' },
+          limit: { type: 'integer', description: 'For list: max rows (default 50, max 200).' },
+          role_id: { type: 'string', description: 'Role UID or exact name (get_role/update_role/delete_role).' },
+          group_id: { type: 'string', description: 'Group UID or exact name (update_group/delete_group).' },
+          name: { type: 'string', description: 'For create_role / create_group: the name. For update_role / update_group: a new name.' },
+          description: { type: 'string', description: 'For create_role / update_role.' },
+          code: { type: 'string', description: 'For create_group: optional code.' },
+          authorities: { type: 'array', items: { type: 'string' }, description: 'For create_role (required) / update_role (REPLACES): authority ids, names, or app names.' },
+          add_authorities: { type: 'array', items: { type: 'string' } },
+          remove_authorities: { type: 'array', items: { type: 'string' }, description: 'Authorities to remove (raw strings accepted — use this to clean unrecognised ones).' },
+          members: { type: 'array', items: { type: 'string' }, description: 'For create_group: user UIDs or usernames.' },
+          add_members: { type: 'array', items: { type: 'string' } },
+          remove_members: { type: 'array', items: { type: 'string' } },
+          dry_run: { type: 'boolean', description: 'For create / create_role / create_group: validate only.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_data_values',
+      description: `Read and write AGGREGATE DATA VALUES — the numbers entered in the Data Entry app — for ONE form = dataset × period × org unit. Use it for "enter 12 malaria cases for January at Ngelehun", "what was reported for ANC in March", "clear the September form", "mark the form complete", "run validation on this form". NEVER hand-write /dataValueSets or /dataValues bodies via dhis2_query for single-form entry.
+
+Actions:
+- get — every value in the form with data-element / disaggregation NAMES, plus empty cells, completion and lock status.
+- set — write values:[{ data_element, category_option_combo?, value, comment? }]. data_element = name, form name, code or UID (resolved inside the dataset). category_option_combo is REQUIRED for disaggregated elements and accepts the disaggregation name ("Female, <5") or option names in any order; omit it for non-disaggregated elements. Values are checked against the value type (integers, ≥0, percentages, booleans yes/no, dates) and option sets (code OR option name) BEFORE sending. Previous cell values are returned as an undo record. dry_run:true validates without saving.
+- delete — values:[{ data_element, category_option_combo? }] or all:true + confirm_all:true to clear the whole form (previous values returned for undo).
+- complete / incomplete — mark the form complete / reopen it.
+- validate — run the dataset's validation rules for this form and list violations.
+Addressing: dataset_id (UID or name), period (DHIS2 id like 202601 / 2026Q1 / 2026W3 — friendly "January 2026", "Q1 2026", "2026-01" are converted for the dataset's period type), org_unit_id (UID or name), attribute_option_combo only for datasets with an attribute category combo.
+Silent DHIS2 traps refused BEFORE writing (the server would store them invisibly with status SUCCESS): a period of the wrong type, an org unit the dataset is not assigned to, a disaggregated element without its category option combo. Also refused: periods not yet open (openFuturePeriods=0 means only ENDED periods accept data — not the current month) and LOCKED forms. A partial import is reported cell by cell (the HTTP 409 does not mean nothing was saved).`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['get', 'set', 'delete', 'complete', 'incomplete', 'validate'], description: 'get=read the form; set=write values; delete=clear values; complete/incomplete=completion registration; validate=run validation rules on the form.' },
+          dataset_id: { type: 'string', description: 'Dataset UID or exact name.' },
+          period: { type: 'string', description: 'Period id for the dataset period type (202601, 2026Q1, 2026W3, 2026 …) or a friendly form ("January 2026").' },
+          org_unit_id: { type: 'string', description: 'Org unit UID or exact name. Must be assigned to the dataset.' },
+          attribute_option_combo: { type: 'string', description: 'Only for datasets with an attribute category combo: the attribute option combo name or UID.' },
+          values: {
+            type: 'array',
+            description: 'For set/delete: the cells.',
+            items: {
+              type: 'object',
+              properties: {
+                data_element: { type: 'string', description: 'Data element name / form name / code / UID (within this dataset).' },
+                category_option_combo: { type: 'string', description: 'Disaggregation name ("Female, <5") or UID. Required only for disaggregated data elements.' },
+                value: { type: 'string', description: 'For set: the value (numbers as strings are fine; option sets accept the code or option name; booleans yes/no).' },
+                comment: { type: 'string' },
+              },
+              required: ['data_element'],
+            },
+          },
+          all: { type: 'boolean', description: 'For delete: clear every value of the form (requires confirm_all:true).' },
+          confirm_all: { type: 'boolean', description: 'For delete with all:true — only after the user explicitly confirmed.' },
+          dry_run: { type: 'boolean', description: 'For set: validate on the server without saving.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_metadata_translations',
+      description: `Translate DHIS2 METADATA objects — the names, short names, form names, descriptions and labels of programs, stages, data elements, options, attributes, datasets, sections, indicators, org units, category options, etc. — into another language (shown to users who pick that Database locale). Use this for "translate the TB program into French", "add Arabic names to these data elements", "the option labels should show in Portuguese". This is NOT for an app's UI strings/buttons (that is manage_custom_translations).
+
+Actions:
+- list_locales — the server's database locales (translations can only be stored for these).
+- add_locale — add a database locale (language + optional country).
+- get — object(s) with their translatable properties, source values and existing translations (optionally one locale).
+- set — locale + translations:{ NAME:"…", SHORT_NAME:"…", FORM_NAME:"…", DESCRIPTION:"…" } for one object (object_type + object_id) or items:[{ object_type, object_id, translations }] for up to 100 objects in one call. Property keys may also be given as field names (name, shortName, formName, description) — they are validated against the object's schema. MERGES with existing translations.
+- remove — locale + optional properties[] (default: all of that locale's translations).
+Why not dhis2_query: PUT {type}/{id}/translations REPLACES the whole translation set (one raw PUT for French wipes the Arabic and Spanish translations), and DHIS2 silently accepts unknown locales and property keys that never render. The result also verifies the translated display name the way users see it.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list_locales', 'add_locale', 'get', 'set', 'remove'], description: 'Which translation operation to perform.' },
+          object_type: { type: 'string', description: 'API collection of the object, e.g. dataElements, programs, programStages, options, trackedEntityAttributes, dataSets, sections, programStageSections, indicators, programIndicators, organisationUnits, categoryOptions, optionSets.' },
+          object_id: { type: 'string', description: 'UID of the object.' },
+          locale: { type: 'string', description: 'Database locale, e.g. "fr", "ar", "pt_BR" (also "fr-FR" or the language name).' },
+          translations: { type: 'object', description: 'For set (single object): property → translated text, e.g. { "NAME": "Paludisme", "SHORT_NAME": "Palu" }.', additionalProperties: { type: 'string' } },
+          properties: { type: 'array', items: { type: 'string' }, description: 'For remove: which properties to remove (default all for the locale).' },
+          items: {
+            type: 'array',
+            description: 'Bulk form for get/set/remove: up to 100 objects.',
+            items: {
+              type: 'object',
+              properties: {
+                object_type: { type: 'string' },
+                object_id: { type: 'string' },
+                translations: { type: 'object', additionalProperties: { type: 'string' } },
+                properties: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['object_id'],
+            },
+          },
+          language: { type: 'string', description: 'For add_locale: ISO 639 language code ("fr").' },
+          country: { type: 'string', description: 'For add_locale: optional ISO 3166 country code ("FR").' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_memory',
+      description: `Your LEARNING MEMORY — lessons about DHIS2 / API behaviour that persist across conversations (stored only in this browser). Lessons relevant to the current request are already shown in the system prompt ("Learning memory"), alongside a tool's manual, and on a failed call; use this tool for anything else.
+- search — look up lessons before a step you are unsure of: query="dashboard add items", optional area / tool / endpoint.
+- record — save a lesson right after you hit an error and FOUND the fix (or learned a non-obvious rule of this DHIS2): area, tools, title (what to do, ≤12 words), problem (what failed and why, with the error), solution (the exact correct tool/endpoint/parameters). Optional endpoint (e.g. "dataStore/<ns>/<key>"), scope "instance" when it only applies to THIS server's configuration (default "general"), supersedes=<id> to replace a lesson that proved wrong.
+- list — what is stored (optionally per area).
+NEVER put patient or personal data in a lesson (no names, IDs, phone numbers, values from records) — only configuration and API knowledge. Recording is refused automatically in any turn that touched patient-level data.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['search', 'record', 'list'], description: 'search=find lessons; record=save a lesson; list=what is stored.' },
+          query: { type: 'string', description: 'For search: words describing the task or error.' },
+          area: { type: 'string', enum: MEMORY_AREA_KEYS, description: 'Task area the lesson belongs to (record: required; search/list: optional filter).' },
+          tool: { type: 'string', description: 'For search: only lessons about this tool.' },
+          tools: { type: 'array', items: { type: 'string' }, description: 'For record: the tool name(s) the lesson is about (e.g. ["manage_dashboards"] or ["dhis2_query"]).' },
+          endpoint: { type: 'string', description: 'Optional API path pattern the lesson is about, e.g. "dashboards/<uid>" or "analytics/events/aggregate".' },
+          title: { type: 'string', description: 'For record: the rule in one line, e.g. "Add tiles with add_items, never PUT the dashboard".' },
+          problem: { type: 'string', description: 'For record: what went wrong and the error it produced.' },
+          solution: { type: 'string', description: 'For record: exactly how to do it correctly next time.' },
+          scope: { type: 'string', enum: ['general', 'instance'], description: 'For record: general DHIS2 behaviour (default) or specific to this server.' },
+          supersedes: { type: 'string', description: 'For record: id of a stored lesson this one corrects (it is replaced).' },
+          limit: { type: 'integer', description: 'For search/list: max lessons to return.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -2327,6 +2505,10 @@ const TOOL_ROUTER = Object.freeze({
   manage_maps: true,
   manage_line_lists: true,
   manage_backups: true,
+  manage_users: true,
+  manage_data_values: true,
+  manage_metadata_translations: true,
+  manage_memory: true,
 });
 
 // ── Lazy Tool Manuals (two-tier tool docs) ───────────────────────────────────
@@ -2372,6 +2554,7 @@ const WRITE_CAPABLE_TOOL_NAMES = new Set([
   'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
   'manage_dashboards', 'manage_maps', 'manage_line_lists',
   'manage_custom_translations', 'manage_growth_chart_plugin',
+  'manage_users', 'manage_data_values', 'manage_metadata_translations',
 ]);
 
 const MANUAL_TOOLS = new Set([
@@ -2392,6 +2575,9 @@ const MANUAL_TOOLS = new Set([
   'manage_line_lists',
   'manage_custom_translations',
   'manage_growth_chart_plugin',
+  'manage_users',
+  'manage_data_values',
+  'manage_metadata_translations',
 ]);
 
 // Short routing descriptions sent on the wire for MANUAL_TOOLS. These carry
@@ -2416,6 +2602,9 @@ const TOOL_SUMMARIES = {
   manage_dashboards: 'Build/inspect analytics dashboards and saved visualizations (charts, pivots, single-value tiles): list, get, create_visualization, create_dashboard (atomic, with inline new visualizations), add_items (the ONLY safe way to add to an EXISTING dashboard — a raw PUT wipes its tiles), remove_item, update, delete. NEVER hand-assemble visualizations/dashboards bodies via dhis2_query (they import as EMPTY charts). render_chart = inline chat preview; this tool SAVES to DHIS2.',
   manage_maps: 'Create/inspect/delete thematic maps (choropleth / bubble): list, get, create (one data_item UID + org_unit_level/org_units + period, optional legend_set_id), delete. NEVER hand-assemble /api/maps bodies via dhis2_query. Place a map on a dashboard via manage_dashboards(action=add_items, items=[{type:"MAP", map_id}]).',
   manage_line_lists: 'Author SAVED line lists — the row-per-record tables of the Line Listing app (eventVisualizations type LINE_LIST): list, get, create (EVENT / ENROLLMENT with cross-stage + repeated-event columns / TRACKED_ENTITY; dimensions by UID or exact name, auto stage/option-code resolution, filters, sorting, legend; the layout is PROVEN against analytics BEFORE saving), update, delete, validate (re-run its query → row_count). NEVER hand-assemble eventVisualizations bodies via dhis2_query (the app cannot open them). Dashboard placement: manage_dashboards items [{type:"EVENT_VISUALIZATION", event_visualization_id}]. line_listing_guide = app UI help; THIS tool saves the actual line lists.',
+  manage_users: 'Administer users, user roles, user groups and authorities: list, get, create (username + names + ≥1 role + policy-compliant password or generate_password, capture/data-view/search org units, groups — names resolve to UIDs), update (roles/org units/groups add/remove, password reset, profile), disable, enable, delete; list_roles, get_role, create_role, update_role, delete_role (authorities validated against /api/authorities — DHIS2 silently stores misspelled ones); list_groups, create_group, update_group (members), delete_group; list_authorities. NEVER POST /users or /userRoles via dhis2_query.',
+  manage_data_values: 'Aggregate data entry for ONE form (dataset × period × org unit): get (values with names, empty cells, completion/lock), set (values by data-element NAME + disaggregation name; value types, option sets, period type, org-unit assignment and period openness checked BEFORE sending — DHIS2 itself silently stores wrong-period / unassigned-OU / missing-disaggregation values), delete, complete, incomplete, validate (run validation rules). Returns previous values as an undo record. NEVER hand-write dataValueSets bodies via dhis2_query for single-form entry.',
+  manage_metadata_translations: 'Translate METADATA objects (names, short names, form names, descriptions, labels of programs, stages, data elements, options, attributes, datasets, indicators, org units …) into a database locale: list_locales, add_locale, get, set (single object or items[] up to 100, MERGES with existing translations, keys validated against the schema), remove. NOT for app UI strings (manage_custom_translations). NEVER PUT {type}/{id}/translations via dhis2_query — it replaces every locale.',
 };
 
 // ── Deep how-to KB text that used to live in buildSystemPrompt ──
@@ -2897,6 +3086,36 @@ A **line list** is a saved row-per-record table (one row per event / enrollment 
 **Diagnosing "the line list shows an error / is empty"** → action=validate on the saved list: it re-runs the app's exact query and returns row_count or the offending dimension. Division-PI columns and analytics-tables-not-run are the two most common causes.
 **Zero-invention rule**: every dimension resolves against the program's real metadata at call time; a typo'd name returns the valid candidates instead of saving a broken list. Never invent UIDs; never POST/PUT eventVisualizations via dhis2_query.`;
 
+const KB_USERS_DETAILS = `### Typical requests → calls
+- "Create a data-entry account for Jane at Ngelehun": list_roles (pick the data-entry role) → create(username, first_name, surname, roles:[role], org_units:["Ngelehun CHC"], password | generate_password:true).
+- "Give the clerks access to Capture": find the role (list_roles / get_role) → update_role(add_authorities:["Capture"]) — app names resolve to M_dhis-web-<app>.
+- "Move Jane to Bo district": update(user_id, org_units:["Bo"]) (replace) or add_org_units / remove_org_units.
+- "Lock this account" → disable. "Reset her password" → update(password) — confirm the new password with the user first.
+### Rules
+- org_units = capture/data-entry scope (REQUIRED for the user to do anything); data_view_org_units = analytics scope (defaults to org_units); search_org_units = tracker search scope.
+- A user always keeps ≥1 role; a role always keeps ≥1 authority (both refused otherwise).
+- Never invent passwords silently: either the user gives one, or pass generate_password:true and relay the returned initial_password ONCE.
+- Never delete the signed-in account; prefer disable over delete.`;
+
+const KB_DATA_VALUES_DETAILS = `### Workflow
+1. Resolve the form: dataset (manage_datasets(action="list") or its name), period (in the dataset period type), org unit (must be assigned to the dataset).
+2. action="get" first when the user asks what is there or when you need the exact data-element / disaggregation names.
+3. action="set" with ALL the values of the request in ONE call. If problems[] comes back, NOTHING was written — fix exactly those entries and resend the whole call.
+4. Report what was saved; quote previous_values when existing values were overwritten (that is the undo record).
+### Rules
+- category_option_combo only for disaggregated data elements — use the names shown in valid_category_option_combos / get.
+- openFuturePeriods=0 → the CURRENT period is not open yet (only ended periods). Tell the user instead of retrying; only change openFuturePeriods if they ask.
+- Clearing a whole form (delete all:true) needs confirm_all:true AFTER the user saw the list of values.
+- Patient-level tracker data is NOT handled here — this tool is aggregate only.`;
+
+const KB_METADATA_TRANSLATIONS_DETAILS = `### Workflow for "translate <program/dataset> into <language>"
+1. list_locales — if the language is missing, ask the user, then add_locale.
+2. Gather the objects: get_program_info (program, stages, data elements, attributes, options) or manage_datasets(action="get").
+3. Write the translations yourself, then ONE set call with items:[{ object_type, object_id, translations:{ NAME, SHORT_NAME?, FORM_NAME? } }] (≤100 per call; split bigger jobs).
+4. Tell the user to pick the language under Profile → Settings → "Database locale" to see it.
+### Property keys (validated per object type)
+NAME, SHORT_NAME (≤50 chars), DESCRIPTION, FORM_NAME (the label in data-entry forms — translate it whenever the object has a form name). Programs also have labels such as ENROLLMENT_DATE_LABEL, INCIDENT_DATE_LABEL. get lists the exact keys for an object.`;
+
 const MANUAL_EXTRAS = {
   create_metadata: [KB_CREATE_PROGRAM_DETAILS, KB_VALUE_TYPE_MAPPING, KB_PROGRAM_RULE_SYNTAX, KB_PI_GRAMMAR].join('\n\n'),
   manage_metadata: [KB_METADATA_DELETE_FLOW, KB_METADATA_TEA_OU, KB_METADATA_ICON_FLOW, KB_METADATA_SHARING].join('\n\n'),
@@ -2914,6 +3133,9 @@ const MANUAL_EXTRAS = {
   manage_line_lists: KB_LINE_LISTS_DETAILS,
   manage_custom_translations: KB_TRANSLATIONS_DETAILS,
   manage_growth_chart_plugin: KB_GROWTH_CHART_DETAILS,
+  manage_users: KB_USERS_DETAILS,
+  manage_data_values: KB_DATA_VALUES_DETAILS,
+  manage_metadata_translations: KB_METADATA_TRANSLATIONS_DETAILS,
   // manage_maps: full description already covers usage; no extra KB.
 };
 
@@ -3082,6 +3304,51 @@ function stubToolContentForHistory(content) {
 // Keeping the tool list small prevents context-window overflow and helps
 // the model make better routing decisions.  Every extra tool is wasted
 // context tokens and an invitation for the LLM to pick the wrong one.
+// Intent detection for the administration tools (src/tools-admin.js), shared by
+// getContextualTools (tool selection) and buildSystemPrompt (routing stubs) so
+// the two can never disagree. `t` must already be lower-cased.
+function detectAdminIntents(t) {
+  // ── User-administration intent (manage_users) ──
+  // Accounts, roles, groups, authorities, passwords. "users" alone is too
+  // common in sharing phrasings ("share with all users"), so it only counts
+  // next to an account-management verb; explicit role/group/authority/password
+  // nouns count on their own. Purely additive — sharing keeps manage_metadata.
+  const wantsUserAdminIntent =
+    /\buser\s*(?:roles?|groups?|accounts?|management|admin(?:istration)?|authorit(?:y|ies))\b/.test(t)
+    || /\b(?:authorit(?:y|ies)|passwords?|usernames?|log[\s-]?in\s+accounts?|user\s+names?)\b/.test(t)
+    || (/\b(?:create|add|new|register|disable|deactivate|enable|reactivate|lock|unlock|delete|remove|reset|invite|onboard|rename|list|show|find|which|who)\b/.test(t)
+        && /\b(?:users?|accounts?|data\s*(?:entry\s*)?clerks?|staff\s+accounts?|logins?)\b/.test(t)
+        && !/\b(?:share|sharing|public\s*access)\b/.test(t));
+  // ── Aggregate data-value intent (manage_data_values) ──
+  // Entering / reading / clearing / completing ONE aggregate form. Surfaced in
+  // the Data Entry apps, on explicit "data value(s)" wording, on entry verbs
+  // coupled with a dataset/form/period phrase, and on completion/validation of
+  // a form.
+  const wantsDataValuesIntent =
+    /\bdata\s*values?\b/.test(t)
+    || /\b(?:datavaluesets?|data\s*value\s*sets?)\b/.test(t)
+    || (/\b(?:enter|record|report|submit|input|key\s*in|fill\s*in|type\s*in|save)\b/.test(t)
+        && /\b(?:data\s*sets?|datasets?|forms?|monthly|weekly|quarterly|aggregate|period|20\d\d(?:0[1-9]|1[0-2])|20\d\dq[1-4]|january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(t)
+        && !/\b(?:enrol(?:l)?(?:ment)?s?|tracked\s*entit|tei|patients?|events?)\b/.test(t))
+    || /\b(?:mark|set)\b.{0,40}\b(?:form|data\s*set|dataset|report)\b.{0,30}\b(?:complete|completed|incomplete|uncomplete)\b/.test(t)
+    || /\bcomplete\s*(?:data\s*set\s*)?registrations?\b/.test(t)
+    || (/\b(?:clear|wipe|delete|remove)\b/.test(t) && /\b(?:values?|form)\b/.test(t) && /\b(?:data\s*sets?|datasets?|period|month|aggregate)\b/.test(t))
+    || (/\bvalidat(?:e|ion)\b/.test(t) && /\b(?:this|the)\s+form\b/.test(t));
+  // ── Metadata-object translation intent (manage_metadata_translations) ──
+  // "translate the TB program / these data elements / the option names into
+  // French". Disjoint from app-UI string translation (manage_custom_translations):
+  // a translation turn that names metadata objects and NO app-UI noun routes
+  // here ONLY.
+  const _translateWord = /\b(?:translat(?:e|ed|es|ing|ions?)|locali[sz](?:e|ation)|in\s+(?:french|arabic|spanish|portuguese|swahili|amharic|russian|chinese|hindi|lao|khmer|burmese|nepali|dari|pashto|farsi|persian|indonesian|vietnamese|tajik))\b/.test(t);
+  const _metadataNoun = /\b(?:programs?|programmes?|stages?|data\s*elements?|options?|option\s*sets?|attributes?|tracked\s*entity|data\s*sets?|datasets?|sections?|indicators?|org(?:anisation)?\s*units?|categor(?:y|ies)|category\s*options?|metadata|form\s*names?|short\s*names?|database\s*locales?|db\s*locales?)\b/.test(t);
+  const _appUiNoun = /\b(?:app|application|ui|interface|button|menu|screen|header|string|wording|capture\s+app|dashboard\s+app)\b/.test(t);
+  const wantsMetadataTranslationIntent =
+    /\b(?:database|db)\s*locales?\b/.test(t)
+    || (_translateWord && _metadataNoun);
+  const metadataTranslationOnly = wantsMetadataTranslationIntent && !_appUiNoun;
+  return { wantsUserAdminIntent, wantsDataValuesIntent, wantsMetadataTranslationIntent, metadataTranslationOnly };
+}
+
 function getContextualTools(ctx, userText, browseWeb) {
   const appType = (ctx?.appType || '');
   const combinedText = String(userText || '').toLowerCase();
@@ -3269,6 +3536,7 @@ function getContextualTools(ctx, userText, browseWeb) {
     || (/\b(register|listing|row[-\s]?level|record[-\s]?level)\b/.test(combinedText)
         && /\b(tracker|program|stage|enrollment|event|patient|case|cohort)\b/.test(combinedText)
         && /\b(create|build|make|design|set\s*up|save|generate|author|update|list)\b/.test(combinedText));
+  const { wantsUserAdminIntent, wantsDataValuesIntent, wantsMetadataTranslationIntent, metadataTranslationOnly } = detectAdminIntents(combinedText);
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -3427,8 +3695,28 @@ function getContextualTools(ctx, userText, browseWeb) {
 
   // ── Custom-translation authoring — app UI string translation / re-labelling ──
   // App-agnostic: surface whenever the user expresses translation/relabel intent.
-  if (wantsTranslationIntent) {
+  if (wantsTranslationIntent && !metadataTranslationOnly) {
     selected.add('manage_custom_translations');
+  }
+
+  // ── Metadata-object translations — names/labels of programs, DEs, options… ──
+  if (wantsMetadataTranslationIntent) {
+    selected.add('manage_metadata_translations');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
+  }
+
+  // ── User administration — accounts, roles, groups, authorities ──
+  if (wantsUserAdminIntent) {
+    selected.add('manage_users');
+    selected.add('search_metadata');
+  }
+
+  // ── Aggregate data values — one dataset × period × org-unit form ──
+  if (wantsDataValuesIntent || isAggDataEntry) {
+    selected.add('manage_data_values');
+    selected.add('manage_datasets');
+    selected.add('search_metadata');
   }
 
   // ── Growth-chart plugin setup — install + datastore config for the WHO chart ──
@@ -3575,6 +3863,11 @@ function getContextualTools(ctx, userText, browseWeb) {
   if (wantsBackupIntent || hasWriteTool) {
     selected.add('manage_backups');
   }
+
+  // ── Learning memory — always available while the feature is switched on
+  //    (lessons are written/searched mid-task; the tool is read/append-only
+  //    and touches nothing on the DHIS2 server). ──
+  if (typeof isMemoryEnabled === 'function' && isMemoryEnabled()) selected.add('manage_memory');
 
   // ── Web browsing ──
   if (browseWeb) selected.add('browse_web');
@@ -4267,10 +4560,33 @@ A CUSTOM form is hand-laid-out HTML for data entry, for BOTH dataSets (Aggregate
   }
 
   // ── Custom Translations KB — translate / re-label app UI strings (DHIS2 2.43+) ──
-  if (wantsTranslationPrompt) {
+  const adminIntents = detectAdminIntents(text);
+  if (wantsTranslationPrompt && !adminIntents.metadataTranslationOnly) {
     p += `
 ## DHIS2 Custom Translations — use the **manage_custom_translations** tool
 EXPERIMENTAL DHIS2 2.43+ feature: translate or re-label an app's UI strings via the "custom-translations" dataStore — no source-code changes. "Translate this app", "rename a button/label", "reword the UI" → **manage_custom_translations** (list/get/set/remove) — NEVER hand-write those dataStore keys via dhis2_query (the controller registry must stay in sync; the tool does that). Source strings must match the on-screen text EXACTLY.
+`;
+  }
+
+  // ── Metadata-object translations / user administration / aggregate data
+  //    values (src/tools-admin.js) — decide-time routing stubs only; the
+  //    how-to lives in each tool's manual. ──
+  if (adminIntents.wantsMetadataTranslationIntent) {
+    p += `
+## Translating METADATA — use the **manage_metadata_translations** tool
+Names / short names / form names / descriptions of programs, stages, data elements, options, attributes, datasets, indicators, org units … are translated per object into a DATABASE locale with **manage_metadata_translations** (list_locales → set with items[] in ONE call; it MERGES). NEVER PUT {type}/{id}/translations via dhis2_query (it replaces every other locale). App UI strings/buttons are a different feature (manage_custom_translations).
+`;
+  }
+  if (adminIntents.wantsUserAdminIntent) {
+    p += `
+## Users, roles & groups — use the **manage_users** tool
+Accounts (create/update/disable/enable/delete, password reset, org-unit scopes), user roles (authorities validated against the server) and user groups (membership) go through **manage_users** — NEVER raw POST /users or /userRoles via dhis2_query. Whether a user can SEE a program/dataset is sharing (manage_metadata(action=update_sharing)) plus org-unit assignment — not a role change unless the user lacks the app authority.
+`;
+  }
+  if (adminIntents.wantsDataValuesIntent || inAggDataEntryCtx) {
+    p += `
+## Aggregate data values — use the **manage_data_values** tool
+Reading, entering, clearing, completing or validating ONE aggregate form (dataset × period × org unit) goes through **manage_data_values** — values by data-element NAME + disaggregation name; it refuses the values DHIS2 would silently store invisibly (wrong period type, unassigned org unit, missing disaggregation). Totals across org units/periods are ANALYTICS (dhis2_query analytics), not this tool.
 `;
   }
 

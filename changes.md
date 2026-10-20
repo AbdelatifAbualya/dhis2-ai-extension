@@ -3174,3 +3174,225 @@ parser; dashboard holding the 3 original tiles **plus** both line lists
 (the turn-3 tiles were not destroyed) — the ENROLLMENT register spanning all
 three stages and the EVENT register scoped to the Treatment stage, both
 `LAST_12_MONTHS`.
+
+## v2.8.25 — administration tools (users, aggregate data values, metadata translations) + six silent-failure fixes (2026-10-20)
+
+Method: complex admin tasks were first done **by hand** against the local DHIS2
+2.42.5.1 (`localhost:8081`), recording what actually works; only then was each
+proven API sequence reflected into the extension. The extension had 33 tools
+but **no** dedicated path for three everyday DHIS2 jobs — user/role
+administration, aggregate data entry, and translating metadata — so the model
+had to hand-write raw `dhis2_query` bodies into APIs whose failure modes are
+**silent** (HTTP 200/201/204 while storing something useless). All new code
+lives in a new 8th module, `src/tools-admin.js`, loaded before `src/agent.js`.
+
+### DHIS2 behaviour discovered (all verified live, none documented in the tools before)
+| Area | What DHIS2 does |
+|---|---|
+| Users | `POST /api/users?dryRun=true` **ignores dryRun and creates the user**; only `/metadata?importMode=VALIDATE` is a real dry run. |
+| Users | The legacy `userCredentials:{username,password,userRoles}` shape → E4049 + E4055 on 2.42. |
+| Users | Password policy: 8–72 chars (systemSettings) + lower + upper + digit + special char. |
+| Roles | An unknown authority (`BOGUS_AUTH`) is stored verbatim with **201** and grants nothing. |
+| Groups | `PATCH users/{id}` `replace /userGroups` → **500**; `add` → 200 but changes nothing. Only `POST/DELETE userGroups/{g}/users/{u}` works. |
+| Data values | Without strict* flags, a **weekly period on a monthly dataset**, an **unassigned org unit**, and a **disaggregated DE with no COC** (filed under default) are all stored with status SUCCESS — invisible in Data Entry. |
+| Data values | `openFuturePeriods=0` ⇒ only ENDED periods are open; the current month is rejected (E7641). |
+| Data values | A partial import answers **HTTP 409 / WARNING while some values WERE saved**. |
+| Data values | `importStrategy=DELETE` **without `value`** crashes the importer for option-set DEs ("The import process failed: null"). Sending the stored value avoids it. |
+| Data elements | A DE that ever held aggregate data can never be deleted (E4030 `DataValueAudit`) until `POST /maintenance/dataPruning/dataElements/{uid}`. |
+| Datasets | Deleting a dataset whose DEs use an option set returns **HTTP 500** (`afterTransactionCompletion … OptionSet … no Session`) — but the delete **is committed**. |
+| Translations | `PUT {type}/{id}/translations` **replaces the whole set** (one French write wipes Arabic/Spanish); unknown locales/properties are accepted with 204 and never render. Translated names show only with `?translate=true&locale=`. |
+| Indicator types | Names are instance-specific: this instance has "Percentage" (factor 100) and no "Per cent", so `manage_indicators(indicator_type:"Per cent")` failed outright. |
+| Rule actions | `data_element: "<name>"` (instead of `data_element_name`) was ignored: HIDEFIELD rules were **skipped**, and a SHOWWARNING was saved **with no field** (legal, so no error) — the warning floated at the top of the form. |
+
+### New tools (36 total)
+1. **`manage_users`** — users (list/get/create/update/disable/enable/delete), roles
+   (list/get/create/update/delete), groups (list/create/update/delete),
+   `list_authorities`. Names resolve to UIDs; username/duplicate/password-policy
+   checks before sending; creation via `/metadata` VALIDATE→COMMIT;
+   `generate_password` returns a strong password once; legacy `userCredentials`
+   healed; authorities validated against `/api/authorities` (exact id, human
+   name — token-subset match "Add data value" → `F_DATAVALUE_ADD` — or app name
+   "Capture" → `M_dhis-web-capture`) with did-you-mean suggestions;
+   `get_role` flags unrecognised authority strings; group membership through the
+   group endpoint and verified after create; a user always keeps ≥1 role, a role
+   ≥1 authority; never deletes the signed-in account; every update/delete is
+   backed up first.
+2. **`manage_data_values`** — one form (dataset × period × org unit): `get`
+   (values with names, empty cells, completion + lock), `set`, `delete`
+   (cells or `all` + `confirm_all`), `complete`, `incomplete`, `validate`
+   (validation-rule violations with names/values). Data elements by
+   name/form name/code/UID; disaggregation by name or option names in any order
+   (symbol-preserving: "5+" never matches "<5"); value types and option sets
+   (code **or** option name) checked; friendly periods ("January 2026",
+   "Q1 2026", "2026-01"); period type, org-unit assignment, period openness and
+   locks refused **before** sending; strict* import flags as the server
+   backstop; previous cell values returned as the undo record; partial imports
+   reported cell by cell.
+3. **`manage_metadata_translations`** — `list_locales`, `add_locale`, `get`, `set`
+   (single object or `items[]` ≤100), `remove`. MERGES with existing
+   translations, validates locale (accepts "fr-FR" / "French") and property keys
+   against the object's schema (`NAME`, `SHORT_NAME`, `FORM_NAME`,
+   `DESCRIPTION`, program labels …), verifies the translated display name.
+
+Wiring for all three: `TOOLS`, `TOOL_ROUTER`, `WRITE_CAPABLE_TOOL_NAMES`,
+`MANUAL_TOOLS` + `TOOL_SUMMARIES` + `MANUAL_EXTRAS` (two-tier docs),
+`detectAdminIntents()` (shared by `getContextualTools` and `buildSystemPrompt`
+so they cannot disagree), routing stubs in `buildSystemPrompt`, `executeTool`
+dispatch, panel icon/label/detail, agent thinking labels.
+
+### Fixes to existing behaviour
+4. **Rule-action key aliases** (`src/tools-programs.js` `normalizeRuleActionAliases`,
+   applied to every `create_metadata` / `manage_program_rules` call):
+   `data_element`, `dataElement{id|name}`, `de`, `attribute`, `tea`,
+   `tracked_entity_attribute`, `field`, `target`, `stage`, `section`,
+   `action_type`, `message` → canonical keys (UID-shaped → `*_id`, else `*_name`;
+   canonical keys never overwritten). `canonicalizeActionTargetNames` also moves
+   a TEA name given as a data-element target (and vice versa) to the right key;
+   the create path accepts `data_element_id` / `tei_attribute_id` of objects in
+   the same call.
+5. **Indicator type by factor** (`src/tools-metadata.js` `resolveIndicatorType`):
+   exact name → case-insensitive name → the instance's type with the implied
+   factor ("Per cent"/"percent"/"%" → 100, "per thousand" → 1000, … "number" →
+   1); only when no such type exists **and** the call writes anyway is the
+   standard type created. The result says which type was used.
+6. **Write authorization for imperative data-entry/admin verbs**
+   (`src/core.js` `WRITE_AUTH_IMPERATIVE_RE`): "Enter 12 malaria cases…",
+   "Reset Jane's password…", "Mark the form complete", "Register three clinics"
+   were classified read_only and refused. These verbs now authorize ONLY at a
+   sentence start / after a request marker, and never in a problem report or a
+   narrative clause ("when I enter data and then submit it, it fails" stays
+   read_only).
+7. **`dhis2_query` hardening** (`src/tools-metadata.js`): PATCH is pre-checked
+   against `/api/schemas` (unknown property → did-you-mean, bad enum / period
+   type → allowed values) — runs after every tool-specific redirect guard;
+   raw `dataValueSets` imports get strict* flags and an honest partial-import
+   summary; raw `PUT …/translations`, `POST /users` and role-authority writes are
+   redirected to the new tools; `PATCH users /userGroups` refused; a literal
+   `undefined`/`null` path segment is refused before it costs a 404.
+8. **Post-commit 5xx on deletes** (`src/core.js` `safeDhis2Fetch`): on
+   `afterTransactionCompletion` errors from a DELETE / metadata DELETE, the
+   targets are re-checked; if all are gone the call reports the success it was
+   (with `_post_commit_server_error`), fixing false "deletion failed" reports in
+   every delete site at once.
+9. **Aggregate-data delete block** (`src/core.js`, `src/tools-programs.js`):
+   E4030 on `DataValue`/`DataValueAudit` now carries the exact (destructive,
+   confirmation-gated) `maintenance/dataPruning/dataElements/<uid>` recovery.
+
+### Verification
+- `npm run verify` — all green, +48 new assertions (classifier, aliases,
+  routing disjointness, period/value/COC coercion, password policy, factor
+  inference, strict-flag hardening, prune hint).
+- New live scenario **`scripts/scenario-admin-tools.js`** (`npm run admin`):
+  66 assertions through the real `executeTool` on localhost:8081 — builds a
+  disaggregated monthly form, writes/reads/overwrites/completes/validates/clears
+  it, proves all six silent-wrong-data cases are refused client-side with **no
+  API call**, merges translations across fr/ar, creates a role/group/user and
+  edits them, exercises every dhis2_query guard, the rule aliases and the
+  indicator-type fix, then deletes everything including its own backups.
+  **266 API calls, 0 unexpected failures** (3 marked expected: the deliberately
+  provoked partial import, DHIS2's post-commit dataset-delete 500 and its 404
+  verification probe).
+- Regression: `scenario-line-lists` (110 calls, 0 failed), `scenario-sticky-context`,
+  `scenario-stage-context`, `scenario-soft-deleted-de` — all pass unchanged.
+- Instance left exactly as found (objects, data values, audits, DB locales,
+  backups).
+- Not yet done: an end-to-end run of the new tools through the real agentic
+  loop with an LLM (needs a provider key).
+
+## v2.8.25 (cont.) — Learning memory: the assistant never repeats a DHIS2 mistake it has already solved (2026-10-20)
+
+New module **`src/memory.js`** (loaded right after `core.js`; `TOOLS` uses its area list) +
+tool **`manage_memory`** (37 tools) + Settings UI.
+
+### What it stores — and what it never stores
+Lessons about DHIS2 / API behaviour only: `{ area, tools, endpoint, title, problem, solution }`
+plus source (`auto` / `assistant` / `user`), scope (`general` or `instance` = only this server),
+instance host, DHIS2 version, seen/used counts. Storage: `chrome.storage.local`
+(`dhis2AiMemory`, switch `memoryEnabled`) — never the DHIS2 server, never the developer.
+**Patient data can never be stored** (code-enforced, verified):
+1. **Taint** — no memory write of any kind in a turn that read/wrote patient-level tracker
+   records (`toolReadsPatientData`, any non-GET tracker path, tracker summaries in a result,
+   `cross_stage_entity_intersection`), ran on a patient-record page (TEI/enrollment/event in
+   the page context), or ran the save-error prefetch. `manage_memory(record)` is refused there.
+2. **No raw values** in automatic lessons — tool, action, endpoint pattern, argument KEY names,
+   query-parameter names and an allow-list of enum-like configuration values only.
+3. **Scrub + reject** on every stored text: UIDs → `<uid>` (stricter test that keeps
+   11-letter API words like `programType`), e-mails, phone/ID numbers (≥8 digits), dates,
+   filter/query values, server URLs → path; a lesson that still reads like personal data
+   ("patient named …", "Mrs …", "first name: …") is refused.
+
+### How lessons are made
+- **Automatically** (`memoryObserveCall` after every executed call, `memoryEndTurn` in the
+  loop's `finally`): a failure followed by a success of the same tool/action (same endpoint
+  family for `dhis2_query`, or the tool a failure redirected to) becomes a lesson naming the
+  exact change ("indicator.indicator_type: Per thousand → Percentage", "added dataset_id").
+  An unfixed failure whose tool explained the fix becomes a "known issue". Write-auth
+  refusals, privacy blocks, preflight/circuit-breaker blocks, manuals and 404-on-unknown-UID
+  are never lessons.
+- **By the model** — right after it recovers, the successful result carries a one-time
+  `_memory_note` asking for ONE `manage_memory(record)` call; a model-written lesson
+  supersedes the automatic one for that tool.
+- **By the user** — "remember … / from now on … / next time …" in the user's own message
+  makes the recorded lesson a **user rule** (highest rank); or a note added in the viewer.
+- Near-duplicates merge (seen count; better source wins), cap 400 with least-valuable
+  eviction, `supersedes` replaces a lesson that proved wrong.
+
+### How lessons are used (task-aware)
+- **System prompt**: the best ≤8 lessons for THIS request, scored by the tools selected for
+  the turn (`getContextualTools`), task-area keywords (25 areas: programs, rules, PIs,
+  indicators, datasets, data values, dashboards, maps, line lists, users, translations, …)
+  and word overlap — under a BINDING header ("before every call check the lessons; never
+  make a call a lesson says fails — follow it or tell the user").
+- **Manual gate**: a tool's own lessons ride with its manual on first use (`_memory_lessons`
+  + `_memory_rule`).
+- **Failed call**: lessons for that tool/action/endpoint are attached to the error result.
+- **`manage_memory(search|list)`** for explicit lookup.
+- Memory OFF → no learning, no injection, `manage_memory` not offered; stored lessons kept.
+
+### Settings UI (`sidepanel/panel.{html,css,js}`)
+Settings → **Learning memory**: on/off switch (applies immediately) with lesson count, and
+**View memories**: search, filter by area, per-lesson delete, export JSON, "Add a note
+yourself", two-click "Clear all" (no blocking dialog). Every lesson string is rendered with
+`textContent` (lesson text can come from the model — verified an `<img onerror>` title
+renders as text). After a turn that learned something, the chat shows "🧠 Learned N lessons
+for next time" (click → viewer). Works in light and dark themes.
+
+### Also fixed (found by the memory itself)
+- `manage_datasets` — every action except list/create now accepts the dataset NAME
+  (`dataset_name`, or a name in `dataset_id`); "dataset_id required for get" was the most
+  frequent automatic lesson in the first LLM run.
+- `src/agent.js` — the loop's success/failure bookkeeping branch simplified.
+
+### Verification
+- `npm run verify` — +47 memory assertions: scrubbing, personal-data refusal, merge, task-aware
+  retrieval (indicator + dashboard lessons in, unrelated line-list lesson out), manual-gate
+  lessons, automatic failure→fix capture with no values, write-auth refusals ignored, taint
+  on patient page / patient read attempt / tracker write, user-rule tagging, ON/OFF.
+- Panel UI driven in real Chrome (shimmed copy of the real panel): toggle, viewer, search,
+  area filter, delete, add-note validation + save, XSS safety, two-click clear, learned note,
+  dark theme.
+- `npm run admin` (now also: `manage_datasets(get)` by name) — 268 calls, 0 unexpected failures.
+- **Real-LLM acceptance** `scripts/llm-memory-acceptance.js` with
+  `accounts/fireworks/models/deepseek-v4p1-flash-1017` against localhost:8081 — see results below.
+
+**Real-LLM acceptance results** (`deepseek-v4p1-flash-1017`, 6 turns incl. a new thread and a
+patient-record page, three runs):
+
+| Turn | DHIS2 calls | Failed | Memory |
+|---|---|---|---|
+| T1 indicator + dashboard | 16 | **0** | — |
+| T2 enter data (previous + **current** month) | 23 | **0** | current-month refusal → "known issue" lesson |
+| T3 "remember: ended months only; charts LAST_12_MONTHS" | 0 | **0** | 2 lessons recorded as **user rules** (merged with T2's) |
+| T4 **new thread**: enter data for the current month | 3 | **0** | lesson applied — the doomed write was **not attempted**; user told why |
+| T5 new indicator + add chart to existing dashboard | 23 | **0** | LAST_12_MONTHS rule applied, `add_items` used |
+| T6 patient-record page, "remember how to fix it" | 3 | **0** | model tried to record → **refused by the taint**; 0 lessons written |
+
+0 provider errors; stored memory audited: **0 UID-like tokens, no personal-data pattern**;
+everything created (and every backup) removed afterwards.
+
+Two fixes came out of the runs: (1) run 1 showed the most frequent automatic lesson was
+"manage_datasets(get) needs dataset_id" → `manage_datasets` now resolves names; (2) runs 1–2
+showed the model reading a binding lesson at the END of the long system prompt and still
+making the call → lessons now go in a transient system message right AFTER the user's message
+(dropped from history, re-selected every turn), and "remember …" lessons are tagged as user
+rules from the user's own words. Run 3: the known failure was not repeated.

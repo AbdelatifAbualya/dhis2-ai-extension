@@ -36,9 +36,9 @@ const bad = (m) => { console.log('  \x1b[31m✗\x1b[0m ' + m); failures++; };
 console.log('\nSyntax check (node --check):');
 const runtimeFiles = [
   'background.js', 'content.js', 'generate-icons.js',
-  'src/core.js', 'src/registry.js', 'src/providers.js',
+  'src/core.js', 'src/memory.js', 'src/registry.js', 'src/providers.js',
   'src/tools-metadata.js', 'src/tools-programs.js', 'src/tools-linelists.js',
-  'src/agent.js',
+  'src/tools-admin.js', 'src/agent.js',
   'sidepanel/panel.js',
 ];
 for (const rel of runtimeFiles) {
@@ -91,7 +91,8 @@ try {
   // `dhis2` is a bundle-lexical `let`, so expose a reader for the few checks
   // that need to drive per-turn counters (the loop guards).
   vm.runInContext(bundle + '\n;globalThis.__dhis2 = () => dhis2;'
-    + '\n;globalThis.__TOOL_ROUTER = TOOL_ROUTER;',
+    + '\n;globalThis.__TOOL_ROUTER = TOOL_ROUTER;'
+    + '\n;globalThis.__memoryState = () => memoryState; globalThis.__memoryTurn = () => memoryTurn;',
     ctx, { filename: 'background.bundle.js' });
   loaded = true;
   ok(`loaded ${modules.length} modules: ${modules.map((m) => m.replace('src/', '')).join(', ')}`);
@@ -1187,6 +1188,274 @@ if (loaded) {
     eq('SHOWWARNING without a DE still passes (legal)', missingTarget('SHOWWARNING', {}), false);
   }
 }
+
+// ── Administration tools (src/tools-admin.js) + 2026-10-20 fixes ──────────────
+if (loaded) {
+  console.log('\nAdministration tools & 2026-10-20 fixes:');
+  const fn = (n) => (typeof ctx[n] === 'function' ? ctx[n] : null);
+  const eq = (label, got, want) => {
+    if (JSON.stringify(got) === JSON.stringify(want)) ok(`${label} => ${JSON.stringify(got)}`);
+    else bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`);
+  };
+  const need = (n) => { const f = fn(n); if (!f) bad(`${n} — missing`); return f; };
+
+  // Imperative write verbs authorize; the same verbs inside a complaint do not.
+  const cwa = need('classifyWriteAuthorization');
+  if (cwa) {
+    eq('"Enter 12 malaria cases for January…" authorizes', cwa('Enter 12 malaria cases for January 2026 at Agouza').scope, 'broad');
+    eq('"Reset Jane\'s password…" authorizes', cwa("Reset Jane's password to Abc12345!").scope, 'broad');
+    eq('"please mark the September form complete" authorizes', cwa('please mark the September form complete').scope, 'broad');
+    eq('"When I enter data and then submit the form it fails" stays read_only', cwa('When I enter data and then submit the form it fails').scope, 'read_only');
+    eq('"If I mark it complete the values disappear" stays read_only', cwa('If I mark it complete the values disappear').scope, 'read_only');
+    eq('"why can\'t I enter values?" stays read_only', cwa("why can't I enter values?").scope, 'read_only');
+  }
+
+  // Rule-action key aliases land on the canonical keys.
+  const nra = need('normalizeRuleActionAliases');
+  if (nra) {
+    const a1 = nra({ type: 'HIDEFIELD', data_element: 'Sample ID' });
+    eq('data_element:"Sample ID" → data_element_name', a1.data_element_name, 'Sample ID');
+    const a2 = nra({ action_type: 'SHOWWARNING', dataElement: { id: 'a3kGcGpz8FJ' }, message: 'Low' });
+    eq('dataElement:{id} → data_element_id (+type, +content)', [a2.data_element_id, a2.type, a2.content], ['a3kGcGpz8FJ', 'SHOWWARNING', 'Low']);
+    const a3 = nra({ type: 'SETMANDATORYFIELD', attribute: 'National ID' });
+    eq('attribute:"National ID" → tracked_entity_attribute_name', a3.tracked_entity_attribute_name, 'National ID');
+    const a4 = nra({ type: 'HIDEFIELD', data_element_name: 'Keep me', data_element: 'Not me' });
+    eq('an explicit canonical key is never overwritten', a4.data_element_name, 'Keep me');
+    const a5 = nra({ type: 'HIDEFIELD', field: 'Temperature' });
+    eq('UID-shaped English word "Temperature" stays a NAME', [a5.data_element_name, a5.data_element_id], ['Temperature', undefined]);
+  }
+  const cat = need('canonicalizeActionTargetNames');
+  if (cat) {
+    const act = { data_element_name: 'national id' };
+    cat(act, ['Weight'], ['National ID']);
+    eq('a TEA name given as data_element_name moves to the attribute key', [act.tracked_entity_attribute_name, act.data_element_name], ['National ID', undefined]);
+  }
+
+  // Routing: metadata translation vs app-UI translation are disjoint.
+  // (Fresh thread — the sticky-tool checks above left tools "used".)
+  try { ctx.__dhis2().toolsUsedThisThread = []; } catch { /* older bundle */ }
+  const gct = need('getContextualTools');
+  if (gct) {
+    const names = (ctxObj, text) => gct(ctxObj, text, false, null).map((t) => t.function.name);
+    let n = names({ appType: 'Maintenance' }, 'translate the TB program and its data elements into French');
+    eq('"translate the TB program…" → manage_metadata_translations', n.includes('manage_metadata_translations'), true);
+    eq('…and NOT the app-UI string tool', n.includes('manage_custom_translations'), false);
+    n = names({ appType: 'Capture' }, 'translate the Capture app buttons to Arabic');
+    eq('"translate the Capture app buttons" → manage_custom_translations', n.includes('manage_custom_translations'), true);
+    n = names({ appType: 'Dashboard' }, 'create a user account for Jane with the data entry role');
+    eq('"create a user account…" → manage_users', n.includes('manage_users'), true);
+    n = names({ appType: 'Dashboard' }, 'share this dashboard with all users');
+    eq('"share … with all users" does NOT surface manage_users', n.includes('manage_users'), false);
+    n = names({ appType: 'Aggregate Data Entry', datasetId: 'a3kGcGpz8FJ' }, 'what is missing here?');
+    eq('Data Entry app → manage_data_values', n.includes('manage_data_values'), true);
+    n = names({ appType: 'Dashboard' }, 'enter 12 malaria cases in the monthly dataset for January 2026 at Agouza');
+    eq('"enter … monthly dataset … January" → manage_data_values', n.includes('manage_data_values'), true);
+    n = names({ appType: 'Capture', programId: 'a3kGcGpz8FJ' }, 'enter a new event for this patient');
+    eq('tracker data entry does NOT surface manage_data_values', n.includes('manage_data_values'), false);
+  }
+
+  // Aggregate value coercion / periods / disaggregation matching.
+  const npi = need('normalizePeriodInput');
+  if (npi) {
+    eq('"January 2026" (Monthly) → 202601', npi('Monthly', 'January 2026'), '202601');
+    eq('"2026-03" (Monthly) → 202603', npi('Monthly', '2026-03'), '202603');
+    eq('"Q2 2026" (Quarterly) → 2026Q2', npi('Quarterly', 'Q2 2026'), '2026Q2');
+    eq('"2026 week 3" (Weekly) → 2026W3', npi('Weekly', '2026 week 3'), '2026W3');
+  }
+  const po = need('periodOrdinal');
+  if (po) eq('Monthly ordinal 202601 - 202512 = 1', po('Monthly', '202601') - po('Monthly', '202512'), 1);
+  const cdv = need('coerceDataValue');
+  if (cdv) {
+    eq('INTEGER_ZERO_OR_POSITIVE "-2" refused', !!cdv({ valueType: 'INTEGER_ZERO_OR_POSITIVE' }, '-2').problem, true);
+    eq('BOOLEAN "yes" → "true"', cdv({ valueType: 'BOOLEAN' }, 'yes').value, 'true');
+    eq('option NAME → code', cdv({ valueType: 'TEXT', optionSet: { options: [{ code: 'LOW', displayName: 'Low' }] } }, 'low').value, 'LOW');
+    eq('unknown option refused', !!cdv({ valueType: 'TEXT', optionSet: { options: [{ code: 'LOW', displayName: 'Low' }] } }, 'Plenty').problem, true);
+    eq('NUMBER "1,250" → "1250"', cdv({ valueType: 'NUMBER' }, '1,250').value, '1250');
+  }
+  const mc = need('matchCoc');
+  if (mc) {
+    const cocs = [{ id: 'aaaaaaaaaa1', displayName: 'Female, <5', categoryOptions: [{ displayName: 'Female' }, { displayName: '<5' }] },
+                  { id: 'aaaaaaaaaa2', displayName: 'Male, <5', categoryOptions: [{ displayName: 'Male' }, { displayName: '<5' }] }];
+    eq('COC by option names in any order', (mc(cocs, '<5, Female') || {}).id, 'aaaaaaaaaa1');
+    eq('COC by option array', (mc(cocs, ['<5', 'Male']) || {}).id, 'aaaaaaaaaa2');
+    eq('"Female, 5+" does NOT match "Female, <5" (symbols kept)', mc(cocs, 'Female, 5+'), null);
+    const ages = [{ id: 'bbbbbbbbbb1', displayName: '<5', categoryOptions: [{ displayName: '<5' }] }, { id: 'bbbbbbbbbb2', displayName: '5+', categoryOptions: [{ displayName: '5+' }] }];
+    eq('"5+" resolves to the 5+ band', (mc(ages, '5+') || {}).id, 'bbbbbbbbbb2');
+    eq('"<5" resolves to the <5 band', (mc(ages, '<5') || {}).id, 'bbbbbbbbbb1');
+  }
+  const hdv = need('hardenDataValueSetsPath');
+  if (hdv) {
+    eq('raw dataValueSets import gets strictPeriods', /strictPeriods=true/.test(hdv('dataValueSets')), true);
+    eq('explicit strictPeriods=false is respected', /strictPeriods=false/.test(hdv('dataValueSets?strictPeriods=false')), true);
+    eq('DELETE strategy left untouched', hdv('dataValueSets?importStrategy=DELETE'), 'dataValueSets?importStrategy=DELETE');
+  }
+
+  // Users: password policy + username shape.
+  const cp = need('checkPassword');
+  if (cp) {
+    eq('"Abc12345!" passes the policy', cp('Abc12345!', { min: 8, max: 72 }).length, 0);
+    eq('"Abcdefgh!" lacks a digit', cp('Abcdefgh!', { min: 8, max: 72 }).some((p) => /digit/.test(p)), true);
+    const gp = need('generateStrongPassword');
+    if (gp) eq('generated password satisfies the policy', cp(gp(14), { min: 8, max: 72 }).length, 0);
+  }
+  const cu = need('checkUsername');
+  if (cu) { eq('"zz_ok-name.1" is a valid username', cu('zz_ok-name.1'), null); eq('"Bad Name" refused', !!cu('Bad Name'), true); }
+
+  // Indicator types by factor.
+  const iif = need('impliedIndicatorFactor');
+  if (iif) {
+    eq('"Per cent" → factor 100', (iif('Per cent') || {}).factor, 100);
+    eq('"%" → factor 100', (iif('%') || {}).factor, 100);
+    eq('"per 100,000" → factor 100000', (iif('per 100,000') || {}).factor, 100000);
+    eq('"Number (Factor 1)" → factor 1', (iif('Number (Factor 1)') || {}).factor, 1);
+  }
+
+  // Aggregate-data delete block → data-pruning hint names the right UID.
+  const adh = need('aggregateDataBlockHint');
+  if (adh) eq('hint carries the DE UID from a metadata DELETE body', /dataPruning\/dataElements\/Sdn2X0UkIQL/.test(adh('metadata?importStrategy=DELETE {"dataElements":[{"id":"Sdn2X0UkIQL"}]}')), true);
+}
+
+// ── Learning memory (src/memory.js) ──────────────────────────────────────────
+// Async block: every await below resolves on the microtask queue, which drains
+// before the setImmediate verdict.
+if (loaded) (async () => {
+  console.log('\nLearning memory:');
+  const fn = (n) => (typeof ctx[n] === 'function' ? ctx[n] : null);
+  const eq = (label, got, want) => {
+    if (JSON.stringify(got) === JSON.stringify(want)) ok(`${label} => ${JSON.stringify(got)}`);
+    else bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`);
+  };
+  const truthy = (label, got) => (got ? ok(`${label}`) : bad(`${label} => ${JSON.stringify(got)}`));
+  const need = (n) => { const f = fn(n); if (!f) bad(`${n} — missing`); return f; };
+  const st = ctx.__memoryState && ctx.__memoryState();
+  if (!st) { bad('memoryState not exposed'); return; }
+  await ctx.ensureMemoryLoaded();
+  st.entries = [];
+  st.enabled = true;
+
+  // Scrubbing: identifiers and personal values never reach storage.
+  const scrub = need('scrubMemoryText');
+  if (scrub) {
+    eq('UIDs → <uid>', scrub('tracker/trackedEntities/a3kGcGpz8FJ failed for CcHoHIzjuVo'), 'tracker/trackedEntities/<uid> failed for <uid>');
+    eq('API words like programType survive', scrub('set programType and periodTypes'), 'set programType and periodTypes');
+    eq('e-mail → <email>', scrub('sent to jane.doe@moh.gov.sl'), 'sent to <email>');
+    eq('phone → <number>', scrub('call +232 76 123 456'), 'call <number>');
+    eq('dates → <date>', scrub('born 1990-04-12'), 'born <date>');
+    eq('filter values → <value>', scrub('GET trackedEntities?filter=w75KJ2mc4zz:eq:Fatmata'), 'GET trackedEntities?filter=<uid>:eq:<value>');
+    eq('monthly period id survives, long ids do not', scrub('period 202601 id 12345678'), 'period 202601 id <number>');
+    eq('server URL reduced to path', scrub('https://play.dhis2.org/api/42/dashboards/abc?x=1'), '/api/dashboards/abc?x=1');
+  }
+  const personal = need('looksLikePersonalData');
+  if (personal) {
+    eq('"patient named Fatmata" is personal', personal('the patient named Fatmata could not enroll'), true);
+    eq('"Mrs Kamara" is personal', personal('record of Mrs Kamara'), true);
+    eq('"first name: Ali" is personal', personal('first name: Ali'), true);
+    eq('an API lesson is not personal', personal('PATCH users/<uid> /userGroups returns 500; use userGroups/<g>/users/<u>'), false);
+  }
+
+  // Recording through the tool: validation, privacy refusal, merge.
+  const mm = need('executeManageMemory');
+  if (mm) {
+    let r = await mm({ action: 'record', area: 'dashboards', tools: ['manage_dashboards'], title: 'Add tiles with add_items, never PUT the dashboard', problem: 'A PUT dashboards/<uid> with only the new item wiped every existing tile.', solution: 'Use manage_dashboards(action="add_items", dashboard_id, items=[{visualization_id}]) — it appends and snapshots first.' });
+    truthy('record a dashboard lesson', r.success && r.id);
+    r = await mm({ action: 'record', area: 'dashboards', tools: ['manage_dashboards'], title: 'Use add_items to add tiles, never PUT the dashboard', problem: 'PUT dashboards wiped every existing tile', solution: 'manage_dashboards add_items appends safely.' });
+    eq('a near-duplicate lesson MERGES (no second entry)', [r.merged_with_existing, st.entries.length], [true, 1]);
+    r = await mm({ action: 'record', area: 'tracker_data', title: 'Enrollment for the patient named Fatmata fails', solution: 'Use a different date for Fatmata Kamara please' });
+    truthy('a lesson with personal data is REFUSED', r._error && /personal/.test(r._error));
+    await mm({ action: 'record', area: 'indicators', tools: ['manage_indicators'], title: 'Percent indicator type is named Percentage here', problem: 'indicator_type "Per cent" does not exist on this server', solution: 'Pass indicator_type:"Percentage" (factor 100) for percentages.', scope: 'instance' });
+    await mm({ action: 'record', area: 'line_lists', tools: ['manage_line_lists'], title: 'Line list PI columns must not divide', problem: 'A division PI as a column was refused', solution: 'Use a row-safe SUM program indicator as the column.' });
+    eq('three distinct lessons stored', st.entries.length, 3);
+  }
+
+  // Retrieval is task-aware.
+  const block = need('buildMemoryPromptBlock');
+  if (block) {
+    const txt = block('create an ANC coverage indicator as a percentage then put it on a dashboard', ['manage_indicators', 'manage_dashboards', 'dhis2_query']);
+    truthy('prompt block carries the indicator lesson', /Percentage/.test(txt));
+    truthy('prompt block carries the dashboard lesson', /add_items/.test(txt));
+    truthy('prompt block leaves out the unrelated line-list lesson', !/division PI/.test(txt));
+    const none = block('how many enrollments last month?', ['count_records', 'dhis2_query']);
+    truthy('an unrelated request gets no lessons (just the search pointer)', !/add_items|Percentage/.test(none));
+  }
+  const lf = need('memoryLessonsFor');
+  if (lf) {
+    const l = lf({ tool: 'manage_dashboards', args: { action: 'add_items' }, userText: 'add a chart' });
+    truthy('manual-gate lessons for manage_dashboards found', l.length === 1 && /add_items/.test(l[0]));
+  }
+
+  // Automatic capture: failure → fix in one turn becomes a lesson.
+  const begin = need('memoryBeginTurn'), observe = need('memoryObserveCall'), end = need('memoryEndTurn');
+  if (begin && observe && end) {
+    const before = st.entries.length;
+    begin('create an indicator', { appType: 'Maintenance' }, new Set(['manage_indicators', 'manage_memory']));
+    observe('manage_indicators', { action: 'create', indicator: { name: 'X', indicator_type: 'Per thousand', numerator: '#{a}', denominator: '#{b}' } },
+      { _error: 'No indicatorType named "Per thousand".', _hint: 'Use one of this instance\'s types: "Percentage" (factor 100).' });
+    const o = observe('manage_indicators', { action: 'create', indicator: { name: 'X', indicator_type: 'Percentage', numerator: '#{a}', denominator: '#{b}' } }, { success: true, indicator_id: 'a3kGcGpz8FJ' });
+    truthy('recovery nudges the model to record the lesson', o.note && /manage_memory/.test(o.note));
+    await end();
+    const auto = st.entries.find(e => e.source === 'auto');
+    eq('an automatic lesson was written', st.entries.length, before + 1);
+    truthy('…naming the exact change (indicator_type Per thousand → Percentage)', auto && /indicator_type: Per thousand → Percentage/.test(auto.solution));
+    truthy('…without the indicator NAME or expression values', auto && !/#\{a\}/.test(JSON.stringify(auto)));
+
+    // Gate refusals are not lessons.
+    const n1 = st.entries.length;
+    begin('delete it', { appType: 'Maintenance' }, new Set());
+    observe('manage_metadata', { action: 'delete' }, { _error: 'Refused: not authorized', _scope: 'requires_user_confirmation' });
+    observe('manage_metadata', { action: 'delete' }, { success: true });
+    await end();
+    eq('write-auth refusals never become lessons', st.entries.length, n1);
+
+    // Privacy taint: a turn that touched patient records writes NOTHING.
+    begin('fix the enrollment', { appType: 'Capture', teiId: 'a3kGcGpz8FJ', programId: 'CcHoHIzjuVo' }, new Set(['manage_memory']));
+    truthy('a patient-record page taints the turn', !!ctx.__memoryTurn().taint);
+    observe('create_metadata', { action: 'add_stage' }, { _error: 'E4000 missing name' });
+    observe('create_metadata', { action: 'add_stage' }, { success: true });
+    const refused = await mm({ action: 'record', area: 'programs', title: 'Stages need a name always', solution: 'Always send the stage name field.' });
+    await end();
+    eq('tainted turn: no automatic lesson', st.entries.length, n1);
+    truthy('tainted turn: manage_memory(record) refused', refused._error && /patient-level/.test(refused._error));
+    begin('list people', { appType: 'Maintenance' }, new Set());
+    observe('dhis2_query', { path: 'tracker/trackedEntities?program=CcHoHIzjuVo' }, { _error: 'Refused by hard privacy safeguard', _privacy_block: true });
+    truthy('a patient-data read attempt taints the turn', !!ctx.__memoryTurn().taint);
+    await end();
+    begin('create a person', { appType: 'Maintenance' }, new Set());
+    observe('dhis2_query', { path: 'tracker?async=false', method: 'POST', body: { trackedEntities: [] } }, { success: true });
+    truthy('a tracker WRITE taints the turn', !!ctx.__memoryTurn().taint);
+    await end();
+  }
+
+  // "remember …" in the USER's words makes the recorded lesson a user rule.
+  if (mm) {
+    vm.runInContext('lastUserText = "Please remember for the future: always use LAST_12_MONTHS on charts";', ctx);
+    let r = await mm({ action: 'record', area: 'visualizations', tools: ['manage_dashboards'], title: 'Charts always use LAST_12_MONTHS here', solution: 'Set periods ["LAST_12_MONTHS"] on every chart.' });
+    eq('"remember …" from the user → source user (user rule)', r.lesson && r.lesson.source, 'user');
+    vm.runInContext('lastUserText = "make a chart of malaria";', ctx);
+    r = await mm({ action: 'record', area: 'maps', tools: ['manage_maps'], title: 'Maps need an org unit level for districts', solution: 'Pass org_unit_level 2 for districts on this hierarchy.' });
+    eq('a self-learned lesson stays source assistant', r.lesson && r.lesson.source, 'assistant');
+  }
+
+  // Search tool + on/off switch.
+  if (mm) {
+    const r = await mm({ action: 'search', query: 'dashboard tiles wiped' });
+    truthy('search finds the dashboard lesson', r.success && r.lessons?.[0]?.area === 'dashboards');
+  }
+  const gct = fn('getContextualTools');
+  if (gct) {
+    truthy('manage_memory is offered while memory is ON', gct({ appType: 'Dashboard' }, 'make a chart', false).some(t => t.function.name === 'manage_memory'));
+    st.enabled = false;
+    truthy('manage_memory is withheld while memory is OFF', !gct({ appType: 'Dashboard' }, 'make a chart', false).some(t => t.function.name === 'manage_memory'));
+    eq('no prompt block while memory is OFF', block ? block('put it on a dashboard', ['manage_dashboards']) : '', '');
+    begin && begin('x', {}, new Set());
+    const n2 = st.entries.length;
+    observe && observe('manage_indicators', { action: 'create' }, { _error: 'boom' });
+    observe && observe('manage_indicators', { action: 'create' }, { success: true });
+    end && await end();
+    eq('nothing is learned while memory is OFF', st.entries.length, n2);
+    st.enabled = true;
+  }
+  st.entries = [];
+})().catch((e) => bad(`learning-memory checks threw: ${e && e.stack || e}`));
 
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.

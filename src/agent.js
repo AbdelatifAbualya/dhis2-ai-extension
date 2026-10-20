@@ -193,6 +193,9 @@ async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
   try {
     return await _runAgenticLoopInner(userText, imageBase64, browseWeb);
   } finally {
+    // Learning memory: turn the turn's recovered failures into lessons (every
+    // exit path, including throws). Never allowed to break the turn.
+    try { await memoryEndTurn(); } catch (e) { console.warn('[Memory] end-of-turn failed:', e?.message || e); }
     releaseKeepalive();
   }
 }
@@ -230,8 +233,12 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   seedRecentCreations();
   console.log(`[AgenticLoop] knownIds seeded with ${dhis2.knownIds.size} UID(s); knownIcons + recentCreations reset`);
   // ── Dynamic tool selection — send only tools relevant to this request ──
+  await ensureMemoryLoaded(); // the memory on/off switch decides whether manage_memory is offered
   const contextualTools = getContextualTools(ctx, userText, browseWeb);
   const contextualToolNames = new Set(contextualTools.map(t => t.function.name));
+  // Learning memory: start observing this turn (privacy taint is decided here
+  // for patient-record pages and save-error diagnosis).
+  memoryBeginTurn(userText, ctx, contextualToolNames);
   // The ONE case where an unselected tool must stay unavailable: the user
   // reported a save failure and has not authorized a fix, so destructive tools
   // are withheld for the whole turn (see the late-admission branch below).
@@ -288,6 +295,15 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     ...conversationHistory,
     { role: 'user', content: userContent },
   ];
+  // Learning memory: the stored lessons that match THIS request go right after
+  // the user's message (where models attend most — at the end of a long system
+  // prompt a binding lesson was read and then ignored in the live acceptance
+  // run). Transient: buildTurnHistory drops system messages, so lessons are
+  // re-selected fresh every turn and never pile up in history.
+  {
+    const memoryBlock = buildMemoryPromptBlock(userText, [...contextualToolNames]);
+    if (memoryBlock) messages.push({ role: 'system', content: memoryBlock.trim() });
+  }
 
   const charts = [];
   const apiCallsLog = [];
@@ -526,6 +542,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     manage_program_indicators: 'Processing program indicators',
     manage_metadata: 'Processing metadata changes',
     manage_line_lists: 'Working on line lists',
+    manage_users: 'Reviewing user administration',
+    manage_data_values: 'Reviewing data values',
+    manage_metadata_translations: 'Reviewing translations',
+    manage_memory: 'Reviewing learning memory',
   };
   const thinkingLabels = [
     'Analyzing your question',
@@ -806,6 +826,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           deliveredManuals.add(tc.function.name);
           console.log(`[AgenticLoop] Manual gate: delivering ${tc.function.name} manual (call not executed)`);
           toolResult = buildManualGateResult(tc.function.name);
+          // The tool's own stored lessons travel with its manual.
+          const toolLessons = memoryLessonsFor({ tool: tc.function.name, args, userText });
+          if (toolLessons.length) { toolResult._memory_lessons = toolLessons; toolResult._memory_rule = MEMORY_TOOL_RULE; }
         } else {
           if (tc.function.name !== 'render_chart') {
             apiCallsLog.push({ tool: tc.function.name, args: JSON.parse(JSON.stringify(args)) });
@@ -885,7 +908,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             if (failNote && failNote.famCount >= 2) {
               toolResult._failure_streak = failNote.famCount;
               toolResult._hint = `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of ${tc.function.name} with the same error this turn. Identical retries are BLOCKED. Change the failing part based on the exact error above (e.g. simplify the expression to the supported grammar, or test with dry_run). If you cannot fix it now, STOP calling ${tc.function.name}: give the user a final answer listing what succeeded (names + IDs), what failed with this exact error, and your recommended next step.`;
-            } else if (!failNote) {
+            }
+            // Learning memory: a failure gets the stored fix for it attached; a
+            // success that resolves an earlier failure this turn gets a nudge
+            // to record the lesson (automatic lesson written at turn end anyway).
+            if (toolResult && typeof toolResult === 'object' && !Array.isArray(toolResult)) {
+              const mem = memoryObserveCall(tc.function.name, args, toolResult);
+              if (mem.lessons) { toolResult._memory_lessons = mem.lessons; toolResult._memory_rule = MEMORY_TOOL_RULE; }
+              if (mem.note) toolResult._memory_note = mem.note;
+            }
+            if (!failNote) {
               // Success — unlocks ONE identical retry for previously failed
               // calls (a prerequisite may have just been fixed).
               dhis2.toolSuccessCount = (dhis2.toolSuccessCount || 0) + 1;
@@ -1742,6 +1774,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'GET_LAST_INTERACTION': {
       sendResponse(lastInteraction);
+      return true;
+    }
+
+    // Learning memory (settings → Learning memory): view / delete / clear /
+    // add a note / switch on-off. The worker is the single writer.
+    case 'MEMORY_GET':
+    case 'MEMORY_SET_ENABLED':
+    case 'MEMORY_DELETE':
+    case 'MEMORY_CLEAR':
+    case 'MEMORY_ADD_NOTE': {
+      memoryPanelRequest(msg)
+        .then(r => sendResponse(r))
+        .catch(e => sendResponse({ error: e.message }));
       return true;
     }
   }

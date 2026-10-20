@@ -137,7 +137,7 @@ function loadLLM(pageContext = { appType: 'Maintenance' }) {
   const boot = `\n;dhis2.baseUrl=${JSON.stringify(BASE)};dhis2.apiVersion=${APIVER};`
     + `dhis2.pageContext=${JSON.stringify(pageContext)};`
     + `dhis2.knownIds=new Set();dhis2.programMetadata=null;`
-    + `globalThis.__getDhis2=()=>dhis2;`;
+    + `globalThis.__getDhis2=()=>dhis2;globalThis.__memoryState=()=>memoryState;`;
   const bundle = modules.map((m) => `\n//# ${m}\n` + fs.readFileSync(path.join(ROOT, m), 'utf8')).join('\n') + boot;
   vm.runInContext(bundle, ctx, { filename: 'background.bundle.js' });
 

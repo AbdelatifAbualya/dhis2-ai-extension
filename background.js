@@ -16,6 +16,9 @@
 
      src/core.js            provider config · global state · write-auth & safety
                             gates · DHIS2 transport & backups · context/init
+     src/memory.js          learning memory (lessons about DHIS2/API behaviour;
+                            never patient data) · manage_memory tool — loaded
+                            right after core.js (registry's TOOLS uses its areas)
      src/registry.js        tool schemas · knowledge-base · manuals · tool
                             selection · system-prompt builder
      src/providers.js       LLM provider streaming · image · web search ·
@@ -28,16 +31,21 @@
                             indicators, notifications) · plugins · standalone
      src/tools-linelists.js line-listing authoring (eventVisualizations of type
                             LINE_LIST: resolve/validate/probe/CRUD)
+     src/tools-admin.js     administration tools (users/roles/groups, aggregate
+                            data values, metadata translations) · schema-aware
+                            PATCH pre-check for dhis2_query
      src/agent.js           agentic loop · feedback · keepalive · message router
                             and every chrome.* event listener
    ══════════════════════════════════════════════════════════════════════════════ */
 
 importScripts(
   'src/core.js',
+  'src/memory.js',
   'src/registry.js',
   'src/providers.js',
   'src/tools-metadata.js',
   'src/tools-programs.js',
   'src/tools-linelists.js',
+  'src/tools-admin.js',
   'src/agent.js',
 );
