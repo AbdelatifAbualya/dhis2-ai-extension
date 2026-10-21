@@ -168,7 +168,7 @@ Universal OpenAI-compatible. Configure `apiBaseUrl`, `modelId`, optional `apiKey
 
 **Local-first by default.** First-run config points at Ollama on `localhost:11434` with `llama3.2` and no key. Pull the model once (`ollama pull llama3.2`) and the assistant works fully offline against your DHIS2 session.
 
-`isLocalProvider` / `isValidProviderUrl` helpers gate the no-key path and reject non-`http(s)` URLs. All LLM and Tavily fetches have `AbortSignal.timeout` (90s non-stream / 60s stream-connect / 30s Tavily). `SAVE_PROVIDER_CONFIG` validates URL scheme, providerType allowlist, `maxTokens` 256-200000, `temperature` 0-2, and caps every string field.
+`isLocalProvider` / `isValidProviderUrl` helpers gate the no-key path and reject non-`http(s)` URLs. The patient-data privacy gate uses the stricter `providerRequestsStayLocal`: only a provider whose requests actually go to `localhost` counts as local. An "Ollama" preset pointed at another machine is treated as remote. All LLM and Tavily fetches have `AbortSignal.timeout` (90s non-stream / 60s stream-connect / 30s Tavily). `SAVE_PROVIDER_CONFIG` validates URL scheme, providerType allowlist, `maxTokens` 256-200000, `temperature` 0-2, and caps every string field.
 
 ### Vision
 
@@ -223,17 +223,22 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
 ```
 dhis2-AI/
-├── manifest.json              MV3 config (v2.8.13)
+├── manifest.json              MV3 config (v2.8.25)
 ├── background.js              Service worker entry — thin importScripts() loader
 ├── src/                       Background worker modules (loaded, in order, by background.js)
 │   ├── core.js                config · state · safety gates · DHIS2 transport · backups · context
+│   ├── memory.js              learning memory (lessons, privacy taint, manage_memory)
 │   ├── registry.js            tool schemas · KB · manuals · tool selection · system prompt
 │   ├── providers.js           LLM streaming · image · web search · patient-data privacy gate
 │   ├── tools-metadata.js      executeTool dispatcher + standard metadata tools
 │   ├── tools-programs.js      program-authoring tools · plugins · standalone
-│   └── agent.js               agentic loop · feedback · keepalive · message router
+│   ├── tools-linelists.js     manage_line_lists
+│   ├── tools-admin.js         manage_users · manage_data_values · manage_metadata_translations
+│   └── agent.js               agentic loop · feedback · keepalive · screenshot · message router
 ├── scripts/
-│   └── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
+│   ├── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
+│   ├── live-harness.js        real executeTool against a live DHIS2 (basic-auth fetch shim)
+│   └── scenario-*.js          live regression scenarios (npm run admin / sticky, …)
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
 │   ├── panel.html             Side panel UI
@@ -270,6 +275,200 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 - **No `dhis2_query` writes for sharing, program rules, or category objects.** The dedicated tools encode the right endpoint + content-type + post-create maintenance triggers.
 - **Lint before POST.** Local validators reject malformed program-rule conditions, fabricated icon keys, malformed sharing access strings, etc., so the chatbot doesn't waste a turn on a server-side bounce.
 - **Verify before recommend.** Memory and prior-conversation references are checked against `git log` / current code state before being acted on; per-turn `knownIds` registry blocks UIDs the model can't justify.
+- **Document every change in the [Changelog](#changelog) below**: what changed, why, and how it was verified. There are no separate change files.
+
+---
+
+## Changelog
+
+Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
+
+### Unreleased (after 2.8.25) — 2026-10-21
+
+**Security & performance review.** Each issue was reproduced live on DHIS2 2.42.5.1 before being fixed.
+- **Privacy-gate bypass closed.** The patient-data gate checked the raw `dhis2_query` path, but `fetch()` resolves `..`, `%2e` and `\` and drops `#…`, and DHIS2 decodes `%74`. With a cloud model, `programs/../tracker/trackedEntities` and seven other spellings returned patient rows. `safeDhis2Fetch` and `apiUrl` now refuse such paths (`ambiguousApiPathReason`), and the gate matches the canonical path.
+- **"Local" means where requests go.** An "Ollama" preset pointed at `ollama.com` or another machine counted as local for the privacy gate. The new `providerRequestsStayLocal` decides by the request URL.
+- **Content-script messages are untrusted.** Code running in a DHIS2 page could read the stored API key, re-point the provider URL and read the learning memory through the message router. Content scripts may now send only their five message types; everything else must come from the extension's own pages.
+- **Only the focused tab drives context.** A background DHIS2 tab navigating, or expiring to the login page, re-pointed the session mid-turn. Only the active tab of the focused window counts now, and only its top frame.
+- **Markdown links** in replies are limited to `http(s)`/`mailto` with quotes encoded, which stops attribute injection.
+- **Performance:** one in-app navigation loaded the page context up to 4× concurrently (6–8 requests, now 2). `initializeFromUrl` shares and serializes runs, and the latest navigation wins. Hidden tabs no longer wake the service worker.
+
+**Screenshots work without `activeTab` / `<all_urls>`.** `captureVisibleTab` needs one of those, and the manifest deliberately has neither. The selection overlay now captures the tab itself with `getDisplayMedia({ preferCurrentTab })`: Chrome asks "Allow … to see this tab?", and the overlay grabs one native-resolution frame, crops it and stops the stream. A "Capture selection" button covers drags that outlive the ~5 s user activation. A cancelled prompt no longer cuts off a streaming reply. Requires HTTPS or localhost.
+
+### 2.8.25 — 2026-10-20
+- **Administration tools** (`src/tools-admin.js`):
+  - `manage_users`: users, roles and groups. Enforces the password policy and validates authorities, which DHIS2 otherwise stores even when misspelled.
+  - `manage_data_values`: aggregate data entry by names. Refuses wrong-period-type, unassigned-org-unit and missing-disaggregation values that DHIS2 silently stores invisibly.
+  - `manage_metadata_translations`: merges instead of wiping other locales.
+- **Learning memory** (`src/memory.js`, `manage_memory`, Settings → Learning memory). Lessons are recorded from failure→fix sequences and injected per task. Turns that touch patient data write nothing.
+- **Six silent-failure fixes:**
+  - rule-action key aliases;
+  - indicator type matched by factor;
+  - imperative data-entry/admin verbs now authorize writes;
+  - `dhis2_query` PATCH pre-checked against `/api/schemas`, and strict flags added to raw `dataValueSets` imports;
+  - post-commit 5xx on deletes verified;
+  - an aggregate-data delete block gets a data-pruning hint.
+
+### 2.8.24 — 2026-08-06
+- `manage_line_lists` was mislabelled in the panel, so it looked like the wrong tool was being used. Labels and routing fixed.
+- A stage the user called "repeatable" no longer ships one-event-only.
+- `GET optionSets/A,B,C` (HTTP 405) is healed.
+- The detected stage is persisted on every page-context write.
+
+### 2.8.23 — 2026-07-28
+- **Sticky stage context** (`carryStickyContext`): Capture's enrollment dashboard has no stage in its URL, so the context is no longer wiped by URL re-parses.
+  - content.js re-sends the stage every 30 s, and the DOM fallback needs a unique match.
+  - The panel shows a Stage chip.
+- **Blocked-delete recovery:** E4030 from soft-deleted events gets the exact `softDeletedEventRemoval` recovery.
+- An empty 2xx response counts as success.
+
+### 2.8.22 — 2026-07-27
+- **Unfinished-turn guard:** the loop no longer ends a task on a text-only "I'll now…" reply.
+- Program-rule actions are no longer shipped without their target. Loose target names are resolved.
+
+### 2.8.21 — 2026-07-26
+- **Growth chart:** the 80 KB tool-result truncation also hit internal reads, which reported `Program "undefined"`. Internal fetches now bypass it, and measurement data elements are chosen by numeric value type.
+
+### 2.8.20 — 2026-07-26
+- The tool router keeps a thread's tools on follow-up turns.
+- Bug reports no longer authorize writes.
+- "Add all OUs + fix sharing" can no longer drop the program from Capture.
+- About 600 lines of dead code removed.
+- Twelve classes of guaranteed-failed API call are healed before sending.
+
+### 2.8.19 — 2026-07-20
+- **Program-rule correctness:**
+  - Dead option literals are reported.
+  - Duplicate-rule lint covers every action type.
+  - "Person" is no longer substituted for a tracked entity type the user named.
+- **Section-safe stage edits:** adding or removing stage data elements backs up first and preserves `formType` and sections; `section_name` routing added.
+- **Not-signed-in switches:** switching to a DHIS2 instance you're not signed in to now gives a clean message instead of a CORS console error (`redirect: 'manual'`).
+
+### 2.8.18 — 2026-07-19
+- `manage_program_indicators` create accepts `indicators: […]` in a single import.
+- A coverage percentage is ONE program indicator: `AVERAGE` of `d2:condition(…, 100, 0)`. This fixed the 47-PI build that never finished.
+
+### 2.8.17 — 2026-07-19
+- **Named-program guard:** when a program the user named isn't found, program-bound writes on a different program are refused, and the assistant stops and asks instead of building on a lookalike.
+
+### 2.8.16 — 2026-07-19
+- **Weak-LLM reliability.** Fixes:
+  - wire-message sanitizing and tool-argument shape healing;
+  - recovery of leaked XML tool calls;
+  - reuse-compatibility gates for data elements, attributes and option sets.
+- The 3-prompt maternal-care acceptance completed with 0 failed API calls on MiniMax-M3 and Kimi-K2.6.
+
+### 2.8.15 — 2026-07-18
+- New `manage_line_lists` tool (`src/tools-linelists.js`): saved Line Listing tables (EVENT / ENROLLMENT / TRACKED_ENTITY). Layouts are proven against analytics before saving, and the tool refuses the traps that silently break line lists.
+- Dashboards accept `EVENT_VISUALIZATION` tiles.
+
+### 2.8.14 — 2026-07-14
+- **Complex-program robustness:**
+  - `create_program` pre-validation;
+  - malformed or truncated calls no longer disable the tool;
+  - a discovery-streak guard stops long runs of read-only calls;
+  - corrupted streamed tool-call JSON is repaired.
+
+### 2.8.13 — 2026-07-12
+- `create_program` skips one bad rule and continues, instead of dead-looping. A mechanical circuit breaker disables a tool after 3 blocks.
+- **Modular refactor:** `background.js` was split into `src/*.js` modules (byte-identical), with `npm run verify` and `ARCHITECTURE.md`.
+- **`create_program` correctness:** COMPLETEENROLLMENT and HIDEOPTION binding, stage sections, and "continue" now authorizes writes.
+- **Dashboard "replace a tile":** infinite loop fixed. Every tool call now gets a result, and there's a no-progress guard. Tracker data elements are refused in charts.
+
+### 2.8.12 — 2026-07-12
+- xAI Grok preset, plus custom-provider URL normalization and host-permission grant.
+
+### 2.8.11 — 2026-07-11
+- **Program rules:**
+  - cross-turn UID memory;
+  - the one-rule visibility doctrine (lint + audit);
+  - `A{Display Name}` token healing;
+  - in-place action updates.
+- Program deletes cascade (rules, program-rule variables, program indicators first).
+
+### 2.8.10 — 2026-07-10
+- A bare "yes" after a refused write authorizes only that tool.
+- Growth-chart dataStore guard and routing.
+- Refusals say the tool exists.
+
+### 2.8.9 — 2026-07-10
+- **Program indicators:**
+  - widget visibility (`display_in_form`);
+  - ENROLLMENT date boundaries;
+  - a whitelist of the 16 `d2:` functions the parser actually accepts.
+
+### 2.8.8 — 2026-07-10
+- **Existing metadata is never recreated:**
+  - loud dedup probes;
+  - name-conflict self-healing;
+  - case-insensitive reuse of attributes and data elements;
+  - verb-targeted write-auth negation.
+
+### 2.8.7 — 2026-07-09
+- `[` and `]` are percent-encoded in query strings, so self-hosted Tomcat DHIS2 no longer returns 400 on bracketed `fields`/`filter`.
+
+### 2.8.6 / 2.8.5 — 2026-07-08
+- `create_program` checks the tracked entity type exists (by UID or name) before import, and never sends the word "Person" as a UID. Matching is done in memory instead of with a brittle `name:eq` filter.
+
+### 2.8.4 — 2026-07-07
+- Creating on a fresh instance no longer hits the guard walls: field names are no longer mistaken for UIDs, a stop after consecutive HTTP errors, and the root org unit is resolved on an empty instance.
+
+### 2.8.3 — 2026-07-07
+- A new thread fully resets conversation memory and page context.
+
+### 2.8.2 — 2026-07-07
+- **MCH-scenario fixes:**
+  - stage-by-name rule actions;
+  - no phantom IDs after a failed create;
+  - option-code program-rule variables;
+  - empty-field numeric guards;
+  - program-indicator name disambiguation.
+
+### 2.8.1 — 2026-07-07
+- Repeated-failure guard, a budget-exhaustion summary, and a liveness heartbeat and stream-stall guard.
+
+### 2.8.0 — 2026-07-06
+- **Lazy tool manuals:** write tools send slim definitions, and the full manual is delivered on first use. That cut per-iteration context by 42%.
+- Inline program-rule variable resolution fixed.
+
+### 2.7.0 — 2026-07-04
+- **TB end-to-end audit fixes:** program-rule action and condition binding, a program-indicator OR-filter linter, and `create_program` ID chaining.
+- New `manage_maps` tool.
+- SQL-view execution is privacy-gated.
+
+### 2.6.0 – 2.6.8 — 2026-06-30 to 2026-07-02
+- New `manage_dashboards` tool, with safe `add_items`/`remove_item`/`update`/`delete`, pre-write snapshots and a destructive-write guard.
+- The privacy gate now also covers file-extension variants (`.csv`, `.json`).
+- **Orchestration of multi-step goals:**
+  - dashboards;
+  - org-unit provisioning;
+  - program indicator → dashboard;
+  - existing option set → data element → dataset;
+  - legend set → indicator.
+- **End-to-end audit fixes:**
+  - option theft;
+  - default data sharing;
+  - responsive custom forms;
+  - `A{}` resolution;
+  - ASSIGN option codes;
+  - search ranking.
+
+### 2.5.0 — 2026-07-01
+- **Hard-coded privacy gate:** patient-level tracker data can be read only when the model is local (Ollama).
+
+### 2.4.1 – 2.4.5 — 2026-06-30
+- New tools: `manage_validation_rules`, `manage_org_units`, `manage_indicators`, `manage_option_sets` and `manage_legend_sets`.
+
+### 2.2.0 – 2.4.0 — 2026-06-28/29
+- New tools: `manage_custom_forms` (custom HTML forms for datasets and program stages), `manage_custom_translations` (2.43 custom translations) and `manage_growth_chart_plugin` (WHO growth chart setup).
+- The agentic loop cap was raised to 50.
+- Option-set codes deduplicated (`A+`/`A-` no longer collide as `A_`).
+- Fixed cross-turn memory loss, a value-type default and a program-rule misdiagnosis.
+
+### 2.1.8 – 2.1.9 — 2026-06-04 to 2026-06-08
+- Agentic loop cap raised from 12 to 30.
+- An instance switch on the same host detects the login redirect instead of failing with a CORS error.
+- Permissions hardened for the Chrome Web Store: host access is now granted at runtime, per server.
 
 ---
 
