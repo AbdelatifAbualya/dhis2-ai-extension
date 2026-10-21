@@ -1961,10 +1961,19 @@ const PATIENT_DATA_TOOL_NAMES = new Set([
 // True when a raw dhis2_query path targets individual patient records.
 function pathReadsPatientData(rawPath) {
   if (typeof rawPath !== 'string') return false;
-  const base = rawPath.split('?')[0].replace(/^\//, '').replace(/^api\/\d+\//i, '').toLowerCase();
-  // Boundary `(\/|\.|$)` = the resource name is followed by a sub-path (`/`), a
-  // format/extension suffix (`.json`, `.csv`, `.xml`, `.geojson`, `.csv.gz`, …),
-  // or end-of-path. The extension form MUST be gated too: `tracker/events.csv`,
+  // Match on the path the server will actually serve: fetch() resolves dot
+  // segments (also as %2e) and backslashes and drops the #fragment, and DHIS2
+  // decodes %-escapes — "programs/../tracker/trackedEntities" and
+  // "tracker/%74rackedEntities" are tracker reads. safeDhis2Fetch refuses such
+  // paths too (ambiguousApiPathReason); this keeps the gate correct on its own.
+  let base = rawPath.split(/[?#]/)[0].replace(/\\/g, '/').replace(/^\/+/, '').replace(/^api\/\d+\//i, '');
+  try { base = new URL('./' + base, 'http://h/api/0/').pathname; } catch {}
+  try { base = decodeURIComponent(base); } catch {}
+  base = base.replace(/^\/+/, '').replace(/^api\/(\d+\/)?/i, '').toLowerCase();
+  // Boundary `(?![a-z0-9])` = the resource name is not followed by another
+  // identifier character: a sub-path (`/`), a format/extension suffix (`.json`,
+  // `.csv`, `.xml`, `.geojson`, `.csv.gz`, …), a stray `%3F`/`#`, or end-of-path.
+  // The extension form MUST be gated too: `tracker/events.csv`,
   // `tracker/trackedEntities.json`, `analytics/events/query.csv` etc. return the
   // exact same patient-level rows as the extension-less endpoint, so anchoring on
   // `/` or `$` alone (the old patterns) let a `.csv`/`.json` suffix slip the gate.
@@ -1972,11 +1981,11 @@ function pathReadsPatientData(rawPath) {
   // analytics/events/aggregate, dataValueSets, …) begin with these exact resource
   // names followed by `/`, `.`, or end, so the `.` boundary never over-gates them.
   // New Tracker API individual-record endpoints
-  if (/^tracker\/(events|enrollments|trackedentities|relationships)(\/|\.|$)/.test(base)) return true;
+  if (/^tracker\/(events|enrollments|trackedentities|relationships)(?![a-z0-9])/.test(base)) return true;
   // Legacy tracker endpoints
-  if (/^(events|enrollments|trackedentityinstances)(\/|\.|$)/.test(base)) return true;
+  if (/^(events|enrollments|trackedentityinstances)(?![a-z0-9])/.test(base)) return true;
   // Row-level (individual) event/enrollment analytics — aggregate is de-identified and allowed
-  if (/^analytics\/(events|enrollments)\/query(\/|\.|$)/.test(base)) return true;
+  if (/^analytics\/(events|enrollments)\/query(?![a-z0-9])/.test(base)) return true;
   // SQL view EXECUTION (…/data, …/execute). A saved SQL view can SELECT arbitrary
   // columns — including patient identifiers — from any table (trackedentityinstance,
   // event/programstageinstance, enrollment, trackedentityattributevalue, …), so
@@ -1986,7 +1995,7 @@ function pathReadsPatientData(rawPath) {
   // readable as metadata. A purely-aggregate view is over-gated on a remote model —
   // run it on a local model or use aggregate analytics. Verified live 2026-07-03:
   // sqlViews/{id}/data was NOT gated before this line (torture-test bypass probe).
-  if (/^sqlviews\/[a-z0-9]+\/(data|execute)(\/|\.|$)/i.test(base)) return true;
+  if (/^sqlviews\/[a-z0-9]+\/(data|execute)(?![a-z0-9])/i.test(base)) return true;
   return false;
 }
 // True when a tool call would read patient-level tracker data.
@@ -2004,7 +2013,7 @@ function toolReadsPatientData(name, args) {
 // Returns a refusal object if the call must be blocked, else null.
 function enforcePatientDataPrivacyGate(name, args) {
   if (!toolReadsPatientData(name, args)) return null;
-  if (isLocalProvider(getProviderConfig())) return null; // local model → permitted
+  if (providerRequestsStayLocal(getProviderConfig())) return null; // requests stay on this machine → permitted
   return {
     _error: 'Refused by hard privacy safeguard: patient-level tracker data (events, enrollments, tracked entities, individual event rows) can only be read when the assistant runs on a LOCAL model (Ollama / localhost). The current provider is remote/cloud, so this data cannot be accessed.',
     _privacy_block: true,

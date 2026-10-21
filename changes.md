@@ -3470,3 +3470,105 @@ with the unmodified extension. **`manifest.json` is unchanged** (no permissions,
   - plain-http LAN origin → panel shows the HTTPS/upload hint;
   - in every run no overlay/button is left behind.
 - Regression: `npm run admin` — 68 checks, 268 API calls, 0 unexpected failures, cleanup 0 failed.
+
+---
+
+## Unreleased — Security & performance review: privacy-gate bypass, untrusted content-script messages, 4× context loads (2026-10-21)
+
+A review of the extension's trust boundaries and hot paths. Every finding below was **reproduced
+live before fixing** (Chrome 155 + localhost:8081 2.42.5.1, or the real `executeTool` through the
+live harness) and re-measured after. `manifest.json` is unchanged.
+
+### Security
+
+1. **Hard patient-data privacy gate bypassable by path spelling (HIGH).**
+   `pathReadsPatientData` (`src/providers.js`) matched the raw string (`^tracker/(events|…)`), but
+   `fetch()` resolves dot segments (also written `%2e`) and backslashes and drops `#fragment`s, and
+   DHIS2 decodes `%`-escaped letters. With a cloud provider, the real `dhis2_query` returned patient
+   rows for `programs/../tracker/trackedEntities`, `./tracker/trackedEntities`,
+   `programs/%2e%2e/…`, `tracker/%74rackedEntities`, `tracker\trackedEntities`,
+   `programs/x/../../tracker/events`, `trackedEntityTypes/../tracker/enrollments` and
+   `tracker/events#`. Fixed in two layers:
+   - `src/core.js` **`ambiguousApiPathReason`**: `safeDhis2Fetch` (returns `_refused_path`) and
+     `apiUrl` (throws) refuse any path portion containing `.`/`..` segments (raw or `%2e`), `\`, `#`,
+     `;` or a %-escaped letter/digit/`-._~`. No DHIS2 API path needs them, and every gate (privacy,
+     write auth, dataStore guards) and every ID interpolated into a path is covered at once. The query
+     string is untouched (`;` in `dimension=`, `%23` in expressions, `%20` in keys still pass).
+   - `pathReadsPatientData` now matches the **canonical** path (URL-resolved like fetch, then
+     percent-decoded like the server), with boundary `(?![a-z0-9])` instead of `(\/|\.|$)`.
+   After: all 9 forms → `BLOCKED (privacy gate)`; the default local Ollama still reads patient data.
+2. **"Ollama" preset pointed at a remote host counted as local (MEDIUM).** `isLocalProvider`
+   returns true for any `providerType: 'ollama'`, so `https://ollama.com/v1` (or a machine on the LAN)
+   got patient rows. New `providerRequestsStayLocal(cfg)` (`src/core.js`) decides by where requests
+   actually go (`apiBaseUrl`, or that provider's default endpoint when empty). It's used by the
+   privacy gate and the system-prompt rule 11. `isLocalProvider` keeps its meaning for "no API key
+   needed".
+3. **Content-script messages reached privileged handlers (MEDIUM).** The router accepted every type
+   from any sender with our extension id, which includes content scripts running in DHIS2 pages.
+   Chrome's guidance is to treat those as untrusted, since a compromised page renderer can send them.
+   Live: page-side content-script code read the stored API key, re-pointed `SAVE_PROVIDER_CONFIG` to
+   `https://attacker.example/v1` (all future chats + the key would go there), and read the memory.
+   Now content-script senders may only send `DHIS2_CONTEXT_UPDATE`, `DHIS2_STAGE_DETECTED` and the
+   three `SCREENSHOT_*` replies (`CONTENT_SCRIPT_MESSAGE_TYPES`). Everything else requires
+   `sender.url` under `chrome.runtime.getURL('')` (the side panel). `DHIS2_CONTEXT_UPDATE` may only
+   report its own page's origin.
+4. **Background tabs re-pointed the session (MEDIUM, integrity).** `tabs.onUpdated`,
+   `webNavigation.onReferenceFragmentUpdated` and content-script messages fired for EVERY tab. Live:
+   a background DHIS2 tab navigating moved `pageContext`/`programMetadata` to that tab's program while
+   the user was on another one. A background tab bouncing to the login page on session expiry likewise
+   reset `connected` mid-turn. Now only the active tab of the focused window counts
+   (`isFocusedActiveTab`), and fragment events only from the top frame (2.42's global-shell iframe
+   was a second source).
+5. **Markdown link attribute injection (LOW, CSP-mitigated).** `esc()` doesn't escape quotes, so
+   `[x](https://a" style="position:fixed;inset:0…" x=")` added attributes to the `<a>` (live: a
+   full-screen overlay), and only `javascript:/data:/vbscript:` were blocked (`chrome://`, `file://`
+   were linked). Now only `http(s)://` and `mailto:` are linked, with quotes encoded
+   (`sidepanel/panel.js` `renderMarkdown`).
+6. Hardening, not exploitable today: chart tooltip and data-table cells now `esc()` the value.
+   `normalizeChartSpec` already coerces series values to numbers. `fetchViaTab` matches the instance
+   exactly instead of by prefix.
+
+### Performance
+
+7. **One in-app navigation loaded the page context up to 4× (and could race).** `tabs.onUpdated`, the
+   fragment event, content.js's `hashchange` message and its 2 s poll each ran `initializeFromUrl`
+   concurrently, and each re-fetched program metadata and the rules count. `initializeFromUrl` is now
+   a wrapper: same-URL calls share one run, and runs are serialized. A queued run whose URL is no
+   longer the latest is skipped, and its caller gets the latest run's result. A 20 s queue timeout
+   stops a hung request blocking later navigations. `ensureConnected` calls the raw
+   `initializeFromUrlNow`, since it runs inside tool calls where joining an in-flight run could wait
+   on itself.
+8. **Hidden tabs kept waking the service worker** (URL poll + stage resend every 30 s). content.js now
+   skips both while `document.hidden`, and re-syncs on `visibilitychange`.
+
+Measured in Chrome with the extension loaded (fetches counted in the service worker):
+
+| | before | after |
+|---|---|---|
+| one in-app navigation (Capture, other program) | 6–8 requests, 3–4× program metadata | **2 requests, 1×** |
+| two navigations 50 ms apart | 14 requests | **4 requests**, final state consistent |
+| a background DHIS2 tab navigates | 12 requests, **foreground context hijacked** | **0 requests**, context kept |
+
+### Reviewed, not changed
+- `count_records`'s tracker fallback interpolates `status`/`filters` unencoded, but returns only the
+  count. The main provider key is also sent to a separately configured `visionApiBaseUrl`.
+  User-configured; noted.
+- Streaming render is rAF-batched and the agent loop builds prompt/tools once per turn. History never
+  stores images. These were not hotspots.
+
+### Verification
+- `npm run verify` — 405 checks, +21: disguised-path refusal (8 forms) and plain paths untouched
+  (query `;`/`#`, `%20` keys); `safeDhis2Fetch`/`apiUrl` refuse before any request; gate canonical
+  matching and no over-blocking; `providerRequestsStayLocal` cases; router refuses GET_API_KEY /
+  SAVE_PROVIDER_CONFIG / CHAT_MESSAGE / MEMORY_GET from a page while the panel still works;
+  background-tab stage ignored and focused applied; cross-origin context report ignored; init dedupe
+  (3→1), latest-wins, no overlap. Against the old source these checks fail. verify now keeps the real
+  `safeDhis2Fetch` (an earlier block stubs it). The sticky-stage persistence check follows the stage
+  code to `applyDetectedStage`.
+- Live Chrome probes before/after: privilege (key read / provider re-point / memory) → no response;
+  markdown injection neutralized; navigation table above; the screenshot suite still passes (DPR 1/2
+  pixel-aligned, slow drag, cancel).
+- Live regressions on localhost:8081: `scenario-admin-tools` 68 ✓ / 268 calls / 0 unexpected
+  failures / cleanup 0; `scenario-line-lists` 37 ✓ / 0 failed; `scenario-stage-context` 10 ✓ /
+  0 failed; `scenario-soft-deleted-de` 9 ✓ / 0 unexpected; `npm run sticky` ✓. No path refused by
+  the new guard in any scenario, and none of the code-built path literals would be.

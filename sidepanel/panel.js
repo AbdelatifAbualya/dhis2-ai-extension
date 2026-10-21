@@ -2294,7 +2294,8 @@ ${turnXml}
           if (!Array.isArray(params)) params = [params];
           let html = `<div style="font-weight:600;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid #f0f0f0">${esc(params[0].axisValueLabel || '')}</div>`;
           params.forEach(p => {
-            const val = formatNumber(p.value, spec.y_axis?.format);
+            // formatNumber passes non-numeric values through as-is; this is HTML.
+            const val = esc(formatNumber(p.value, spec.y_axis?.format));
             html += `<div style="display:flex;align-items:center;gap:6px;padding:2px 0">
               ${p.marker}<span style="flex:1">${esc(p.seriesName)}</span><strong style="margin-left:8px">${val}</strong>
             </div>`;
@@ -2575,7 +2576,7 @@ ${turnXml}
       html += `<tr><td><strong>${esc(cat)}</strong></td>`;
       spec.series.forEach(s => {
         const v = s.data[i];
-        html += `<td>${v != null ? formatNumber(v, spec.y_axis?.format) : '-'}</td>`;
+        html += `<td>${v != null ? esc(formatNumber(v, spec.y_axis?.format)) : '-'}</td>`;
       });
       html += '</tr>';
     });
@@ -2691,10 +2692,13 @@ ${turnXml}
     // Horizontal rule
     h = h.replace(/^---$/gm, '<hr>');
 
-    // URLs (block javascript: and data: URIs for safety)
+    // URLs. Model output can carry text from DHIS2 metadata or web pages, and
+    // esc() leaves quotes alone, so a quote in the href could add attributes to
+    // the <a>. Only plain http(s)/mailto links are linked, quotes encoded.
     h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, href) => {
-      if (/^\s*(javascript|data|vbscript):/i.test(href)) return text;
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+      href = href.trim();
+      if (!/^(https?:\/\/|mailto:)/i.test(href)) return text;
+      return `<a href="${href.replace(/"/g, '&quot;').replace(/'/g, '&#39;')}" target="_blank" rel="noopener noreferrer">${text}</a>`;
     });
     h = h.replace(/(^|[^"=])(https?:\/\/[^\s<)"]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
 

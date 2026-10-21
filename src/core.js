@@ -45,6 +45,15 @@ function isLocalProvider(cfg) {
   if (cfg.providerType === 'ollama') return true;
   return isLocalProviderUrl(cfg.apiBaseUrl);
 }
+// Stricter check for PRIVACY decisions: where chat requests actually go, not
+// the preset name. isLocalProvider() treats every "ollama" preset as local
+// (fine for "no API key needed"), but an Ollama preset pointed at
+// https://ollama.com or another machine sends tool results off the device.
+function providerRequestsStayLocal(cfg) {
+  if (!cfg) return false;
+  const fallback = cfg.providerType === 'anthropic' ? 'https://api.anthropic.com' : DEFAULT_PROVIDER_CONFIG.apiBaseUrl;
+  return isLocalProviderUrl(cfg.apiBaseUrl || fallback);
+}
 // Strict validator for user-supplied provider/vision URLs.
 // Rejects javascript:, data:, file: and anything that doesn't parse.
 function isValidProviderUrl(rawUrl) {
@@ -1502,7 +1511,7 @@ async function ensureConnected() {
     if (activeTab?.url) {
       const activeBaseUrl = extractBaseUrl(activeTab.url);
       if (activeBaseUrl && dhis2.baseUrl && activeBaseUrl !== dhis2.baseUrl) {
-        const r = await initializeFromUrl(activeTab.url);
+        const r = await initializeFromUrlNow(activeTab.url);
         if (!r?.error) return dhis2.connected && !!dhis2.baseUrl;
         // Re-init failed — fall through and try the legacy paths so we still
         // return a usable answer (better than blocking the user entirely).
@@ -1521,7 +1530,7 @@ async function ensureConnected() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.url) {
-      const result = await initializeFromUrl(tab.url);
+      const result = await initializeFromUrlNow(tab.url);
       return result.success === true;
     }
   } catch {}
@@ -1795,6 +1804,8 @@ function apiUrl(path) {
   // encodeStrictQueryChars (hoisted). appendQueryParamsToPath already encodes
   // via URLSearchParams, so this only matters for raw bracketed path strings.
   const s = String(path);
+  const ambiguous = ambiguousApiPathReason(s);
+  if (ambiguous) throw new Error(`Refused API path "${s.split('?')[0]}": ${ambiguous}`);
   const qIdx = s.indexOf('?');
   if (qIdx === -1) return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${s}`;
   return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${s.substring(0, qIdx)}?${encodeStrictQueryChars(s.substring(qIdx + 1))}`;
@@ -2311,7 +2322,9 @@ async function fetchViaTab(fullUrl, method, headers, bodyStr) {
   if (!dhis2.baseUrl) return null;
   try {
     const tabs = await chrome.tabs.query({});
-    const dhis2Tab = tabs.find(t => t.url && t.url.startsWith(dhis2.baseUrl));
+    // Exact base match: a bare prefix test also matched another instance whose
+    // path merely starts the same way (…/stable-2-41 vs …/stable-2-41-1).
+    const dhis2Tab = tabs.find(t => t.url && (t.url === dhis2.baseUrl || t.url.startsWith(dhis2.baseUrl + '/')));
     if (!dhis2Tab) { console.warn('[fetchViaTab] No DHIS2 tab found'); return null; }
 
     const results = await chrome.scripting.executeScript({
@@ -2356,6 +2369,22 @@ function encodeStrictQueryChars(query) {
   );
 }
 
+// Every gate (patient-data privacy, write authorization, dataStore guards)
+// inspects a tool's path as a literal string, but fetch() resolves dot
+// segments — also spelled %2e — and backslashes, drops a #fragment, and DHIS2
+// decodes %-escaped letters. So "programs/../tracker/trackedEntities",
+// "./tracker/events", "tracker/%74rackedEntities" or "tracker\trackedEntities"
+// read patient rows straight past the privacy gate (verified live on 2.42.5.1).
+// No DHIS2 API path needs any of these, so refuse them: what the gates check
+// is what gets sent. Only the part before "?" is checked.
+function ambiguousApiPathReason(path) {
+  const p = String(path).split('?')[0];
+  if (/[\\#;]/.test(p)) return 'it contains a backslash, "#" or ";"';
+  if (/(^|\/)(\.|%2e){1,2}(\/|$)/i.test(p)) return 'it contains a "." or ".." segment';
+  if (/%(3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9ae]|2d|2e)/i.test(p)) return 'it percent-encodes a letter, digit or "-._~"';
+  return null;
+}
+
 // E4030 on a data element / category option combo that holds AGGREGATE data.
 const AGGREGATE_DATA_BLOCK_RE = /associated with another object:?\s*`?(?:DataValue(?:Audit)?|DataValueAudit)\b/i;
 function aggregateDataBlockHint(pathOrId) {
@@ -2383,6 +2412,14 @@ async function safeDhis2Fetch(path, options = {}) {
   }
 
   let cleanPath = path.replace(/^\//, '').replace(/^api\/\d+\//, '');
+  const ambiguous = ambiguousApiPathReason(cleanPath);
+  if (ambiguous) {
+    return {
+      _error: `Refused API path "${cleanPath.split('?')[0]}": ${ambiguous}. The browser or server would rewrite it into a different endpoint than the one requested.`,
+      _hint: 'Use the plain resource path, e.g. "programs/<uid>?fields=…": no ../ or ./ segments, backslashes, "#", ";" or %-escaped letters.',
+      _refused_path: true,
+    };
+  }
   const qIdx = cleanPath.indexOf('?');
   let fullUrl;
   if (qIdx !== -1) {
@@ -4103,7 +4140,41 @@ function carryStickyContext(freshCtx, prevCtx) {
   return ctx;
 }
 
-async function initializeFromUrl(url) {
+// One in-app navigation reaches initializeFromUrl up to four times (tabs.onUpdated,
+// the webNavigation fragment event, content.js's hashchange message and its 2 s
+// poll), and every copy re-fetched the program metadata — measured 4× per
+// navigation on 2.42. Calls for the same URL now share one run, and runs are
+// serialized so an older navigation finishing late can't overwrite a newer
+// page's context; a queued run whose URL is no longer the latest is skipped and
+// its caller gets the latest run's result. ensureConnected calls
+// initializeFromUrlNow directly: it runs inside tool calls, where joining an
+// in-flight run could mean waiting on itself.
+const INIT_QUEUE_TIMEOUT_MS = 20000; // a hung DHIS2 request must not block every later navigation
+const _initRuns = new Map();
+let _initQueue = Promise.resolve();
+let _initLatestUrl = null;
+function initializeFromUrl(url) {
+  _initLatestUrl = url;
+  let run = _initRuns.get(url);
+  if (!run) {
+    run = _initQueue.then(() => (url === _initLatestUrl ? initializeFromUrlNow(url) : { superseded: true }));
+    _initRuns.set(url, run);
+    let timer;
+    const settled = run.catch(() => {}).finally(() => {
+      clearTimeout(timer);
+      if (_initRuns.get(url) === run) _initRuns.delete(url);
+    });
+    _initQueue = Promise.race([settled, new Promise((r) => { timer = setTimeout(r, INIT_QUEUE_TIMEOUT_MS); })]);
+  }
+  return run.then(function followLatest(r) {
+    if (!r?.superseded) return r;
+    const latest = _initRuns.get(_initLatestUrl);
+    if (latest && latest !== run) return latest.then(followLatest);
+    return { success: !!dhis2.connected, state: getSerializableState() };
+  });
+}
+
+async function initializeFromUrlNow(url) {
   const baseUrl = extractBaseUrl(url);
   if (!baseUrl) return { error: 'Not a DHIS2 page' };
 

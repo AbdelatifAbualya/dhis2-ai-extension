@@ -1550,50 +1550,94 @@ function broadcast(data) {
 
 // ── Message Handler ──────────────────────────────────────────────────────────
 
+// Content scripts run inside DHIS2 pages, and Chrome's extension security model
+// treats their messages as untrusted (a compromised page renderer can send
+// whatever a content script can). They only ever send these types; everything
+// else — API keys, provider config, chat turns (which can authorize writes),
+// memory, feedback — is accepted only from the extension's own pages.
+const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
+  'DHIS2_CONTEXT_UPDATE', 'DHIS2_STAGE_DETECTED',
+  'SCREENSHOT_AREA_SELECTED', 'SCREENSHOT_CAPTURED', 'SCREENSHOT_FAILED',
+]);
+function isExtensionPageSender(sender) {
+  const prefix = chrome.runtime.getURL('');
+  return !!prefix && typeof sender.url === 'string' && sender.url.startsWith(prefix);
+}
+
+// Page context follows the tab the user is looking at. tabs.onUpdated,
+// webNavigation and content scripts report EVERY tab, so a background DHIS2 tab
+// reloading — or bouncing to the login page when its session expired — used to
+// re-point the connection (or reset `connected`) in the middle of a turn the
+// user was running in another tab.
+async function isFocusedActiveTab(tabId) {
+  try {
+    const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    return !!t && t.id === tabId;
+  } catch { return false; }
+}
+// Content-script context events: from a tab, only the focused active one counts.
+function fromFocusedTabOrPage(sender) {
+  return sender.tab ? isFocusedActiveTab(sender.tab.id) : Promise.resolve(true);
+}
+
+// Content script detected the active stage (from URL hash or DOM observation).
+// Use hasUidShape (loose) — the stage ID comes from a DHIS2-served URL and is
+// further cross-checked against knownStages below.
+function applyDetectedStage(payload) {
+  const detectedStageId = payload?.stageId;
+  if (detectedStageId && hasUidShape(detectedStageId)) {
+    // Only update if different from current and it's a valid stage in the program
+    const currentStageId = dhis2.pageContext?.stageId;
+    if (detectedStageId !== currentStageId) {
+      // Validate against known stages if program metadata is loaded
+      const knownStages = dhis2.programMetadata?.programStages;
+      if (!knownStages || knownStages.some(s => s.id === detectedStageId)) {
+        if (!dhis2.pageContext) dhis2.pageContext = {};
+        dhis2.pageContext.stageId = detectedStageId;
+        console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${payload?.source || 'unknown'})`);
+        // PERSIST. The detected stage exists ONLY here — no URL re-parse can
+        // recover it on the enrollment dashboard. Chrome kills the MV3
+        // worker after ~30 s idle and restores dhis2 from session storage,
+        // so an in-memory-only write meant the stage was reliably known for
+        // a short while and then gone ("the chatbot finds it for a bit then
+        // loses it", reported live 2026-08-06).
+        saveState();
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+      }
+    }
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Only accept messages from our own extension's content scripts and pages.
   // Reject anything with an external `sender.id` or an `externally_connectable` origin.
   if (sender.id !== chrome.runtime.id) return false;
   if (!msg || typeof msg.type !== 'string') return false;
+  if (!CONTENT_SCRIPT_MESSAGE_TYPES.has(msg.type) && !isExtensionPageSender(sender)) {
+    console.warn(`[security] Ignored "${msg.type}" from outside the extension's pages (${sender.url || 'unknown sender'})`);
+    return false;
+  }
   switch (msg.type) {
     case 'DHIS2_CONTEXT_UPDATE': {
       const url = msg.payload?.url || sender.tab?.url;
-      if (url) {
-        initializeFromUrl(url).then(r => {
-          broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-          sendResponse(r);
-        }).catch(e => sendResponse({ error: e.message }));
-      }
+      // A content script may only report its own page's origin.
+      let sameOrigin = false;
+      try { sameOrigin = !sender.tab || new URL(url).origin === new URL(sender.url || sender.tab.url).origin; } catch {}
+      if (!url || !sameOrigin) { sendResponse({ ignored: true }); return false; }
+      fromFocusedTabOrPage(sender).then(async (focused) => {
+        if (!focused) { sendResponse({ ignored: 'not the focused tab' }); return; }
+        const r = await initializeFromUrl(url);
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+        sendResponse(r);
+      }).catch(e => sendResponse({ error: e.message }));
       return true;
     }
 
     case 'DHIS2_STAGE_DETECTED': {
-      // Content script detected the active stage (from URL hash or DOM observation)
-      // Use hasUidShape (loose) — the stage ID comes from a DHIS2-served URL
-      // and is further cross-checked against knownStages below.
-      const detectedStageId = msg.payload?.stageId;
-      if (detectedStageId && hasUidShape(detectedStageId)) {
-        // Only update if different from current and it's a valid stage in the program
-        const currentStageId = dhis2.pageContext?.stageId;
-        if (detectedStageId !== currentStageId) {
-          // Validate against known stages if program metadata is loaded
-          const knownStages = dhis2.programMetadata?.programStages;
-          if (!knownStages || knownStages.some(s => s.id === detectedStageId)) {
-            if (!dhis2.pageContext) dhis2.pageContext = {};
-            dhis2.pageContext.stageId = detectedStageId;
-            console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${msg.payload?.source || 'unknown'})`);
-            // PERSIST. The detected stage exists ONLY here — no URL re-parse can
-            // recover it on the enrollment dashboard. Chrome kills the MV3
-            // worker after ~30 s idle and restores dhis2 from session storage,
-            // so an in-memory-only write meant the stage was reliably known for
-            // a short while and then gone ("the chatbot finds it for a bit then
-            // loses it", reported live 2026-08-06).
-            saveState();
-            broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-          }
-        }
-      }
-      sendResponse({ success: true });
+      fromFocusedTabOrPage(sender).then((focused) => {
+        if (focused) applyDetectedStage(msg.payload);
+        sendResponse({ success: true });
+      }).catch(e => sendResponse({ error: e.message }));
       return true;
     }
 
@@ -1914,17 +1958,25 @@ chrome.action.onClicked.addListener(async (tab) => {
 // ── Tab URL Change ───────────────────────────────────────────────────────────
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.url && (tab.url.includes('/dhis-web-') || tab.url.includes('/apps/') || tab.url.includes('/api/'))) {
-    initializeFromUrl(tab.url).then(() => {
-      broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+  if (info.url && tab.active && (tab.url.includes('/dhis-web-') || tab.url.includes('/apps/') || tab.url.includes('/api/'))) {
+    isFocusedActiveTab(tabId).then((focused) => {
+      if (!focused) return;
+      return initializeFromUrl(tab.url).then(() => {
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+      });
     }).catch(() => {});
   }
 });
 
+// Top frame only: 2.42's global shell runs each app in an iframe whose own
+// fragment changes would otherwise re-initialize from the iframe's URL.
 chrome.webNavigation?.onReferenceFragmentUpdated?.addListener?.((details) => {
-  if (details.url && (details.url.includes('/dhis-web-') || details.url.includes('/apps/'))) {
-    initializeFromUrl(details.url).then(() => {
-      broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+  if (details.frameId === 0 && details.url && (details.url.includes('/dhis-web-') || details.url.includes('/apps/'))) {
+    isFocusedActiveTab(details.tabId).then((focused) => {
+      if (!focused) return;
+      return initializeFromUrl(details.url).then(() => {
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+      });
     }).catch(() => {});
   }
 });
