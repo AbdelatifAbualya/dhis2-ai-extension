@@ -1421,18 +1421,26 @@ function injectedScreenshotSelection() {
     const w = Math.abs(e.clientX - startX);
     const h = Math.abs(e.clientY - startY);
     overlay.remove();
+    document.removeEventListener('keydown', cancelHandler);
     if (w < 10 || h < 10) return;
-    setTimeout(() => {
-      chrome.runtime.sendMessage({
-        type: 'SCREENSHOT_AREA_SELECTED',
-        payload: {
-          x: Math.round(x),
-          y: Math.round(y),
-          width: Math.round(w),
-          height: Math.round(h),
-          devicePixelRatio: window.devicePixelRatio || 1,
-        },
-      });
+    const selection = {
+      x: Math.round(x),
+      y: Math.round(y),
+      width: Math.round(w),
+      height: Math.round(h),
+      devicePixelRatio: window.devicePixelRatio || 1,
+      viewportWidth: window.innerWidth,
+    };
+    setTimeout(async () => {
+      const res = await chrome.runtime
+        .sendMessage({ type: 'SCREENSHOT_AREA_SELECTED', payload: selection })
+        .catch(() => null);
+      if (!res?.captureInPage) return;
+      // getDisplayMedia needs transient user activation, which expires ~5 s
+      // after the mousedown. A slow drag outlives it, so ask for one more click
+      // instead of failing.
+      if (navigator.userActivation && !navigator.userActivation.isActive) confirmThenCapture(selection);
+      else captureThisTab(selection);
     }, 80);
   });
 
@@ -1445,6 +1453,93 @@ function injectedScreenshotSelection() {
   document.addEventListener('keydown', cancelHandler);
 
   document.body.appendChild(overlay);
+
+  // chrome.tabs.captureVisibleTab needs activeTab or <all_urls>, which the
+  // manifest deliberately doesn't declare, so the background refuses and we
+  // capture from inside the page: getDisplayMedia + preferCurrentTab needs no
+  // extension permission — Chrome asks the user to share this tab, we grab one
+  // frame and stop the stream immediately.
+  async function captureThisTab(sel) {
+    let stream = null;
+    try {
+      // Missing outside secure contexts (plain-http servers other than localhost).
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        throw Object.assign(new Error('getDisplayMedia is unavailable'), { name: 'InsecureContextError' });
+      }
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        // Without constraints Chrome downscales tab capture to ~800px wide; a
+        // max-only cap yields native-resolution frames (an `ideal` size is
+        // still resampled by a few pixels).
+        video: { displaySurface: 'browser', width: { max: 8192 }, height: { max: 8192 } },
+        audio: false,
+        preferCurrentTab: true,
+        selfBrowserSurface: 'include',
+        surfaceSwitching: 'exclude',
+        monitorTypeSurfaces: 'exclude',
+      });
+      const [track] = stream.getVideoTracks();
+      if (track.getSettings().displaySurface !== 'browser') {
+        throw Object.assign(new Error('a window or screen was shared'), { name: 'WrongSurfaceError' });
+      }
+      const video = document.createElement('video');
+      video.muted = true;
+      video.srcObject = stream;
+      await video.play();
+      // Chrome's "sharing this tab" bar shortens the viewport once capture
+      // starts but never narrows it, so scale by width and clamp the height.
+      const scale = video.videoWidth / sel.viewportWidth;
+      const sx = Math.round(sel.x * scale);
+      const sy = Math.round(sel.y * scale);
+      const sw = Math.min(Math.round(sel.width * scale), video.videoWidth - sx);
+      const sh = Math.min(Math.round(sel.height * scale), video.videoHeight - sy);
+      if (!(sw > 0 && sh > 0)) throw new Error('the captured frame does not cover the selected area');
+      const canvas = document.createElement('canvas');
+      canvas.width = sw;
+      canvas.height = sh;
+      canvas.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+      chrome.runtime.sendMessage({ type: 'SCREENSHOT_CAPTURED', dataUrl: canvas.toDataURL('image/png') });
+    } catch (err) {
+      chrome.runtime.sendMessage({ type: 'SCREENSHOT_FAILED', reason: err.name, error: err.message });
+    } finally {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    }
+  }
+
+  function confirmThenCapture(sel) {
+    const btn = document.createElement('button');
+    btn.id = '__dhis2_screenshot_confirm__';
+    btn.textContent = 'Capture selection';
+    Object.assign(btn.style, {
+      position: 'fixed',
+      left: (sel.x + sel.width / 2) + 'px',
+      top: (sel.y + sel.height / 2) + 'px',
+      transform: 'translate(-50%, -50%)',
+      zIndex: '2147483647',
+      background: '#4f46e5',
+      color: '#fff',
+      border: 'none',
+      padding: '8px 18px',
+      borderRadius: '8px',
+      fontSize: '14px',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      fontWeight: '500',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+      cursor: 'pointer',
+    });
+    const escHandler = (e) => {
+      if (e.key === 'Escape') {
+        btn.remove();
+        document.removeEventListener('keydown', escHandler);
+      }
+    };
+    btn.addEventListener('click', () => {
+      btn.remove();
+      document.removeEventListener('keydown', escHandler);
+      captureThisTab(sel);
+    });
+    document.addEventListener('keydown', escHandler);
+    document.body.appendChild(btn);
+  }
 }
 
 // ── Broadcasting ─────────────────────────────────────────────────────────────
@@ -1738,7 +1833,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             func: injectedScreenshotSelection,
           });
         } catch (e) {
-          broadcast({ type: 'AI_ERROR', error: 'Cannot capture this page. Try on a regular web page.' });
+          broadcast({ type: 'SCREENSHOT_ERROR', error: 'Cannot capture this page. Try on a regular web page.' });
         }
       });
       sendResponse({ ok: true });
@@ -1746,23 +1841,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case 'SCREENSHOT_AREA_SELECTED': {
-      // Capture the visible tab, then crop to the selected area
+      // Prompt-free path: capture the visible tab, then crop to the selected area.
+      // Without activeTab / <all_urls> Chrome refuses captureVisibleTab, so the
+      // overlay is told to capture the tab itself (captureThisTab).
       const { x, y, width, height, devicePixelRatio } = msg.payload;
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        if (!tabs[0]?.id) { sendResponse({ error: 'No active tab' }); return; }
+      (async () => {
         try {
-          const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+          const dataUrl = await chrome.tabs.captureVisibleTab(sender.tab?.windowId ?? null, { format: 'png' });
           // Crop the captured image to the selected region
           const cropped = await cropImage(dataUrl, x, y, width, height, devicePixelRatio);
           // Send the cropped image back to the side panel
           broadcast({ type: 'SCREENSHOT_RESULT', dataUrl: cropped });
           sendResponse({ ok: true });
         } catch (e) {
-          broadcast({ type: 'AI_ERROR', error: 'Screenshot failed: ' + e.message });
-          sendResponse({ error: e.message });
+          sendResponse({ captureInPage: true });
         }
-      });
+      })();
       return true;
+    }
+
+    case 'SCREENSHOT_CAPTURED': {
+      // Already-cropped PNG from the overlay's in-page tab capture.
+      if (sender.tab && typeof msg.dataUrl === 'string' && msg.dataUrl.startsWith('data:image/png;base64,')) {
+        broadcast({ type: 'SCREENSHOT_RESULT', dataUrl: msg.dataUrl });
+      }
+      return false;
+    }
+
+    case 'SCREENSHOT_FAILED': {
+      const errors = {
+        NotAllowedError: 'Screenshot cancelled. To attach one, click **Allow** when Chrome asks "Allow … to see this tab?".',
+        WrongSurfaceError: 'Screenshot cancelled: a window or screen was shared. Choose **this tab** when Chrome asks.',
+        InsecureContextError: 'Screenshots need the DHIS2 page to be on HTTPS (or localhost). Use **Upload image** or paste a screenshot (Ctrl+V) instead.',
+      };
+      broadcast({ type: 'SCREENSHOT_ERROR', error: errors[msg.reason] || 'Screenshot failed: ' + (msg.error || 'unknown error') });
+      return false;
     }
 
     case 'GET_FEEDBACK_LOG': {

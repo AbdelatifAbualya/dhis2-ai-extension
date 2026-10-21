@@ -67,7 +67,7 @@ know a moved declaration has no load-time dependents.
 | `src/tools-programs.js` | 8.0k | The program-authoring tools: full program/stage creation, program rules (+ linters), program indicators (+ linters), program notifications, custom translations, growth-chart plugin, standalone metadata/architect helpers. |
 | `src/tools-linelists.js` | 0.7k | `manage_line_lists` — Line Listing authoring (eventVisualizations of type LINE_LIST): program-metadata dimension resolution, filter/repetition/legend/PI linting, the pre-save analytics probe, CRUD + validate. |
 | `src/tools-admin.js` | 1.3k | Administration tools: `manage_users` (users, roles with authority validation, groups), `manage_data_values` (one aggregate form: get/set/delete/complete/validate with client-side period/OU/disaggregation/value checks), `manage_metadata_translations` (merge-safe object translations); shared id-or-name resolution, the schema cache, and `precheckPatchAgainstSchema` used by `dhis2_query`. |
-| `src/agent.js` | 1.7k | The agentic loop (`runAgenticLoop`, `_runAgenticLoopInner`); feedback storage; the bounded keepalive lease; screenshot cropping; `broadcast`; the `chrome.runtime.onMessage` router and every other `chrome.*` event listener. |
+| `src/agent.js` | 1.7k | The agentic loop (`runAgenticLoop`, `_runAgenticLoopInner`); feedback storage; the bounded keepalive lease; screenshot capture (selection overlay with in-page tab-capture fallback) and cropping; `broadcast`; the `chrome.runtime.onMessage` router and every other `chrome.*` event listener. |
 
 ## The safety gates (do not weaken these to simplify anything)
 

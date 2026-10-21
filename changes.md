@@ -3396,3 +3396,77 @@ showed the model reading a binding lesson at the END of the long system prompt a
 making the call → lessons now go in a transient system message right AFTER the user's message
 (dropped from history, re-selected every turn), and "remember …" lessons are tagged as user
 rules from the user's own words. Run 3: the known failure was not repeated.
+
+---
+
+## Unreleased (on top of v2.8.25) — Screenshots work again without `activeTab` / `<all_urls>` (2026-10-21)
+
+### The bug
+**Attach → Take Screenshot** always ended with
+`Screenshot failed: Either the '<all_urls>' or 'activeTab' permission is required.`
+`chrome.tabs.captureVisibleTab` only works for an extension holding `activeTab` or `<all_urls>`.
+The manifest deliberately has neither (it asks for the specific DHIS2 origin at runtime), and a
+granted origin does **not** satisfy that check. Reproduced on localhost:8081 (2.42.5.1) in Chrome 155
+with the unmodified extension. **`manifest.json` is unchanged** (no permissions, no version bump).
+
+### The fix — capture from inside the page
+- `src/agent.js` `injectedScreenshotSelection` (the overlay injected via `chrome.scripting`, which
+  only needs the already-granted origin): after the drag it still asks the background first
+  (`SCREENSHOT_AREA_SELECTED`). When the background answers `captureInPage`, the new nested
+  `captureThisTab` calls `navigator.mediaDevices.getDisplayMedia({ preferCurrentTab: true, … })`.
+  That web API needs no extension permission. Chrome shows its own prompt, *"Allow localhost:8081
+  to see this tab?"*, and the user clicks **Allow**. The overlay takes ONE frame, crops it on a
+  canvas, sends the PNG back (`SCREENSHOT_CAPTURED`) and stops the stream immediately.
+- **Transient-activation guard** (`confirmThenCapture`): getDisplayMedia needs user activation,
+  which expires ~5 s after the mousedown. If a slow drag outlives it, a "Capture selection" button
+  appears on the selection and its click provides fresh activation, so nothing fails.
+- `SCREENSHOT_AREA_SELECTED` (background): captureVisibleTab is still tried first (the prompt-free
+  path if the extension ever holds the permission). It now captures the *sender's* window, and on
+  failure answers `{ captureInPage: true }` instead of broadcasting the error.
+- New background cases: `SCREENSHOT_CAPTURED` relays the PNG as `SCREENSHOT_RESULT` (only from a
+  tab sender, only `data:image/png;base64,`). `SCREENSHOT_FAILED` maps reasons to plain messages
+  (cancelled prompt → "click **Allow**…"; insecure http origin → "use Upload image / paste";
+  wrong surface → "choose this tab").
+- `sidepanel/panel.js`: screenshot errors arrive as the new `SCREENSHOT_ERROR` and are shown with
+  `addMessage('error', …)`. Before, they came as `AI_ERROR`, which also finalizes the stream and
+  resets `isSending`. Cancelling the prompt while a reply was streaming would have cut that reply
+  off. The START "Cannot capture this page" error uses the same message type.
+
+### Chrome quirks found (verified live, don't re-derive)
+- With no constraints, Chrome downscales tab capture to **800 px wide**. `width/height: { ideal }`
+  is still resampled (1278 px for a 1280 px viewport), and `resizeMode: 'none'` is ignored. A
+  **max-only cap** (`max: 8192`) gives native frames: 1280×812 at DPR 1, 2560×1626 at DPR 2.
+- Once capture starts, Chrome's "sharing this tab" bar **shortens the viewport by 56 px** but never
+  narrows it, and the first frame predates it. So the crop scale is `frameWidth / viewportWidth`
+  and the height is clamped.
+- MV3 content scripts can't use `new Function`/eval, and executeScript serializes `func`, so every
+  helper lives inside `injectedScreenshotSelection`.
+- In 2.42 the apps run inside the global-shell iframe (`/apps/dashboard`). The full-viewport
+  overlay in the top frame still receives the drag, and tab capture includes the iframe.
+- Tab capture goes through a video pipeline: colours shift by a few levels and glyph edges show
+  chroma-subsampling noise. That's irrelevant for the model reading the screenshot.
+- getDisplayMedia exists only in secure contexts. `http://localhost` works; a plain-http LAN IP
+  (`http://192.168.1.30:8081`) gets the "use Upload image / paste" message.
+
+### Verification
+- `npm run verify` — +14 assertions: background hand-off (refused fast path → `captureInPage`, no
+  error), PNG relay + sender/type filter, cancel → `SCREENSHOT_ERROR`; the overlay run **from its
+  serialized source** in a fresh context with a fake DOM: self-contained, capture only after the
+  overlay is gone, DPR-2 crop math, stream stopped, prompt-free path skips the prompt,
+  expired-activation button, cancel and insecure-context reasons. The verdict also fails if the
+  block never finishes. Running the new checks against the OLD `agent.js` turns verify red.
+- Live, real Chrome 155 against localhost:8081: the extension was loaded into a throwaway profile
+  via CDP `Extensions.loadUnpacked`. The test copy's manifest declared `http://localhost:8081/*`,
+  the same permission state as an install whose user granted that origin. The real
+  `START_SCREENSHOT_CAPTURE` handler ran, the drag used trusted CDP mouse input, and the share
+  prompt was answered by Chrome's `--auto-accept-this-tab-capture` / `--auto-reject-this-tab-capture`
+  test switches. Results:
+  - original build → the exact user-reported error (reproduced);
+  - fixed, DPR 1 → 520×300 PNG in the panel preview; pixel-compared against a CDP compositor grab
+    of the same rect, best alignment offset (0,0);
+  - fixed, DPR 2 → 1040×600, offset (0,0);
+  - slow drag (>5 s) → "Capture selection" button → correct capture, button not in the image;
+  - cancelled prompt → panel shows "Screenshot cancelled. To attach one, click **Allow**…";
+  - plain-http LAN origin → panel shows the HTTPS/upload hint;
+  - in every run no overlay/button is left behind.
+- Regression: `npm run admin` — 68 checks, 268 API calls, 0 unexpected failures, cleanup 0 failed.

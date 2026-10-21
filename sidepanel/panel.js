@@ -387,10 +387,13 @@
       }
     });
 
-    // Listen for screenshot result from background
+    // Listen for screenshot result from background. Screenshot errors get their
+    // own message type: AI_ERROR would also end a reply that is still streaming.
     chrome.runtime.onMessage.addListener((msg) => {
       if (msg.type === 'SCREENSHOT_RESULT' && msg.dataUrl) {
         setPendingImage(msg.dataUrl);
+      } else if (msg.type === 'SCREENSHOT_ERROR' && msg.error) {
+        addMessage('error', msg.error);
       }
     });
 

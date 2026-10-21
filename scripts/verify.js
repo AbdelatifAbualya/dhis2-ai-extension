@@ -57,8 +57,9 @@ if (!modules.length) bad('background.js declares no src/*.js modules');
 const noop = () => {};
 const evt = () => ({ addListener: noop, removeListener: noop, hasListener: () => false });
 const store = () => ({ get: () => Promise.resolve({}), set: () => Promise.resolve(), remove: () => Promise.resolve() });
+const messageListeners = [];
 const chrome = {
-  runtime: { id: 'verify', onMessage: evt(), onInstalled: evt(), onStartup: evt(),
+  runtime: { id: 'verify', onMessage: { ...evt(), addListener: (f) => messageListeners.push(f) }, onInstalled: evt(), onStartup: evt(),
              getURL: (p) => p, getPlatformInfo: (cb) => cb && cb({ os: 'linux' }) },
   storage: { local: store(), session: store(), onChanged: evt() },
   tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve([]) },
@@ -1457,10 +1458,130 @@ if (loaded) (async () => {
   st.entries = [];
 })().catch((e) => bad(`learning-memory checks threw: ${e && e.stack || e}`));
 
+// ── Screenshot capture (src/agent.js) ────────────────────────────────────────
+// The manifest declares neither activeTab nor <all_urls>, so captureVisibleTab
+// is refused: the background must hand capture to the injected overlay, which
+// executeScript SERIALIZES — it may only use what it defines itself, so it runs
+// here from its source text in a fresh context with a minimal DOM. Microtask-
+// only (no real timers), like the block above. A handler that never answers
+// would leave this block pending forever, so the verdict also checks it finished.
+let screenshotChecksDone = false;
+if (loaded) (async () => {
+  console.log('\nScreenshot capture (no activeTab / <all_urls>):');
+  const truthy = (label, got) => (got ? ok(`${label}`) : bad(`${label} => ${JSON.stringify(got)}`));
+  const flush = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
+  const listener = messageListeners[0];
+  if (!listener || typeof ctx.injectedScreenshotSelection !== 'function') { bad('screenshot handler / injectedScreenshotSelection missing'); return; }
+
+  // Background message handling.
+  const sent = [];
+  chrome.runtime.sendMessage = (m) => { sent.push(m); return Promise.resolve(); };
+  const fromTab = { id: 'verify', tab: { id: 7, windowId: 1 } };
+  const call = (msg, sender = fromTab) => new Promise((resolve) => {
+    if (listener(msg, sender, resolve) !== true) resolve(undefined);
+  });
+  chrome.tabs.captureVisibleTab = () => Promise.reject(new Error("Either the '<all_urls>' or 'activeTab' permission is required."));
+  const r = await call({ type: 'SCREENSHOT_AREA_SELECTED', payload: { x: 1, y: 1, width: 50, height: 50, devicePixelRatio: 1 } });
+  truthy('captureVisibleTab refused → overlay told to capture in-page', r && r.captureInPage === true);
+  truthy('…with no error shown for the refused fast path', !sent.length);
+  await call({ type: 'SCREENSHOT_CAPTURED', dataUrl: 'data:image/png;base64,iVBORw0KGgo=' });
+  truthy('in-page PNG is relayed to the panel as SCREENSHOT_RESULT', sent.length === 1 && sent[0].type === 'SCREENSHOT_RESULT');
+  sent.length = 0;
+  await call({ type: 'SCREENSHOT_CAPTURED', dataUrl: 'data:text/html;base64,PGI+' });
+  await call({ type: 'SCREENSHOT_CAPTURED', dataUrl: 'data:image/png;base64,iVBORw0KGgo=' }, { id: 'verify' });
+  truthy('non-PNG data / a sender that is not a tab is dropped', !sent.length);
+  await call({ type: 'SCREENSHOT_FAILED', reason: 'NotAllowedError', error: 'Permission denied' });
+  truthy('cancelled share prompt → SCREENSHOT_ERROR (not AI_ERROR, which ends a streaming reply) naming Allow',
+    sent[0]?.type === 'SCREENSHOT_ERROR' && /Allow/.test(sent[0].error));
+  delete chrome.runtime.sendMessage;
+  delete chrome.tabs.captureVisibleTab;
+
+  // The injected overlay, from its serialized source.
+  const src = ctx.injectedScreenshotSelection.toString();
+  const page = ({ activation = true, response = { captureInPage: true }, getDisplayMedia } = {}) => {
+    const msgs = [];
+    const t = { stopped: false, gdmCalls: 0, overlayGoneAtCapture: null, drawn: null };
+    const el = (tag) => {
+      const e = {
+        tag, id: '', style: {}, children: [], listeners: {},
+        addEventListener(type, f) { (this.listeners[type] ||= []).push(f); },
+        appendChild(c) { this.children.push(c); c.parent = this; },
+        remove() { if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this); },
+        fire(type, ev = {}) { for (const f of this.listeners[type] || []) f({ preventDefault: noop, ...ev }); },
+      };
+      if (tag === 'video') e.play = async () => { e.videoWidth = 2000; e.videoHeight = 1488; };
+      if (tag === 'canvas') {
+        e.getContext = () => ({ drawImage: (...a) => { t.drawn = a.slice(1); } });
+        e.toDataURL = () => 'data:image/png;base64,QUJD';
+      }
+      return e;
+    };
+    const body = el('body');
+    const track = { getSettings: () => ({ displaySurface: 'browser' }), stop: () => { t.stopped = true; } };
+    const gdm = getDisplayMedia || (async () => {
+      t.gdmCalls++;
+      t.overlayGoneAtCapture = !body.children.length;
+      return { getVideoTracks: () => [track], getTracks: () => [track] };
+    });
+    const win = {
+      document: { body, createElement: el, getElementById: (id) => body.children.find((c) => c.id === id) || null, addEventListener: noop, removeEventListener: noop },
+      innerWidth: 1000, innerHeight: 800, devicePixelRatio: 2,
+      navigator: { userActivation: { isActive: activation }, mediaDevices: getDisplayMedia === null ? undefined : { getDisplayMedia: gdm } },
+      chrome: { runtime: { sendMessage: (m) => { msgs.push(m); return Promise.resolve(m.type === 'SCREENSHOT_AREA_SELECTED' ? response : undefined); } } },
+      setTimeout: (f) => Promise.resolve().then(f),
+    };
+    win.window = win;
+    vm.runInContext(`(${src})()`, vm.createContext(win));
+    const overlay = body.children[0];
+    const drag = () => {
+      overlay.fire('mousedown', { clientX: 100, clientY: 50 });
+      overlay.fire('mousemove', { clientX: 300, clientY: 200 });
+      overlay.fire('mouseup', { clientX: 400, clientY: 250 });
+    };
+    return { t, msgs, body, drag };
+  };
+
+  let p = page();
+  p.drag();
+  await flush();
+  truthy('overlay is self-contained: runs from its serialized source', p.msgs.some((m) => m.type === 'SCREENSHOT_AREA_SELECTED'));
+  truthy('in-page capture starts only after the overlay is removed', p.t.gdmCalls === 1 && p.t.overlayGoneAtCapture === true);
+  truthy('crop maps CSS px → frame px by width (DPR 2: 100,50 300×200 → 200,100 600×400)',
+    JSON.stringify(p.t.drawn) === JSON.stringify([200, 100, 600, 400, 0, 0, 600, 400]));
+  truthy('cropped PNG sent as SCREENSHOT_CAPTURED and the stream stopped',
+    p.msgs.some((m) => m.type === 'SCREENSHOT_CAPTURED' && m.dataUrl === 'data:image/png;base64,QUJD') && p.t.stopped);
+
+  p = page({ response: { ok: true } });
+  p.drag();
+  await flush();
+  truthy('prompt-free path succeeded → no tab-capture prompt', p.t.gdmCalls === 0);
+
+  p = page({ activation: false });
+  p.drag();
+  await flush();
+  const btn = p.body.children.find((c) => c.id === '__dhis2_screenshot_confirm__');
+  truthy('expired user activation (slow drag) → "Capture selection" button, no prompt yet', btn && p.t.gdmCalls === 0);
+  btn && btn.fire('click');
+  await flush();
+  truthy('…clicking it captures and removes the button', p.t.gdmCalls === 1 && !p.body.children.length);
+
+  p = page({ getDisplayMedia: async () => { throw Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' }); } });
+  p.drag();
+  await flush();
+  truthy('cancelled prompt → SCREENSHOT_FAILED NotAllowedError', p.msgs.some((m) => m.type === 'SCREENSHOT_FAILED' && m.reason === 'NotAllowedError'));
+
+  p = page({ getDisplayMedia: null });
+  p.drag();
+  await flush();
+  truthy('insecure context (no mediaDevices) → SCREENSHOT_FAILED InsecureContextError', p.msgs.some((m) => m.type === 'SCREENSHOT_FAILED' && m.reason === 'InsecureContextError'));
+  screenshotChecksDone = true;
+})().catch((e) => { screenshotChecksDone = true; bad(`screenshot checks threw: ${e && e.stack || e}`); });
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(() => {
   console.log('');
+  if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (failures) { console.error(`\x1b[31mFAILED\x1b[0m — ${failures} check(s) failed\n`); process.exit(1); }
   console.log('\x1b[32mAll checks passed.\x1b[0m\n');
 });
