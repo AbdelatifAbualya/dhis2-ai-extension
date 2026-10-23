@@ -186,6 +186,14 @@ function summarizeSaveErrorDiagnosis(diag) {
   };
 }
 
+// A provider stream that stalled or whose connection dropped. Before any text
+// reached the panel the request is safely repeatable (`messages` is not
+// mutated until a response arrives). Fireworks dropped streams mid-response
+// several times on 2026-10-22: "terminated" (Node) / "network error" (Chrome).
+function isRetryableStreamDrop(err) {
+  return /stream stalled|\bterminated\b|network ?error|failed to fetch|other side closed|socket hang up|ECONNRESET|connection (?:reset|closed)|BodyStreamBuffer/i.test(String((err && err.message) || err || ''));
+}
+
 // ── Agentic Loop ─────────────────────────────────────────────────────────────
 
 async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
@@ -250,7 +258,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   // The provider receives SLIM definitions for MANUAL_TOOLS (routing info
   // only); each such tool's full manual is delivered by the gate below on its
   // first call this turn, BEFORE anything executes.
-  const wireTools = toWireTools(contextualTools);
+  const wireTools = toWireTools(stripUnavailableToolActions(contextualTools));
   const deliveredManuals = new Set();
 
   const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb);
@@ -546,6 +554,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     manage_data_values: 'Reviewing data values',
     manage_metadata_translations: 'Reviewing translations',
     manage_memory: 'Reviewing learning memory',
+    manage_custom_app: 'Checking the app build',
   };
   const thinkingLabels = [
     'Analyzing your question',
@@ -633,7 +642,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
       // transparently — `messages` was not mutated for this iteration, so the
       // request is safely repeatable. If text already streamed, rethrow so the
       // user sees the error rather than duplicated output.
-      if (/stream stalled/i.test(provErr?.message || '') && !streamStartBroadcast && providerStallRetries < 2) {
+      if (isRetryableStreamDrop(provErr) && !streamStartBroadcast && providerStallRetries < 2) {
         providerStallRetries++;
         console.warn(`[AgenticLoop] provider stream stalled — retrying (${providerStallRetries}/2)`);
         broadcast({ type: 'AI_THINKING', iteration: i + 1, label: `Connection dropped — retrying (${providerStallRetries}/2)` });
@@ -778,7 +787,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           // still get one "resend the same call" pass before split advice.
           const hitTokenLimit = argsCorrupted.finishReason === 'length';
           const persistent = hitTokenLimit || dhis2.corruptedCallCount >= 3;
-          const splitHint = `Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.`;
+          const splitHint = toolName === 'manage_custom_app'
+            // An app's source cannot be split across calls — the code must shrink.
+            ? `Write SHORTER source: drive repeated fields from one array of UIDs mapped over (never one block per field), drop comments and decorative markup, and put helpers used by both app and plugin in shared.jsx once. Write the code directly in the call — do not draft it in your reasoning first.`
+            : `Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.`;
           const feedback = {
             _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was ${hitTokenLimit ? `cut off by the response token limit after ${argsCorrupted.rawLength} characters` : `truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON)`}. NOTHING was executed.`,
             _hint: persistent
@@ -1671,6 +1683,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'CHAT_MESSAGE': {
       sendResponse({ status: 'processing' });
       (async () => {
+        await stateRestored;
         await ensureConnected();
         // Re-extract context from current tab for SPA navigation
         try {
@@ -1701,7 +1714,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               freshCtx.programId !== oldProgramId ||
               freshCtx.visualizationId !== oldVisualizationId ||
               freshCtx.mapId !== oldMapId ||
-              (!freshCtx.programId && !!oldProgramId);
+              (!freshCtx.programId && !!oldProgramId) ||
+              // A large programMetadata is not persisted (see
+              // persistableDhis2Snapshot) — re-fetch it after a worker restart.
+              (!!freshCtx.programId && !dhis2.programMetadata);
 
             if (needsFullRefresh) {
               await initializeFromUrl(tab.url);

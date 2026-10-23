@@ -2063,7 +2063,7 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
 Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
 - create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (aggregate indicator / AGGREGATE-domain dataElement / programIndicator UIDs — types are auto-resolved AND verified), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed. ⚠ data_items must be AGGREGATE dimensions: a TRACKER data element or a tracked-entity attribute CANNOT be plotted directly (the tile renders an error) — first create a PROGRAM INDICATOR (manage_program_indicators) that aggregates it, then plot that program indicator's UID. The tool refuses a raw tracker data element with this guidance.
 - create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
-- add_items: add chart(s)/map(s)/line-list(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, { type:"EVENT_VISUALIZATION", event_visualization_id } to embed a saved line list from manage_line_lists, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
+- add_items: add chart(s)/map(s)/line-list(s)/text/app plugins to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, { type:"EVENT_VISUALIZATION", event_visualization_id } to embed a saved line list from manage_line_lists, { type:"APP", app_key } to embed an installed dashboard plugin, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
 - remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
 - list / get: list dashboards (optional name filter) / read one dashboard with its items (each item's id, type, and referenced visualization/map).
 Every mutating action is backed up first (undo via manage_backups). For sharing use manage_metadata(action=update_sharing). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
@@ -2115,7 +2115,8 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
             items: {
               type: 'object',
               properties: {
-                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'EVENT_VISUALIZATION', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map, EVENT_VISUALIZATION to embed a saved line list (create with manage_line_lists).' },
+                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'EVENT_VISUALIZATION', 'TEXT', 'APP'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map, EVENT_VISUALIZATION to embed a saved line list (create with manage_line_lists), APP to embed an installed dashboard plugin (app_key).' },
+                app_key: { type: 'string', description: 'Key of an INSTALLED dashboard plugin (type APP), e.g. one built with manage_custom_app. Verified against /api/apps.' },
                 visualization_id: { type: 'string', description: 'UID of an EXISTING visualization to embed (type VISUALIZATION).' },
                 map_id: { type: 'string', description: 'UID of an EXISTING map to embed (type MAP).' },
                 event_visualization_id: { type: 'string', description: 'UID of an EXISTING saved line list / event visualization to embed (type EVENT_VISUALIZATION). line_list_id is accepted as an alias.' },
@@ -2422,6 +2423,84 @@ NEVER put patient or personal data in a lesson (no names, IDs, phone numbers, va
   {
     type: 'function',
     function: {
+      name: 'manage_custom_app',
+      description: `Build, install and maintain CUSTOM DHIS2 APPS and DASHBOARD PLUGINS from code you write — "build a dashboard widget that shows ANC coverage by district", "make an app that lists programs with their stage counts", "a plugin that charts monthly enrollments". You write React JSX; the tool compiles it, checks it, packages it with a prebuilt runtime kit (React 18 + @dhis2/ui + @dhis2/app-runtime) and installs it on the user's DHIS2 server (POST /api/apps). Zero setup for the user. A saved chart/pivot/map is NOT an app — for those use manage_dashboards / manage_maps.
+
+Actions:
+- list — installed apps whose key starts with "ai-" (include_all:true for every app), with built_by_assistant, version, launch / plugin URLs.
+- get_source — the JSX source + AI manifest embedded in an assistant-built app (read before an update).
+- preview — compile + safety-scan + lint + verify every hard-coded UID + package WITHOUT installing. Returns the manifest, file list, the data resources the code reads, warnings and a preview_token. ALWAYS preview first and show the user a short summary before create.
+- create — install a NEW app (fails if the key exists). After the user approves a preview pass preview_token (installs exactly what was previewed) instead of resending the files.
+- update — change an assistant-built app: pass only the changed files (others are kept), version bumps (patch by default), the previous version is backed up first.
+- delete — back up, then uninstall (delete_app_data:true also deletes the app's dataStore namespace — ask first).
+- rollback — reinstall a previous version from backup (latest by default, or version / backup_key).
+- place — show an installed plugin where users work: target "dashboard" (dashboard_id, or dashboard_name for a new dashboard), "enrollment_dashboard" / "enrollment_event_new" / "enrollment_event_edit" (program_id, column, position) for a Capture widget, or "form" (program_stage_id or program_id + field_map) for a Capture form-field plugin. Writes the Tracker Plugin Configurator's own configuration, backed up first.
+- unplace — take a plugin off dashboards / Capture (all, or one target). delete does this automatically.
+- placements — where a plugin is currently shown.
+
+Files (strings of JSX): app.jsx (kind "app"), plugin.jsx (kind "plugin"), both for "app_and_plugin"; optional shared.jsx is loaded first and its top-level declarations are visible to both. Only the kit globals exist — React, ReactDOMClient, D2UI, D2Runtime, postRobot, echarts (auto-bundled when referenced), D2_APP_CONFIG — no imports, no npm packages.
+
+Guarantees: keys always start with "ai-"; apps not built by the assistant (no assistant marker + src/manifest.ai.json) are never updated or deleted; banned code (eval, new Function, cookies, localStorage, <script>, raw HTML injection, imports, requests to other servers) is refused; with needs_write_access:false any data mutation is refused; UIDs in the code that do not exist on the server are refused. Requires the App Management authority on the server.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'get_source', 'preview', 'create', 'update', 'delete', 'rollback', 'place', 'unplace', 'placements'], description: 'list / get_source / preview / placements are read-only; create / update / delete / rollback / place / unplace write to the server.' },
+          name: { type: 'string', description: 'Display name, e.g. "ANC coverage widget". The key is derived from it when key is omitted.' },
+          key: { type: 'string', description: 'App key: "ai-" + lower-case letters/digits/hyphens, max 40 chars. Required for update / delete / rollback / get_source.' },
+          description: { type: 'string', description: 'One-sentence description shown in DHIS2.' },
+          kind: { type: 'string', enum: ['app', 'plugin', 'app_and_plugin'], description: 'app = standalone page in the app menu; plugin = embeddable widget (dashboard item); app_and_plugin = both, sharing code.' },
+          plugin_type: { type: 'string', enum: ['DASHBOARD', 'CAPTURE'], description: 'Required when kind includes a plugin. DASHBOARD = a Dashboard app item. CAPTURE = a Capture enrollment-dashboard widget (props teiId, programId, enrollmentId, orgUnitId; the user places it with the Tracker Plugin Configurator).' },
+          files: {
+            type: 'object',
+            description: 'JSX source per file. create/preview: all files the kind needs. update: only the files that change (an empty string removes shared.jsx).',
+            properties: {
+              'app.jsx': { type: 'string' },
+              'plugin.jsx': { type: 'string' },
+              'shared.jsx': { type: 'string' },
+            },
+          },
+          needs_write_access: { type: 'boolean', description: 'Default false (read-only app: any mutation is refused). true ONLY when the app must save data (settings, notes…) — tell the user what it writes.' },
+          datastore_namespace: { type: 'boolean', description: 'Default true: reserve the dataStore namespace = key for the app (D2_APP_CONFIG.namespace). false if the app stores nothing.' },
+          prompt_summary: { type: 'string', description: 'One line: what the user asked for (stored with the source for later updates).' },
+          preview_token: { type: 'string', description: 'For create: the token returned by preview — installs exactly the previewed build.' },
+          version: { type: 'string', description: 'For update: explicit new version (default: bump). For rollback: the version to restore.' },
+          version_bump: { type: 'string', enum: ['patch', 'minor', 'major'], description: 'For update (default patch).' },
+          backup_key: { type: 'string', description: 'For rollback: a specific backup to restore.' },
+          include_all: { type: 'boolean', description: 'For list: include every installed app, not only ai-*.' },
+          delete_app_data: { type: 'boolean', description: 'For delete: also delete the app\'s dataStore namespace (its saved settings/notes). Only when the user asks.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Skip the backup before update/delete/rollback/place/unplace. Only after the user is told the backup failed AND explicitly accepts.' },
+          target: { type: 'string', enum: ['dashboard', 'enrollment_dashboard', 'enrollment_event_new', 'enrollment_event_edit', 'form'], description: 'For place / unplace: where the plugin goes. dashboard = a Dashboard app item (DASHBOARD plugins). enrollment_dashboard / enrollment_event_new / enrollment_event_edit = a widget on that Capture page of one tracker program (CAPTURE plugins). form = a form-field plugin inside a Capture data entry form (CAPTURE plugins, needs field_map). unplace without target removes the plugin everywhere.' },
+          dashboard_id: { type: 'string', description: 'For place target "dashboard": an existing dashboard to add the plugin to.' },
+          dashboard_name: { type: 'string', description: 'For place target "dashboard": create a NEW dashboard with this name holding the plugin (when no dashboard_id).' },
+          width: { type: 'integer', description: 'For place target "dashboard": item width on the 58-column grid (default 29).' },
+          height: { type: 'integer', description: 'For place target "dashboard": item height (default 20).' },
+          program_id: { type: 'string', description: 'For place enrollment_* targets: the tracker program. For target "form": the program whose REGISTRATION form gets the plugin (instead of program_stage_id).' },
+          program_stage_id: { type: 'string', description: 'For place target "form": the tracker program stage whose event form gets the plugin.' },
+          column: { type: 'string', enum: ['left', 'right'], description: 'For enrollment_* targets: page column (default right).' },
+          position: { type: 'string', enum: ['top', 'bottom'], description: 'Where in the column (default top) / form or section (default bottom).' },
+          section: { type: 'string', description: 'For target "form": an existing form section (id or name) to put the plugin in. Omit to give the plugin its own section.' },
+          section_name: { type: 'string', description: 'For target "form" without section: title of the plugin\'s own section (default: the app name).' },
+          field_map: {
+            type: 'array',
+            description: 'For target "form": the fields the plugin may read and write. plugin_field = the alias the plugin code uses (values.<alias>, setFieldValue({ fieldId: "<alias>" })); field_id = the data element (stage form) or tracked entity attribute (registration form) UID. replace_field:true takes the field out of its normal place in the form (the plugin renders it instead); default false keeps it visible.',
+            items: {
+              type: 'object',
+              properties: {
+                plugin_field: { type: 'string' },
+                field_id: { type: 'string' },
+                replace_field: { type: 'boolean' },
+              },
+              required: ['plugin_field', 'field_id'],
+            },
+          },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -2432,7 +2511,7 @@ Every update/delete on programs, data elements, OUs, program rules, indicators, 
 
 Backups are kept for ${BACKUP_RETENTION_DAYS} days by default. action=purge_old deletes anything older than retention_days (default ${BACKUP_RETENTION_DAYS}).
 
-Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL. Tombstone entries (objects that were already gone at snapshot time) are skipped. Restore is idempotent — running it twice is safe.`,
+Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL. Tombstone entries (objects that were already gone at snapshot time) are skipped. Restore is idempotent — running it twice is safe. App backups (keys "backup-…-app-<key>-…", made by manage_custom_app) hold an app's source: restoring one reinstalls that app version.`,
       parameters: {
         type: 'object',
         properties: {
@@ -2509,6 +2588,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_data_values: true,
   manage_metadata_translations: true,
   manage_memory: true,
+  manage_custom_app: true,
 });
 
 // ── Lazy Tool Manuals (two-tier tool docs) ───────────────────────────────────
@@ -2555,6 +2635,7 @@ const WRITE_CAPABLE_TOOL_NAMES = new Set([
   'manage_dashboards', 'manage_maps', 'manage_line_lists',
   'manage_custom_translations', 'manage_growth_chart_plugin',
   'manage_users', 'manage_data_values', 'manage_metadata_translations',
+  'manage_custom_app',
 ]);
 
 const MANUAL_TOOLS = new Set([
@@ -2578,6 +2659,7 @@ const MANUAL_TOOLS = new Set([
   'manage_users',
   'manage_data_values',
   'manage_metadata_translations',
+  'manage_custom_app',
 ]);
 
 // Short routing descriptions sent on the wire for MANUAL_TOOLS. These carry
@@ -2604,6 +2686,7 @@ const TOOL_SUMMARIES = {
   manage_line_lists: 'Author SAVED line lists — the row-per-record tables of the Line Listing app (eventVisualizations type LINE_LIST): list, get, create (EVENT / ENROLLMENT with cross-stage + repeated-event columns / TRACKED_ENTITY; dimensions by UID or exact name, auto stage/option-code resolution, filters, sorting, legend; the layout is PROVEN against analytics BEFORE saving), update, delete, validate (re-run its query → row_count). NEVER hand-assemble eventVisualizations bodies via dhis2_query (the app cannot open them). Dashboard placement: manage_dashboards items [{type:"EVENT_VISUALIZATION", event_visualization_id}]. line_listing_guide = app UI help; THIS tool saves the actual line lists.',
   manage_users: 'Administer users, user roles, user groups and authorities: list, get, create (username + names + ≥1 role + policy-compliant password or generate_password, capture/data-view/search org units, groups — names resolve to UIDs), update (roles/org units/groups add/remove, password reset, profile), disable, enable, delete; list_roles, get_role, create_role, update_role, delete_role (authorities validated against /api/authorities — DHIS2 silently stores misspelled ones); list_groups, create_group, update_group (members), delete_group; list_authorities. NEVER POST /users or /userRoles via dhis2_query.',
   manage_data_values: 'Aggregate data entry for ONE form (dataset × period × org unit): get (values with names, empty cells, completion/lock), set (values by data-element NAME + disaggregation name; value types, option sets, period type, org-unit assignment and period openness checked BEFORE sending — DHIS2 itself silently stores wrong-period / unassigned-OU / missing-disaggregation values), delete, complete, incomplete, validate (run validation rules). Returns previous values as an undo record. NEVER hand-write dataValueSets bodies via dhis2_query for single-form entry.',
+  manage_custom_app: 'Build and install CUSTOM DHIS2 apps, dashboard plugins and Capture plugins (enrollment widgets, form-field plugins) from JSX you write (React + @dhis2/ui runtime kit, no setup): list, get_source, preview (compile + safety scan + UID check, no install — ALWAYS first, then ask the user), create (after approval, with preview_token), update (changed files only, auto-backup + version bump), delete, rollback; place / unplace / placements put an installed plugin on a dashboard, on a Capture enrollment/event page, or into a Capture stage/registration form with a field map (writes the Tracker Plugin Configurator\'s config, backed up first). Keys always start with "ai-"; apps the assistant did not build are never touched. A saved chart/pivot is manage_dashboards, not an app. NEVER POST /api/apps, DELETE apps or write dataStore/capture via dhis2_query.',
   manage_metadata_translations: 'Translate METADATA objects (names, short names, form names, descriptions, labels of programs, stages, data elements, options, attributes, datasets, indicators, org units …) into a database locale: list_locales, add_locale, get, set (single object or items[] up to 100, MERGES with existing translations, keys validated against the schema), remove. NOT for app UI strings (manage_custom_translations). NEVER PUT {type}/{id}/translations via dhis2_query — it replaces every locale.',
 };
 
@@ -3116,6 +3199,197 @@ const KB_METADATA_TRANSLATIONS_DETAILS = `### Workflow for "translate <program/d
 ### Property keys (validated per object type)
 NAME, SHORT_NAME (≤50 chars), DESCRIPTION, FORM_NAME (the label in data-entry forms — translate it whenever the object has a form name). Programs also have labels such as ENROLLMENT_DATE_LABEL, INCIDENT_DATE_LABEL. get lists the exact keys for an object.`;
 
+// Custom apps / plugins (src/tools-apps.js). Runtime facts were observed on
+// DHIS2 2.42.5.1 + Dashboard app 101.6.1 (2026-10-21) — see the module header.
+// The "DHIS2 app conventions" block adapts the DHIS2 app-development agent
+// skill (github.com/devotta-labs/dhis2-app-skills, dhis2-app-dev @0ad888fd35,
+// the skill developers.dhis2.org recommends for AI-assisted app development)
+// to this no-build runtime: its App Platform tooling (pnpm scaffolding,
+// TanStack Query/Table, react-router, react-hook-form, d2-i18n, CSS modules,
+// eslint/tsc) does not exist in the kit, so each rule is restated with the
+// equivalent the kit does have. Rules, not copied code.
+const KB_CUSTOM_APPS_DETAILS = `### How the generated code runs
+- Only these globals exist: React, ReactDOMClient, D2UI (every @dhis2/ui export), D2Runtime (@dhis2/app-runtime: Provider, DataProvider, useDataQuery, useDataEngine, useAlert, useAlerts, useConfig…), postRobot, echarts (bundled automatically when the code references it) and D2_APP_CONFIG = { baseUrl, apiVersion, serverVersion: { major, minor, patch, full }, namespace, key, version }. No import / require / npm packages — so no react-router, TanStack Query/Table, react-hook-form, i18n library or CSS modules.
+- Destructure EVERY name you use at the top of the file — the tool refuses undeclared components/hooks and names the kit does not export:
+\`\`\`
+const { useState, useEffect, useRef, useMemo } = React;
+const { Provider, useDataQuery, useDataEngine, useAlert, useAlerts } = D2Runtime;
+const { Card, NoticeBox, CircularLoader, AlertBar, AlertStack, DataTable, DataTableHead, DataTableRow, DataTableColumnHeader, DataTableBody, DataTableCell } = D2UI;
+\`\`\`
+- Root of an APP (end of app.jsx). The runtime Provider gives data, useConfig() and useAlert(); <Alerts /> draws the alerts the way the DHIS2 app shell does:
+\`\`\`
+function Alerts() {
+  const alerts = useAlerts();
+  return (
+    <AlertStack>
+      {alerts.map(({ id, message, remove, options: { onHidden, ...props } }) => (
+        <AlertBar key={id} {...props} onHidden={() => { if (onHidden) onHidden(); remove(); }}>{message}</AlertBar>
+      ))}
+    </AlertStack>
+  );
+}
+const CONFIG = { baseUrl: D2_APP_CONFIG.baseUrl, apiVersion: D2_APP_CONFIG.apiVersion, serverVersion: D2_APP_CONFIG.serverVersion };
+ReactDOMClient.createRoot(document.getElementById('root')).render(<Provider config={CONFIG}><App /><Alerts /></Provider>);
+\`\`\`
+- Never render a HeaderBar — the DHIS2 Global Shell draws the header around every app. External links: target="_blank" rel="noopener noreferrer".
+
+### DHIS2 app conventions (the DHIS2 app-development skill, adapted to this runtime)
+- React 18 only: no Suspense for data fetching, no React 19 APIs (use, useFormStatus, useActionState, useOptimistic). Handle loading explicitly.
+- @dhis2/ui for every UI element — check it before building anything custom: DataTable*, Pagination, Transfer, OrganisationUnitTree, SingleSelectField / MultiSelectField, InputField, TextAreaField, Checkbox, Switch, Radio, Tag, Chip, Tooltip, Popover, Menu / MenuItem / FlyoutMenu, TabBar / Tab, Button / ButtonStrip / SplitButton / DropdownButton, Modal (ModalTitle / ModalContent / ModalActions), Card, NoticeBox, CircularLoader, Divider, Layer + Popper. Never hand-made look-alikes of these.
+- Show displayName (not name) for every DHIS2 object — it is translated. ALWAYS pass fields with exactly the properties you render.
+- The API contract comes from the server, not from memory: before writing a query, run the exact resource + params once with dhis2_query (GET) and read the real response shape (keys, pager, value types). The server the app installs on is the version that matters.
+- Lists: server-side paging (params page + pageSize → response pager { page, pageCount, total, pageSize }), server-side search (filter displayName:ilike:<text>, added only when there is text: ...(q ? { filter: \`displayName:ilike:\${q}\` } : {})) and server-side order (order: 'displayName:asc'). Never download a whole collection to filter or page it in the browser.
+- Tables: <DataTable layout="fixed">; Pagination (1-indexed) inside DataTableFoot > DataTableRow > DataTableCell colSpan={columns}; an empty result is ONE row with one colSpan cell saying so; row actions → a small Button opening a FlyoutMenu (Layer + Popper) of MenuItems.
+- Writes: const engine = useDataEngine(); await engine.mutate({ resource, id, type: 'create' | 'update' | 'delete', data }). Keep a pending flag (Button loading / disabled while it runs), refetch the affected query afterwards, and report the outcome with useAlert:
+  const { show } = useAlert(({ msg }) => msg, ({ ok }) => (ok ? { success: true } : { critical: true })); … show({ msg: 'Note saved', ok: true }).
+- ALWAYS confirm before deleting: <Modal small> with ModalTitle, ModalContent naming the item, ModalActions > <ButtonStrip end> "Cancel" + <Button destructive>Delete</Button>.
+- Forms: @dhis2/ui inputs call onChange({ value }) — not an event; SingleSelectField uses selected + onChange({ selected }). Validate before saving and show it on the field (error + validationText). Group buttons in ButtonStrip; a short form can live in a Modal.
+- Layout: a section ("widget") = white box, border 1px solid #d5dde5, radius 3px, header 16px / weight 500 / colour #404b5a with 16px padding, content padding 16px. Dashboard-style app pages: two columns flex 3 (main) : 1 (summaries), gap 16px — one column below ~800px.
+- Styling: DHIS2 design tokens — var(--colors-grey900), var(--spacers-dp16), var(--elevations-e100) — not hand-picked colours or spacing.
+- Version differences: gate version-specific params in ONE feature map on the server version: const FEATURES = { multiText: 41 }; const supports = (f) => !!D2_APP_CONFIG.serverVersion && D2_APP_CONFIG.serverVersion.minor >= FEATURES[f]; (inside Provider, useConfig().serverVersion is the same).
+- Several views: hash routes (location.hash = '#/details/' + id, re-render on 'hashchange') — changing the hash fires popstate, which keeps the Global Shell URL in sync. There is no router in the kit.
+- Strings: no i18n library — keep user-facing strings in one TEXT object per locale when the app must be multilingual (see Arabic below).
+- Metadata rarely changes: fetch it once (a module-level query) and reuse it; data and analytics refetch when filters change.
+
+### Reading data
+- Define every query ONCE at module level — the runtime keeps the FIRST query object it sees (an inline object that changes with props silently keeps returning the old data) — and pass changing values as variables:
+\`const PROGRAMS = { list: { resource: 'programs', params: { fields: 'id,displayName', paging: false } } };\` → useDataQuery(PROGRAMS) → data.list.programs
+\`const KPIS = { a: { resource: 'analytics', params: ({ ou, pe }) => ({ dimension: ['dx:ID1;ID2'], filter: [\`ou:\${ou}\`, \`pe:\${pe}\`] }) } };\` → useDataQuery(KPIS, { variables: { ou, pe } })
+- Resources are RELATIVE ('analytics', 'programs', 'dataStore/…') — never absolute URLs.
+- A Modal is open whenever it is rendered: render it only when needed ({target && <Modal onClose={…}>…</Modal>}) or pass hide={!open}. An always-rendered Modal's backdrop blocks every click in the app (the tool refuses it).
+- Mutation shapes the runtime REFUSES ("Invalid query", nothing is sent): type 'delete' WITH data, type 'create' WITH id, json-patch without an array. Deleting the last item of a list kept in one key: update the key with [] (or a separate { resource, type: 'delete' } with no data) — never one object whose type switches to 'delete' while it still carries data.
+- Saved data lives in the app's own namespace (D2_APP_CONFIG.namespace, needs_write_access:true). ONE key that may not exist yet: read \`{ s: { resource: \`dataStore/\${D2_APP_CONFIG.namespace}\`, params: { fields: '.', filter: '_:eq:notes' } } }\` → data.s.entries[0]?.value (HTTP 200 with entries [] when nothing is saved). All keys: params { fields: '.', pageSize: 200 } → entries [{ key, value }]. NEVER GET dataStore/<ns>/<key> (query or engine.fetch) — it is a 404 until the first save, a failed request on every first visit; the tool refuses it. Save with engine.mutate({ resource: \`dataStore/\${ns}/<key>\`, type: saved ? 'update' : 'create', data }) — 'create' on an existing key is a 409, 'update' on a missing one a 404, so track which applies.
+- Analytics: resource 'analytics', params { dimension: ['dx:ID1;ID2', 'pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'] } → { headers:[{ name }], rows, metaData:{ items:{ <id>:{ name } } } }. Find columns by header name; values are STRINGS → Number(v). A dx with no data has NO row — show "No data" for it, never 0.
+- Event counts: resource \`analytics/events/aggregate/\${programId}\`, params { dimension: ['pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'], outputType: 'EVENT' } — a count with no events is the row ['0'], not an empty result.
+- Variables are read once per mount: render the data part in a child component with key={ou + '|' + pe} so a filter change remounts it and refetches (or call refetch(newVariables)).
+- States: loading → a centred <CircularLoader small />; error → <NoticeBox error title="Could not load …">{error.message}</NoticeBox>; empty → <NoticeBox title="No data">…</NoticeBox> or a muted message. Never a blank screen.
+
+### Dashboard plugins (plugin.jsx, plugin_type "DASHBOARD")
+\`\`\`
+const { useRef, useEffect } = React;
+const { Provider } = D2Runtime;
+
+function Plugin({ dashboardItemFilters = {}, dashboardMode, dashboardItemId, setPluginHeight }) {
+  const ou = (dashboardItemFilters.ou || []).map((o) => o.id).join(';') || 'USER_ORGUNIT';
+  const pe = (dashboardItemFilters.pe || []).map((p) => p.id).join(';') || 'LAST_12_MONTHS';
+  const ref = useRef(null);
+  useEffect(() => {                       // only hosts that support resizing pass a function
+    if (typeof setPluginHeight !== 'function' || !ref.current) return;
+    const ro = new ResizeObserver(() => setPluginHeight(Math.ceil(ref.current.scrollHeight)));
+    ro.observe(ref.current);
+    return () => ro.disconnect();
+  }, [setPluginHeight]);
+  return (
+    <div ref={ref} style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: 12, boxSizing: 'border-box' }}>
+      <Content key={ou + '|' + pe} ou={ou} pe={pe} />
+    </div>
+  );
+}
+
+const CONFIG = { baseUrl: D2_APP_CONFIG.baseUrl, apiVersion: D2_APP_CONFIG.apiVersion, serverVersion: D2_APP_CONFIG.serverVersion };
+const root = ReactDOMClient.createRoot(document.getElementById('root'));
+// plugin + parentAlertsAdd: useAlert() messages appear in the dashboard, not inside the small item
+const render = (props) => root.render(
+  <Provider config={CONFIG} plugin parentAlertsAdd={props.alertsAdd}><Plugin {...props} /></Provider>);
+if (window.parent === window) render({});            // opened outside a dashboard
+else postRobot.send(window.parent, 'getPropsFromParent').then(({ data }) => render(data)).catch(() => render({}));
+postRobot.on('updated', ({ data }) => { render(data); });   // filter / mode changes — re-render, never reload
+\`\`\`
+- Props (Dashboard app 101.x): dashboardItemId, dashboardItemFilters, dashboardMode ('view' | 'edit' | 'print-layout'), setDashboardItemDetails, setInErrorState, alertsAdd, setPluginHeight, setPluginWidth.
+- Filters: dashboardItemFilters.ou = [{ id, name, path }], .pe = [{ id, name }]; other keys are dynamic dimensions. Join the ids with ";"; default ou 'USER_ORGUNIT', and a sensible default period. Say in the plugin which org unit / period it shows.
+- SIZE: the Dashboard app gives an item a FIXED size and passes setPluginHeight = null. The page fills the item (#root is 100% high): lay out with height '100%' + flex column; charts flex: 1; tiles gridTemplateColumns 'repeat(auto-fit, minmax(140px, 1fr))'. It must work from ~300 px wide (small items, phones) to full width with no horizontal scroll and nothing cut off.
+- Edit mode (dashboardMode === 'edit'): show a settings view. Per-item settings live in the app namespace under dashboardItemId (each copy of the plugin has its own id, so settings stay independent):
+  read: \`const SETTINGS = { s: { resource: \`dataStore/\${D2_APP_CONFIG.namespace}\`, params: ({ id }) => ({ fields: '.', filter: \`_:eq:\${id}\` }) } };\` → useDataQuery(SETTINGS, { variables: { id: dashboardItemId } }) → data.s.entries[0]?.value (HTTP 200 with entries [] when nothing is saved). NEVER GET dataStore/<ns>/<key> directly: that is a 404 (console error) on first use.
+  write: await engine.mutate({ resource: \`dataStore/\${D2_APP_CONFIG.namespace}/\${dashboardItemId}\`, type: saved ? 'update' : 'create', data: settings }) — 'create' on an existing key is a 409 and 'update' on a missing one a 404, so track which applies. Then refetch and show({ msg: 'Settings saved', ok: true }). Needs needs_write_access:true.
+
+### Capture enrollment plugins (plugin.jsx, plugin_type "CAPTURE")
+Verified on Capture 106 against the enrollment plugins already in use: same handshake as above (getPropsFromParent, then 'updated'); the props are { teiId, programId, enrollmentId, orgUnitId } plus setPluginHeight. Read exactly those — never guess other names or parse the page URL.
+\`\`\`
+const EVENTS = { ev: { resource: 'tracker/events', params: ({ enrollment, stage }) => ({
+  enrollments: enrollment, programStage: stage, order: 'occurredAt:desc', pageSize: 100,
+  fields: 'event,occurredAt,status,dataValues[dataElement,value]' }) } };
+function Plugin({ enrollmentId, setPluginHeight }) {
+  useEffect(() => {                       // Capture sizes the frame to the height you report
+    const root = document.getElementById('root');
+    if (typeof setPluginHeight !== 'function') return;
+    const ro = new ResizeObserver(() => setPluginHeight(Math.ceil(root.getBoundingClientRect().height)));
+    ro.observe(root);
+    return () => ro.disconnect();
+  }, [setPluginHeight]);
+  return <div style={{ padding: 8 }}>{enrollmentId ? <Orders enrollment={enrollmentId} /> : <NoticeBox title="Open an enrollment">…</NoticeBox>}</div>;
+}
+// Orders: useDataQuery(EVENTS, { variables: { enrollment, stage: '<stage UID>' } }) → data.ev.events
+\`\`\`
+- Height: report the height of #root as above (Capture plugin pages make #root display: flow-root, so every margin is inside it). Never report a wrapper's offsetHeight (its own margins are left out and Capture cuts them off) and never give the content height '100%' (it then reports the frame's own height and never shrinks).
+- Look: Capture draws its own widgets as cards — background white, border '1px solid var(--colors-grey400)', borderRadius 3, a header row (minHeight 44, padding '8px 8px 8px 12px', fontSize 15, fontWeight 500, color var(--colors-grey800)) and content padding '0 12px 12px'. Draw the same card so the plugin looks like part of Capture (the frame itself has no border).
+- Layout: the enrollment-dashboard column is only ~350–450 px wide. Show a LIST (name on one line, the details as a smaller line under it), not a multi-column table — long names overflow table cells. Let text wrap (overflowWrap: 'anywhere'). Leave out events that have no values (e.g. SCHEDULE events): one short line like "2 scheduled orders with nothing recorded yet" instead of an empty block each.
+- Data: the plugin reads the enrollment in the USER's browser with their own access. You never read patient rows to build or test it (the privacy gate refuses them on a cloud model): take the stage, data element and option-set UIDs from get_program_info, map option codes to names with optionSets/<id>?fields=options[code,displayName], and handle "no events yet".
+- Placement: after install, put it on the page with place(target "enrollment_dashboard", program_id, column "right" | "left", position "top" | "bottom") — or "enrollment_event_new" / "enrollment_event_edit" for the add-event / edit-event pages, which also pass programStageId and eventId. The tool writes Capture's own layout for that program (starting from Capture's default when the program has none) and backs it up. Tell the user to reload the Capture tab once. Never write dataStore/capture with dhis2_query — that is blocked; place is the only way.
+
+### Capture form-field plugins (plugin.jsx, plugin_type "CAPTURE", placed with target "form")
+A form-field plugin sits INSIDE a data entry form (a tracker stage's event form, or a program's registration form) and reads / writes only the fields mapped to it. Verified props: { values, setFieldValue, setContextFieldValue, fieldsMetadata, errors, warnings, formSubmitted, viewMode, orgUnitId } plus setPluginHeight — no programId / enrollmentId. values, fieldsMetadata, errors and warnings are keyed by the ALIASES you choose (plugin_field in field_map); setFieldValue({ fieldId: '<alias>', value }) only accepts mapped aliases.
+\`\`\`
+// Aliases used here: weight, height (read) and bmi (written) — place with
+// field_map [{ plugin_field: 'weight', field_id: '<DE>' }, { plugin_field: 'height', field_id: '<DE>' }, { plugin_field: 'bmi', field_id: '<DE>' }]
+function Plugin({ values = {}, setFieldValue, viewMode, setPluginHeight }) {
+  const w = parseFloat(values.weight);
+  const h = parseFloat(values.height);
+  const bmi = w > 0 && h > 0 ? (w / ((h / 100) ** 2)).toFixed(1) : '';
+  useEffect(() => {                       // write only when it changed, never in view mode
+    if (viewMode || typeof setFieldValue !== 'function') return;
+    if (String(values.bmi ?? '') !== bmi) setFieldValue({ fieldId: 'bmi', value: bmi });
+  }, [bmi, viewMode]);
+  useEffect(() => {                       // same height reporting as the enrollment widget
+    const root = document.getElementById('root');
+    if (typeof setPluginHeight !== 'function') return;
+    const ro = new ResizeObserver(() => setPluginHeight(Math.ceil(root.getBoundingClientRect().height)));
+    ro.observe(root);
+    return () => ro.disconnect();
+  }, [setPluginHeight]);
+  return <div style={{ padding: '4px 0' }}>{bmi ? 'BMI ' + bmi + ' kg/m²' : 'Enter weight and height to calculate BMI'}</div>;
+}
+\`\`\`
+- Value formats for setFieldValue: numbers, text and option codes are STRINGS ("42", "code1"); DATE "YYYY-MM-DD"; BOOLEAN 'true' | 'false'; TRUE_ONLY 'true'; AGE { date }; COORDINATE { latitude, longitude }; ORGANISATION_UNIT { id }. Clear a value with ''. values arrive in the same formats.
+- setContextFieldValue({ fieldId: 'occurredAt' | 'enrolledAt' | 'geometry', value }) sets the event / enrollment date or geometry.
+- Keep it compact (it sits between form fields), report its height like the enrollment widget, and do nothing that writes in viewMode.
+- field_map: map EXACTLY the aliases the code uses — the tool refuses a placement whose code writes an unmapped alias. field_id must be a data element of that stage (event form) or an attribute of the program (registration form); take them from get_program_info. replace_field:true takes the field out of its normal place (the plugin then draws its own input for it); the default false keeps the normal input visible — right for calculated fields the plugin fills.
+- place target "form" with program_stage_id (event form) or program_id (registration form); section = an existing section to put it in, else it gets its own section; position top | bottom.
+
+### Charts (echarts)
+\`\`\`
+function Chart({ option }) {
+  const el = useRef(null);
+  useEffect(() => {
+    const chart = echarts.init(el.current);
+    const ro = new ResizeObserver(() => chart.resize());
+    ro.observe(el.current);
+    return () => { ro.disconnect(); chart.dispose(); };
+  }, []);
+  useEffect(() => { const c = echarts.getInstanceByDom(el.current); if (c) c.setOption(option, true); }, [option]);
+  return <div ref={el} style={{ flex: 1, minHeight: 160, width: '100%' }} />;
+}
+\`\`\`
+Give the option grid { left: 8, right: 16, top: 24, bottom: 8, containLabel: true }, axis labels that fit (short labels, hideOverlap on narrow widths), the DHIS2 blue #147cd7 for a single series, and tooltip: { trigger: 'axis' }.
+
+### Arabic / right-to-left
+- Root element dir="rtl" lang="ar" when the labels are Arabic or the user's UI locale is right-to-left: useDataQuery({ me: { resource: 'me', params: { fields: 'settings' } } }) → me.settings.keyUiLocale ('ar', 'fa', 'ur', 'he', 'ps', 'ckb' are RTL). Use logical CSS (paddingInlineStart, marginInlineEnd, textAlign: 'start') so the layout mirrors. Arabic text renders with the system Arabic font.
+
+### Look & feel
+- KPI / single-value tiles: like DHIS2's single-value items — label (13px, grey700) above a large CENTRED number (fontSize 'clamp(24px, 10vmin, 44px)', weight 500, tabular-nums), the tile filling its grid cell; a missing value shows "No data" in grey, never 0.
+- App pages: padding clamp(12px, 4vw, 24px), a clear title (22px / 500) and a one-line description; plugins: padding 8–12px, no page title (the dashboard shows the item name). No fixed pixel widths that break a 360 px phone (use % / flex / grid, hide secondary table columns when narrow), no debug output, numbers formatted with toLocaleString().
+
+### What the tool refuses or warns about
+- Refused: eval / new Function / string timers, document.cookie, localStorage / sessionStorage / indexedDB (browser storage is shared by every DHIS2 app — use the app's dataStore namespace), <script> injection, dangerouslySetInnerHTML / innerHTML, import / require / export, requests to other servers, WebSocket / EventSource / sendBeacon; with needs_write_access:false (default) any mutation or non-GET request; UID-shaped strings that do not exist on the server; undeclared components/hooks, names the kit does not export, inline query objects, a HeaderBar.
+- Warned (fix them): a metadata query without fields, fields using name instead of displayName, a delete without a confirmation Modal, a hard-coded server address.
+
+### Workflow
+1. Discover the real metadata first (search_metadata, get_program_info) and run the exact queries the app will make with dhis2_query to see the response shape and confirm the numbers exist — never invent UIDs or response fields.
+2. preview. If it returns compile_errors / violations / problems / unknown_uids, fix exactly those and preview again; also fix every warning.
+3. Tell the user in 3–5 lines: what it shows, which data it reads, whether it writes anything, where it will appear. Ask for approval.
+4. After approval: create with the preview_token. Installing in the same turn as the preview is refused unless the user's own message asked to install ("create and install …") — so end the turn with the summary and the question. Report global_shell_url (apps) or the where_to_find steps.
+5. Placing a plugin: if the user asked for it to appear somewhere ("on this dashboard", "in the enrollment dashboard", "in this form"), place it right after create in the same approved turn; otherwise ASK where they want it and place it after they answer — the tool refuses a placement nobody asked for, and never create a dashboard nobody asked for. Use the page context for program / stage / dashboard ids when the user says "here". Report the where_to_find text (Capture needs one reload).
+6. Later changes: get_source → update with only the changed files (placements keep working — same key); "undo" → rollback; remove it from a page → unplace.`;
+
 const MANUAL_EXTRAS = {
   create_metadata: [KB_CREATE_PROGRAM_DETAILS, KB_VALUE_TYPE_MAPPING, KB_PROGRAM_RULE_SYNTAX, KB_PI_GRAMMAR].join('\n\n'),
   manage_metadata: [KB_METADATA_DELETE_FLOW, KB_METADATA_TEA_OU, KB_METADATA_ICON_FLOW, KB_METADATA_SHARING].join('\n\n'),
@@ -3136,6 +3410,7 @@ const MANUAL_EXTRAS = {
   manage_users: KB_USERS_DETAILS,
   manage_data_values: KB_DATA_VALUES_DETAILS,
   manage_metadata_translations: KB_METADATA_TRANSLATIONS_DETAILS,
+  manage_custom_app: KB_CUSTOM_APPS_DETAILS,
   // manage_maps: full description already covers usage; no extra KB.
 };
 
@@ -3220,6 +3495,29 @@ function slimSchemaProp(def) {
 // provider. Non-MANUAL_TOOLS pass through untouched; MANUAL_TOOLS get the slim
 // routing description + slimmed schema (with the `action` enum description
 // kept in full — it is routing information the model needs at decide time).
+// architect_metadata(browse_dhis2_docs) searches through Tavily. Without a
+// saved key every call failed ("No Tavily API key configured" — a user's
+// session, 2026-10-22), so the action and its parameter are not offered at all
+// until a key is saved.
+function stripUnavailableToolActions(tools) {
+  if (_hasTavilyKey) return tools;
+  return tools.map((t) => {
+    if (t?.function?.name !== 'architect_metadata') return t;
+    const f = t.function;
+    const props = { ...f.parameters.properties };
+    props.action = { ...props.action, enum: props.action.enum.filter((a) => a !== 'browse_dhis2_docs') };
+    delete props.docs_query;
+    return {
+      ...t,
+      function: {
+        ...f,
+        description: f.description.replace('; use browse_dhis2_docs when unsure', '').replace(/\n- browse_dhis2_docs:[^\n]*/, ''),
+        parameters: { ...f.parameters, properties: props },
+      },
+    };
+  });
+}
+
 function toWireTools(tools) {
   return tools.map(t => {
     const name = t?.function?.name;
@@ -3347,6 +3645,25 @@ function detectAdminIntents(t) {
     || (_translateWord && _metadataNoun);
   const metadataTranslationOnly = wantsMetadataTranslationIntent && !_appUiNoun;
   return { wantsUserAdminIntent, wantsDataValuesIntent, wantsMetadataTranslationIntent, metadataTranslationOnly };
+}
+
+// Intent detection for manage_custom_app (src/tools-apps.js), shared by
+// getContextualTools and buildSystemPrompt. `t` must already be lower-cased.
+// An EXISTING DHIS2 app named as the place of the work ("in the capture app,
+// create a program") is not a request to build an app, and the WHO growth
+// chart / App Hub installs have their own tool.
+const DHIS2_NAMED_APP_RE = /\b(?:capture|tracker\s*capture|maintenance|dashboard|data\s*visuali[sz]er|line[\s-]*listing|maps?|(?:aggregate\s+)?data\s*entry|import[\/\s-]*export|settings|user|reports?|app\s*management|scheduler|messaging|data\s*administration|usage\s*analytics|datastore|translations?|menu\s*management|data\s*quality|approval|sms\s*configuration|cache\s*cleaner|global\s*shell|login|tracker\s*plugin\s*configurator)\s+(?:app|application)s?\b/g;
+function detectCustomAppIntent(t) {
+  if (/\bgrowth\s*chart|\bapp\s*hub\b/.test(t)) return false;
+  if (/\b(?:custom|my|own|new|standalone|small|simple|little)\s+(?:dhis2\s+)?(?:apps?|applications?|plugins?|widgets?)\b/.test(t)
+    || /\b(?:dashboard|capture|enrollment|enrolment|form[-\s]?field|registration[-\s]?form)\s+(?:plugins?|widgets?)\b/.test(t)
+    || /\btracker\s+plugin\s+configurator\b/.test(t)
+    || /\b(?:place|add|put|pin|show)\b.{0,40}\b(?:plugins?|widgets?)\b.{0,40}\b(?:dashboard|capture|enrol?lment|form|stage)\b/.test(t)
+    || /\bplugins?\s+(?:for|on)\s+(?:the\s+|a\s+|my\s+)?dashboards?\b/.test(t)
+    || /\bai-[a-z0-9]+(?:-[a-z0-9]+)*\b/.test(t)
+    || /\bmanage_custom_app\b/.test(t)) return true;
+  const rest = t.replace(DHIS2_NAMED_APP_RE, ' ');
+  return /\b(?:build|make|create|write|develop|code|generate|scaffold|design|install|update|modify|change|edit|fix|improve|delete|remove|uninstall|roll\s*back|rollback|revert|undo|list|show)\b.{0,60}\b(?:apps?|applications?|plugins?|widgets?|mini[-\s]?apps?)\b/.test(rest);
 }
 
 function getContextualTools(ctx, userText, browseWeb) {
@@ -3537,6 +3854,7 @@ function getContextualTools(ctx, userText, browseWeb) {
         && /\b(tracker|program|stage|enrollment|event|patient|case|cohort)\b/.test(combinedText)
         && /\b(create|build|make|design|set\s*up|save|generate|author|update|list)\b/.test(combinedText));
   const { wantsUserAdminIntent, wantsDataValuesIntent, wantsMetadataTranslationIntent, metadataTranslationOnly } = detectAdminIntents(combinedText);
+  const wantsCustomAppIntent = detectCustomAppIntent(combinedText);
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -3717,6 +4035,15 @@ function getContextualTools(ctx, userText, browseWeb) {
     selected.add('manage_data_values');
     selected.add('manage_datasets');
     selected.add('search_metadata');
+  }
+
+  // ── Custom apps & dashboard plugins — code the model writes, installed on
+  //    the server. Discovery companions: real UIDs come from search_metadata /
+  //    get_program_info / indicator lists, numbers from dhis2_query analytics. ──
+  if (wantsCustomAppIntent) {
+    selected.add('manage_custom_app');
+    selected.add('search_metadata');
+    selected.add('get_program_info');
   }
 
   // ── Growth-chart plugin setup — install + datastore config for the WHO chart ──
@@ -4587,6 +4914,15 @@ Accounts (create/update/disable/enable/delete, password reset, org-unit scopes),
     p += `
 ## Aggregate data values — use the **manage_data_values** tool
 Reading, entering, clearing, completing or validating ONE aggregate form (dataset × period × org unit) goes through **manage_data_values** — values by data-element NAME + disaggregation name; it refuses the values DHIS2 would silently store invisibly (wrong period type, unassigned org unit, missing disaggregation). Totals across org units/periods are ANALYTICS (dhis2_query analytics), not this tool.
+`;
+  }
+
+  // ── Custom apps & dashboard plugins — decide-time routing stub only; the
+  //    how-to (globals, plugin handshake, layout, safety rules) is the manual. ──
+  if (detectCustomAppIntent(text)) {
+    p += `
+## Custom apps & dashboard plugins — use the **manage_custom_app** tool
+When the user asks for an app, plugin or widget, WRITE it (React JSX on the prebuilt runtime kit) and install it with **manage_custom_app** — no setup for the user. Flow: find the real UIDs and check the data exists → preview → summarise for the user and ask → create with the preview_token after "yes". A plain saved chart/pivot/map is manage_dashboards / manage_maps instead — offer that when the user did not ask for an app or plugin. NEVER POST /api/apps or DELETE apps/<key> via dhis2_query.
 `;
   }
 

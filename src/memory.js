@@ -66,7 +66,7 @@ const MEMORY_AREAS = {
   users:               { label: 'Users, roles & groups',      tools: ['manage_users'], resources: ['users', 'userRoles', 'userGroups', 'authorities', 'me'], words: /\b(users?|roles?|groups?|authorit(y|ies)|passwords?|accounts?)\b/ },
   translations:        { label: 'Translations',               tools: ['manage_metadata_translations', 'manage_custom_translations'], resources: ['translations', 'locales'], words: /\b(translat\w*|locales?|languages?|french|arabic|spanish|portuguese)\b/ },
   analytics:           { label: 'Analytics queries',          tools: ['get_event_analytics', 'count_records', 'manage_program_indicators'], resources: ['analytics', 'resourceTables'], words: /\b(analytics|how\s+many|counts?|trends?|totals?|breakdown)\b/ },
-  plugins:             { label: 'Apps & plugins',             tools: ['manage_growth_chart_plugin'], resources: ['appHub', 'apps', 'dataStore'], words: /\b(plugins?|growth\s*charts?|apps?\s+(install|hub))\b/ },
+  plugins:             { label: 'Apps & plugins',             tools: ['manage_growth_chart_plugin', 'manage_custom_app'], resources: ['appHub', 'apps', 'dataStore'], words: /\b(plugins?|widgets?|growth\s*charts?|apps?\s+(install|hub)|custom\s+apps?)\b/ },
   metadata_general:    { label: 'Metadata (general)',         tools: ['manage_metadata', 'search_metadata', 'architect_metadata', 'manage_backups'], resources: ['metadata', 'schemas', 'icons', 'maintenance', 'system'], words: /\b(metadata|delete|icons?|styles?|backups?|import|schemas?)\b/ },
   api_general:         { label: 'API (general)',              tools: ['dhis2_query'], resources: [], words: /\b(api|endpoint|query)\b/ },
 };

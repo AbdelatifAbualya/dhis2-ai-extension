@@ -278,7 +278,9 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
     try {
       readResult = await readSseChunkWithStallGuard(reader, cfg.modelId || 'the LLM provider');
     } catch (stallErr) {
-      try { reader.cancel(); } catch {}
+      // cancel() on a stream that already errored (connection dropped) returns
+      // a promise rejected with that error — catch it or it is unhandled.
+      try { reader.cancel().catch(() => {}); } catch {}
       throw stallErr;
     }
     const { done, value } = readResult;
@@ -684,7 +686,9 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
     try {
       readResult = await readSseChunkWithStallGuard(reader, 'Anthropic');
     } catch (stallErr) {
-      try { reader.cancel(); } catch {}
+      // cancel() on a stream that already errored (connection dropped) returns
+      // a promise rejected with that error — catch it or it is unhandled.
+      try { reader.cancel().catch(() => {}); } catch {}
       throw stallErr;
     }
     const { done, value } = readResult;

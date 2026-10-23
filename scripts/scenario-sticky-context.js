@@ -35,7 +35,7 @@ const SESSION = {};
 
 function bootWorker() {
   const loaderSrc = fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8');
-  const modules = [...loaderSrc.matchAll(/'(src\/[^']+\.js)'/g)].map((m) => m[1]);
+  const modules = [...loaderSrc.matchAll(/'((?:src|libs)\/[^']+\.js)'/g)].map((m) => m[1]);
   if (!modules.length) throw new Error('background.js declares no src/*.js modules');
 
   const noop = () => {};

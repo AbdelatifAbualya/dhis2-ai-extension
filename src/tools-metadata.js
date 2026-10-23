@@ -169,6 +169,18 @@ async function executeTool(name, args) {
       }
     }
 
+    // Guard: installing / removing apps goes through manage_custom_app, which
+    // only ever touches assistant-built "ai-" apps (marker-checked) and backs
+    // them up first. A raw DELETE apps/<key> could uninstall a real app, and a
+    // raw POST cannot even carry the multipart zip. PUT apps (reload) is fine.
+    if (method !== 'GET' && /^apps(?:\/|\?|$)/.test(safePath) && !(method === 'PUT' && /^apps(?:\?|$)/.test(safePath))) {
+      return {
+        _error: `Blocked: ${method} ${safePath.split('?')[0]} via dhis2_query. Apps are installed, updated and removed with manage_custom_app (assistant-built "ai-" apps only, with a backup first).`,
+        _hint: 'Use manage_custom_app(action="list" | "create" | "update" | "delete" | "rollback"). Apps the assistant did not build are managed in the App Management app — tell the user.',
+        _redirect: 'manage_custom_app',
+      };
+    }
+
     // Guard: writes to dataStore/capture/* and dataStore/settings/* are owned
     // by the Capture / Settings apps. Fabricating keys here (e.g. dataStore/capture/ruleEngine
     // with {useNew: true}) looks like a "fix" but can poison the app cache. If the key is
@@ -176,7 +188,9 @@ async function executeTool(name, args) {
     if ((method === 'POST' || method === 'PUT' || method === 'PATCH') && /^dataStore\/(capture|settings|user-settings|userDataStore)\b/i.test(safePath)) {
       return {
         _error: `Blocked: ${method} to ${safePath.split('?')[0]} is unsafe from the assistant. The dataStore/capture and dataStore/settings namespaces are owned by the DHIS2 Capture and Settings apps. Writing arbitrary keys (or default values like {"useNew":true}) can corrupt the app cache.`,
-        _hint: 'If a dataStore key is missing, open the relevant DHIS2 app and let it recreate the key on first use. If the user explicitly asks for a specific value, ask them to confirm the exact JSON before writing.',
+        // No confirmation lifts this block — the old "ask them to confirm the
+        // exact JSON" hint made the model promise a write it could never do.
+        _hint: 'This block is unconditional: no user confirmation lifts it, so never offer to write it "if the user confirms". If a key is missing, open the relevant DHIS2 app and let it recreate the key on first use. To place a plugin the assistant built, use manage_custom_app(action="place") — it edits these keys safely (backup, exact Configurator format). Any other plugin is placed by the user in the Tracker Plugin Configurator app.',
       };
     }
 
@@ -272,6 +286,14 @@ async function executeTool(name, args) {
       const _healed = healMultiUidPath(safePath, method);
       if (_healed !== safePath) {
         console.log(`[dhis2_query] healed multi-UID path → ${_healed}`);
+        safePath = _healed;
+      }
+    }
+    // ── `filter=a:eq:x;b:ilike:y` → two filter parameters (400 heal) ──
+    {
+      const _healed = healJoinedMetadataFilters(safePath);
+      if (_healed !== safePath) {
+        console.log(`[dhis2_query] split joined metadata filters → ${_healed}`);
         safePath = _healed;
       }
     }
@@ -2392,6 +2414,10 @@ async function executeTool(name, args) {
   // ── learning memory (src/memory.js) ──
   if (name === 'manage_memory') {
     return await executeManageMemory(args);
+  }
+  // ── custom apps & dashboard plugins (src/tools-apps.js) ──
+  if (name === 'manage_custom_app') {
+    return await executeManageCustomApp(args);
   }
 
   return { _error: `Unhandled tool route: ${name}` };
@@ -4786,6 +4812,32 @@ async function executeManageMaps(args) {
   return { _error: `Unknown manage_maps action: ${action}`, _hint: 'One of: list, get, create, delete.' };
 }
 
+// A dashboard APP item must name an installed DASHBOARD plugin — anything
+// else renders as a broken tile. Item shape verified live 2026-10-22:
+// { type: 'APP', appKey, x, y, width, height } imports cleanly via /metadata.
+async function checkDashboardAppItem(appKey) {
+  if (!appKey) return { _error: 'type APP needs app_key (the key of an installed dashboard plugin).' };
+  // Same rule as manage_custom_app(place): a plugin goes on a dashboard only
+  // when the user asked for that. A model refused by place created a whole
+  // dashboard here instead (live 2026-10-22).
+  if (typeof placementWasRequested === 'function' && !placementWasRequested()) {
+    return {
+      _error: 'Not added: the user has not asked for this plugin to be put on a dashboard.',
+      _hint: 'Ask the user where they want it first. Do not route around manage_custom_app(place) with manage_dashboards, and never create a dashboard nobody asked for.',
+      _awaiting_approval: true,
+    };
+  }
+  const apps = await safeDhis2Fetch('apps', { noTruncate: true });
+  if (apps?._error) return { _error: `Could not list installed apps: ${apps._error}` };
+  const app = (Array.isArray(apps) ? apps : []).find((a) => a.key === appKey);
+  if (!app) return { _error: `No app with key "${appKey}" is installed.`, _hint: 'manage_custom_app(action="list") shows the installed AI apps.' };
+  const pluginType = app.plugin_type || app.pluginType || null;
+  if (!app.pluginLaunchUrl || (pluginType && pluginType !== 'DASHBOARD')) {
+    return { _error: `"${appKey}" is not a dashboard plugin (plugin type ${pluginType || 'none'}), so it cannot be a dashboard item.` };
+  }
+  return { app };
+}
+
 async function executeManageDashboards(args) {
   const action = args?.action;
   if (!action) {
@@ -4913,7 +4965,7 @@ async function executeManageDashboards(args) {
     const dashboardItems = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : (it.app_key || it.appKey) ? 'APP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
       const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
       const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
       let x, y;
@@ -4938,8 +4990,13 @@ async function executeManageDashboards(args) {
         di.eventVisualization = { id: evId };
       } else if (itType === 'TEXT') {
         di.text = String(it.text || '');
+      } else if (itType === 'APP') {
+        const appKey = it.app_key || it.appKey;
+        const chk = await checkDashboardAppItem(appKey);
+        if (chk._error) return { ...chk, _error: `Item ${i + 1}: ${chk._error}` };
+        di.appKey = appKey;
       } else {
-        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list) or TEXT.` };
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list), APP (an installed dashboard plugin) or TEXT.` };
       }
       dashboardItems.push(di);
     }
@@ -5057,7 +5114,7 @@ async function executeManageDashboards(args) {
     const summary = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : (it.app_key || it.appKey) ? 'APP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
       const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
       const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
       let x, y;
@@ -5100,8 +5157,14 @@ async function executeManageDashboards(args) {
       } else if (itType === 'TEXT') {
         di.text = String(it.text || '');
         summary.push({ item_id: di.id, type: 'TEXT' });
+      } else if (itType === 'APP') {
+        const appKey = it.app_key || it.appKey;
+        const chk = await checkDashboardAppItem(appKey);
+        if (chk._error) return { ...chk, _error: `Item ${i + 1}: ${chk._error}` };
+        di.appKey = appKey;
+        summary.push({ item_id: di.id, type: 'APP', app_key: appKey, app_name: chk.app.displayName || chk.app.name || appKey });
       } else {
-        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list) or TEXT (or new_visualization).` };
+        return { _error: `Item ${i + 1} has unsupported type "${itType}". Use VISUALIZATION, MAP, EVENT_VISUALIZATION (a saved line list), APP (an installed dashboard plugin) or TEXT (or new_visualization).` };
       }
       newItems.push(di);
     }

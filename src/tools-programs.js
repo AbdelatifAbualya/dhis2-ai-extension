@@ -9596,7 +9596,7 @@ async function executeArchitectMetadata(args) {
           const stored = await chrome.storage.local.get(['tavilyApiKey']);
           const tavilyKey = stored.tavilyApiKey;
           if (!tavilyKey) {
-            return { _error: 'No Tavily API key configured. Open settings to add your Tavily API key. Alternatively, use browse_web tool directly.' };
+            return { _error: 'No Tavily API key configured, so DHIS2 docs search is unavailable.', _hint: 'Do not retry this action. Continue with the guidance in your tool manuals; the user can add a Tavily key in settings to enable docs search.' };
           }
 
           const resp = await fetch(TAVILY_SEARCH_URL, {

@@ -14,15 +14,17 @@ is the source that ships. Three runtime pieces:
 | Background service worker | `background.js` → `src/*.js` | All AI + DHIS2 logic: LLM streaming, the agentic loop, 30+ tools, safety gates, metadata/tracker writes. |
 | Side panel | `sidepanel/panel.{html,css,js}` | The chat UI, streaming display, tool cards, charts, exports. |
 
-## The background worker is 9 modules, not one file
+## The background worker is 11 modules (+ 2 vendored libs), not one file
 
 `background.js` used to be a single ~26k-line service worker. It is now a thin
-loader that pulls in nine focused modules **in order** with the synchronous
-`importScripts()` API:
+loader that pulls in two vendored libraries and eleven focused modules **in order**
+with the synchronous `importScripts()` API:
 
 ```
 background.js  (loader)
 └─ importScripts(
+     libs/sucrase.min.js     JSX → JS compiler (self.sucrase) — used by tools-apps.js
+     libs/fflate.min.js      zip (self.fflate) — used by tools-apps.js
      src/core.js             provider config · global state · write-auth & safety gates ·
                              DHIS2 transport & backups · context
      src/memory.js           learning memory (lessons, privacy taint, retrieval, manage_memory)
@@ -32,13 +34,15 @@ background.js  (loader)
      src/tools-programs.js   program-authoring tools
      src/tools-linelists.js  line-list authoring
      src/tools-admin.js      users · data values · metadata translations · PATCH pre-check
+     src/tools-apps.js       manage_custom_app — AI-built DHIS2 apps & dashboard plugins
+     src/tools-apps-placement.js  manage_custom_app place / unplace / placements
      src/agent.js            agent loop · feedback · keepalive · message router
    )
 ```
 
 ### Why `importScripts` and not ES modules?
 
-The nine modules share **one classic-worker global scope**, exactly as when this
+The modules share **one classic-worker global scope**, exactly as when this
 was a single file. A `const` or `function` declared in `core.js` is visible to
 every later module with no `import`/`export`. That is deliberate:
 
@@ -67,6 +71,8 @@ know a moved declaration has no load-time dependents.
 | `src/tools-programs.js` | 8.0k | The program-authoring tools: full program/stage creation, program rules (+ linters), program indicators (+ linters), program notifications, custom translations, growth-chart plugin, standalone metadata/architect helpers. |
 | `src/tools-linelists.js` | 0.7k | `manage_line_lists` — Line Listing authoring (eventVisualizations of type LINE_LIST): program-metadata dimension resolution, filter/repetition/legend/PI linting, the pre-save analytics probe, CRUD + validate. |
 | `src/tools-admin.js` | 1.3k | Administration tools: `manage_users` (users, roles with authority validation, groups), `manage_data_values` (one aggregate form: get/set/delete/complete/validate with client-side period/OU/disaggregation/value checks), `manage_metadata_translations` (merge-safe object translations); shared id-or-name resolution, the schema cache, and `precheckPatchAgainstSchema` used by `dhis2_query`. |
+| `src/tools-apps.js` | 1.4k | `manage_custom_app`: key rules, the runtime kit loader (`libs/d2-kit/` via `fetch(chrome.runtime.getURL(…))`), Sucrase compile + JSX tag/bracket diagnosis, the static safety scan, the runtime-error lint (kit export lists in `KIT_VERSION.json`), hard-coded-UID verification, packaging (manifest, HTML, `app-config.js`, embedded `src/`), install/verify through `uploadAppZip` (`core.js`), app backups in the shared backup namespace, preview tokens, update/rollback/delete. Only ever touches `ai-*` apps carrying the assistant's marker. |
+| `src/tools-apps-placement.js` | 0.6k | `manage_custom_app` `place` / `unplace` / `placements`. Dashboard plugins go onto dashboards through `manage_dashboards` (`APP` items). Capture plugins are written into Capture's own configuration in the `capture` dataStore namespace, in the Tracker Plugin Configurator's exact format (verified against the Capture 106 bundle): enrollment-page layouts per program (starting from Capture's default page when a program has none), and stage / registration forms with a field map. Every write is backed up (`capture_config` entries that `manage_backups` restores) and read back with jsonb-key-order-insensitive comparison. `unplace` restores replaced fields and drops entries that are back to Capture's default. |
 | `src/agent.js` | 1.7k | The agentic loop (`runAgenticLoop`, `_runAgenticLoopInner`); feedback storage; the bounded keepalive lease; screenshot capture (selection overlay with in-page tab-capture fallback) and cropping; `broadcast`; the `chrome.runtime.onMessage` router and every other `chrome.*` event listener. |
 
 ## The safety gates (do not weaken these to simplify anything)
@@ -116,12 +122,23 @@ npm run verify      # or: node scripts/verify.js
 ```
 
 It has **no dependencies**. It (1) `node --check`s every runtime file, (2) loads
-all nine modules in `importScripts` order under a minimal `chrome` shim to prove
+all modules (and the two vendored libs) in `importScripts` order under a minimal `chrome` shim to prove
 the split is internally consistent, and (3) exercises the safety-critical pure
 functions. A red result means a gate changed shape or a module stopped loading.
 
 Then do a real reload: `chrome://extensions` → refresh the extension card →
 reload the DHIS2 tab. Node checks are necessary, not sufficient.
+
+### Vendored files and the one dev-time build
+
+The extension never runs npm. `libs/d2-kit/` (the runtime kit packed into every
+AI-built app), `libs/sucrase.min.js` and `libs/fflate.min.js` are **committed
+output** of `scripts/build-runtime-kit.js`, a dev-only script that installs exact
+pinned versions in a temp dir and bundles them with esbuild. Run it only when
+bumping a pin; the output is reproducible byte for byte. `npm run apps`
+(`scripts/scenario-custom-apps-visual.js`) is the live + visual acceptance suite
+for `manage_custom_app` (needs a local DHIS2, Chrome and an existing Playwright
+install).
 
 ## Deferred (intentionally not done in this pass)
 

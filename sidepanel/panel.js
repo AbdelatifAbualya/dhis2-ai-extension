@@ -1663,6 +1663,7 @@ ${turnXml}
       manage_data_values: { cls: 'tool-icon-dataset', icon: '\u{1F522}' },
       manage_metadata_translations: { cls: 'tool-icon-create', icon: '\u{1F524}' },
       manage_memory: { cls: 'tool-icon-info', icon: '\u{1F9E0}' },
+      manage_custom_app: { cls: 'tool-icon-create', icon: '\u{1F9E9}' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
     const iconInfo = iconMap[tool] || { cls: 'tool-icon-api', icon: '\u{1F6E0}️' };
@@ -1705,6 +1706,7 @@ ${turnXml}
       manage_data_values: 'Working on data values',
       manage_metadata_translations: 'Translating metadata',
       manage_memory: 'Using learning memory',
+      manage_custom_app: 'Building a DHIS2 app',
       diagnose_save_error: 'Diagnosing save error',
     };
     // Fallback must never claim a specific tool. Labelling an unmapped tool
@@ -1982,6 +1984,17 @@ ${turnXml}
       if (Array.isArray(args.values)) parts.push(`${args.values.length} value(s)`);
       if (args.all) parts.push('ALL values');
       if (args.dry_run) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_custom_app') {
+      const parts = [args.action || 'list'];
+      if (args.key) parts.push(String(args.key).slice(0, 40));
+      else if (args.name) parts.push(`"${String(args.name).slice(0, 40)}"`);
+      if (args.kind) parts.push(String(args.kind) + (args.plugin_type ? ` (${String(args.plugin_type).toLowerCase()})` : ''));
+      if (args.files && typeof args.files === 'object') parts.push(Object.keys(args.files).join(' + '));
+      if (args.preview_token) parts.push('approved preview');
+      if (args.needs_write_access) parts.push('writes data');
+      if (args.target) parts.push(`→ ${String(args.target).replace(/_/g, ' ')}`);
+      if (Array.isArray(args.field_map) && args.field_map.length) parts.push(`${args.field_map.length} mapped field(s)`);
       detail = parts.join(', ');
     } else if (tool === 'manage_memory') {
       const parts = [args.action || 'search'];

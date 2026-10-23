@@ -65,6 +65,9 @@ function isValidProviderUrl(rawUrl) {
 
 let _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };
 let _cachedApiKey = null;
+// Whether a Tavily key is saved — tools that need it are not offered without
+// one (see stripUnavailableToolActions in registry.js).
+let _hasTavilyKey = false;
 
 function getProviderConfig() {
   return _cachedProviderConfig;
@@ -109,11 +112,12 @@ function sanitizeHeaderValue(v) {
 }
 
 // Load cached settings at startup
-chrome.storage.local.get(['providerConfig', 'fireworksApiKey']).then(d => {
+chrome.storage.local.get(['providerConfig', 'fireworksApiKey', 'tavilyApiKey']).then(d => {
   if (d.providerConfig) {
     _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, ...d.providerConfig };
   }
   if (d.fireworksApiKey) _cachedApiKey = sanitizeHeaderValue(d.fireworksApiKey);
+  _hasTavilyKey = !!sanitizeHeaderValue(d.tavilyApiKey);
 });
 
 // Keep caches in sync whenever settings change
@@ -124,6 +128,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
   if (Object.prototype.hasOwnProperty.call(changes, 'fireworksApiKey')) {
     _cachedApiKey = sanitizeHeaderValue(changes.fireworksApiKey.newValue) || null;
+  }
+  if (Object.prototype.hasOwnProperty.call(changes, 'tavilyApiKey')) {
+    _hasTavilyKey = !!sanitizeHeaderValue(changes.tavilyApiKey.newValue);
   }
 });
 const TAVILY_SEARCH_URL = 'https://api.tavily.com/search';
@@ -1099,6 +1106,7 @@ const DISCOVERY_ACTIONS = {
   manage_program_indicators: new Set(['list', 'get']),
   manage_program_notifications: new Set(['list', 'get']),
   manage_backups: new Set(['list', 'get']),
+  manage_custom_app: new Set(['list', 'get_source', 'preview', 'placements']),
 };
 function isDiscoveryCall(toolName, args) {
   if (DISCOVERY_ONLY_TOOLS.has(toolName)) return true;
@@ -1485,7 +1493,10 @@ function userExplicitlyWantsDescendants(userText) {
 }
 
 // ── State Restoration (MV3 service worker can die and restart) ──────────────
-(async () => {
+// A chat message is what wakes an evicted worker, so its handler awaits this
+// before building the turn — otherwise it can read conversationHistory while
+// the get() below is still in flight and run the turn with no memory.
+const stateRestored = (async () => {
   try {
     const stored = await chrome.storage.session.get(['dhis2Full', 'chatHistory']);
     // Do NOT resurrect the previous thread if a new-thread reset (CLEAR_HISTORY)
@@ -1633,6 +1644,27 @@ function snapshotDhis2ForPersistence() {
   return out;
 }
 
+// chrome.storage.session holds 10 MB for the whole extension and rejects an
+// over-quota set() as a unit. programMetadata embeds every option of every
+// option set on every stage field, so it grows with the server's data: the
+// Pharmacy program (15 drug slots × the EDL/CDL drug list) is 6.1 MB, and every
+// save on its pages failed (verified live 2026-10-22). It is a cache that
+// initializeFromUrl re-fetches from the page URL, so above this size it is
+// left out of the persisted copy instead of sinking the write.
+const PERSIST_DHIS2_MAX_CHARS = 1_500_000;
+const REFETCHABLE_DHIS2_CACHES = ['programMetadata'];
+
+function persistableDhis2Snapshot() {
+  const snap = snapshotDhis2ForPersistence();
+  let json = JSON.stringify(snap);
+  if (json.length > PERSIST_DHIS2_MAX_CHARS) {
+    for (const k of REFETCHABLE_DHIS2_CACHES) delete snap[k];
+    console.warn(`[saveState] state is ${json.length} chars — not persisting ${REFETCHABLE_DHIS2_CACHES.join(', ')} (re-fetched after a restart)`);
+    json = JSON.stringify(snap);
+  }
+  return JSON.parse(json);
+}
+
 // ── Conversation-memory helpers ─────────────────────────────────────────────
 // The agentic loop accumulates a full structured turn in its local `messages`
 // array: the user message, every assistant message that issued tool_calls, and
@@ -1711,15 +1743,34 @@ function buildTurnHistory(messages, persistFromIdx, userContentOverride) {
   return out;
 }
 
+// Each key is written on its own: when all three shared one set() and the
+// state was over quota, the chat history was rejected with it, the error was
+// swallowed, and the first message after the idle worker was evicted ran with
+// no memory of the conversation ("yes install it" → "what is 'it'?").
 async function saveState() {
-  try {
-    await chrome.storage.session.set({
-      dhis2State: getSerializableState(),
-      dhis2Full: JSON.parse(JSON.stringify(snapshotDhis2ForPersistence())),
-      // Trim on a user boundary so a reload never restores an orphaned tool msg.
-      chatHistory: trimConversationHistory(conversationHistory),
-    });
-  } catch {}
+  const parts = [
+    ['dhis2State', () => getSerializableState()],
+    ['dhis2Full', () => persistableDhis2Snapshot()],
+    // Trim on a user boundary so a reload never restores an orphaned tool msg.
+    ['chatHistory', () => trimConversationHistory(conversationHistory)],
+  ];
+  await Promise.all(parts.map(async ([key, build]) => {
+    let value;
+    try {
+      value = build();
+      await chrome.storage.session.set({ [key]: value });
+    } catch (e) {
+      console.warn(`[saveState] ${key} not persisted: ${e?.message || e}`);
+      if (key !== 'chatHistory' || !Array.isArray(value)) return;
+      // Keep the most recent turns rather than nothing.
+      for (let keep = Math.floor(value.length / 2); keep >= 1; keep = Math.floor(keep / 2)) {
+        try {
+          await chrome.storage.session.set({ chatHistory: trimConversationHistory(value, keep) });
+          return;
+        } catch { /* halve again */ }
+      }
+    }
+  }));
 }
 
 // ── New-thread reset ────────────────────────────────────────────────────────
@@ -1849,6 +1900,25 @@ function healMultiUidPath(path, method) {
   params.append('filter', `id:in:[${ids.join(',')}]`);
   if (!params.has('paging')) params.set('paging', 'false');
   return `${segs[0]}?${params.toString()}`;
+}
+
+// Two metadata filters joined in ONE filter parameter
+// (`filter=programType:eq:WITH_REGISTRATION;displayName:ilike:mch`) is a 400 —
+// DHIS2 wants one filter parameter per expression (verified 2026-10-22; a
+// model probing its app's search query sent exactly that). Split it. Metadata
+// endpoints only: in analytics `filter=ou:A;B` is ONE dimension filter and
+// must stay joined, and every part must itself read property:operator:value.
+const JOINED_FILTER_RE = /^[\w.]+:!?[A-Za-z$!]+:[^;]*(?:;[\w.]+:!?[A-Za-z$!]+:[^;]*)+$/;
+function healJoinedMetadataFilters(path) {
+  const s = String(path || '');
+  const [p, q] = s.split('?');
+  if (!q || /^\/?(?:analytics|tracker|events|dataValueSets|dataValues|dataStore|sqlViews|trackedEntityInstances|enrollments|relationships|query|dataEntry)\b/.test(p)) return s;
+  const params = new URLSearchParams(q);
+  const filters = params.getAll('filter');
+  if (!filters.some((f) => JOINED_FILTER_RE.test(f))) return s;
+  params.delete('filter');
+  for (const f of filters) for (const part of (JOINED_FILTER_RE.test(f) ? f.split(';') : [f])) params.append('filter', part);
+  return `${p}?${params.toString()}`;
 }
 
 function generateDhis2Uid() {
@@ -2177,6 +2247,16 @@ async function restoreFromBackup(backupKey) {
       _hint: 'Use manage_backups(action="list") to see available keys.',
     };
   }
+  // App backups (manage_custom_app) hold JSX source, not metadata: restoring
+  // one reinstalls that app version (src/tools-apps.js, loaded later).
+  if (entry?.custom_app && typeof restoreCustomAppFromBackup === 'function') {
+    return await restoreCustomAppFromBackup(backupKey, entry);
+  }
+  // Capture configuration backups (manage_custom_app place / unplace) hold a
+  // dataStore/capture value, not metadata (src/tools-apps-placement.js).
+  if (entry?.capture_config && typeof restoreCaptureConfigFromBackup === 'function') {
+    return await restoreCaptureConfigFromBackup(backupKey, entry);
+  }
   const objects = Array.isArray(entry?.objects) ? entry.objects : [];
   if (objects.length === 0) return { _error: `Backup ${backupKey} contains no objects.` };
 
@@ -2340,7 +2420,10 @@ async function fetchViaTab(fullUrl, method, headers, bodyStr) {
           return { error: e.message };
         }
       },
-      args: [fullUrl, method, headers, bodyStr],
+      // executeScript args must be structured-cloneable: `undefined` (every
+      // body-less write — i.e. every DELETE) made Chrome reject the injection
+      // ("Value is unserializable") and silently fall back to a direct fetch.
+      args: [fullUrl, method, headers, bodyStr ?? null],
     });
 
     const result = results?.[0]?.result;
@@ -2353,6 +2436,111 @@ async function fetchViaTab(fullUrl, method, headers, bodyStr) {
     console.warn('[fetchViaTab] Error:', e.message);
     return null;
   }
+}
+
+// ── App upload (multipart POST /api/apps) ─────────────────────────────────────
+// fetchViaTab carries string bodies only, so the zip crosses into the DHIS2 tab
+// as base64, is rebuilt into a Blob there and POSTed same-origin with the user's
+// session (field name `file`, as DHIS2 requires). Falls back to a direct
+// service-worker FormData fetch when no DHIS2 tab is open.
+// The FILENAME is significant: DHIS2 stores an app's files under
+// apps/<filename-without-.zip>, so two apps uploaded under one filename
+// overwrite — and on delete remove — each other's files (verified 2.42.5.1).
+// Callers pass a name unique to the app (manage_custom_app uses <key>.zip).
+// The direct fallback is for non-browser callers (the Node harness): in Chrome,
+// DHIS2 answers a write from the extension's own origin with HTTP 200 and an
+// EMPTY body and does nothing (verified 2.42.5.1 — upload and DELETE alike), so
+// an empty 2xx is reported as "not installed", never as success.
+// Returns { app (the server's JSON), status } or { _error }.
+function bytesToBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+async function uploadAppZip(bytes, filename) {
+  if (!dhis2.baseUrl || !dhis2.apiVersion) {
+    const ok = await ensureConnected();
+    if (!ok) return { _error: 'Not connected to DHIS2. Navigate to a DHIS2 page.' };
+  }
+  const url = `${dhis2.baseUrl}/api/apps`;
+  const name = String(filename || 'app.zip');
+  let raw = null;
+  let viaTab = false;
+  try {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find(t => t.url && (t.url === dhis2.baseUrl || t.url.startsWith(dhis2.baseUrl + '/')));
+    if (tab) {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async (u, b64, fname) => {
+          try {
+            const bin = atob(b64);
+            const buf = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+            const fd = new FormData();
+            fd.append('file', new Blob([buf], { type: 'application/zip' }), fname);
+            const resp = await fetch(u, {
+              method: 'POST', body: fd, credentials: 'include', redirect: 'manual',
+              headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+            });
+            if (resp.type === 'opaqueredirect') return { ok: false, status: 0, redirected: true, text: '' };
+            return { ok: resp.ok, status: resp.status, text: await resp.text() };
+          } catch (e) {
+            return { error: e.message };
+          }
+        },
+        args: [url, bytesToBase64(bytes), name],
+      });
+      const r = results?.[0]?.result;
+      if (r && !r.error) { raw = r; viaTab = true; }
+      else console.warn('[uploadAppZip] in-tab upload failed:', r?.error || 'no result');
+    }
+  } catch (e) {
+    console.warn('[uploadAppZip] tab path unavailable:', e.message);
+  }
+  if (!raw) {
+    try {
+      const fd = new FormData();
+      fd.append('file', new Blob([bytes], { type: 'application/zip' }), name);
+      const resp = await fetch(url, {
+        method: 'POST', body: fd, credentials: 'include', redirect: 'manual',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+      });
+      raw = resp.type === 'opaqueredirect'
+        ? { ok: false, status: 0, redirected: true, text: '' }
+        : { ok: resp.ok, status: resp.status, text: await resp.text().catch(() => '') };
+    } catch (e) {
+      return { _error: `App upload failed: ${e.message}` };
+    }
+  }
+  console.log(`[uploadAppZip] POST /api/apps (${name}, ${bytes.length} bytes) → HTTP ${raw.status}`);
+  if (raw.redirected || raw.status === 0 || raw.status === 401 || (raw.status >= 300 && raw.status < 400)) {
+    return { _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true, _hint: 'Nothing was installed. Ask the user to log in to DHIS2 in the browser tab, then retry the same call.' };
+  }
+  let body = null;
+  try { body = raw.text ? JSON.parse(raw.text) : null; } catch { /* non-JSON */ }
+  if (!raw.ok) {
+    const msg = (body && body.message) || (raw.text && raw.text.length < 300 ? raw.text : '') || `HTTP ${raw.status}`;
+    return {
+      _error: `DHIS2 rejected the app (HTTP ${raw.status}): ${msg}`,
+      _status: raw.status,
+      ...(raw.status === 403 ? { _hint: 'This DHIS2 user may not install apps — it needs the App Management authority (M_dhis-web-app-management) or ALL.' } : {}),
+      ...(raw.status === 409 && /namespace/i.test(msg) ? { _hint: 'Another app already reserves this dataStore namespace. Choose a different key.' } : {}),
+    };
+  }
+  if (!body || typeof body !== 'object') {
+    return {
+      _error: `DHIS2 answered HTTP ${raw.status} with an empty body — the app was NOT installed.`,
+      _status: raw.status,
+      _hint: viaTab
+        ? 'Retry once; if it repeats, the server may be behind a proxy that strips upload responses.'
+        : 'App installs go through an open DHIS2 tab where the user is logged in (the browser does not let the extension post the upload itself). Ask the user to open or refresh a DHIS2 tab on this server, then retry the same call.',
+    };
+  }
+  return { app: body, status: raw.status };
 }
 
 // Percent-encode the characters that RFC 7230 / Tomcat reject in a raw request
@@ -2498,8 +2686,11 @@ async function safeDhis2Fetch(path, options = {}) {
       const text = await resp.text().catch(() => '');
       rawResp = { ok: resp.ok, status: resp.status, statusText: resp.statusText, text };
 
-      // For writes: if direct fetch returned empty, retry once (session quirks in MV3)
-      if (isWrite && (!text || !text.trim())) {
+      // For writes: if direct fetch returned empty, retry once (session quirks in MV3).
+      // Never on 204: "No Content" IS the success response, and re-sending the
+      // write turned a completed DELETE /api/apps/<key> into "404 App does not
+      // exist" (verified 2.42.5.1, 2026-10-21).
+      if (isWrite && resp.status !== 204 && (!text || !text.trim())) {
         console.warn(`[safeDhis2Fetch] Empty from direct ${method}, retrying.`);
         const resp2 = await fetch(fullUrl, { ...fetchOpts, credentials: 'include' });
         const text2 = await resp2.text().catch(() => '');
@@ -2567,6 +2758,12 @@ async function safeDhis2Fetch(path, options = {}) {
             if (er.message && importErrors.length < 8) importErrors.push(er.message);
           }
         }
+      }
+      // A direct DELETE /{type}/{id} answers with an ObjectReport, whose
+      // reasons sit in response.errorReports (no typeReports) — the shape every
+      // DELETE has now that body-less writes really go through the tab.
+      for (const er of (errBody?.response?.errorReports || [])) {
+        if (er.message && importErrors.length < 8 && !importErrors.includes(er.message)) importErrors.push(er.message);
       }
       if (importErrors.length) errMsg += ` — ${importErrors.join('; ')}`;
       // E4030 "associated with another object: Event" after the user already

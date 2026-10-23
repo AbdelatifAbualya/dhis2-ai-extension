@@ -20,7 +20,7 @@
 
 ---
 
-## The 37 tools
+## The 38 tools
 
 Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → panel.js iconMap + toolLabels → CSS`. The model is given only the subset relevant to the current page and request — usually 6–12 of them.
 
@@ -63,6 +63,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 | 35 | `manage_data_values` | Aggregate data entry for one dataset × period × org-unit form: get / set / delete / complete / incomplete / validate. Values by data-element and disaggregation NAME; refuses the wrong-period-type, unassigned-org-unit and missing-disaggregation values DHIS2 would silently store invisibly; returns previous values as an undo record. |
 | 36 | `manage_metadata_translations` | Translate names / short names / form names / descriptions of any metadata object into a database locale — merges (a raw PUT wipes other locales), validates locale + property keys, bulk up to 100 objects. |
 | 37 | `manage_memory` | The assistant's **learning memory**: `search` / `record` / `list` lessons about DHIS2 and API behaviour (what failed and the exact fix). Relevant lessons are also injected automatically — in the system prompt, with a tool's manual, and on a failed call. Stored only in this browser; never patient data (see below). |
+| 38 | `manage_custom_app` | **AI-built DHIS2 apps & dashboard plugins.** The model writes React JSX; the tool compiles it, safety-scans and lints it, verifies every hard-coded UID, packages it with a prebuilt runtime kit (React 18 + `@dhis2/ui` + `@dhis2/app-runtime`) and installs it (`POST /api/apps`). Actions: `list`, `get_source`, `preview`, `create`, `update`, `delete`, `rollback`. Only ever touches assistant-built `ai-*` apps; backs up before every change. See [Building apps & plugins](#building-apps--plugins). |
 
 ### Page-context auto-detection
 
@@ -140,6 +141,65 @@ These are the silent-failure traps that this codebase has hit and codified, so y
 - **HIDEFIELD on a compulsory program-stage data element** doesn't visually hide it in New Tracker Capture. The chatbot now auto-PUTs `compulsory:false` on affected PSDEs and pairs the rule with a `SETMANDATORYFIELD` rule keyed to the inverse condition, so compulsion is restored when the field shows again.
 
 ---
+
+## Building apps & plugins
+
+Ask for an app, a dashboard widget or a Capture plugin in plain language — *"build a dashboard widget that shows ANC coverage by district for the selected period"*, *"add a widget to this enrollment dashboard that lists the medications ordered"*, *"add a plugin to this form that shows the BMI category"* — and the assistant writes it, packages it, installs it on your DHIS2 server and, if you ask, puts it where you work. **Zero setup:** no Node, no CLI, no build server. Everything runs inside the extension.
+
+**How it works.** The model writes React JSX against a fixed set of globals (`React`, `ReactDOMClient`, `D2UI` = all of `@dhis2/ui`, `D2Runtime` = `@dhis2/app-runtime`, `postRobot`, `echarts`, `D2_APP_CONFIG`). `manage_custom_app` compiles it with Sucrase (`libs/sucrase.min.js`), checks it, and zips it with fflate (`libs/fflate.min.js`) together with the prebuilt runtime kit (`libs/d2-kit/`: one 1.6 MB IIFE + Roboto + design tokens). The zip (~0.5 MB, ~0.9 MB with charts) is uploaded through your logged-in DHIS2 tab to `POST /api/apps`, then verified in `/api/apps`.
+
+**The workflow the assistant follows** (it is in the tool manual): look up the real metadata and run the exact queries the app will make → `preview` (compile + safety scan + lint + UID check, nothing installed) → a 3–5 line summary for you (what it shows, which data it reads, whether it writes, where it appears) → after your "yes", `create` with the preview token, so exactly the previewed build is installed → the app link, or the steps to add the plugin to a dashboard (Edit → search the app name, listed under *Apps*).
+
+**What it refuses, in code.** Keys must start with `ai-`, and apps without the assistant's marker (`developer.company` in the manifest plus `src/manifest.ai.json`) are never updated or deleted. The safety scan rejects `eval` / `new Function`, `document.cookie`, `localStorage`/`sessionStorage`/`indexedDB`, `<script>` injection, `dangerouslySetInnerHTML` / `innerHTML`, `import`/`require`/`export`, requests to other servers and WebSocket/EventSource/`sendBeacon`. Unless the app is declared `needs_write_access`, any mutation is rejected too. The lint catches the runtime errors that would otherwise only show a blank page:
+- undeclared components or hooks;
+- names the kit does not export;
+- inline query objects, which the runtime silently freezes;
+- a missing render root, `DataProvider` or plugin handshake;
+- a `HeaderBar` (the v42 Global Shell already draws one);
+- crossed or unclosed JSX tags, which Sucrase itself accepts.
+
+UID-shaped strings that do not exist on the server are refused. `create`/`update`/`delete`/`rollback`/`place`/`unplace` pass the normal write-authorization gate; `list`/`get_source`/`preview`/`placements` are read-only. A preview is installed in the same turn only when your own message asked to install; otherwise the assistant shows the summary and waits for your answer.
+
+**Placing plugins** (`place` / `unplace` / `placements`):
+- **Dashboards:** the plugin becomes an `APP` item on an existing dashboard (appended, dashboard backed up first) or on a new one. `manage_dashboards` accepts `{ type: "APP", app_key }` items too.
+- **Capture pages:** an enrollment widget goes on the enrollment dashboard, the add-event or the edit-event page of one tracker program, in the left or right column, at the top or bottom. The tool writes Capture's own layout (`dataStore/capture/enrollmentOverviewLayout` and the two event-page keys) exactly as the Tracker Plugin Configurator does. A program without a layout starts from Capture's default page, so nothing else on the page changes.
+- **Capture forms:** a form-field plugin goes into a tracker stage's event form or a program's registration form (`dataStore/capture/dataEntryForms`), with a **field map**: the aliases the plugin uses (`values.weight`, `setFieldValue({ fieldId: "bmi" })`) mapped to data elements or attributes. The form is written section by section the way the Configurator writes it. A mapped field either stays in the form or is replaced by the plugin (`replace_field`). A placement whose code writes an alias the field map does not cover is refused (Capture would reject that write).
+- **Safety:** every Capture write is backed up first (`manage_backups(restore)` puts the old value back) and read back to verify it. `unplace` puts any replaced fields back where the plugin was, and removes a program or form entry that is back to Capture's default, so it follows the metadata again. `delete` takes a plugin off every dashboard and Capture page before uninstalling it. Writing `dataStore/capture` through `dhis2_query` stays blocked. Capture reads its configuration when it loads, so one reload shows the change.
+
+**Maintenance.** Each app embeds its own JSX source, so `update` takes only the changed files, bumps the version and backs up the previous version first. App backups live in the usual `dhis2-ai-extension-backups` namespace, the last 5 per app, and `manage_backups(restore)` reinstalls them too. `rollback` reinstalls a previous version. `delete` backs up first; `delete_app_data:true` also drops the app's dataStore namespace.
+
+**How generated code is written.** The tool manual adapts the [DHIS2 app-development agent skill](https://github.com/devotta-labs/dhis2-app-skills) (the one [developers.dhis2.org recommends](https://developers.dhis2.org/docs/guides/ai-development)) to this no-build runtime:
+- React 18 only, and `@dhis2/ui` for everything;
+- show `displayName`, always pass `fields`, and take the API contract from the server, not from memory;
+- server-side paging, search and order;
+- `engine.mutate` with alerts and pending states, and a confirmation Modal before every delete;
+- the DHIS2 widget and dashboard layouts and design tokens;
+- server-version feature flags;
+- hash routes so the Global Shell URL stays in sync.
+
+The skill's App Platform tooling (scaffolding, TanStack, react-router, i18n, CSS modules) does not exist in the kit, so each rule is restated with the equivalent the kit has.
+
+**DHIS2 behaviour this relies on** (verified on 2.42.5.1 / Dashboard app 101.6.1 / Capture 106.2.2):
+- **Upload filename:** the app's storage folder is named after the uploaded *file* (two apps uploaded as `app.zip` overwrite and co-delete each other). Uploads are therefore always `<key>.zip`, and a taken folder is refused.
+- **Namespace conflicts:** a reserved namespace that is already in use is a 409, checked before upload.
+- **App files:** they are served only unversioned (`/api/apps/<key>/…`), and `index.html` redirects to the Global Shell unless `?redirect=false`.
+- **Plugin size:** the Dashboard app gives a plugin item a **fixed** size (`setPluginHeight` is `null`), so plugin pages fill the item instead.
+- **Filters:** `dashboardItemFilters` (`ou`/`pe`) arrive through post-robot's `updated` message without reloading the plugin.
+- **Settings without 404s:** `dataStore/<ns>?fields=.&filter=_:eq:<key>` answers 200 even when nothing is saved, which is how plugins read per-item settings.
+- **Capture plugins:**
+  - An enrollment plugin receives `programId`, `enrollmentId`, `teiId`, `orgUnitId` (plus `programStageId`/`eventId` on event pages) and `navigate`.
+  - A form-field plugin receives `values`, `fieldsMetadata`, `errors`, `warnings` (all keyed by its own aliases), `setFieldValue`, `setContextFieldValue`, `formSubmitted`, `viewMode` and `orgUnitId`.
+  - Both get `setPluginHeight`: Capture sizes the frame to what the plugin reports.
+  - Form configs list data elements as `type: "TrackedEntityAttribute"`, and fields a config leaves out still appear in a trailing section.
+
+  Read from Capture's bundle and the Configurator's saved configs.
+
+Requirements: the App Management authority; dashboard plugins need DHIS2 ≥ 40.5 and Dashboard app ≥ 101; Capture form-field plugins are placed on tracker program stages and registration forms. An approve/reject card in the panel is still planned.
+
+**Maintainers.**
+- `node scripts/build-runtime-kit.js` rebuilds `libs/d2-kit/`, `libs/sucrase.min.js` and `libs/fflate.min.js` from exact pinned versions. It is dev-only, and the output is committed and reproducible byte for byte.
+- `npm run apps` runs the live and visual acceptance suite (`scripts/scenario-custom-apps-visual.js`, Playwright plus a local Chrome) and writes `test-results/custom-apps/report.html`. `--keep` leaves the test apps and dashboards in place for inspection.
+- `npm run apps:llm` (`scripts/llm-apps-acceptance.js`, needs `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`) has the chatbot itself build five complex apps and plugins. Each is verified in the real Dashboard and Capture apps, every DHIS2 call the chatbot makes is audited, and the server is left as found. Report: `test-results/custom-apps-llm/report.html`.
 
 ## Learning memory
 
@@ -223,7 +283,7 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
 ```
 dhis2-AI/
-├── manifest.json              MV3 config (v2.8.25)
+├── manifest.json              MV3 config (v2.8.26)
 ├── background.js              Service worker entry — thin importScripts() loader
 ├── src/                       Background worker modules (loaded, in order, by background.js)
 │   ├── core.js                config · state · safety gates · DHIS2 transport · backups · context
@@ -234,11 +294,14 @@ dhis2-AI/
 │   ├── tools-programs.js      program-authoring tools · plugins · standalone
 │   ├── tools-linelists.js     manage_line_lists
 │   ├── tools-admin.js         manage_users · manage_data_values · manage_metadata_translations
+│   ├── tools-apps.js          manage_custom_app (AI-built apps & dashboard plugins)
 │   └── agent.js               agentic loop · feedback · keepalive · screenshot · message router
 ├── scripts/
 │   ├── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
 │   ├── live-harness.js        real executeTool against a live DHIS2 (basic-auth fetch shim)
-│   └── scenario-*.js          live regression scenarios (npm run admin / sticky, …)
+│   ├── build-runtime-kit.js   DEV-ONLY: rebuilds libs/d2-kit + sucrase + fflate (pinned)
+│   ├── custom-app-scenarios/  JSX of the acceptance-test apps
+│   └── scenario-*.js          live regression scenarios (npm run admin / sticky / apps, …)
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
 │   ├── panel.html             Side panel UI
@@ -248,7 +311,10 @@ dhis2-AI/
 │   ├── dhis2_chrome_extension_system_prompt.md
 │   └── dhis2_linelisting_tool.json
 ├── libs/
-│   └── echarts.min.js
+│   ├── echarts.min.js
+│   ├── sucrase.min.js         JSX compiler for manage_custom_app (worker IIFE)
+│   ├── fflate.min.js          zip for manage_custom_app (UMD)
+│   └── d2-kit/                runtime kit packed into every AI-built app (JS, CSS, fonts, KIT_VERSION.json)
 ├── icons/
 │   ├── icon16.png  icon48.png  icon128.png
 └── README.md
@@ -283,7 +349,122 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
-### Unreleased (after 2.8.25) — 2026-10-21
+### Also in 2.8.26 — placing plugins: dashboards, Capture pages, Capture forms (2026-10-22)
+
+**The assistant now puts the plugins it builds where people work**, and writes exactly what the Tracker Plugin Configurator writes (new module `src/tools-apps-placement.js`).
+- **`manage_custom_app` `place` / `unplace` / `placements`.**
+  - `target "dashboard"`: an existing dashboard (appended through `manage_dashboards`, backed up first) or a new one.
+  - `"enrollment_dashboard"` / `"enrollment_event_new"` / `"enrollment_event_edit"`: a widget on that Capture page of one tracker program, left or right column, top or bottom.
+  - `"form"`: a form-field plugin in a tracker stage's event form or a program's registration form, with a `field_map` from the plugin's aliases to data elements or attributes. A mapped field stays in the form, or the plugin replaces it (`replace_field`).
+  - `delete` takes a plugin off every page first. `placements` is read-only.
+- **The formats were verified, not assumed.** Sources: the Capture 106.2.2 bundle on 2.42.5.1, the configs the Configurator (3.0.2) had saved on that server, and developers.dhis2.org.
+  - A program without a layout starts from Capture's own default page, which differs from the docs' example.
+  - Data elements in stage forms are written as `type: "TrackedEntityAttribute"`, like the Configurator does. Fields left out of a config still appear in a trailing section.
+  - Plugin props: enrollment pages pass `programId` / `enrollmentId` / `teiId` / `orgUnitId` (+ `programStageId` / `eventId`). Forms pass `values` / `fieldsMetadata` / `errors` / `warnings` keyed by alias, `setFieldValue`, `setContextFieldValue`, `formSubmitted`, `viewMode`. Both pass `setPluginHeight`.
+  - `setFieldValue` only accepts mapped aliases, so `place` refuses a field map that misses an alias the code writes.
+- **Safety.**
+  - Every `dataStore/capture` write is backed up (`capture_config` backups; `manage_backups(restore)` writes the old value back) and read back. The comparison ignores key order, because DHIS2 stores dataStore values as jsonb.
+  - `unplace` puts replaced fields back and removes an entry that is back to Capture's default.
+  - Raw `dhis2_query` writes to `dataStore/capture` stay blocked, and its hint now points to `place`.
+- **Manual.**
+  - A form-field plugin template, `setFieldValue` value formats, field-map rules and placement steps.
+  - Capture's widget card style (white, 1 px grey400 border, 3 px radius, 44 px header), read from the bundle.
+- **Fixes found while testing.**
+  - Capture plugin pages no longer get `body.d2-plugin`. Its full-height `#root` is right for fixed-size dashboard items, but in Capture a wrapper of 100% height reports the frame's own height. A model-written widget was cut off that way (651 px frame, 697 px content).
+  - The lint no longer tells form-field plugins to read `enrollmentId`.
+- **Found by having the chatbot build real apps** (`npm run apps:llm`, Fireworks GLM-5.3-flash). Each defect was fixed at the root, checked against the model's own code, and has a check in `npm run verify`:
+  - **Notes-app read:** the notes app GET `dataStore/<ns>/notes` before the key existed, a 404 on every first visit. The lint now refuses direct key reads in code that never uses the `filter=_:eq:<key>` read (HTTP 200, `entries: []` when nothing is saved). Key paths inside mutations stay allowed. The manual teaches the read and create/update rules for any app, not only dashboard settings.
+  - **Notes-app delete:** the same app deleted the last note with `{ type: last ? 'delete' : 'update', data }`, which app-runtime refuses ("Mutation type 'delete' does not support property 'data'"). Nothing was sent, and the note could never be deleted. The lint now refuses `type: 'delete'` with `data` and `type: 'create'` with `id` in mutation objects.
+  - **Unrequested dashboard:** asked only to "build a dashboard widget … show me a preview first", then "yes, install it", the model also created a dashboard nobody asked for and put the widget on it. Installing is not placing: `place` now goes ahead only when a placement was asked for, either in the user's message or a recent one ("add it to …", "as a widget on the enrollment dashboard", "plugin here", "place it"), or as a yes to the assistant's own placement question. Otherwise it refuses and tells the model to ask where it should go. Refused once, the model created the dashboard through `manage_dashboards` instead, so `APP` items there obey the same rule. Scenario 9 checks that nothing was placed.
+  - **Height lost to a wrapper's margin:** a model-written form plugin reported the `offsetHeight` of a wrapper that had `margin: 4px 0`, and Capture cut off the margin (frame 88 px, content 92 px). Capture plugin pages now also load `capture-plugin.css` (`#root { display: flow-root }`, so every margin stays inside `#root`). The manual's templates report `#root`'s height, and the lint warns when a Capture plugin reports a wrapper's `offsetHeight`.
+  - **Always-open modal:** another notes app rendered its delete-confirmation `<Modal>` unconditionally. It was open on load, and its backdrop blocked every click in the app. The lint now refuses a `Modal` rendered as an unconditional child (behind `cond &&`, a ternary, `hide=` or a component's own `return` is fine), and the manual says so.
+  - **Search-query probe:** while testing its app's search, the model sent `dhis2_query` `filter=programType:eq:WITH_REGISTRATION;displayName:ilike:mch`, a 400. On metadata endpoints this is now split into one `filter` parameter per expression; analytics `ou:A;B` and tracker filters stay as they are.
+- **`manage_dashboards`** accepts `{ type: "APP", app_key }` items in `create_dashboard` and `add_items`, after checking the key is an installed dashboard plugin. The item shape was verified with a VALIDATE + COMMIT import.
+- **No Tavily key → no docs search offered.** `architect_metadata(browse_dhis2_docs)` failed on every call without a key (in the hands-on session). The action, its parameter and its mention in the description are now left out of the wire tools until a key is saved; a direct call gets "unavailable, do not retry".
+- **Verified.**
+  - `npm run verify`: 600 checks, all passing.
+  - `npm run apps` (the whole visual suite, with the real model for scenario 9): 330 of 330. The tool made 228 API calls; the only 5 failures were the deliberate negative tests.
+  - `npm run apps:llm`, real model, five complex requests in plain user language. Every case passed on its latest run, with zero failed DHIS2 calls from the chatbot (A 9, B 15, C 39, D 26, E 6 calls):
+    - A: a program explorer app with search and paging (correct stage and data-element counts);
+    - B: a malaria chart plugin placed on a new dashboard;
+    - C: the medication widget placed on the Pharmacy enrollment dashboard, listing the 11 ordered drugs in real Capture, sized exactly;
+    - D: a BMI / fever form-field plugin the model mapped to Weight, Height and Temperature itself, working in the real Capture form;
+    - E: a notes app that saves, confirms and deletes on the server.
+  - In every run the Capture configuration and the app list ended exactly as before.
+  - `npm run verify` also covers placement round trips against an in-memory server: place → unplace must leave every key identical.
+  - `npm run apps --only=10,11,12,13`: 49 live checks, 0 failed API calls.
+    - The KPI plugin was placed on a new dashboard and rendered.
+    - A medication widget was placed on the Pharmacy enrollment dashboard. In the **real Capture app** it lists the 11 drugs actually ordered, at 1440 px and 1024 px, sized to its content.
+    - A form-field plugin was placed in the W4W Initial Assessment form. In the real Capture event form, typed weight, height and temperature reach the plugin, and `setFieldValue` writes the mapped field. The form was left without saving.
+    - After every unplace and delete, `dataStore/capture` is identical to before.
+  - The test cleanups now delete only backups whose reason names a test object or app, so other activity on a shared server is never touched.
+
+### Also in 2.8.26 — fixes from the first hands-on test (2026-10-22)
+
+**The assistant forgot the conversation after a pause on large programs.** The test was on a Capture enrollment page of the Pharmacy program. The assistant previewed a plugin and asked "Shall I install it?". The answer "yes install it" got "I don't have a record of what 'it' refers to". This was reproduced in real Chrome with the real extension and side panel, using both a recording mock LLM and Fireworks GLM-5.3-flash.
+- **Cause.**
+  - `programMetadata` caches every option of every option set on every stage field. For the Pharmacy program (15 drug slots × the drug list) that is 6.1 MB.
+  - `saveState` wrote it in the same `chrome.storage.session.set()` as the chat history. Chrome rejected the whole write ("Session storage quota bytes exceeded") and the empty `catch {}` swallowed the error.
+  - Chrome evicts the idle MV3 worker after 30 s. The next message restored no history, and with it lost the sticky tool list, so `manage_custom_app` was not even offered.
+  - Any large program was affected: every follow-up turn after a pause, and the stage context that sticky context relies on.
+- **Fix (`src/core.js`, `src/agent.js`).**
+  - `chatHistory`, `dhis2Full` and `dhis2State` are written separately, and failures are logged.
+  - An over-budget state leaves out the re-fetchable `programMetadata`; the chat handler re-fetches it when it is missing after a restart.
+  - A history that is itself over quota keeps its newest turns.
+  - `CHAT_MESSAGE` awaits the state restore before building the turn.
+- **Capture enrollment plugins: the manual now states what is true.**
+  - The tool accepted `plugin_type: "CAPTURE"`, but the manual said nothing about it, so the model guessed props and told the user the widget would be "selectable" in Capture.
+  - The props `{ teiId, programId, enrollmentId, orgUnitId }` and `setPluginHeight` were verified against three enrollment plugins already installed on 2.42 / Capture 106. The manual now covers them, the tracker query, auto-height reporting, a narrow-column list layout, the rule against reading patient rows, and the fact that placement is manual (Tracker Plugin Configurator).
+  - The lint warns when a Capture plugin reads neither `enrollmentId` nor `teiId`, or never reports its height.
+  - `where_to_find` says plainly that the widget is not placed automatically.
+- **No more impossible offers.**
+  - The `dhis2_query` block on `dataStore/capture` is unconditional, but its hint said "ask them to confirm the exact JSON before writing". The model then offered "say yes and I'll write the layout", a write that would be blocked again. The hint now says no confirmation lifts it and points to the Tracker Plugin Configurator.
+  - A `manage_custom_app` call cut off by the output-token limit now gets "write shorter source" advice instead of advice about splitting a tracker program.
+- **No install before the user approves.**
+  - With the real model, "Build a dashboard widget … Show me a preview first." was previewed and installed in the same turn. The manual said to ask, but nothing enforced it, and the suite's check for it was broken: it counted the manual-gate notice as an install and searched for "create" in a summary that never contains it.
+  - Previews now remember their turn. `create` is refused (`_awaiting_approval`) unless one of these holds: the user's own message asked to install ("create and install …"; not "preview first" or "don't install"), it asked to put the plugin somewhere (placing implies installing), or a preview of that key was shown in an earlier turn. This applies whether the model passes the preview token or the files: in one run the model sent the files instead of the token, which skipped a token-only check.
+  - The refusal tells the model to end the turn and ask; it no longer retries the same install.
+  - Scenario 9 now judges by the server's app list and deletes whatever key the model chose. It also starts a fresh conversation every run: `llm-harness.js` persists session storage to `.llm-session.json`, so the scenario had been continuing the previous run's thread, and the model skipped discovery for the app it "remembered".
+- **A dropped LLM stream is retried.** If the provider's connection drops before any text has reached the panel ("terminated" / "network error"; Fireworks did this several times during the runs), the agent loop now retries the request up to twice, exactly as it already did for a stalled stream. The request is safely repeatable at that point because nothing in it has run yet. Once text has streamed, the error is still shown, so output is never duplicated.
+- **A dropped LLM stream left an unhandled rejection.** Fireworks closed a streaming connection mid-response. The stall handler's `reader.cancel()` returns a rejected promise on an already-errored stream, and nothing caught it. Chrome logged it as an uncaught error; under Node it killed the visual suite before its cleanup. The rejection is now caught, in both the OpenAI-compatible and the Anthropic paths. The suite also records an unhandled rejection as a failed check, so a run always reaches cleanup.
+
+### 2.8.26 — 2026-10-21
+
+**AI-built DHIS2 apps & dashboard plugins (`manage_custom_app`, new module `src/tools-apps.js`).** The assistant writes React JSX and installs it as a real DHIS2 app or dashboard plugin, with zero setup for the user. See [Building apps & plugins](#building-apps--plugins).
+- **Runtime kit.** A dev-only `scripts/build-runtime-kit.js` produces the committed kit from exact pins: React 18.3.1, @dhis2/ui 10.18.0, @dhis2/app-runtime 3.17.4, post-robot 10.0.46 (the version the host uses), Roboto 400/500/700 with an Arabic system-font fallback, `@dhis2/ui` design tokens as CSS variables, and the export lists the lint checks against. It also produces Sucrase and fflate for the worker. The extension itself stays build-free. A rebuild from a clean install matches the committed files byte for byte.
+- **Tool.**
+  - Actions: `list` / `get_source` / `preview` / `create` / `update` / `delete` / `rollback`.
+  - Safety scan, lint and UID verification. Crossed JSX tags are refused because Sucrase compiles them silently, and a missing `)` is reported on its own line rather than where Sucrase backtracked.
+  - A `preview_token` (memory + `chrome.storage.session`) so `create` installs exactly the previewed build.
+  - Version bumps, app backups (last 5) and `manage_backups(restore)` support.
+  - Client-side pre-checks for existing keys, namespace collisions and upload-folder collisions, so the server never answers with a 409.
+  - `D2_APP_CONFIG` gives the generated code the server's `baseUrl`, `apiVersion` and `serverVersion`.
+- **Wiring.**
+  - `uploadAppZip` in `core.js`: multipart upload through the DHIS2 tab, falling back to the worker; a 401 or login redirect becomes "Not signed in".
+  - `list` / `get_source` / `preview` are discovery actions.
+  - Registry schema, manual, routing stub and intent detection; dispatcher; memory area; panel card.
+  - `dhis2_query` can no longer `POST /api/apps` or `DELETE apps/<key>`; those go through the tool, which only touches assistant-built `ai-*` apps.
+- **Manual.** It incorporates the DHIS2 app-development agent skill (devotta-labs/dhis2-app-skills @0ad888fd35, recommended by developers.dhis2.org), restated as rules for this runtime, not copied code. It adds what this server showed:
+  - the fixed-size dashboard items (`setPluginHeight = null`) and the `print-layout` mode;
+  - the `useStaticInput` trap, where inline query objects are frozen at first render;
+  - the 404-free dataStore settings read;
+  - alerts forwarded to the dashboard via `parentAlertsAdd`.
+- **Transport fixes found by the real-browser run** (they help every tool, not only this one):
+  - `fetchViaTab` passed `undefined` as the body of every body-less write. Chrome rejects that in `executeScript` args ("Value is unserializable"), so **every DELETE silently fell back to a direct worker fetch**. DHIS2 answers a write from the extension's own origin with HTTP 200, an empty body, and does nothing (verified for DELETE and for the multipart upload). Metadata deletes only worked thanks to the POST `importStrategy=DELETE` retry; dataStore-key and app deletes did not. The body is now `null`, and DELETEs really go through the tab (204).
+  - `safeDhis2Fetch` re-sent a write answered **204 No Content** through its empty-body retry, turning a completed `DELETE /api/apps/<key>` into "404 App does not exist". 204 is never retried now.
+  - A direct DELETE's 409 carries its reasons in `response.errorReports` (ObjectReport); those are now surfaced like import errors, keeping the existing E4030 hints.
+  - `uploadAppZip` reports an empty 2xx as "NOT installed — open a DHIS2 tab" instead of passing it through.
+- **Verified.**
+  - `npm run verify`: 91 new offline checks, all green.
+  - The existing live suites (`npm run admin`, line lists, sticky context) still pass with 0 unexpected failed calls.
+  - The extension was loaded unpacked in real Chrome 155 over CDP. Inside the real service worker: libs and modules load under the MV3 CSP, preview reads the kit via `chrome.runtime.getURL`, the preview token survives in `chrome.storage.session`, the upload goes through the DHIS2 tab (201), the app renders, and the delete goes through the tab (204). 12 of 12 checks.
+  - `npm run apps` on DHIS2 2.42.5.1 / Dashboard 101.6.1 / Global Shell 1.12.3 (Chrome, 1440 px and 400 px): 7 generated apps/plugins across 8 scenarios plus an error-state app, **277 checks, 0 failed**, 40 screenshots. The tool made 88 API calls; the only 5 failures were the deliberate negative tests (one bypassed-pre-check 409, four logged-out 401s). The instance was left exactly as found.
+    - Coverage: standalone app (direct + Global Shell), KPI and echarts dashboard plugins following the ou/pe filters without reload, edit and print modes, per-item settings in two independent instances, a write-enabled notes app (refused when declared read-only), Arabic/RTL under `keyUiLocale=ar`, update → rollback, and the negative paths (syntax error, banned patterns, key prefix, real apps, namespace collision, existing key, logged out, read-only turn).
+    - Rendered numbers were compared with the same API queries.
+    - Every screenshot was reviewed by eye. The KPI tiles were redesigned to centred single-value style after review.
+- **Not done here.** The end-to-end LLM scenario was skipped because no LLM credentials were configured. Capture plugins and automatic dashboard placement are phase 2.
+
+### Also in 2.8.26 — security & performance review (2026-10-21)
 
 **Security & performance review.** Each issue was reproduced live on DHIS2 2.42.5.1 before being fixed.
 - **Privacy-gate bypass closed.** The patient-data gate checked the raw `dhis2_query` path, but `fetch()` resolves `..`, `%2e` and `\` and drops `#…`, and DHIS2 decodes `%74`. With a cloud model, `programs/../tracker/trackedEntities` and seven other spellings returned patient rows. `safeDhis2Fetch` and `apiUrl` now refuse such paths (`ambiguousApiPathReason`), and the gate matches the canonical path.

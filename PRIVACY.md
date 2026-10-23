@@ -48,6 +48,12 @@ The optional learning memory (Settings → Learning memory, **on** by default, s
 - **Patient and personal data are never stored, enforced in code:** nothing is written to memory during any request that read or wrote individual tracker records or that ran on a patient's record page; automatically captured lessons contain only tool names, parameter *names*, configuration values (such as a value type or period type) and endpoint patterns — never record values; every lesson is scrubbed of identifiers (record/metadata IDs, e-mail addresses, phone and ID numbers, dates, search/filter values), and a lesson that still looks like information about a person is refused.
 - Switching the memory off stops both learning and the use of stored lessons immediately; the stored lessons are kept until you clear them.
 
+### Apps and plugins you ask the assistant to build
+
+When you ask for a custom app, dashboard widget or Capture plugin, the code is written by the AI provider you configured and installed **on your own DHIS2 server** (through your logged-in session, like any other change). The app, its source code and anything it saves (in its own dataStore namespace) live on that server only — nothing is sent to the developer of this extension. Generated apps can only call the DHIS2 server they are installed on: code that sends data to another address, reads cookies or browser storage, or injects scripts is refused before installation, and an app may only save data when you approved it as a writing app.
+
+When the assistant places a plugin on a dashboard or in the Capture app, it changes that server's configuration (the dashboard, or Capture's layout and form settings in the `capture` dataStore namespace), backs up the previous value on the same server first, and never reads patient records to do it. A Capture plugin reads the open record in **your** browser, with your own DHIS2 access; that data goes to the plugin on the page, not to the AI provider.
+
 ## Health and personal information
 
 DHIS2 systems often contain health-related and personally identifiable information. This build is deliberately limited to reduce exposure of individual people's identities:
