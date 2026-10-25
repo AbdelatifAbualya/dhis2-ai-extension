@@ -87,8 +87,9 @@ async function executeTool(name, args) {
 
   // HARD privacy gate (see above): block patient-level tracker-data reads unless
   // the LLM backend is local. Runs before ANY tool logic; cannot be bypassed by
-  // prompt content. De-identified aggregates and metadata pass straight through.
-  const _privacyBlock = enforcePatientDataPrivacyGate(name, args);
+  // prompt content. De-identified aggregates and metadata pass straight through,
+  // and so does a SQL view whose current SQL reads metadata tables only.
+  const _privacyBlock = await enforcePatientDataPrivacyGateAsync(name, args);
   if (_privacyBlock) return _privacyBlock;
 
   // Named-program substitution gate: after a name-filtered program search
@@ -154,6 +155,48 @@ async function executeTool(name, args) {
     if (method !== 'GET') opts.method = method;
     if (args.body) opts.body = args.body;
     let safePath = appendQueryParamsToPath(args.path, args.query_params);
+
+    // Guard: endpoints models guess for data no Web API endpoint returns. A
+    // "transfer history" request burned four failed calls on exactly these
+    // (live 2026-10-23, 2.43.2: GET tracker/ownership/transfer 405,
+    // tracker/ownership 404, audits 404, schemas/enrollment 404). Answer from
+    // what is known instead of sending them.
+    if (method === 'GET') {
+      const _gp = canonicalApiPath(safePath);
+      if (/^(?:tracker\/)?ownership(?:\/|$)/i.test(_gp)) {
+        return {
+          _error: `Not sent: GET ${_gp} has no read endpoint — tracker/ownership/transfer only accepts PUT (it performs a transfer) and tracker/ownership does not exist.`,
+          _hint: 'Ownership-TRANSFER history exists only in the database (programownershiphistory + trackedentityprogramowner). Read it with a SQL view: manage_sql_views — its manual has the verified transfer-history SQL.',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
+      if (/^audits\/?$/i.test(_gp)) {
+        return {
+          _error: 'Not sent: "audits" is not an endpoint by itself (404).',
+          _hint: 'Audit endpoints are audits/dataValue and audits/dataApproval (aggregate); tracker audits (audits/trackedEntity, …) are patient-level and refused on a cloud model. Ownership-transfer history is not an audit — manage_sql_views reads it.',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
+      const _sm = /^schemas\/([^/]+)$/i.exec(_gp);
+      if (_sm && typeof getSchemaIndex === 'function') {
+        const _idx = await getSchemaIndex();
+        if (_idx) {
+          const _raw = _sm[1].replace(/\.json$/i, '');
+          const _hit = _idx.get(_raw.toLowerCase()) || _idx.get(_raw.toLowerCase().replace(/[^a-z0-9]/g, ''));
+          if (_hit && _hit.name !== _raw) {
+            // schemas/dataElements and schemas/DataElement are 404s; the API
+            // wants the singular camelCase name (verified 2.42.5.1).
+            safePath = safePath.replace(/^(\/?(?:api\/(?:\d+\/)?)?schemas\/)[^/?#]+/i, `$1${_hit.name}`);
+          } else if (!_hit) {
+            return {
+              _error: `Not sent: there is no metadata schema "${_raw}" — schemas/<name> takes a METADATA type's singular camelCase name (e.g. schemas/dataElement, schemas/programStage).`,
+              _hint: 'Tracker data (enrollments, events, tracked entities, ownership / transfers) are not metadata schemas. Their real database columns: manage_sql_views(action="describe", tables=[…]).',
+              _scope: 'known_endpoint_guidance',
+            };
+          }
+        }
+      }
+    }
 
     // Guard: POST/PATCH/PUT to staticContent/* requires multipart form data (file upload),
     // not JSON. Previously the model tried POST staticContent/logo_banner with a JSON
@@ -2418,6 +2461,10 @@ async function executeTool(name, args) {
   // ── custom apps & dashboard plugins (src/tools-apps.js) ──
   if (name === 'manage_custom_app') {
     return await executeManageCustomApp(args);
+  }
+  // ── SQL views (src/tools-sqlviews.js) ──
+  if (name === 'manage_sql_views') {
+    return await executeManageSqlViews(args);
   }
 
   return { _error: `Unhandled tool route: ${name}` };

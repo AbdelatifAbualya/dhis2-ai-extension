@@ -31,7 +31,9 @@ For counting only: add totalPages=true&pageSize=1 and read pager.total from resu
 For tracker filters: use filter={attributeId}:eq:{value} NOT dimension syntax.
 For analytics dimension filters: use dimension={stageId}.{dataElementId}:{optionCode}
 Always use option CODE (not displayName) in filters.
-⚠️ NEVER use PUT/PATCH/POST on sharing endpoints (e.g. {type}/{id}/sharing or sharing?type=...) — these will fail with 405/500. Use manage_metadata(action=update_sharing) instead.`,
+⚠️ NEVER use PUT/PATCH/POST on sharing endpoints (e.g. {type}/{id}/sharing or sharing?type=...) — these will fail with 405/500. Use manage_metadata(action=update_sharing) instead.
+- Data with NO Web API endpoint (tracker ownership-TRANSFER history, …) → manage_sql_views, not guessed endpoints: tracker/ownership/transfer is write-only (PUT), tracker/ownership does not exist. schemas/{name} covers METADATA types only, by singular camelCase name (schemas/dataElement); enrollments, events and tracked entities are not schemas — manage_sql_views(describe) shows real database columns.
+- SQL views: create/change them with manage_sql_views. GET sqlViews/{id}/data works here only for a view that reads metadata tables alone (on a cloud model).`,
       parameters: {
         type: 'object',
         properties: {
@@ -2501,6 +2503,53 @@ Guarantees: keys always start with "ai-"; apps not built by the assistant (no as
   {
     type: 'function',
     function: {
+      name: 'manage_sql_views',
+      description: `DHIS2 SQL views — the platform's supported way to read data that NO Web API endpoint exposes, and the data source for a plugin/app that needs it. Use it for: tracker ownership-TRANSFER history (the programownershiphistory table — a "transfer" in DHIS2 tracker is the Capture "Transfer" action that moves a tracked entity's ownership to another org unit; there is NO readable transfer endpoint: tracker/ownership/transfer is write-only), other database-only facts, and real table/column names of THIS server.
+
+Actions:
+- list — saved SQL views (query filters by name).
+- get — one view: its SQL, variables, who can read its rows, and how a plugin reads it.
+- describe — the REAL columns of database tables on this server (tables:[…]) and/or table names containing a word (search:"ownership"). Read-only (uses a temporary view that is removed). ALWAYS describe before writing SQL against a table you have not described this conversation.
+- create — save a view and RUN it once (DHIS2 does not check SQL on save). SQL that fails is reported with the database error and the view is removed again. Default sharing "r-r-----" = every logged-in user can read its rows (a view with no data read gives HTTP 409 E4312 to everyone, superusers included).
+- update — change name / SQL / sharing; backed up first, re-run, put back as it was if the new SQL fails.
+- delete — backed up first.
+- run — run a view: column names + row count always; the rows themselves only when the view reads METADATA tables only (or on a local model). Patient-level rows are never shown on a cloud model.
+
+Never claim a view works or shows data unless create/update/run reported it: say the row_count (0 rows = "no transfers recorded yet"). NEVER create, change or read SQL views through dhis2_query.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'get', 'describe', 'create', 'update', 'delete', 'run'], description: 'list / get / describe / run are read-only; create / update / delete write to the server.' },
+          id: { type: 'string', description: 'The SQL view UID (get / update / delete / run).' },
+          name: { type: 'string', description: 'create: unique view name, e.g. "Transfer history (dashboard plugin)". update: new name.' },
+          description: { type: 'string', description: 'One sentence: what the view returns and which app uses it.' },
+          sql_query: { type: 'string', description: 'ONE read query (SELECT / WITH). Use \${name} variables inside string literals for values the reader supplies: \'\${startDate}\'. Never the words delete, alter, update, create, drop, commit, insert, rename, restore, write, grant, truncate, revoke — DHIS2 refuses them anywhere in the text.' },
+          type: { type: 'string', enum: ['QUERY', 'VIEW', 'MATERIALIZED_VIEW'], description: 'Default QUERY (runs fresh on every read; the only type with variables).' },
+          cache_strategy: { type: 'string', description: 'Default NO_CACHE (live data).' },
+          sharing: {
+            type: 'object',
+            description: 'Who may read the rows. Default {"public":"r-r-----"} (every logged-in user). For a restricted view: {"public":"r-------","user_groups":[{"id":"<group UID>","access":"r-r-----"}]}.',
+            properties: {
+              public: { type: 'string' },
+              user_groups: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, access: { type: 'string' } } } },
+            },
+          },
+          test_variables: { type: 'object', description: 'create / update: a value for EVERY \${variable} in the SQL, used for the test run, e.g. {"startDate":"2020-01-01","endDate":"2030-12-31","orgUnit":"ALL"}. Letters, digits, spaces, "_" and "-" only.' },
+          variables: { type: 'object', description: 'run: a value for every \${variable}.' },
+          tables: { type: 'array', items: { type: 'string' }, description: 'describe: database table names, e.g. ["programownershiphistory","trackedentityprogramowner","organisationunit"].' },
+          search: { type: 'string', description: 'describe: list tables whose name contains this word.' },
+          query: { type: 'string', description: 'list: filter by name.' },
+          page: { type: 'integer', description: 'list / run: page number.' },
+          page_size: { type: 'integer', description: 'run: rows per page (max 100; metadata-only views).' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Skip the backup before update/delete. Only after the user is told the backup failed AND explicitly accepts.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -2589,6 +2638,7 @@ const TOOL_ROUTER = Object.freeze({
   manage_metadata_translations: true,
   manage_memory: true,
   manage_custom_app: true,
+  manage_sql_views: true,
 });
 
 // ── Lazy Tool Manuals (two-tier tool docs) ───────────────────────────────────
@@ -2635,7 +2685,7 @@ const WRITE_CAPABLE_TOOL_NAMES = new Set([
   'manage_dashboards', 'manage_maps', 'manage_line_lists',
   'manage_custom_translations', 'manage_growth_chart_plugin',
   'manage_users', 'manage_data_values', 'manage_metadata_translations',
-  'manage_custom_app',
+  'manage_custom_app', 'manage_sql_views',
 ]);
 
 const MANUAL_TOOLS = new Set([
@@ -2660,6 +2710,7 @@ const MANUAL_TOOLS = new Set([
   'manage_data_values',
   'manage_metadata_translations',
   'manage_custom_app',
+  'manage_sql_views',
 ]);
 
 // Short routing descriptions sent on the wire for MANUAL_TOOLS. These carry
@@ -2687,6 +2738,7 @@ const TOOL_SUMMARIES = {
   manage_users: 'Administer users, user roles, user groups and authorities: list, get, create (username + names + ≥1 role + policy-compliant password or generate_password, capture/data-view/search org units, groups — names resolve to UIDs), update (roles/org units/groups add/remove, password reset, profile), disable, enable, delete; list_roles, get_role, create_role, update_role, delete_role (authorities validated against /api/authorities — DHIS2 silently stores misspelled ones); list_groups, create_group, update_group (members), delete_group; list_authorities. NEVER POST /users or /userRoles via dhis2_query.',
   manage_data_values: 'Aggregate data entry for ONE form (dataset × period × org unit): get (values with names, empty cells, completion/lock), set (values by data-element NAME + disaggregation name; value types, option sets, period type, org-unit assignment and period openness checked BEFORE sending — DHIS2 itself silently stores wrong-period / unassigned-OU / missing-disaggregation values), delete, complete, incomplete, validate (run validation rules). Returns previous values as an undo record. NEVER hand-write dataValueSets bodies via dhis2_query for single-form entry.',
   manage_custom_app: 'Build and install CUSTOM DHIS2 apps, dashboard plugins and Capture plugins (enrollment widgets, form-field plugins) from JSX you write (React + @dhis2/ui runtime kit, no setup): list, get_source, preview (compile + safety scan + UID check, no install — ALWAYS first, then ask the user), create (after approval, with preview_token), update (changed files only, auto-backup + version bump), delete, rollback; place / unplace / placements put an installed plugin on a dashboard, on a Capture enrollment/event page, or into a Capture stage/registration form with a field map (writes the Tracker Plugin Configurator\'s config, backed up first). Keys always start with "ai-"; apps the assistant did not build are never touched. A saved chart/pivot is manage_dashboards, not an app. NEVER POST /api/apps, DELETE apps or write dataStore/capture via dhis2_query.',
+  manage_sql_views: 'DHIS2 SQL views — read data NO Web API endpoint exposes (tracker ownership-TRANSFER history = programownershiphistory table; the Capture "Transfer" action), the data source for plugins that need it, and the REAL table/column names of this server (describe). list / get / describe / run (columns + row count; rows only for metadata-only views) / create (runs the view once — DHIS2 does not check SQL on save — and removes it if it fails) / update / delete (backed up). NEVER probe guessed endpoints for such data, NEVER guess column names (describe first), NEVER create/read SQL views via dhis2_query.',
   manage_metadata_translations: 'Translate METADATA objects (names, short names, form names, descriptions, labels of programs, stages, data elements, options, attributes, datasets, indicators, org units …) into a database locale: list_locales, add_locale, get, set (single object or items[] up to 100, MERGES with existing translations, keys validated against the schema), remove. NOT for app UI strings (manage_custom_translations). NEVER PUT {type}/{id}/translations via dhis2_query — it replaces every locale.',
 };
 
@@ -3239,7 +3291,7 @@ ReactDOMClient.createRoot(document.getElementById('root')).render(<Provider conf
 - Show displayName (not name) for every DHIS2 object — it is translated. ALWAYS pass fields with exactly the properties you render.
 - The API contract comes from the server, not from memory: before writing a query, run the exact resource + params once with dhis2_query (GET) and read the real response shape (keys, pager, value types). The server the app installs on is the version that matters.
 - Lists: server-side paging (params page + pageSize → response pager { page, pageCount, total, pageSize }), server-side search (filter displayName:ilike:<text>, added only when there is text: ...(q ? { filter: \`displayName:ilike:\${q}\` } : {})) and server-side order (order: 'displayName:asc'). Never download a whole collection to filter or page it in the browser.
-- Tables: <DataTable layout="fixed">; Pagination (1-indexed) inside DataTableFoot > DataTableRow > DataTableCell colSpan={columns}; an empty result is ONE row with one colSpan cell saying so; row actions → a small Button opening a FlyoutMenu (Layer + Popper) of MenuItems.
+- Tables: <DataTable layout="fixed">; Pagination (1-indexed) inside DataTableFoot > DataTableRow > DataTableCell colSpan={columns} — its pageSize must be one of 5, 10, 20, 30, 40, 50, 75, 100 (its page-size menu; 25 logs a console error on every render), and pass hidePageSizeSelect when there is no onPageSizeChange; an empty result is ONE row with one colSpan cell saying so; row actions → a small Button opening a FlyoutMenu (Layer + Popper) of MenuItems.
 - Writes: const engine = useDataEngine(); await engine.mutate({ resource, id, type: 'create' | 'update' | 'delete', data }). Keep a pending flag (Button loading / disabled while it runs), refetch the affected query afterwards, and report the outcome with useAlert:
   const { show } = useAlert(({ msg }) => msg, ({ ok }) => (ok ? { success: true } : { critical: true })); … show({ msg: 'Note saved', ok: true }).
 - ALWAYS confirm before deleting: <Modal small> with ModalTitle, ModalContent naming the item, ModalActions > <ButtonStrip end> "Cancel" + <Button destructive>Delete</Button>.
@@ -3263,6 +3315,18 @@ ReactDOMClient.createRoot(document.getElementById('root')).render(<Provider conf
 - Event counts: resource \`analytics/events/aggregate/\${programId}\`, params { dimension: ['pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'], outputType: 'EVENT' } — a count with no events is the row ['0'], not an empty result.
 - Variables are read once per mount: render the data part in a child component with key={ou + '|' + pe} so a filter change remounts it and refetches (or call refetch(newVariables)).
 - States: loading → a centred <CircularLoader small />; error → <NoticeBox error title="Could not load …">{error.message}</NoticeBox>; empty → <NoticeBox title="No data">…</NoticeBox> or a muted message. Never a blank screen.
+
+### Data that no Web API endpoint has → a SQL view (manage_sql_views)
+- Some data has no endpoint at all — e.g. tracker ownership TRANSFER history (who moved which record from which org unit to which, when). Never probe guessed endpoints (tracker/ownership/transfer is write-only, audits/* and schemas/* do not have it) and never build on a proxy signal: create a QUERY SQL view with manage_sql_views (describe the tables → create with test_variables → it runs once and reports columns + row_count), then read it in the plugin. Its manual has the verified transfer-history SQL.
+- Read it with variables and server-side paging — never paging:false, never filter rows in the browser:
+\`\`\`
+const ROWS = { rows: { resource: 'sqlViews/<VIEW UID>/data', params: ({ startDate, endDate, orgUnit, page }) => ({
+  var: [\`startDate:\${startDate}\`, \`endDate:\${endDate}\`, \`orgUnit:\${orgUnit}\`], page, pageSize: 50 }) } };
+// data.rows.listGrid.headers[i].name → column index; data.rows.listGrid.rows → arrays of STRINGS; data.rows.pager → { page, pageCount, total }
+\`\`\`
+- Send EVERY variable on every request (missing one → HTTP 409 E4307). Dates as YYYY-MM-DD. Org unit: the dashboard's filter first (dashboardItemFilters.ou[0].id), else the user's pick, else 'ALL' — a "path like" filter in the SQL includes everything below the chosen unit. A user org-unit picker: OrganisationUnitTree with roots from { me: { resource: 'me', params: { fields: 'organisationUnits[id]' } } }.
+- Errors to show as a NoticeBox, not a crash: 409 with details.errorCode E4312 = "You do not have access to this data — ask an administrator to share the SQL view with you (data read)"; 404 = the view is missing or not shared. Every viewer needs data read on the view: tell the user who can read it (data_access in the manage_sql_views result).
+- The tool checks this at preview: the view exists, someone can read its rows, and every variable the view uses is sent.
 
 ### Dashboard plugins (plugin.jsx, plugin_type "DASHBOARD")
 \`\`\`
@@ -3383,12 +3447,72 @@ Give the option grid { left: 8, right: 16, top: 24, bottom: 8, containLabel: tru
 - Warned (fix them): a metadata query without fields, fields using name instead of displayName, a delete without a confirmation Modal, a hard-coded server address.
 
 ### Workflow
-1. Discover the real metadata first (search_metadata, get_program_info) and run the exact queries the app will make with dhis2_query to see the response shape and confirm the numbers exist — never invent UIDs or response fields.
+1. Discover the real metadata first (search_metadata, get_program_info) and run the exact queries the app will make with dhis2_query to see the response shape and confirm the numbers exist — never invent UIDs or response fields. Data no endpoint has (transfer history …) → manage_sql_views first; patient-level reads are refused to you, so confirm such a source with the tool's columns + row_count, not with rows.
 2. preview. If it returns compile_errors / violations / problems / unknown_uids, fix exactly those and preview again; also fix every warning.
 3. Tell the user in 3–5 lines: what it shows, which data it reads, whether it writes anything, where it will appear. Ask for approval.
 4. After approval: create with the preview_token. Installing in the same turn as the preview is refused unless the user's own message asked to install ("create and install …") — so end the turn with the summary and the question. Report global_shell_url (apps) or the where_to_find steps.
-5. Placing a plugin: if the user asked for it to appear somewhere ("on this dashboard", "in the enrollment dashboard", "in this form"), place it right after create in the same approved turn; otherwise ASK where they want it and place it after they answer — the tool refuses a placement nobody asked for, and never create a dashboard nobody asked for. Use the page context for program / stage / dashboard ids when the user says "here". Report the where_to_find text (Capture needs one reload).
+5. Placing a plugin: if the user asked for it to appear somewhere ("on this dashboard", "install it on a dashboard", "in the enrollment dashboard", "in this form"), place it right after create in the same approved turn; otherwise ASK where they want it and place it after they answer — the tool refuses a placement nobody asked for, and never create a dashboard nobody asked for. Use the page context for program / stage / dashboard ids when the user says "here". "On a dashboard" without a name: the dashboard open in the page context if any, else a new dashboard named after the plugin (dashboard_name) — say which. If place is refused, do not call it again in that turn: ask, and end the turn. Report the where_to_find text (Capture needs one reload).
 6. Later changes: get_source → update with only the changed files (placements keep working — same key); "undo" → rollback; remove it from a page → unplace.`;
+
+// ── SQL views (manage_sql_views) ──
+// Table and column facts verified live 2026-10-23 on 2.42.5.1 (localhost) and
+// 2.43.2 (play.im.dhis2.org) through information_schema; the transfer recipe
+// is the one in the user's dhis2-plugin-skill (sql-view-data-source.md), run on
+// 2.42.5.1 against 14 real transfers.
+const KB_SQL_VIEWS_DETAILS = `### When a SQL view is the answer
+- The data has NO Web API endpoint. Known case: tracker ownership TRANSFER history. In DHIS2, "transfer" (tracker) = Capture → enrollment dashboard → Enrollment widget → Transfer, which calls PUT tracker/ownership/transfer?trackedEntity=…&program=…&ou=… (write-only: a GET is 405, tracker/ownership is 404). Each transfer writes one programownershiphistory row for the PREVIOUS owner and moves trackedentityprogramowner to the new org unit. No endpoint returns that history — a QUERY SQL view does. Do not search for "transfer" programs/stages/data elements first and do not probe endpoints: go straight to describe → create.
+- tracker/*, audits/*, schemas/* cannot show database tables: schemas/<name> covers METADATA types only (singular camelCase, e.g. schemas/dataElement); enrollment, event, trackedEntity are not schemas. Use describe for real columns.
+
+### Rules the server enforces (verified)
+- Saving does NOT check the SQL (a view on a missing table saves with 201). create/update here run the view once and tell you the real result — never say "DHIS2 validated the SQL on save".
+- One read query (SELECT / WITH). These words are refused ANYWHERE in the text, also inside strings and aliases: delete, alter, update, create, drop, commit, createdb, createuser, insert, rename, restore, write, grant, truncate, revoke (E4311). "lastupdated"/"updated_at" are fine.
+- Protected tables (E4310): users, userinfo, trackedentityattributevalue, oauth_access_token, oauth2client — so no person attributes and no user names from userinfo; the createdby columns of the tracker tables already hold the USERNAME.
+- Variables: \${name} inside a string literal ('\${startDate}'), name = letters/digits/_/-. Every reader must send a value for each (var=startDate:2026-01-01,endDate:2026-12-31) or gets E4307; values = letters, digits, spaces, "_" and "-" only (YYYY-MM-DD dates pass; no ":", ".", ","). Cast in SQL: cast('\${startDate}' as date). A sentinel like 'ALL' makes a filter optional: ('\${orgUnit}' = 'ALL' or ou.path like '%' || '\${orgUnit}' || '%').
+- Sharing: readers need DATA read (3rd character "r"). "r-r-----" = every logged-in user reads every row the view returns (variables are not access control); "rw------" means nobody can read rows — not even a superuser (409 E4312). Restrict with user_groups.
+- E7144 "referenced table does not exist … ensure analytics job was run" / E7145 "syntax error" on a SQL view = a wrong table or column name or a SQL error — not analytics; the tool's db_error has the real PostgreSQL message.
+
+### Tracker tables (2.41+; columns verified on 2.42.5.1 and 2.43.2)
+- Renamed in 2.41: trackedentityinstance → trackedentity, programinstance → enrollment, programstageinstance → event; columns trackedentityinstanceid → trackedentityid, programinstanceid → enrollmentid, programstageinstanceid → eventid, executiondate → occurreddate, duedate → scheduleddate. 2.43 splits event into trackerevent (tracker programs, has enrollmentid) and singleevent (event programs).
+- programownershiphistory: programownershiphistoryid, programid, trackedentityid, startdate, enddate, createdby (username), organisationunitid — one row per ENDED ownership: organisationunitid = the org unit transferred FROM, enddate = moment of the transfer.
+- trackedentityprogramowner: trackedentityprogramownerid, trackedentityid, programid, organisationunitid (CURRENT owner), created, lastupdated, createdby (username who made the latest change).
+- trackedentity: trackedentityid, uid, organisationunitid, trackedentitytypeid, deleted, created, lastupdated, inactive …
+- enrollment: enrollmentid, uid, trackedentityid, programid, organisationunitid (enrolling org unit), enrollmentdate, occurreddate, status, deleted …
+- organisationunit: organisationunitid, uid, name, path ("/<root uid>/…/<own uid>" — "path like '%<uid>%'" = that unit and everything below it), hierarchylevel, parentid. program / programstage: programid / programstageid, uid, name.
+- programtempownershipaudit: break-the-glass temporary access (programid, trackedentityid, created, accessedby, reason) — not a transfer.
+- Anything else: describe(search="…") then describe(tables=[…]).
+
+### Transfer history (tested on 2.42.5.1)
+\`\`\`
+with history as (
+  select h.programownershiphistoryid as transfer_id, h.trackedentityid, h.programid,
+         h.organisationunitid as from_ou_id, h.enddate as transferred_at,
+         lead(h.organisationunitid) over w as next_ou_id,
+         lead(h.createdby) over w as next_owner_createdby
+  from programownershiphistory h
+  window w as (partition by h.trackedentityid, h.programid order by h.enddate, h.programownershiphistoryid)
+)
+select to_char(t.transferred_at, 'YYYY-MM-DD HH24:MI') as transferred_at,
+       p.uid as program_id, p.name as program, te.uid as tracked_entity,
+       fo.uid as from_org_unit_id, fo.name as from_org_unit,
+       tu.uid as to_org_unit_id, tu.name as to_org_unit,
+       coalesce(t.next_owner_createdby, cur.createdby) as transferred_by
+from history t
+join program p on p.programid = t.programid
+join trackedentity te on te.trackedentityid = t.trackedentityid and te.deleted = false
+join organisationunit fo on fo.organisationunitid = t.from_ou_id
+left join trackedentityprogramowner cur on cur.trackedentityid = t.trackedentityid and cur.programid = t.programid
+left join organisationunit tu on tu.organisationunitid = coalesce(t.next_ou_id, cur.organisationunitid)
+where t.transferred_at >= cast('\${startDate}' as date)
+  and t.transferred_at < cast('\${endDate}' as date) + interval '1 day'
+  and ('\${orgUnit}' = 'ALL' or fo.path like '%' || '\${orgUnit}' || '%' or tu.path like '%' || '\${orgUnit}' || '%')
+order by t.transferred_at desc
+\`\`\`
+The destination and the acting user of a transfer come from the NEXT history row of the same tracked entity + program, or from the current owner row for the latest transfer. create it with test_variables {"startDate":"2000-01-01","endDate":"2099-12-31","orgUnit":"ALL"}; the result's row_count is the number of transfers recorded — 0 is a real answer ("no transfers yet on this server"), not a failure.
+
+### What you can see
+- On a cloud model a view that reads tracker tables returns only its column names and row count to you (create/update/run) — never its rows. A view that reads ONLY metadata tables (program, dataelement, organisationunit, optionset, information_schema, …) returns rows, also through dhis2_query GET sqlViews/<id>/data. The user sees every row in the plugin; you do not need to.
+- Before installing a plugin on a new view, tell the user who can read its rows (data_access in the result).`;
+
 
 const MANUAL_EXTRAS = {
   create_metadata: [KB_CREATE_PROGRAM_DETAILS, KB_VALUE_TYPE_MAPPING, KB_PROGRAM_RULE_SYNTAX, KB_PI_GRAMMAR].join('\n\n'),
@@ -3411,6 +3535,7 @@ const MANUAL_EXTRAS = {
   manage_data_values: KB_DATA_VALUES_DETAILS,
   manage_metadata_translations: KB_METADATA_TRANSLATIONS_DETAILS,
   manage_custom_app: KB_CUSTOM_APPS_DETAILS,
+  manage_sql_views: KB_SQL_VIEWS_DETAILS,
   // manage_maps: full description already covers usage; no extra KB.
 };
 
@@ -3664,6 +3789,16 @@ function detectCustomAppIntent(t) {
     || /\bmanage_custom_app\b/.test(t)) return true;
   const rest = t.replace(DHIS2_NAMED_APP_RE, ' ');
   return /\b(?:build|make|create|write|develop|code|generate|scaffold|design|install|update|modify|change|edit|fix|improve|delete|remove|uninstall|roll\s*back|rollback|revert|undo|list|show)\b.{0,60}\b(?:apps?|applications?|plugins?|widgets?|mini[-\s]?apps?)\b/.test(rest);
+}
+
+// SQL views (src/tools-sqlviews.js): asked for by name, or the request is for
+// data that only the database has — tracker ownership TRANSFER history
+// ("show the transfers history that happened in all OU", live 2026-10-23).
+function detectSqlViewIntent(t) {
+  return /\bsql\b|\bsql\s*views?\b|\bsqlviews?\b|\bdatabase\s+(?:tables?|columns?|query|queries|views?)\b|\bprogramownershiphistory\b/.test(t)
+    || /\b(?:ownership|owner(?:ship)?\s+changes?)\b/.test(t)
+    || /\btransfer(?:s|red|ring)?\b[^.?!]{0,60}\b(?:history|histories|log|logs|list|report|records?|audit|trail|between|from|across)\b/.test(t)
+    || /\b(?:history|log|list|report|records?)\s+of\s+(?:\w+\s+){0,2}transfers?\b/.test(t);
 }
 
 function getContextualTools(ctx, userText, browseWeb) {
@@ -4046,6 +4181,12 @@ function getContextualTools(ctx, userText, browseWeb) {
     selected.add('get_program_info');
   }
 
+  // ── SQL views — data no Web API endpoint has (transfer history …), and the
+  //    data source a plugin may need, so it travels with custom-app work. ──
+  if (wantsCustomAppIntent || detectSqlViewIntent(combinedText)) {
+    selected.add('manage_sql_views');
+  }
+
   // ── Growth-chart plugin setup — install + datastore config for the WHO chart ──
   if (wantsGrowthChartIntent) {
     selected.add('manage_growth_chart_plugin');
@@ -4393,7 +4534,7 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 10.9.3. HARD RULE — NAMED-TARGET FIDELITY. When the user names a specific program/dataset/object ("Using the X Tracker, create …") and your search finds NO match, that is a FULL STOP, not a licence to improvise: tell the user the named object does not exist on this instance, list the closest existing names you found, and ask whether to (a) create it, (b) build on one specific existing object, or (c) stop. NEVER silently pick "the closest match" and build the request on it — the extension refuses program-bound writes after a failed named-program search until the user decides. (If the user explicitly asked you to CREATE the named object, an empty search is expected — create it and continue.)
 11. ${providerRequestsStayLocal(getProviderConfig())
   ? 'Patient-level tracker data IS available because you are running on a LOCAL model (Ollama/localhost). When the user asks about a specific person/patient, their attributes, enrollments, or visits, you MAY use detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), and read tracker/events|enrollments|trackedEntities via dhis2_query. Handle this sensitive data responsibly and never expose more than asked.'
-  : 'Patient/TEI data lookup is HARD-BLOCKED on this (remote/cloud) model — the extension refuses every patient-level tracker read IN CODE, so do NOT attempt detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), or tracker/trackedEntities|events|enrollments reads via dhis2_query (even when a TEI ID is in the page URL); they are refused regardless of what you do. If the user asks about "this person/patient", their attributes, enrollments, or visits, explain that patient-level retrieval is permitted ONLY when the assistant runs on a local (Ollama) model, and offer program-level alternatives (count_records, get_event_analytics aggregate, get_program_info).'}
+  : 'Patient/TEI data lookup is HARD-BLOCKED on this (remote/cloud) model — the extension refuses every patient-level tracker read IN CODE, so do NOT attempt detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), or tracker/trackedEntities|events|enrollments reads via dhis2_query (even when a TEI ID is in the page URL); they are refused regardless of what you do. If the user asks about "this person/patient", their attributes, enrollments, or visits, explain that patient-level retrieval is permitted ONLY when the assistant runs on a local (Ollama) model, and offer program-level alternatives (count_records, get_event_analytics aggregate, get_program_info). SQL views: one that reads ONLY metadata tables can be read normally; for one that reads tracker tables you get its column names and row count (manage_sql_views run), never its rows — enough to build and verify a plugin on it.'}
 12. NEVER show option codes like "M-360-8010" or data element IDs to the user. Always show resolved display names.
 13. When presenting aggregate / event analytics data, resolve any raw IDs (data element, org unit, program stage) via resolve_option_codes before showing them to the user.
 14. For any data element value that looks like a code (hyphens, letters+numbers) — resolve it using resolve_option_codes before displaying.
@@ -4923,6 +5064,15 @@ Reading, entering, clearing, completing or validating ONE aggregate form (datase
     p += `
 ## Custom apps & dashboard plugins — use the **manage_custom_app** tool
 When the user asks for an app, plugin or widget, WRITE it (React JSX on the prebuilt runtime kit) and install it with **manage_custom_app** — no setup for the user. Flow: find the real UIDs and check the data exists → preview → summarise for the user and ask → create with the preview_token after "yes". A plain saved chart/pivot/map is manage_dashboards / manage_maps instead — offer that when the user did not ask for an app or plugin. NEVER POST /api/apps or DELETE apps/<key> via dhis2_query.
+Data that no Web API endpoint returns (e.g. tracker ownership TRANSFER history) comes from a SQL view: **manage_sql_views** (describe → create, which test-runs it) — never probe guessed endpoints for it.
+`;
+  }
+
+  // ── SQL views — data only the database has ──
+  if (detectSqlViewIntent(text)) {
+    p += `
+## Database-only data — use the **manage_sql_views** tool
+A "transfer" in DHIS2 tracker is an OWNERSHIP transfer (Capture → Enrollment → Transfer): each one is a row in the programownershiphistory table, and NO Web API endpoint returns that history (tracker/ownership/transfer is write-only). Read it — or anything else only the database has — with a QUERY SQL view: manage_sql_views(describe → create, which runs the view once and reports its columns and row count). Do not search programs/stages/data elements for "transfer" and do not probe tracker/ownership, audits or schemas endpoints.
 `;
   }
 

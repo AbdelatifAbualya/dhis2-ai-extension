@@ -38,7 +38,7 @@ const runtimeFiles = [
   'background.js', 'content.js', 'generate-icons.js',
   'src/core.js', 'src/memory.js', 'src/registry.js', 'src/providers.js',
   'src/tools-metadata.js', 'src/tools-programs.js', 'src/tools-linelists.js',
-  'src/tools-admin.js', 'src/tools-apps.js', 'src/tools-apps-placement.js', 'src/agent.js',
+  'src/tools-admin.js', 'src/tools-sqlviews.js', 'src/tools-apps.js', 'src/tools-apps-placement.js', 'src/agent.js',
   'sidepanel/panel.js',
 ];
 for (const rel of runtimeFiles) {
@@ -2250,6 +2250,183 @@ function runStreamRetryChecks() {
   (/isRetryableStreamDrop\(provErr\) && !streamStartBroadcast/.test(src) ? ok : bad)('the agent loop retries only while nothing has streamed to the panel');
 }
 
+// ── SQL views + transfer-history thread fixes (2026-10-23) ──────────────────
+// A "transfer history" dashboard-plugin request failed end to end on 2.43.2:
+// guessed endpoints (405/404/404/500), schemas/<tracker object> 404s, 2.40
+// table names, a view nobody could read (rw------ → E4312), a false "DHIS2
+// validated the SQL on save", and the user's own "install it on a dashbaord"
+// refused as "not asked". Server facts verified live on 2.42.5.1 and 2.43.2.
+async function runSqlViewChecks() {
+  console.log('\nSQL views, privacy exception & the transfer-history thread:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const saved = { apiVersion: d.apiVersion, writeAuth: d.writeAuth, sdf: ctx.safeDhis2Fetch, gsi: ctx.getSchemaIndex };
+  const A = (sql) => ctx.analyzeSqlViewPrivacy(sql).metadataOnly;
+  const TRANSFER_SQL = "with history as (select h.programownershiphistoryid as transfer_id, h.trackedentityid, h.programid, h.organisationunitid as from_ou_id, h.enddate as transferred_at, lead(h.organisationunitid) over w as next_ou_id, lead(h.createdby) over w as next_owner_createdby from programownershiphistory h window w as (partition by h.trackedentityid, h.programid order by h.enddate, h.programownershiphistoryid)) select to_char(t.transferred_at, 'YYYY-MM-DD HH24:MI') as transferred_at, p.name as program, fo.name as from_org_unit, tu.name as to_org_unit, coalesce(t.next_owner_createdby, cur.createdby) as transferred_by from history t join program p on p.programid = t.programid join trackedentity te on te.trackedentityid = t.trackedentityid and te.deleted = false join organisationunit fo on fo.organisationunitid = t.from_ou_id left join trackedentityprogramowner cur on cur.trackedentityid = t.trackedentityid and cur.programid = t.programid left join organisationunit tu on tu.organisationunitid = coalesce(t.next_ou_id, cur.organisationunitid) where t.transferred_at >= cast('${startDate}' as date) and t.transferred_at < cast('${endDate}' as date) + interval '1 day' and ('${orgUnit}' = 'ALL' or fo.path like '%' || '${orgUnit}' || '%') order by t.transferred_at desc";
+  try {
+    // 1. What counts as metadata-only (fail closed on anything unknown).
+    const meta = [
+      'select uid, name from program order by name',
+      "select de.uid, de.name, os.name from dataelement de left join optionset os on os.optionsetid = de.optionsetid where de.valuetype = 'TEXT'",
+      "select table_name, column_name from information_schema.columns where table_schema = 'public'",
+      'with p as (select programid, name from program) select p.name, count(ps.*) from p join programstage ps on ps.programid = p.programid group by p.name',
+      'select extract(year from created) y, count(*) from dataelement group by 1',
+      "select o.uid from organisationunit o where o.path like '%${ou}%'",
+      'select x.v from program p, lateral jsonb_array_elements(p.translations) x(v)',
+      'select name from program union select name from programstage;',
+      'select v.uid from eventvisualization v join eventvisualization_columns c on c.eventvisualizationid = v.eventvisualizationid',
+    ];
+    const notMeta = [
+      'select * from trackedentity', 'select * from program, event', 'select * from program p, (select * from trackedentity) t',
+      'select (select count(*) from programownershiphistory) from program', 'with event as (select * from event) select * from event',
+      'with a as (select * from b), b as (select 1) select * from a', 'select * from (with t as (select 1) select * from t) x, t',
+      "select query_to_xml('select * from trackedentity', true, true, '')", 'select * from program where name = ${n}', 'select * from "${t}"',
+      'select * from program -- ${x}\n', 'select * from public.trackedentity', 'select * from pg_catalog.pg_stat_activity',
+      'select * from program; select * from event', 'do $$ begin perform 1; end $$', 'select * from (program p join trackerevent e on true)',
+      'table event', 'select * from program where uid in (table trackedentity)', 'select pg_catalog.lower(name) from program',
+      'select * from program where uid = any(select uid from singleevent)', 'select * from datavalue',
+      'select * from program p cross join lateral (select * from enrollment) e', 'with recursive r as (select 1) select * from r, enrollment',
+      TRANSFER_SQL,
+    ];
+    truthy(`${meta.length} metadata queries are metadata-only (CTEs, joins, information_schema, lateral SRFs, quoted variables)`, meta.every(A));
+    const leaked = notMeta.filter(A);
+    truthy(`${notMeta.length} queries that read — or could read — anything else are NOT (CTE shadowing, query_to_xml, TABLE, unquoted/commented variables, pg_catalog, datavalue, the transfer SQL)`, leaked.length === 0 || (bad(`leaked: ${JSON.stringify(leaked)}`), false));
+
+    // 2. Gate holes closed; aggregate audits stay readable.
+    truthy('audits/trackedEntity, audits/trackedEntityDataValue, analytics/trackedEntities/query are patient-level', ['audits/trackedEntity?trackedEntities=x', 'audits/trackedEntityDataValue', 'analytics/trackedEntities/query/nEenWmSyUEp'].every((p) => ctx.pathReadsPatientData(p)));
+    truthy('audits/dataValue and audits/dataApproval are not', !ctx.pathReadsPatientData('audits/dataValue') && !ctx.pathReadsPatientData('audits/dataApproval'));
+
+    // 3. The metadata-only exception, decided from the CURRENT server SQL.
+    vm.runInContext(`_cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+    const views = {
+      metaQry0001: { id: 'metaQry0001', type: 'QUERY', sqlQuery: "select uid, name from program where name ilike '%${q}%'" },
+      metaView001: { id: 'metaView001', type: 'VIEW', sqlQuery: 'select uid from program' },
+      trnsfer0001: { id: 'trnsfer0001', type: 'QUERY', sqlQuery: TRANSFER_SQL },
+    };
+    const fetched = [];
+    ctx.safeDhis2Fetch = async (path) => { fetched.push(path); const m = /^sqlViews\/(\w{11})\?/.exec(path); return m && views[m[1]] ? views[m[1]] : { _error: 'DHIS2 API 404', _status: 404 }; };
+    const gate = (args) => ctx.enforcePatientDataPrivacyGateAsync('dhis2_query', args);
+    truthy('cloud model: a metadata-only QUERY view is readable through dhis2_query (var passed in query_params)', (await gate({ path: 'sqlViews/metaQry0001/data', query_params: { var: 'q:anc', pageSize: 50 } })) === null);
+    truthy('…its SQL was fetched from the server for the decision', fetched.some((p) => p.startsWith('sqlViews/metaQry0001?')));
+    const tr = await gate({ path: 'sqlViews/trnsfer0001/data?var=startDate:2020-01-01' });
+    truthy('the transfer view stays refused, with the reason and a pointer to manage_sql_views run', tr && tr._privacy_block && /not metadata-only: reads .*programownershiphistory/.test(tr._error) && /manage_sql_views\(action="run"/.test(tr._hint));
+    truthy('a VIEW-type metadata view stays refused (its rows are a stored copy)', !!(await gate({ path: 'sqlViews/metaView001/data' })));
+    truthy('extra parameters (criteria) or a .csv suffix keep a metadata view refused', !!(await gate({ path: 'sqlViews/metaQry0001/data?criteria=uid:x' })) && !!(await gate({ path: 'sqlViews/metaQry0001/data.csv' })));
+    truthy('a view that cannot be read is refused', !!(await gate({ path: 'sqlViews/missing0001/data' })));
+    truthy('tracker/events is still refused with no SQL-view lookup', !!(await gate({ path: 'tracker/events?program=x' })));
+
+    // 4. manage_sql_views run on a cloud model: rows only for metadata-only views.
+    ctx.safeDhis2Fetch = async (path) => {
+      const m = /^sqlViews\/(\w{11})/.exec(path);
+      if (/\/data\?/.test(path)) return { pager: { page: 1, total: 14 }, listGrid: { headers: [{ name: 'a' }, { name: 'b' }], rows: [['x', 'y']] } };
+      return m && views[m[1]] ? { ...views[m[1]], displayName: m[1] } : { _error: 'DHIS2 API 404', _status: 404 };
+    };
+    const runT = await ctx.executeManageSqlViews({ action: 'run', id: 'trnsfer0001', variables: { startDate: '2020-01-01', endDate: '2030-12-31', orgUnit: 'ALL' } });
+    truthy('run on the transfer view: columns + row_count, rows withheld', runT.row_count === 14 && runT.columns.length === 2 && !runT.rows && /not metadata-only/i.test(runT.rows_withheld || ''));
+    const runM = await ctx.executeManageSqlViews({ action: 'run', id: 'metaQry0001', variables: { q: 'anc' } });
+    truthy('run on a metadata view returns its rows', Array.isArray(runM.rows) && runM.rows.length === 1);
+    truthy('run without a needed variable is refused before any request', /needs a value for \$\{endDate\}/.test((await ctx.executeManageSqlViews({ action: 'run', id: 'trnsfer0001', variables: { startDate: '2020-01-01', orgUnit: 'ALL' } }))._error || ''));
+    truthy('a data error from a patient-level view is not passed on verbatim', /withheld/.test(ctx.sqlViewDbError({ _body: { errorCode: 'E7144', devMessage: 'ERROR: invalid input syntax for type integer: "Jane"' } }, false).db_error) && /does not exist/.test(ctx.sqlViewDbError({ _body: { errorCode: 'E7144', devMessage: 'ERROR: column t.created does not exist' } }, false).db_error));
+
+    // 5. Pre-checks: every DHIS2 refusal found before a request.
+    const pc = (sql, minor, tv) => ctx.precheckSqlViewQuery(sql, { minor, testVariables: tv }).problems.join(' | ');
+    truthy("an illegal keyword inside a string literal ('delete me') is caught — DHIS2 refuses it there too (E4311)", /"delete"/.test(pc("select uid from program where name <> 'delete me'", 42)));
+    truthy('"lastupdated" / "x_delete" are fine', pc("select lastupdated from program where name <> 'x_delete'", 42) === '');
+    truthy('the protected userinfo table is caught (E4310)', /protected table/.test(pc('select u.username from programownershiphistory h join userinfo u on u.username = h.createdby', 42)));
+    truthy('the failed thread\'s 2.40 names are caught on 2.43 (trackedentityinstance, programinstance, trackedentityinstanceid)', (() => { const r = pc('select tei.uid from programownershiphistory owh join trackedentityinstance tei on tei.trackedentityinstanceid = owh.trackedentityinstanceid join programinstance pi on pi.programinstanceid = owh.programinstanceid', 43); return /"trackedentityinstance" does not exist/.test(r) && /"programinstance" does not exist/.test(r) && /trackedentityinstanceid → trackedentityid/.test(r); })());
+    truthy('event is right on 2.42 and wrong on 2.43 (trackerevent / singleevent)', pc('select uid from event', 42) === '' && /trackerevent/.test(pc('select uid from event', 43)) && /only exists from 2\.43/.test(pc('select uid from trackerevent', 42)));
+    truthy('a variable without a test value, or a value with ":", is caught (E4307)', /test_variables/.test(pc(TRANSFER_SQL, 42, { startDate: '2020-01-01', orgUnit: 'ALL' })) && /not a value DHIS2 accepts/.test(pc(TRANSFER_SQL, 42, { startDate: '2020-01-01T00:00', endDate: '2030-12-31', orgUnit: 'ALL' })));
+    truthy('the transfer recipe passes on 2.42 with its test values', pc(TRANSFER_SQL, 42, { startDate: '2000-01-01', endDate: '2099-12-31', orgUnit: 'ALL' }) === '');
+    truthy('sharing rw------ = nobody reads rows; r-r----- or a group with data read = readable', !ctx.sqlViewDataReaders({ public: 'rw------' }).anyone && ctx.sqlViewDataReaders({ public: 'r-r-----' }).anyone && ctx.sqlViewDataReaders({ public: '--------', userGroups: { g: { id: 'g', access: 'r-r-----' } } }).anyone);
+
+    // 6. create: refused before any request on a precheck problem; a view whose
+    //    SQL fails when run is removed again; success runs it once.
+    d.apiVersion = 42; d.writeAuth = { scope: 'broad', reason: 'verify' };
+    const calls = [];
+    let failRun = true;
+    ctx.safeDhis2Fetch = async (path, opts = {}) => {
+      calls.push(`${opts.method || 'GET'} ${path.split('?')[0]}`);
+      if (/^sqlViews\?/.test(path)) return { sqlViews: [] };
+      if (opts.method === 'POST' && path === 'sqlViews') return { status: 'OK', response: { uid: opts.body.id } };
+      if (/\/data\?/.test(path)) return failRun ? { _error: 'DHIS2 API 409', _status: 409, _body: { errorCode: 'E7144', message: 'Query failed because a referenced table does not exist. Please ensure analytics job was run', devMessage: 'ERROR: column h.created does not exist' } } : { pager: { total: 14 }, listGrid: { headers: [{ name: 'transferred_at' }], rows: [['2026-10-19 11:22']] } };
+      if (opts.method === 'DELETE') return { status: 'OK' };
+      return {};
+    };
+    const pre = await ctx.executeManageSqlViews({ action: 'create', name: 'x', sql_query: 'select uid from trackedentityinstance', test_variables: {} });
+    truthy('create with a 2.40 table name is refused with NO request', /problem/.test(pre._error || '') && calls.length === 0);
+    const failed = await ctx.executeManageSqlViews({ action: 'create', name: 'Transfer history', sql_query: TRANSFER_SQL, test_variables: { startDate: '2000-01-01', endDate: '2099-12-31', orgUnit: 'ALL' } });
+    truthy('SQL that fails when run: the real PostgreSQL error, the misleading analytics wording explained, the view removed', /E7144/.test(failed._error || '') && /h\.created does not exist/.test(failed.db_error || '') && /not about analytics/.test(failed._hint || '') && failed.view_removed === true && calls.some((c) => c.startsWith('DELETE sqlViews/')));
+    failRun = false; calls.length = 0;
+    const good = await ctx.executeManageSqlViews({ action: 'create', name: 'Transfer history', sql_query: TRANSFER_SQL, test_variables: { startDate: '2000-01-01', endDate: '2099-12-31', orgUnit: 'ALL' } });
+    truthy('success: ran once, 14 rows counted, rows withheld (patient-level), readable by every user, plugin_read sends every variable', good.success && good.test.row_count === 14 && !good.test.rows && /every logged-in user/.test(good.data_access) && /startDate:\$\{startDate\}/.test(good.plugin_read) && /orgUnit:\$\{orgUnit\}/.test(good.plugin_read));
+    truthy('…POSTed with public data-read sharing "r-r-----"', calls.includes('POST sqlViews'));
+    d.writeAuth = { scope: 'read_only', reason: 'verify' };
+    truthy('create on a read-only turn is refused by the write gate', /Refused/.test((await ctx.executeManageSqlViews({ action: 'create', name: 'y', sql_query: 'select uid from program', test_variables: {} }))._error || ''));
+
+    // 7. dhis2_query: the guessed endpoints are answered without a request.
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    calls.length = 0;
+    ctx.getSchemaIndex = async () => new Map([['dataelement', { name: 'dataElement', plural: 'dataElements' }], ['dataelements', { name: 'dataElement', plural: 'dataElements' }]]);
+    const own = await ctx.executeTool('dhis2_query', { path: 'tracker/ownership/transfer' });
+    truthy('GET tracker/ownership/transfer → answered (write-only; history = SQL view), nothing sent', own._scope === 'known_endpoint_guidance' && /manage_sql_views/.test(own._hint) && calls.length === 0);
+    truthy('GET audits → answered, nothing sent', (await ctx.executeTool('dhis2_query', { path: 'audits' }))._scope === 'known_endpoint_guidance' && calls.length === 0);
+    const sch = await ctx.executeTool('dhis2_query', { path: 'schemas/enrollment' });
+    truthy('GET schemas/enrollment → "not a metadata schema" + describe, nothing sent', /no metadata schema "enrollment"/.test(sch._error || '') && /describe/.test(sch._hint) && calls.length === 0);
+    await ctx.executeTool('dhis2_query', { path: 'schemas/dataElements?fields=name' });
+    truthy('GET schemas/dataElements is healed to schemas/dataElement (the plural is a 404)', calls.some((c) => c === 'GET schemas/dataElement'));
+
+    // 8. Wiring and routing.
+    const R = ctx.__TOOL_ROUTER;
+    truthy('manage_sql_views is routed, write-capable, manual-gated, summarised, with a manual that has the transfer recipe', !!R.manage_sql_views
+      && vm.runInContext("WRITE_CAPABLE_TOOL_NAMES.has('manage_sql_views') && MANUAL_TOOLS.has('manage_sql_views') && !!TOOL_SUMMARIES.manage_sql_views && /programownershiphistory/.test(MANUAL_EXTRAS.manage_sql_views)", ctx));
+    truthy('list / get / describe / run are discovery actions; create is not', ctx.isDiscoveryCall('manage_sql_views', { action: 'describe' }) && ctx.isDiscoveryCall('manage_sql_views', { action: 'run' }) && !ctx.isDiscoveryCall('manage_sql_views', { action: 'create' }));
+    const names = (t) => ctx.getContextualTools({ appType: 'Dashboard' }, t, false).map((x) => x.function.name);
+    const THREAD = 'can you create an install a dhis2 dashboard plugin then install it on a dashbaord that will show the transfers history that happend in all OU where we can filter by date and OU';
+    truthy('the thread\'s request gets manage_sql_views and manage_custom_app', names(THREAD).includes('manage_sql_views') && names(THREAD).includes('manage_custom_app'));
+    truthy('"use SQL View to find the transfer history" gets manage_sql_views', names('yes there is no tranfer program or stage, use SQL View to find the tranfer history').includes('manage_sql_views'));
+    truthy('an ordinary indicator request does not', !names('create a program indicator for anc visits').includes('manage_sql_views'));
+    truthy('detectSqlViewIntent: transfer history / ownership / sql view — not "transfer the data element to another stage"', ctx.detectSqlViewIntent('show the transfers history in all ou') && ctx.detectSqlViewIntent('list of transfers') && ctx.detectSqlViewIntent('create a sql view') && !ctx.detectSqlViewIntent('move this data element to another stage'));
+    const sp = await ctx.buildSystemPrompt(THREAD, false, false);
+    truthy('the system prompt explains that a transfer is an ownership transfer read with a SQL view', /OWNERSHIP transfer/.test(sp) && /programownershiphistory/.test(sp));
+
+    // 9. Placement: the user's own words were refused twice.
+    truthy('"install it on a dashbaord" (typo) is a placement request', ctx.userAskedToPlace([THREAD]));
+    truthy('"create a dashboard plugin that shows X" alone is not', !ctx.userAskedToPlace(['create a dashboard plugin that shows ANC coverage']));
+    truthy('"go ahead install and setup" after the assistant\'s "…then install it and place it on a dashboard" is a placement answer', (() => {
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: 'build a transfer widget' }, { role: 'assistant', content: "Once you confirm, I'll build a dashboard plugin with date-range filters — then install it and place it on a dashboard for you." }]; lastUserText = 'go ahead install and setup';`, ctx);
+      return ctx.placementWasRequested();
+    })());
+    truthy('…but "go ahead" after a message that offered no place is not', (() => {
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: 'build a transfer widget' }, { role: 'assistant', content: 'Here is the preview of the widget. Shall I install it?' }]; lastUserText = 'go ahead';`, ctx);
+      return !ctx.placementWasRequested();
+    })());
+    vm.runInContext('conversationHistory = []; lastUserText = "";', ctx);
+
+    // 10. Preview lint: a plugin on a view nobody can read, or without its variables.
+    const sqlv = { ok00000Vw01: { id: 'ok00000Vw01', displayName: 'T', type: 'QUERY', sqlQuery: TRANSFER_SQL, sharing: { public: 'r-r-----' } }, noRead0Vw01: { id: 'noRead0Vw01', displayName: 'Transfer History (ownership)', type: 'QUERY', sqlQuery: 'select 1 from programownershiphistory', sharing: { public: 'rw------' } } };
+    ctx.safeDhis2Fetch = async (path) => { const m = /^sqlViews\/(\w{11})\?/.exec(path); return m ? sqlv[m[1]] : {}; };
+    const cmp = (src) => ({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', src).code });
+    const noRead = await ctx.checkCustomAppSqlViews(cmp("const ID = 'noRead0Vw01'; const Q = { r: { resource: 'sqlViews/' + ID + '/data', params: { paging: false } } };"), { noRead0Vw01: 'sqlViews' });
+    truthy('the failed thread\'s plugin (view shared rw------) is refused: nobody could read it (E4312)', noRead.errors.some((e) => /NOBODY can read its rows/.test(e)));
+    const noVars = await ctx.checkCustomAppSqlViews(cmp("const Q = { r: { resource: 'sqlViews/ok00000Vw01/data', params: ({ page }) => ({ page, startDate: '2020' }) } };"), { ok00000Vw01: 'sqlViews' });
+    truthy('a plugin that never sends the view\'s variables is refused (E4307) — an object key is not sending', noVars.errors.some((e) => /never sends them/.test(e) && /startDate/.test(e)));
+    const fine = await ctx.checkCustomAppSqlViews(cmp('const Q = { r: { resource: \'sqlViews/ok00000Vw01/data\', params: ({ s, e, o, page }) => ({ var: [`startDate:${s}`, `endDate:${e}`, `orgUnit:${o}`], page, pageSize: 50 }) } };'), { ok00000Vw01: 'sqlViews' });
+    truthy('a plugin that sends every variable and pages on the server passes', fine.errors.length === 0 && fine.warnings.length === 0 && fine.views.length === 1);
+
+    // 11. Pagination page sizes (the model's transfer plugin used 25: console error on every render).
+    const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+    const pagLint = (src) => ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', src).code }, 'plugin', kitMeta, 'DASHBOARD').errors.filter((e) => /Pagination/.test(e.message));
+    const PAG = (extra) => `const { Pagination } = D2UI;\nconst PAGE_SIZE = 25;\nconst P = ({ page, n }) => <Pagination page={page} pageCount={n} pageSize={PAGE_SIZE} total={100} onPageChange={() => {}}${extra} />;`;
+    truthy('<Pagination pageSize={25}> (a constant) is refused — not on its page-size menu', pagLint(PAG('')).some((e) => /no option with the value: "25"/.test(e.message)));
+    truthy('…allowed with hidePageSizeSelect or pageSizes, and with a listed size', !pagLint(PAG(' hidePageSizeSelect')).length && !pagLint(PAG(' pageSizes={["25", "50"]}')).length && !pagLint(PAG('').replace('PAGE_SIZE = 25', 'PAGE_SIZE = 50')).length);
+    truthy('…and a useState(25) page size is caught too', pagLint('const { Pagination } = D2UI;\nconst { useState } = React;\nfunction P() { const [size, setSize] = useState(25); return <Pagination page={1} pageCount={3} pageSize={size} total={60} onPageChange={() => {}} />; }').length === 1);
+  } finally {
+    ctx.safeDhis2Fetch = saved.sdf; ctx.getSchemaIndex = saved.gsi;
+    d.apiVersion = saved.apiVersion; d.writeAuth = saved.writeAuth;
+    vm.runInContext('_cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG }; conversationHistory = []; lastUserText = "";', ctx);
+  }
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -2257,6 +2434,7 @@ setImmediate(async () => {
   if (loaded) { try { runStreamRetryChecks(); } catch (e) { bad(`stream-retry checks threw: ${e && e.stack || e}`); } }
   if (loaded) await runStatePersistenceChecks().catch((e) => bad(`state persistence checks threw: ${e && e.stack || e}`));
   if (loaded) await runPlacementChecks().catch((e) => bad(`placement checks threw: ${e && e.stack || e}`));
+  if (loaded) await runSqlViewChecks().catch((e) => bad(`SQL view checks threw: ${e && e.stack || e}`));
   if (loaded) await runCustomAppChecks().catch((e) => bad(`custom-app checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');

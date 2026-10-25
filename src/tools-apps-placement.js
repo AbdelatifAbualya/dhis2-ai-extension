@@ -438,26 +438,43 @@ async function listPluginPlacements(key) {
 // to have asked for a place — in this message or a recent one — or to be
 // answering the assistant's own "where should it go?" question.
 const PLACE_INTENT_RES = [
-  /\b(?:add|put|place|pin|show|display|insert|embed|attach)\b[^.?!]{0,80}\b(?:on|to|in|into|onto)\b[^.?!]{0,50}\b(?:dashboards?|enrol?lments?|forms?|pages?|stages?|capture|registration)\b/,
+  /\b(?:add|put|place|pin|show|display|insert|embed|attach|install|deploy|set\s*up|setup)\b[^.?!]{0,80}\b(?:on|to|in|into|onto)\b[^.?!]{0,50}\b(?:dashboards?|enrol?lments?|forms?|pages?|stages?|capture|registration)\b/,
   /\b(?:widget|plugin)s?\s+(?:on|in|to|into|onto)\s+(?:the|this|my|a|an|our)?\s*(?:[\w-]+\s+){0,3}(?:dashboards?|forms?|pages?)\b/,
   /\b(?:widget|plugin)s?\s+here\b|\bas\s+a\s+widget\s+here\b/,
   /\b(?:new|existing)\s+dashboard\s+(?:called|named)\b/,
   /\b(?:place|pin|put)\s+(?:it|them|the\s+(?:widget|plugin))\b/,
   /\btracker\s+plugin\s+configurator\b/,
 ];
+// "install it on a dashbaord" (live 2026-10-23) — the user's own request was
+// refused twice because of one transposed pair of letters. Misspellings of
+// the place nouns are read as the noun before the patterns run.
+const PLACE_NOUNS = ['dashboard', 'dashboards', 'enrollment', 'enrolment'];
+function normalizePlaceTypos(text) {
+  return String(text || '').toLowerCase().replace(/\b[a-z]{7,12}\b/g, (w) => {
+    if (PLACE_NOUNS.includes(w)) return w;
+    for (const n of PLACE_NOUNS) {
+      if (w[0] === n[0] && Math.abs(w.length - n.length) <= 2 && _editDistance(w, n) <= 2) return n;
+    }
+    return w;
+  });
+}
 function userAskedToPlace(texts) {
-  return texts.some((t) => PLACE_INTENT_RES.some((re) => re.test(String(t || '').toLowerCase())));
+  return texts.some((t) => { const n = normalizePlaceTypos(t); return PLACE_INTENT_RES.some((re) => re.test(n)); });
 }
 const messageText = (m) => (typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.map((p) => p.text || '').join(' ') : '');
+// The assistant OFFERED a place — as a question ("Should I add it to the ANC
+// dashboard?") or as the plan the user is asked to confirm ("Once you confirm,
+// I'll … install it and place it on a dashboard for you.") — not any message
+// that merely mentions a dashboard widget.
+const PLACE_OFFER_RE = /\b(?:add|put|place|pin|show|display|install)\b[^?.]{0,120}\b(?:on|to|in|into|onto)\b[^?.]{0,80}\b(?:dashboards?|enrol?lment|forms?|capture|page)\b/i;
+const PLACE_AGREE_RE = /^\s*(?:yes|yep|yeah|ok(?:ay)?|sure|please|go\s+ahead|do\s+it|proceed|continue|add\s+it|put\s+it|place\s+it|install|set\s*it\s*up|setup|confirm(?:ed)?)\b/i;
 function placementWasRequested() {
   const history = Array.isArray(conversationHistory) ? conversationHistory : [];
-  const recentUser = history.filter((m) => m && m.role === 'user').slice(-3).map(messageText);
+  const recentUser = history.filter((m) => m && m.role === 'user').slice(-4).map(messageText);
   if (userAskedToPlace([lastUserText, ...recentUser])) return true;
   const lastAssistant = [...history].reverse().find((m) => m && m.role === 'assistant' && messageText(m).trim());
-  // A question that offers a PLACE ("Should I add it to the ANC dashboard?"),
-  // not any question that happens to say "dashboard widget".
-  const offered = !!lastAssistant && /\b(?:add|put|place|pin|show|display)\b[^?.]{0,120}\b(?:on|to|in|into|onto)\b[^?.]{0,80}\b(?:dashboards?|enrol?lment|forms?|capture|page)\b[^?.]{0,80}\?/i.test(messageText(lastAssistant));
-  const agreed = /^\s*(?:yes|yep|yeah|ok(?:ay)?|sure|please|go\s+ahead|do\s+it|add\s+it|put\s+it|place\s+it)\b/i.test(lastUserText || '') || /\bdashboard\b/i.test(lastUserText || '');
+  const offered = !!lastAssistant && PLACE_OFFER_RE.test(normalizePlaceTypos(messageText(lastAssistant)));
+  const agreed = PLACE_AGREE_RE.test(lastUserText || '') || /\bdashboard\b/.test(normalizePlaceTypos(lastUserText));
   return offered && agreed;
 }
 
@@ -469,8 +486,9 @@ async function placeCustomAppPlugin(args) {
   if (!placementWasRequested()) {
     return {
       _error: 'Not placed: the user has not asked for this plugin to be put on a dashboard or in Capture.',
-      _hint: 'Installing is not placing. Tell the user it is installed, and ASK where they want it (which dashboard, or which Capture page / form). Call place after they answer. Do not route around this with manage_dashboards (it applies the same rule), and never create a dashboard nobody asked for.',
+      _hint: 'Installing is not placing. Tell the user it is installed, and ASK where they want it (which dashboard, or which Capture page / form). Call place after they answer — NOT again in this turn: the same call is refused the same way. Do not route around this with manage_dashboards (it applies the same rule), and never create a dashboard nobody asked for.',
       _awaiting_approval: true,
+      _scope: 'awaiting_placement_answer',
     };
   }
   const pa = await placementApp(args.key);

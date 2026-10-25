@@ -340,9 +340,72 @@ const CASES = [
       await page.context().close();
     },
   },
+  {
+    id: 'F',
+    title: 'Transfer-history dashboard plugin (the reported thread, verbatim) — SQL view + plugin + dashboard',
+    pageContext: { appType: 'Dashboard' },
+    placement: true,
+    // The user's own message, typos included (2026-10-23 thread, 2.43.2).
+    prompt: 'can you create an install a dhis2 dashboard plugin then install it on a dashbaord that will show the transfers history that happend in all OU where we can filter by date and OU and it shows all transfer history',
+    async placed(key) {
+      const d = await api(`dashboards?${qs({ filter: `dashboardItems.appKey:eq:${key}`, fields: 'id', paging: 'false' })}`);
+      return (d.dashboards || []).length > 0;
+    },
+    async verify(browser, app, conv) {
+      const tools = conv.transcript.flatMap((t) => t.tools).join(' ');
+      check('no guessed endpoint was probed (tracker/ownership, audits, schemas/<tracker object>)', !/dhis2_query\((?:tracker\/ownership|audits|schemas\/(?:enrollment|event|trackedEntity|programInstance))/i.test(tools), tools);
+      const views = ((await api(`sqlViews?${qs({ fields: 'id,displayName,type,sqlQuery,sharing[public,userGroups]', paging: 'false' })}`)).sqlViews || []).filter((v) => !sqlViewsBefore.has(v.id));
+      createdSqlViews.push(...views.map((v) => v.id));
+      const tv = views.find((v) => /programownershiphistory/i.test(v.sqlQuery));
+      check('it created a QUERY SQL view over programownershiphistory', tv && tv.type === 'QUERY', JSON.stringify(views.map((v) => v.displayName)));
+      check('…that its users can read (data-read sharing)', tv && ((tv.sharing && /^..r/.test(tv.sharing.public || '')) || Object.values((tv.sharing && tv.sharing.userGroups) || {}).some((g) => /^..r/.test(g.access || ''))), JSON.stringify(tv && tv.sharing));
+      const src = await fetch(`${BASE}/api/apps/${app.key}/src/plugin.jsx`, { headers: { Authorization: AUTHH } }).then((r) => r.text()).catch(() => '');
+      check('the plugin reads that view', tv && src.includes(tv.id), src.slice(0, 160));
+      const lastAnswer = conv.transcript.map((t) => t.answer).join(' ');
+      check('no false "validated on save" claim', !/validat\w* (?:the SQL )?on save|rejects invalid (?:SQL|queries) on save/i.test(lastAnswer), lastAnswer.slice(0, 200));
+      // The transfers the plugin should show, read by the test itself (admin).
+      const probe = await fetch(`${BASE}/api/sqlViews`, { method: 'POST', headers: { Authorization: AUTHH, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `ai-test-llm-probe-${Date.now()}`, type: 'QUERY', cacheStrategy: 'NO_CACHE', sharing: { public: 'r-r-----' }, sqlQuery: 'select distinct o.name from programownershiphistory h join organisationunit o on o.organisationunitid = h.organisationunitid' }) }).then((r) => r.json());
+      const pid = probe && probe.response && probe.response.uid;
+      const fromNames = pid ? ((await api(`sqlViews/${pid}/data?paging=false`)).listGrid || { rows: [] }).rows.map((r) => r[0]) : [];
+      if (pid) await apiDelete(`sqlViews/${pid}`);
+      const d = (await api(`dashboards?${qs({ filter: `dashboardItems.appKey:eq:${app.key}`, fields: 'id,displayName,created', paging: 'false' })}`)).dashboards || [];
+      check('the plugin was placed on a dashboard', d.length > 0, JSON.stringify(d));
+      for (const x of d) if (!dashboardsBefore.has(x.id)) createdDashboards.push(x.id);
+      if (!d.length) return;
+      const page = await (await browser.newContext({ viewport: { width: 1440, height: 1000 }, storageState: STATE })).newPage();
+      const log = collect(page, app.key);
+      await page.goto('about:blank');
+      await page.goto(`${BASE}/dhis-web-dashboard/#/${d[0].id}`);
+      const f = await waitFrame(page, app.key, 'plugin.html');
+      check('the plugin renders on the dashboard', !!f);
+      if (f) {
+        await settled(f);
+        await page.waitForTimeout(3000);
+        const text = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+        const shown = fromNames.filter((n) => text.includes(n));
+        check(`it shows the real transfers (org units transferred from: ${fromNames.join(', ')})`, fromNames.length > 0 && shown.length > 0 && !/could not|error|not authori[sz]ed/i.test(text), text.slice(0, 240));
+        const dates = f.locator('input[type="date"]');
+        check('it has a date filter and an org-unit filter', (await dates.count()) >= 1 && /org(?:anisation|anization)?\s*unit|\bOU\b/i.test(text), `${await dates.count()} date inputs`);
+        await shot(page, 'transfer history on its dashboard');
+        if (await dates.count()) {
+          await dates.first().fill('2099-01-01');
+          await dates.first().press('Tab');
+          await page.waitForTimeout(3500);
+          const after = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+          check('a From date in the future empties the list (the date filter works)', !fromNames.some((n) => after.includes(n)) || /\bno\b|0 transfers|nothing/i.test(after), after.slice(0, 200));
+          await shot(page, 'transfer history filtered to 2099');
+        }
+      }
+      check('no console errors / failed requests from the plugin', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
+      await page.context().close();
+    },
+  },
 ];
 
 const createdDashboards = [];
+const createdSqlViews = [];
+let sqlViewsBefore = new Set();
+let dashboardsBefore = new Set();
 const STATE = path.join(OUT, 'session-state.json');
 
 async function main() {
@@ -357,6 +420,8 @@ async function main() {
   for (const k of ['enrollmentOverviewLayout', 'enrollmentEventNewLayout', 'enrollmentEventEditLayout', 'dataEntryForms']) snap[k] = await captureKey(k);
   const backupsBefore = new Set(((await api('dataStore')) || []).includes(BACKUP_NS) ? (await api(`dataStore/${BACKUP_NS}`)) : []);
   const installed = [];
+  sqlViewsBefore = new Set(((await api('sqlViews?fields=id&paging=false')).sqlViews || []).map((v) => v.id));
+  dashboardsBefore = new Set(((await api('dashboards?fields=id&paging=false')).dashboards || []).map((v) => v.id));
   for (const c of CASES.filter((x) => !ONLY.length || ONLY.includes(x.id))) {
     cur = { id: c.id, title: c.title, prompt: c.prompt, checks: [], shots: [], logs: [] };
     R.cases.push(cur);
@@ -371,7 +436,7 @@ async function main() {
       cur.app = { key: conv.created.key, name: conv.created.displayName, plugin_type: conv.created.plugin_type || null };
       const src = await fetch(`${BASE}/api/apps/${conv.created.key}/src/manifest.ai.json`, { headers: { Authorization: AUTHH } });
       check('it carries the assistant marker + source manifest', src.ok && conv.created.developer && conv.created.developer.company === 'dhis2-ai-assistant');
-      await c.verify(browser, conv.created);
+      await c.verify(browser, conv.created, conv);
     } catch (e) {
       check(`case aborted: ${e.message}`, false, e.stack);
     }
@@ -395,13 +460,17 @@ async function main() {
       R.cases.find((x) => x.app && x.app.key === key).cleanup = r.success ? `deleted (placements removed: ${(r.placements_removed || []).length})` : r._error;
     }
     for (const id of createdDashboards) await apiDelete(`dashboards/${id}`);
+    // SQL views the chatbot created this run (and only those).
+    const viewsNow = ((await api('sqlViews?fields=id&paging=false')).sqlViews || []).map((v) => v.id).filter((id) => !sqlViewsBefore.has(id));
+    for (const id of new Set([...createdSqlViews, ...viewsNow])) await apiDelete(`sqlViews/${id}`);
     // Only the backups this run's apps caused (their reason names the app or
     // an ai-test- dashboard) — anything else written meanwhile is left alone.
     const keysNow = ((await api('dataStore')) || []).includes(BACKUP_NS) ? (await api(`dataStore/${BACKUP_NS}`)) : [];
     for (const k of keysNow.filter((x) => !backupsBefore.has(x))) {
       const e = await api(`dataStore/${BACKUP_NS}/${encodeURIComponent(k)}`);
       const why = String((e && e.reason) || '');
-      if (installed.some((key) => why.includes(key) || k.includes(`-app-${key}-`)) || /ai-test LLM/i.test(why)) await apiDelete(`dataStore/${BACKUP_NS}/${encodeURIComponent(k)}`);
+      const ofView = ((e && e.objects) || []).some((o) => o.object_type === 'sqlViews' && !sqlViewsBefore.has(o.object_id));
+      if (installed.some((key) => why.includes(key) || k.includes(`-app-${key}-`)) || /ai-test LLM/i.test(why) || ofView) await apiDelete(`dataStore/${BACKUP_NS}/${encodeURIComponent(k)}`);
     }
     cur = { id: 'Z', title: 'Server left as found', checks: [], shots: [], logs: [] };
     R.cases.push(cur);
@@ -411,6 +480,8 @@ async function main() {
       check(`dataStore/capture/${k} is exactly as before`, canon(now) === canon(snap[k]), diff.length ? `entries that differ: ${diff.join(', ')} — now ${diff.map((p) => canon((now || {})[p]).slice(0, 300)).join(' | ')}` : '');
     }
     check('no app the model installed is left', !(await aiApps()).some((a) => installed.includes(a.key)));
+    const viewsLeft = ((await api('sqlViews?fields=id&paging=false')).sqlViews || []).filter((v) => !sqlViewsBefore.has(v.id));
+    check('no SQL view the model created is left', viewsLeft.length === 0, JSON.stringify(viewsLeft));
   }
   await browser.close();
   R.finished = new Date().toISOString();

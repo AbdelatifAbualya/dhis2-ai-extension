@@ -20,7 +20,7 @@
 
 ---
 
-## The 38 tools
+## The 39 tools
 
 Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → panel.js iconMap + toolLabels → CSS`. The model is given only the subset relevant to the current page and request — usually 6–12 of them.
 
@@ -64,6 +64,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 | 36 | `manage_metadata_translations` | Translate names / short names / form names / descriptions of any metadata object into a database locale — merges (a raw PUT wipes other locales), validates locale + property keys, bulk up to 100 objects. |
 | 37 | `manage_memory` | The assistant's **learning memory**: `search` / `record` / `list` lessons about DHIS2 and API behaviour (what failed and the exact fix). Relevant lessons are also injected automatically — in the system prompt, with a tool's manual, and on a failed call. Stored only in this browser; never patient data (see below). |
 | 38 | `manage_custom_app` | **AI-built DHIS2 apps & dashboard plugins.** The model writes React JSX; the tool compiles it, safety-scans and lints it, verifies every hard-coded UID, packages it with a prebuilt runtime kit (React 18 + `@dhis2/ui` + `@dhis2/app-runtime`) and installs it (`POST /api/apps`). Actions: `list`, `get_source`, `preview`, `create`, `update`, `delete`, `rollback`. Only ever touches assistant-built `ai-*` apps; backs up before every change. See [Building apps & plugins](#building-apps--plugins). |
+| 39 | `manage_sql_views` | **DHIS2 SQL views** — data no Web API endpoint returns (tracker ownership-transfer history lives only in `programownershiphistory`) and the data source for plugins that need it. `list` / `get` / `describe` (the server's real columns via `information_schema`) / `create` (runs the view once — DHIS2 does not check SQL on save — and removes it if it fails) / `update` / `delete` (backed up) / `run` (column names + row count; rows only for metadata-only views on a cloud model). Pre-checks every server refusal (illegal words, protected tables, version-renamed tables, unset variables, sharing nobody can read) before a request. |
 
 ### Page-context auto-detection
 
@@ -104,7 +105,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 1. **Context extraction** — read URL of active DHIS2 tab → app type, program, stage, dataset, OU, TEI, viz, map.
 2. **System prompt assembly** — base rules + only the conditional blocks the request needs.
 3. **Reliability prefetch** — TEI details / visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
-4. **Tool selection** — `getContextualTools()` filters the 37 tools down to the 6–12 relevant for the request.
+4. **Tool selection** — `getContextualTools()` filters the 39 tools down to the 6–12 relevant for the request.
 5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 50 iterations per turn, 3 consecutive empty responses trigger bailout.
 6. **Persistence** — per-turn state (`knownIds`, `knownIcons`, `recentCreations`, `writeAuth`, …) survives service-worker restarts via stripped JSON snapshots.
 
@@ -283,7 +284,7 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
 ```
 dhis2-AI/
-├── manifest.json              MV3 config (v2.8.26)
+├── manifest.json              MV3 config (v2.8.27)
 ├── background.js              Service worker entry — thin importScripts() loader
 ├── src/                       Background worker modules (loaded, in order, by background.js)
 │   ├── core.js                config · state · safety gates · DHIS2 transport · backups · context
@@ -294,10 +295,13 @@ dhis2-AI/
 │   ├── tools-programs.js      program-authoring tools · plugins · standalone
 │   ├── tools-linelists.js     manage_line_lists
 │   ├── tools-admin.js         manage_users · manage_data_values · manage_metadata_translations
+│   ├── tools-sqlviews.js      manage_sql_views (SQL views · real DB columns)
 │   ├── tools-apps.js          manage_custom_app (AI-built apps & dashboard plugins)
+│   ├── tools-apps-placement.js  manage_custom_app place / unplace / placements
 │   └── agent.js               agentic loop · feedback · keepalive · screenshot · message router
 ├── scripts/
 │   ├── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
+│   ├── scenario-sql-views.js  live SQL-view / privacy-exception / endpoint-guard test (npm run sqlviews)
 │   ├── live-harness.js        real executeTool against a live DHIS2 (basic-auth fetch shim)
 │   ├── build-runtime-kit.js   DEV-ONLY: rebuilds libs/d2-kit + sucrase + fflate (pinned)
 │   ├── custom-app-scenarios/  JSX of the acceptance-test apps
@@ -348,6 +352,57 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 ## Changelog
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
+
+### 2.8.27 — SQL views, a metadata-only privacy exception, and the "transfer history" thread (2026-10-23)
+
+**The failing thread.** Asked for "a dashboard plugin that shows the transfer history of all org units, filterable by date and org unit" (2.43.2 playground), the chatbot:
+- did not know that a tracker "transfer" is an ownership transfer, recorded only in the `programownershiphistory` table;
+- probed guessed endpoints: `tracker/ownership/transfer` (405), `tracker/ownership` (404), `audits` (404), `audits/trackedEntity` (500);
+- built version 1 on a proxy signal (enrollment org unit ≠ owner org unit), with no transfer dates;
+- had placement refused twice, although the request said "install it on a dashbaord" and the user then said "go ahead install and setup";
+- once told to use a SQL view, sent `schemas/enrollment|programInstance|trackedEntityInstance` (3 × 404);
+- wrote SQL with 2.40 table and column names and the protected `userinfo` table, saved with sharing `rw------`, so every reader, admin included, gets 409 E4312;
+- told the user "DHIS2 validated the SQL on save". It does not: a view on a nonexistent table saves with 201.
+
+**New tool `manage_sql_views`** (new module `src/tools-sqlviews.js`).
+- `describe` returns the server's real columns from `information_schema`, through a temporary view that is removed again.
+- `create` / `update` run the view once and report its columns and row count. SQL that fails there is reported with the real PostgreSQL error, and the view is removed (create) or put back as it was (update).
+- Every refusal the server would give is caught before any request:
+  - the 15 illegal words, which DHIS2 matches anywhere, strings included (`'delete me'` → E4311);
+  - protected tables;
+  - tables removed in 2.41 / 2.43 (`event` became `trackerevent` + `singleevent` on 2.43);
+  - 2.40 column names;
+  - variables without a value, or with a value DHIS2 rejects;
+  - sharing nobody can read;
+  - a second view with an existing name.
+- Default sharing is `r-r-----`; every result states who can read the rows.
+
+**Privacy: metadata-only SQL views are now readable on a cloud model.** Patient data stays blocked.
+- The decision uses the view's **current** SQL, fetched at read time: a QUERY view whose every table is on a metadata allowlist (programs, data elements, org units, option sets, favourites, `information_schema` …).
+- Anything unknown fails closed: unlisted tables, functions not on a safe list (`query_to_xml`, `dblink` …), variables outside string literals or in comments, more than one statement, VIEW/MATERIALIZED_VIEW types, extra query parameters.
+- A patient-level view gives the model only its column names and row count; database errors that could quote row values are withheld.
+- Gate holes closed: `audits/trackedEntity*` / `audits/enrollment` (patient audit trails) and `analytics/trackedEntities/query`.
+
+**Other fixes from the thread.**
+- **Placement:** misspelled place nouns are recognised ("dashbaord"); "install / set up … on a dashboard" counts as asking; "go ahead" answers the assistant's own placement plan, not only a question. A refused `place` says not to retry that turn.
+- **`dhis2_query` answers guessed endpoints without sending them** (`tracker/ownership*`, bare `audits`, `schemas/<not a metadata type>`), and heals `schemas/dataElements` → `schemas/dataElement`. These refusals do not become memory "lessons".
+- **Plugin preview** refuses a plugin on a SQL view nobody can read, or one that never sends a variable the view needs. It warns on `paging:false` over a patient-level view.
+- **`<Pagination pageSize={25}>` is refused at preview.** The kit's `@dhis2/ui` page-size menu offers 5, 10, 20, 30, 40, 50, 75 and 100, so 25 logs "There is no option with the value: \"25\"" on every render. Both the failed thread's plugin and the first real-model rerun used 25. A listed size, `pageSizes` or `hidePageSizeSelect` passes; the manual says so.
+- **Knowledge.** The manuals now cover:
+  - the verified transfer-history SQL (from the user's dhis2-plugin-skill, run against 14 real transfers on 2.42.5.1);
+  - the 2.41+/2.43 tracker tables;
+  - how a plugin reads a view (variables, server-side paging, dashboard org-unit filter, the E4312 notice).
+- The routing prompt now tells the model that a "transfer" is an ownership transfer, read with a SQL view.
+
+**Verified.**
+- `npm run verify`: 650 checks, all passing, 50 of them new. They include 33 privacy-analyzer cases: CTE shadowing, `TABLE x`, commented / identifier variables, `pg_catalog`, `datavalue`.
+- `npm run sqlviews` (live, cloud provider configured): 30 of 30 checks on localhost 2.42.5.1 (14 transfers) and 30 of 30 on the 2.43.2 playground (0 transfers recorded — reported as such). Each run: 62 API calls, 0 unexpected failures (2 deliberate 409s), instance left as found.
+- Server rules were probed live on 2.42.5.1, and the tables and columns on both 2.42.5.1 and 2.43.2.
+- **Real model, the user's own message verbatim** (new case F in `npm run apps:llm`, Fireworks `deepseek-v4p1-flash-1017`, localhost):
+  - One turn, 64 s. The model described the tables, created the SQL view (14 transfers), previewed and installed the plugin, and placed it on a new dashboard.
+  - 22 DHIS2 calls, 0 failed. No guessed endpoint, no false claims.
+  - In the real Dashboard app the plugin shows the 14 transfers (from, to, by, when). The date filter works. No console errors.
+  - 20 of 20 checks pass, and the server is left as found. The first run failed only on the page-size console error, fixed above.
 
 ### Also in 2.8.26 — placing plugins: dashboards, Capture pages, Capture forms (2026-10-22)
 

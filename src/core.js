@@ -1107,6 +1107,7 @@ const DISCOVERY_ACTIONS = {
   manage_program_notifications: new Set(['list', 'get']),
   manage_backups: new Set(['list', 'get']),
   manage_custom_app: new Set(['list', 'get_source', 'preview', 'placements']),
+  manage_sql_views: new Set(['list', 'get', 'describe', 'run']),
 };
 function isDiscoveryCall(toolName, args) {
   if (DISCOVERY_ONLY_TOOLS.has(toolName)) return true;
@@ -1127,7 +1128,7 @@ function discoveryStreakStopOrNull(toolName, args) {
   if (streak < DISCOVERY_STREAK_LIMIT) return null;
   return {
     _error: `STOP researching: ${streak} read-only/discovery calls in a row this turn with NOTHING created or changed. You already have enough information to act.`,
-    _hint: `Issue the actual write the task needs NOW. To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
+    _hint: `Issue the actual write the task needs NOW (an app or plugin: manage_custom_app preview; data no endpoint has: manage_sql_views create). To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
     _scope: 'no_progress_repeat',   // feeds the circuit breaker: if the model ignores this and keeps spinning, the discovery tool is disabled and the loop ends
     _discovery_streak: streak,
   };

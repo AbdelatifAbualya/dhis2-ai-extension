@@ -438,6 +438,7 @@ const MEMORY_IGNORED_SCOPES = new Set([
   'incomplete_call', 'incomplete_call_repeat', 'circuit_breaker_tool_disabled', 'target_not_found',
   'destructive_404_limit_reached', 'http_error_limit_reached', 'repeated_identical_failure',
   'same_error_family_limit', 'no_progress_repeat', 'unknown_uid_in_args',
+  'known_endpoint_guidance', 'awaiting_placement_answer',
 ]);
 
 function memoryBeginTurn(userText, ctx, toolNames) {

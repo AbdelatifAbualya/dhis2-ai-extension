@@ -34,6 +34,8 @@
      src/tools-admin.js     administration tools (users/roles/groups, aggregate
                             data values, metadata translations) · schema-aware
                             PATCH pre-check for dhis2_query
+     src/tools-sqlviews.js  manage_sql_views — SQL views: data no Web API
+                            endpoint has (transfer history), real DB columns
      src/tools-apps.js      manage_custom_app — AI-built DHIS2 apps & dashboard
                             plugins (validate · safety-scan · package · install)
      src/tools-apps-placement.js  manage_custom_app place / unplace / placements
@@ -57,6 +59,7 @@ importScripts(
   'src/tools-programs.js',
   'src/tools-linelists.js',
   'src/tools-admin.js',
+  'src/tools-sqlviews.js',
   'src/tools-apps.js',
   'src/tools-apps-placement.js',
   'src/agent.js',

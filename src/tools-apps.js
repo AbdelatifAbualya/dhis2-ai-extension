@@ -48,6 +48,8 @@ const CUSTOM_APP_SOURCE_NAMES = ['shared.jsx', 'app.jsx', 'plugin.jsx'];
 const CUSTOM_APP_KINDS = new Set(['app', 'plugin', 'app_and_plugin']);
 const CUSTOM_APP_PLUGIN_TYPES = new Set(['DASHBOARD', 'CAPTURE']);
 const CUSTOM_APP_MAX_FILE_CHARS = 200 * 1024;
+// @dhis2/ui Pagination's default page-size menu (read from libs/d2-kit, 2026-10-23).
+const CUSTOM_APP_PAGE_SIZES = ['5', '10', '20', '30', '40', '50', '75', '100'];
 const CUSTOM_APP_ACTIONS = ['list', 'get_source', 'preview', 'create', 'update', 'delete', 'rollback', 'place', 'unplace', 'placements'];
 const CUSTOM_APP_KIT_GLOBALS = new Set([
   'React', 'ReactDOMClient', 'D2UI', 'D2Runtime', 'postRobot', 'echarts', 'D2_APP_CONFIG',
@@ -512,6 +514,37 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     }
   }
 
+  // <Pagination> draws a page-size menu of 5, 10, 20, 30, 40, 50, 75, 100 (this
+  // kit's @dhis2/ui). Any other pageSize logs "There is no option with the
+  // value: "25"" on every render — the model-written transfer-history plugin
+  // did exactly that (live 2026-10-23, deepseek-v4p1-flash), as did the failed
+  // thread's v1.1. A listed size, pageSizes, or hidePageSizeSelect fixes it.
+  for (const [file, v] of Object.entries(views)) {
+    for (const m of v.bare.matchAll(/React\.createElement\(\s*Pagination\s*,\s*\{/g)) {
+      const start = m.index + m[0].length - 1;
+      let depth = 0;
+      let end = start;
+      for (; end < v.bare.length; end++) {
+        if (v.bare[end] === '{') depth++;
+        else if (v.bare[end] === '}' && --depth === 0) break;
+      }
+      const props = v.code.slice(start, end + 1);
+      if (/\bpageSizes\s*:/.test(props) || /\bhidePageSizeSelect\s*:\s*(?!false\b)/.test(props)) continue;
+      const pm = /\bpageSize\s*:\s*([A-Za-z_$][\w$]*|\d+)/.exec(props);
+      if (!pm) continue;
+      let size = pm[1];
+      if (!/^\d+$/.test(size)) {
+        const c = new RegExp(`\\b(?:const|let|var)\\s+${size}\\s*=\\s*(\\d+)\\b`).exec(allCode)
+          || new RegExp(`\\[\\s*${size}\\s*,[^\\]]*\\]\\s*=\\s*(?:React\\.)?useState\\(\\s*(\\d+)\\s*\\)`).exec(allCode);
+        if (!c) continue;
+        size = c[1];
+      }
+      if (!CUSTOM_APP_PAGE_SIZES.includes(size)) {
+        errors.push({ file, line: lineAt(v.bare, m.index), message: `<Pagination pageSize={${size}}>: its page-size menu offers only ${CUSTOM_APP_PAGE_SIZES.join(', ')}, so every render logs "There is no option with the value: "${size}"". Use one of those sizes (in the query's pageSize too), pass hidePageSizeSelect when users cannot change it, or pass pageSizes that include "${size}".` });
+      }
+    }
+  }
+
   // Mutation shapes app-runtime refuses at runtime ("Invalid query", nothing
   // is sent): type 'delete' with data, type 'create' with id. A model-written
   // notes app deleted its last note with { type: last ? 'delete' : 'update',
@@ -651,6 +684,48 @@ async function checkCustomAppUids(uids) {
     }
   }
   return { checked: uids.length, found, unknown: uids.filter((u) => !found[u]) };
+}
+
+// A plugin reading a SQL view fails for its users when nobody has DATA read
+// on the view (HTTP 409 E4312 — superusers included: live 2026-10-23, a view
+// saved "rw------" made the installed plugin unusable) or when the code does
+// not send a variable the SQL uses (409 E4307). found = the UID check's map.
+async function checkCustomAppSqlViews(compiled, found) {
+  const errors = [];
+  const warnings = [];
+  const views = [];
+  const sv = Object.values(compiled).map((js) => customAppSourceViews(js));
+  const code = sv.map((v) => v.code).join('\n');
+  if (!/sqlViews/.test(code)) return { errors, warnings, views };
+  // Only the CONTENTS of string / template literals (bare blanks them).
+  const literals = sv.map((v) => Array.from({ length: v.code.length }, (_, i) => (v.code[i] !== v.bare[i] ? v.code[i] : '\n')).join('')).join('\n');
+  const ids = Object.keys(found || {}).filter((id) => found[id] === 'sqlViews');
+  if (!ids.length) {
+    warnings.push('The code reads sqlViews/… but names no SQL view that exists on this server — create it with manage_sql_views and use the id it returns.');
+    return { errors, warnings, views };
+  }
+  const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const id of ids) {
+    const v = await safeDhis2Fetch(`sqlViews/${id}?fields=id,displayName,type,sqlQuery,sharing`, { noTruncate: true });
+    if (!v || v._error) continue;
+    const readers = sqlViewDataReaders(v.sharing);
+    const vars = sqlViewVariables(v.sqlQuery);
+    views.push({ id, name: v.displayName, readers: readers.text, variables: vars });
+    if (!readers.anyone) {
+      errors.push(`SQL view ${id} ("${v.displayName}"): ${readers.text}. Fix it first: manage_sql_views(action="update", id="${id}", sharing={"public":"r-r-----"}) — or share it with the user groups who will use this plugin.`);
+    }
+    // A variable is sent when "name:" is inside a string or template literal:
+    // `startDate:${start}` or 'startDate:' + start (an object key is not enough).
+    const missing = vars.filter((n) => !new RegExp(`\\b${reEsc(n)}:`).test(literals));
+    if (missing.length) {
+      errors.push(`SQL view ${id} uses ${missing.map((n) => `\${${n}}`).join(', ')} but the code never sends ${missing.length > 1 ? 'them' : 'it'}: every request needs var: [\`${missing[0]}:\${…}\`${missing.length > 1 ? ', …' : ''}] or DHIS2 answers 409 E4307.`);
+    }
+    if (/\bpaging\s*:\s*(?:false|'false'|"false")/.test(code) && !analyzeSqlViewPrivacy(v.sqlQuery).metadataOnly) {
+      warnings.push(`SQL view ${id}: the code reads it with paging:false — every load downloads every row it returns. Page on the server (page, pageSize → pager.total) and filter with the view's variables.`);
+    }
+    if (v.type && v.type !== 'QUERY') warnings.push(`SQL view ${id} is a ${v.type}: its rows are a stored copy, refreshed only when it is executed again. A QUERY view is always current.`);
+  }
+  return { errors, warnings, views };
 }
 
 // API resources the code reads/writes — a plain-language summary for the user.
@@ -1104,6 +1179,16 @@ async function prepareCustomAppBuild(spec, opts = {}) {
     };
   }
 
+  const sqlCheck = await checkCustomAppSqlViews(compiled, uidCheck.found);
+  if (sqlCheck.errors.length) {
+    return {
+      _error: `The code reads ${sqlCheck.views.length > 1 ? 'SQL views' : 'a SQL view'} its users could not read: ${sqlCheck.errors.length} problem(s).`,
+      problems: sqlCheck.errors,
+      _hint: 'Fix each listed problem (the view with manage_sql_views, the code here) and preview again.',
+    };
+  }
+  lint.warnings.push(...sqlCheck.warnings);
+
   spec.usesEcharts = /(?<![\w$.])echarts\b/.test(Object.values(compiled).map((js) => customAppSourceViews(js).bare).join('\n'));
   let echartsBytes = null;
   if (spec.usesEcharts) {
@@ -1118,6 +1203,7 @@ async function prepareCustomAppBuild(spec, opts = {}) {
     report: {
       warnings: lint.warnings,
       uid_check: uidCheck,
+      sql_views: sqlCheck.views,
       api_resources: customAppApiResources(compiled),
     },
   };
@@ -1497,6 +1583,7 @@ async function executeManageCustomApp(args) {
       datastore_namespace: spec.namespace || undefined,
       uses_echarts: spec.usesEcharts,
       api_resources: prep.report.api_resources,
+      sql_views: prep.report.sql_views && prep.report.sql_views.length ? prep.report.sql_views : undefined,
       verified_uids: prep.report.uid_check.found,
       warnings: prep.report.warnings.length ? prep.report.warnings : undefined,
       server_conflicts: conflicts.length ? conflicts : undefined,

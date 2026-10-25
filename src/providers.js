@@ -1962,18 +1962,22 @@ async function detectEnrollmentAbnormalities(args, programId, orgUnitId) {
 const PATIENT_DATA_TOOL_NAMES = new Set([
   'detect_enrollment_abnormalities',
 ]);
+// The API path the server will actually serve, without query: fetch() resolves
+// dot segments (also as %2e) and backslashes and drops the #fragment, and DHIS2
+// decodes %-escapes — "programs/../tracker/trackedEntities" and
+// "tracker/%74rackedEntities" are tracker reads. safeDhis2Fetch refuses such
+// paths too (ambiguousApiPathReason); this keeps the gate correct on its own.
+// Case is kept (UIDs are case-sensitive); callers lower-case to match.
+function canonicalApiPath(rawPath) {
+  let base = String(rawPath).split(/[?#]/)[0].replace(/\\/g, '/').replace(/^\/+/, '').replace(/^api\/\d+\//i, '');
+  try { base = new URL('./' + base, 'http://h/api/0/').pathname; } catch {}
+  try { base = decodeURIComponent(base); } catch {}
+  return base.replace(/^\/+/, '').replace(/^api\/(\d+\/)?/i, '');
+}
 // True when a raw dhis2_query path targets individual patient records.
 function pathReadsPatientData(rawPath) {
   if (typeof rawPath !== 'string') return false;
-  // Match on the path the server will actually serve: fetch() resolves dot
-  // segments (also as %2e) and backslashes and drops the #fragment, and DHIS2
-  // decodes %-escapes — "programs/../tracker/trackedEntities" and
-  // "tracker/%74rackedEntities" are tracker reads. safeDhis2Fetch refuses such
-  // paths too (ambiguousApiPathReason); this keeps the gate correct on its own.
-  let base = rawPath.split(/[?#]/)[0].replace(/\\/g, '/').replace(/^\/+/, '').replace(/^api\/\d+\//i, '');
-  try { base = new URL('./' + base, 'http://h/api/0/').pathname; } catch {}
-  try { base = decodeURIComponent(base); } catch {}
-  base = base.replace(/^\/+/, '').replace(/^api\/(\d+\/)?/i, '').toLowerCase();
+  const base = canonicalApiPath(rawPath).toLowerCase();
   // Boundary `(?![a-z0-9])` = the resource name is not followed by another
   // identifier character: a sub-path (`/`), a format/extension suffix (`.json`,
   // `.csv`, `.xml`, `.geojson`, `.csv.gz`, …), a stray `%3F`/`#`, or end-of-path.
@@ -1988,17 +1992,23 @@ function pathReadsPatientData(rawPath) {
   if (/^tracker\/(events|enrollments|trackedentities|relationships)(?![a-z0-9])/.test(base)) return true;
   // Legacy tracker endpoints
   if (/^(events|enrollments|trackedentityinstances)(?![a-z0-9])/.test(base)) return true;
-  // Row-level (individual) event/enrollment analytics — aggregate is de-identified and allowed
-  if (/^analytics\/(events|enrollments)\/query(?![a-z0-9])/.test(base)) return true;
+  // Row-level (individual) analytics — aggregate is de-identified and allowed.
+  // analytics/trackedEntities/query (2.41+) lists tracked entities with their
+  // attribute values, like tracker/trackedEntities.
+  if (/^analytics\/(events|enrollments|trackedentities)\/query(?![a-z0-9])/.test(base)) return true;
+  // Tracker audit trails (who read / changed which record, old and new values).
+  // A model looking for "transfer history" reached audits/trackedEntity — it
+  // only failed because a parameter was missing (live 2026-10-23). Aggregate
+  // data-value and approval audits stay readable.
+  if (/^audits\/(?!datavalue(?![a-z0-9])|dataapproval(?![a-z0-9]))[a-z]/.test(base)) return true;
   // SQL view EXECUTION (…/data, …/execute). A saved SQL view can SELECT arbitrary
-  // columns — including patient identifiers — from any table (trackedentityinstance,
-  // event/programstageinstance, enrollment, trackedentityattributevalue, …), so
-  // executing one on a remote model could exfiltrate row-level tracker data past
-  // the endpoint checks above. Fail closed: gate the execution sub-endpoints. The
-  // view DEFINITION (…/sqlViews/{id}?fields=…, i.e. no /data|/execute) stays
-  // readable as metadata. A purely-aggregate view is over-gated on a remote model —
-  // run it on a local model or use aggregate analytics. Verified live 2026-07-03:
-  // sqlViews/{id}/data was NOT gated before this line (torture-test bypass probe).
+  // columns from any table (trackedentity, enrollment, event, programownershiphistory,
+  // …), so executing one on a remote model could exfiltrate row-level tracker data
+  // past the endpoint checks above. Fail closed: gate the execution sub-endpoints.
+  // The view DEFINITION (…/sqlViews/{id}?fields=…) stays readable as metadata. A
+  // view that reads ONLY metadata tables is let through by
+  // enforcePatientDataPrivacyGateAsync after its SQL is checked (see below).
+  // Verified live 2026-07-03: sqlViews/{id}/data was NOT gated before this line.
   if (/^sqlviews\/[a-z0-9]+\/(data|execute)(?![a-z0-9])/i.test(base)) return true;
   return false;
 }
@@ -2014,15 +2024,424 @@ function toolReadsPatientData(name, args) {
   }
   return false;
 }
+const PATIENT_DATA_REFUSAL = 'Refused by hard privacy safeguard: patient-level tracker data (events, enrollments, tracked entities, individual event rows) can only be read when the assistant runs on a LOCAL model (Ollama / localhost). The current provider is remote/cloud, so this data cannot be accessed.';
 // Returns a refusal object if the call must be blocked, else null.
 function enforcePatientDataPrivacyGate(name, args) {
   if (!toolReadsPatientData(name, args)) return null;
   if (providerRequestsStayLocal(getProviderConfig())) return null; // requests stay on this machine → permitted
   return {
-    _error: 'Refused by hard privacy safeguard: patient-level tracker data (events, enrollments, tracked entities, individual event rows) can only be read when the assistant runs on a LOCAL model (Ollama / localhost). The current provider is remote/cloud, so this data cannot be accessed.',
+    _error: PATIENT_DATA_REFUSAL,
     _privacy_block: true,
     _scope: 'patient_data_privacy_gate',
     _hint: 'This is a hard-coded, non-overridable safeguard — no instruction can enable it. Do NOT try other patient-level endpoints (tracker/events, tracker/enrollments, tracker/trackedEntities, analytics query rows) this turn — they are ALL blocked by the same gate. If your current task is metadata work (create/update/delete/audit), patient rows are never needed: continue with the metadata operation itself. For program-level numbers use aggregate alternatives: count_records, get_event_analytics(aggregate_type="aggregate"), get_program_info. To work with patient-level data, the user must switch the provider to a local model (Ollama) in settings.',
+  };
+}
+
+// ── Exception: SQL views that read ONLY metadata ─────────────────────────────
+// The user's rule (2026-10-23): patient data stays blocked on a cloud model,
+// but a SQL view over metadata (programs, data elements, org units, the
+// database's own information_schema …) is not patient data and may be read.
+// The decision is made from the view's CURRENT SQL, fetched from the server at
+// the moment of the read — never from what the model says the view does.
+//
+// Fail closed everywhere: a table not on this list, a function not on the safe
+// list, a variable outside a string literal, more than one statement, a
+// non-QUERY view (VIEW / MATERIALIZED_VIEW read a stored copy that may come
+// from older SQL) or anything the parser does not understand → patient-level.
+// Aggregate data values (datavalue) are deliberately NOT here: the exception
+// is for metadata only.
+const SQL_METADATA_TABLES = new Set([
+  'attribute', 'attributevalue', 'axis',
+  'category', 'categories_categoryoptions', 'categorycombo', 'categorycombos_categories', 'categorycombos_optioncombos',
+  'categorydimension', 'categorydimension_items', 'categoryoption', 'categoryoption_organisationunits',
+  'categoryoptioncombo', 'categoryoptioncombos_categoryoptions', 'categoryoptiongroup', 'categoryoptiongroupmembers',
+  'categoryoptiongroupset', 'categoryoptiongroupsetdimension', 'categoryoptiongroupsetdimension_items', 'categoryoptiongroupsetmembers',
+  'compulsorydatasetmembers', 'concept', 'constant',
+  'dashboard', 'dashboard_items', 'dashboarditem', 'dashboarditem_reports', 'dashboarditem_resources',
+  'dataapprovallevel', 'dataapprovalworkflow', 'dataapprovalworkflowlevels', 'datadimensionitem',
+  'dataelement', 'dataelementaggregationlevels', 'dataelementgroup', 'dataelementgroupmembers', 'dataelementgroupset',
+  'dataelementgroupsetdimension', 'dataelementgroupsetdimension_items', 'dataelementgroupsetmembers', 'dataelementlegendsets',
+  'dataelementoperand', 'dataentryform', 'datainputperiod',
+  'eventchart', 'eventreport', 'eventvisualization',
+  'dataset', 'datasetelement', 'datasetindicators', 'datasetlegendsets', 'datasetnotification_datasets',
+  'datasetnotificationtemplate', 'datasetnotificationtemplate_deliverychannel', 'datasetoperands', 'datasetsource',
+  'expression', 'expressiondimensionitem', 'externalmaplayer', 'i18nlocale', 'icon',
+  'indicator', 'indicatorgroup', 'indicatorgroupmembers', 'indicatorgroupset', 'indicatorgroupsetmembers', 'indicatorlegendsets', 'indicatortype',
+  'map', 'maplegend', 'maplegendset', 'mapmapviews', 'mapview',
+  'optiongroup', 'optiongroupmembers', 'optiongroupset', 'optiongroupsetmembers', 'optionset', 'optionvalue',
+  'organisationunit', 'orgunitgroup', 'orgunitgroupmembers', 'orgunitgroupset', 'orgunitgroupsetdimension',
+  'orgunitgroupsetdimension_items', 'orgunitgroupsetmembers', 'orgunitlevel',
+  'period', 'periodboundary', 'periodtype',
+  'predictor', 'predictorgroup', 'predictorgroupmembers', 'predictororglevels', 'predictororgunitlevels',
+  'program', 'program_attributes', 'program_organisationunits', 'programexpression',
+  'programindicator', 'programindicatorgroup', 'programindicatorgroupmembers', 'programindicatorlegendsets',
+  'programnotificationtemplate', 'programnotificationtemplate_deliverychannel',
+  'programrule', 'programruleaction', 'programrulevariable', 'programsection', 'programsection_attributes',
+  'programstage', 'programstage_programindicators', 'programstagedataelement', 'programstagesection',
+  'programstagesection_dataelements', 'programstagesection_programindicators', 'programtrackedentityattributedimensionitem',
+  'relationshipconstraint', 'relationshiptype', 'relativeperiods', 'report',
+  'section', 'sectiondataelements', 'sectiongreyedfields', 'sectionindicators', 'sqlview',
+  'trackedentityattribute', 'trackedentityattributedimension', 'trackedentityattributegroup', 'trackedentityattributelegendsets',
+  'trackedentitydataelementdimension', 'trackedentityprogramindicatordimension', 'trackedentitytype', 'trackedentitytypeattribute',
+  'usergroup', 'userrole',
+  'validationnotificationtemplate', 'validationnotificationtemplate_recipientusergroups', 'validationnotificationtemplatevalidationrules',
+  'validationrule', 'validationrulegroup', 'validationrulegroupmembers', 'validationrulegroupusergroupstoalert', 'validationruleorganisationunitlevels',
+  'visualization',
+  // Resource tables rebuilt from metadata by the analytics job.
+  '_categoryoptioncomboname', '_categorystructure', '_dataelementcategoryoptioncombo', '_dataelementgroupsetstructure',
+  '_dataelementstructure', '_dateperiodstructure', '_indicatorgroupsetstructure', '_organisationunitgroupsetstructure',
+  '_orgunitstructure', '_periodstructure',
+]);
+// Favourites keep their dimension lists in per-type link tables
+// (eventvisualization_columns, mapview_periods, …): all metadata.
+const SQL_METADATA_TABLE_RE = /^(?:visualization|eventvisualization|eventchart|eventreport|mapview)_[a-z_]+$/;
+function isSqlMetadataTable(name) {
+  return SQL_METADATA_TABLES.has(name) || SQL_METADATA_TABLE_RE.test(name);
+}
+// Functions that only compute on their arguments (no table access, no dynamic
+// SQL, no side effects). Anything else — query_to_xml, dblink, pg_read_file,
+// current_setting, set_config, a user-defined function — fails closed.
+const SQL_SAFE_FUNCTIONS = new Set([
+  'count', 'sum', 'min', 'max', 'avg', 'every', 'bool_and', 'bool_or', 'string_agg', 'array_agg', 'json_agg', 'jsonb_agg',
+  'json_object_agg', 'jsonb_object_agg', 'row_number', 'rank', 'dense_rank', 'percent_rank', 'cume_dist', 'ntile',
+  'lag', 'lead', 'first_value', 'last_value', 'nth_value',
+  'lower', 'upper', 'initcap', 'length', 'char_length', 'character_length', 'octet_length', 'concat', 'concat_ws', 'replace',
+  'split_part', 'left', 'right', 'lpad', 'rpad', 'ltrim', 'rtrim', 'btrim', 'strpos', 'reverse', 'repeat', 'translate',
+  'starts_with', 'regexp_replace', 'regexp_match', 'regexp_matches', 'regexp_split_to_array', 'regexp_split_to_table',
+  'string_to_array', 'string_to_table', 'array_to_string', 'array_length', 'array_position', 'array_remove', 'array_append',
+  'cardinality', 'unnest', 'generate_series', 'format', 'quote_literal', 'quote_ident', 'md5',
+  'to_char', 'to_date', 'to_timestamp', 'to_number', 'date_trunc', 'date_part', 'age', 'now', 'make_date', 'make_interval',
+  'justify_days', 'justify_interval', 'isfinite', 'date', 'clock_timestamp', 'statement_timestamp',
+  'abs', 'round', 'floor', 'ceil', 'ceiling', 'trunc', 'mod', 'power', 'sqrt', 'sign', 'div', 'width_bucket',
+  'to_json', 'to_jsonb', 'row_to_json', 'json_build_object', 'jsonb_build_object', 'json_build_array', 'jsonb_build_array',
+  'json_array_elements', 'json_array_elements_text', 'jsonb_array_elements', 'jsonb_array_elements_text',
+  'json_each', 'json_each_text', 'jsonb_each', 'jsonb_each_text', 'json_object_keys', 'jsonb_object_keys',
+  'json_extract_path', 'json_extract_path_text', 'jsonb_extract_path', 'jsonb_extract_path_text',
+  'json_typeof', 'jsonb_typeof', 'json_array_length', 'jsonb_array_length', 'jsonb_path_query', 'jsonb_path_exists',
+  'jsonb_pretty', 'jsonb_strip_nulls', 'json_to_recordset', 'jsonb_to_recordset', 'json_to_record', 'jsonb_to_record',
+  'st_astext', 'st_asgeojson', 'st_x', 'st_y', 'st_centroid', 'st_geometrytype', 'st_isvalid',
+  // type names used with a modifier: cast(x as numeric(10,2)), varchar(50), character varying(20)
+  'numeric', 'decimal', 'varchar', 'char', 'character', 'varying', 'bit', 'varbit', 'timestamp', 'timestamptz', 'time',
+  'timetz', 'interval', 'float', 'float4', 'float8',
+]);
+// Set-returning functions that may stand in FROM in place of a table.
+const SQL_SAFE_FROM_FUNCTIONS = new Set([
+  'generate_series', 'unnest', 'regexp_split_to_table', 'string_to_table', 'regexp_matches',
+  'json_array_elements', 'json_array_elements_text', 'jsonb_array_elements', 'jsonb_array_elements_text',
+  'json_each', 'json_each_text', 'jsonb_each', 'jsonb_each_text', 'json_object_keys', 'jsonb_object_keys',
+  'json_to_recordset', 'jsonb_to_recordset', 'json_to_record', 'jsonb_to_record', 'jsonb_path_query',
+]);
+// Keywords that may be followed by "(" without being a function call.
+const SQL_PAREN_KEYWORDS = new Set([
+  'in', 'exists', 'any', 'all', 'some', 'values', 'row', 'array', 'over', 'filter', 'within', 'group', 'by', 'and', 'or',
+  'not', 'when', 'then', 'else', 'case', 'select', 'distinct', 'on', 'where', 'having', 'using', 'as', 'is', 'like', 'ilike',
+  'similar', 'between', 'limit', 'offset', 'from', 'join', 'lateral', 'union', 'intersect', 'except', 'with', 'recursive',
+  'materialized', 'rollup', 'cube', 'grouping', 'sets', 'cast', 'coalesce', 'nullif', 'greatest', 'least', 'extract',
+  'position', 'substring', 'trim', 'overlay', 'collate', 'return', 'returning', 'partition', 'order', 'window', 'fetch',
+]);
+// Keywords that end a FROM clause at the same nesting depth.
+const SQL_FROM_END = new Set(['where', 'group', 'order', 'having', 'limit', 'offset', 'window', 'union', 'intersect', 'except', 'fetch', 'for', 'returning']);
+// Functions whose own argument list uses FROM (extract(year from d), substring(s from 2) …).
+const SQL_FROM_ARG_FUNCTIONS = new Set(['extract', 'substring', 'trim', 'overlay']);
+
+// Splits SQL into tokens. String literals become { t: 'str' }; DHIS2 variables
+// are recorded as quoted (inside '…' or $$…$$ — DHIS2 accepts only letters,
+// digits, spaces, "_" and "-" as values, so they cannot leave the literal) or
+// unquoted (anywhere else, where a value can become SQL: a table name, a
+// keyword, `1 union select …`).
+function tokenizeSqlForPrivacy(sql) {
+  const toks = [];
+  const problems = [];
+  const quotedVars = [];
+  const unquotedVars = [];
+  const noteVars = (text, into) => { for (const m of String(text).matchAll(/\$\{([^}]*)\}/g)) into.push(m[1]); };
+  const s = String(sql);
+  const n = s.length;
+  let i = 0;
+  while (i < n) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '-' && s[i + 1] === '-') {
+      const j = s.indexOf('\n', i);
+      const end = j < 0 ? n : j;
+      noteVars(s.slice(i, end), unquotedVars); // a value with a newline would end the comment
+      i = end; continue;
+    }
+    if (c === '/' && s[i + 1] === '*') {
+      let depth = 1;
+      let j = i + 2;
+      while (j < n && depth) {
+        if (s[j] === '/' && s[j + 1] === '*') { depth++; j += 2; } else if (s[j] === '*' && s[j + 1] === '/') { depth--; j += 2; } else j++;
+      }
+      if (depth) problems.push('unterminated /* comment');
+      noteVars(s.slice(i, j), unquotedVars);
+      i = j; continue;
+    }
+    if (c === "'") {
+      // E'…' strings use backslash escapes; the E was read as an identifier.
+      const prev = toks[toks.length - 1];
+      const escaped = !!(prev && prev.t === 'ident' && prev.v === 'e' && prev.end === i);
+      if (escaped) toks.pop();
+      let j = i + 1;
+      while (j < n) {
+        if (escaped && s[j] === '\\') { j += 2; continue; }
+        if (s[j] === "'") { if (s[j + 1] === "'") { j += 2; continue; } break; }
+        j++;
+      }
+      if (j >= n) problems.push('unterminated string literal');
+      noteVars(s.slice(i + 1, j), quotedVars);
+      toks.push({ t: 'str' });
+      i = j + 1; continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      while (j < n) { if (s[j] === '"') { if (s[j + 1] === '"') { j += 2; continue; } break; } j++; }
+      if (j >= n) problems.push('unterminated quoted identifier');
+      const body = s.slice(i + 1, j);
+      noteVars(body, unquotedVars); // a value inside "…" names a table or column
+      toks.push({ t: 'ident', v: body.replace(/""/g, '"').toLowerCase(), quoted: true, end: j + 1 });
+      i = j + 1; continue;
+    }
+    if (c === '$') {
+      if (s[i + 1] === '{') {
+        const j = s.indexOf('}', i);
+        if (j < 0) { problems.push('unterminated ${variable}'); break; }
+        unquotedVars.push(s.slice(i + 2, j));
+        toks.push({ t: 'var' });
+        i = j + 1; continue;
+      }
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(s.slice(i));
+      if (m) {
+        const end = s.indexOf(m[0], i + m[0].length);
+        if (end < 0) { problems.push('unterminated $$ string'); break; }
+        noteVars(s.slice(i + m[0].length, end), quotedVars);
+        toks.push({ t: 'str' });
+        i = end + m[0].length; continue;
+      }
+      problems.push('positional parameter ($n)');
+      i++; continue;
+    }
+    const id = /^[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*/.exec(s.slice(i, i + 200));
+    if (id) { toks.push({ t: 'ident', v: id[0].toLowerCase(), end: i + id[0].length }); i += id[0].length; continue; }
+    const num = /^\d+(?:\.\d+)?(?:e[+-]?\d+)?/i.exec(s.slice(i, i + 64));
+    if (num) { toks.push({ t: 'num' }); i += num[0].length; continue; }
+    if ('(),.;'.includes(c)) { toks.push({ t: c }); i++; continue; }
+    toks.push({ t: 'op', v: c });
+    i++;
+  }
+  return { toks, problems, quotedVars, unquotedVars };
+}
+
+// Index of the ")" matching the "(" at toks[open], or -1.
+function sqlMatchingParen(toks, open) {
+  let depth = 0;
+  for (let k = open; k < toks.length; k++) {
+    if (toks[k].t === '(') depth++;
+    else if (toks[k].t === ')') { depth--; if (depth === 0) return k; }
+  }
+  return -1;
+}
+
+// What a SQL query reads. metadataOnly is true only when every table it reads
+// is a metadata table and nothing in it could read anything else.
+function analyzeSqlViewPrivacy(sql) {
+  const out = { metadataOnly: false, tables: [], patientTables: [], unsafeFunctions: [], unquotedVariables: [], problems: [] };
+  if (typeof sql !== 'string' || !sql.trim()) { out.problems.push('empty SQL'); return out; }
+  const { toks, problems, unquotedVars } = tokenizeSqlForPrivacy(sql);
+  out.problems.push(...problems);
+  out.unquotedVariables = [...new Set(unquotedVars)];
+  while (toks.length && toks[toks.length - 1].t === ';') toks.pop();
+  if (toks.some((tk) => tk.t === ';')) out.problems.push('more than one statement');
+  const first = toks.find((tk) => tk.t !== '(');
+  if (!first || first.t !== 'ident' || !['select', 'with', 'values', 'table'].includes(first.v)) {
+    out.problems.push('not a SELECT query');
+  }
+
+  // Top-level WITH: CTE names and their body ranges, for scoping. Nested WITH
+  // names are not tracked — a reference to one counts as a table (fail closed).
+  const ctes = [];
+  let recursive = false;
+  let mainStart = 0;
+  const cteNameIdx = new Set();
+  if (toks[0] && toks[0].t === 'ident' && toks[0].v === 'with') {
+    let k = 1;
+    if (toks[k] && toks[k].t === 'ident' && toks[k].v === 'recursive') { recursive = true; k++; }
+    for (;;) {
+      const nameTok = toks[k];
+      if (!nameTok || nameTok.t !== 'ident') { out.problems.push('could not read the WITH clause'); break; }
+      cteNameIdx.add(k);
+      k++;
+      if (toks[k] && toks[k].t === '(') { const close = sqlMatchingParen(toks, k); if (close < 0) break; k = close + 1; }
+      if (!(toks[k] && toks[k].t === 'ident' && toks[k].v === 'as')) { out.problems.push('could not read the WITH clause'); break; }
+      k++;
+      if (toks[k] && toks[k].t === 'ident' && toks[k].v === 'not') k++;
+      if (toks[k] && toks[k].t === 'ident' && toks[k].v === 'materialized') k++;
+      if (!(toks[k] && toks[k].t === '(')) { out.problems.push('could not read the WITH clause'); break; }
+      const close = sqlMatchingParen(toks, k);
+      if (close < 0) { out.problems.push('unbalanced parentheses'); break; }
+      ctes.push({ name: nameTok.v, bodyStart: k, bodyEnd: close });
+      k = close + 1;
+      if (toks[k] && toks[k].t === ',') { k++; continue; }
+      break;
+    }
+    mainStart = k;
+  }
+  // Is the unqualified name at token index i a reference to a CTE in scope?
+  const isCteRef = (name, i) => {
+    const idx = ctes.findIndex((c) => c.name === name);
+    if (idx < 0) return false;
+    if (i >= mainStart || recursive) return true;
+    const inside = ctes.findIndex((c) => i > c.bodyStart && i < c.bodyEnd);
+    return inside > idx; // only CTEs defined EARLIER are visible inside a body
+  };
+
+  const tables = new Set();
+  const patient = new Set();
+  const unsafeFns = new Set();
+  const frames = [{ inFrom: false, expectRef: false, aliasPos: false, fnFrom: false, fromItem: false }];
+  for (let i = 0; i < toks.length; i++) {
+    const tk = toks[i];
+    const f = frames[frames.length - 1];
+    if (tk.t === '(') {
+      const prev = toks[i - 1];
+      const nf = { inFrom: false, expectRef: false, aliasPos: false, fromItem: false,
+        fnFrom: !!(prev && prev.t === 'ident' && SQL_FROM_ARG_FUNCTIONS.has(prev.v)) };
+      if (f.expectRef) {
+        // "(" where a table belongs: a subquery, or a parenthesised join list.
+        f.expectRef = false;
+        nf.fromItem = true;
+        const nx = toks[i + 1];
+        if (!(nx && nx.t === 'ident' && ['select', 'with', 'values', 'table'].includes(nx.v))) { nf.inFrom = true; nf.expectRef = true; }
+      }
+      f.aliasPos = false;
+      frames.push(nf);
+      continue;
+    }
+    if (tk.t === ')') {
+      if (frames.length > 1) { const closed = frames.pop(); if (closed.fromItem) frames[frames.length - 1].aliasPos = true; }
+      else out.problems.push('unbalanced parentheses');
+      continue;
+    }
+    if (tk.t === ',') { f.aliasPos = false; if (f.inFrom) f.expectRef = true; continue; }
+    if (tk.t !== 'ident') { f.expectRef = false; f.aliasPos = false; continue; }
+
+    const v = tk.v;
+    const next = toks[i + 1];
+    if (f.expectRef) {
+      if (!tk.quoted && (v === 'lateral' || v === 'only')) continue;
+      const parts = [v];
+      let j = i;
+      while (toks[j + 1] && toks[j + 1].t === '.' && toks[j + 2] && toks[j + 2].t === 'ident') { parts.push(toks[j + 2].v); j += 2; }
+      f.expectRef = false;
+      if (toks[j + 1] && toks[j + 1].t === '(') {
+        if (!(parts.length === 1 && SQL_SAFE_FROM_FUNCTIONS.has(parts[0]))) unsafeFns.add(parts.join('.'));
+        const close = sqlMatchingParen(toks, j + 1);
+        if (close < 0) { out.problems.push('unbalanced parentheses'); break; }
+        // Arguments are scanned like any expression; afterwards an alias may follow.
+        frames.push({ inFrom: false, expectRef: false, aliasPos: false, fnFrom: false, fromItem: true });
+        i = j + 1;
+        continue;
+      }
+      let name = null;
+      if (parts.length === 1) {
+        if (!isCteRef(parts[0], i)) name = parts[0];
+      } else if (parts.length === 2 && parts[0] === 'information_schema') {
+        tables.add(parts.join('.'));
+      } else if (parts.length === 2 && parts[0] === 'public') {
+        name = parts[1];
+      } else {
+        patient.add(parts.join('.'));
+      }
+      if (name) { tables.add(name); if (!isSqlMetadataTable(name)) patient.add(name); }
+      f.aliasPos = true;
+      i = j;
+      continue;
+    }
+    if (f.aliasPos && !tk.quoted) {
+      if (v === 'as') continue;
+      // An alias, optionally with a column list: "t (a, b)" is not a call.
+      if (!SQL_PAREN_KEYWORDS.has(v) && !SQL_FROM_END.has(v) && !['join', 'inner', 'left', 'right', 'full', 'outer', 'cross', 'natural', 'on', 'using', 'tablesample'].includes(v)) {
+        f.aliasPos = false;
+        if (next && next.t === '(') { const close = sqlMatchingParen(toks, i + 1); if (close > 0) i = close; }
+        continue;
+      }
+    } else if (f.aliasPos && tk.quoted) {
+      f.aliasPos = false;
+      if (next && next.t === '(') { const close = sqlMatchingParen(toks, i + 1); if (close > 0) i = close; }
+      continue;
+    }
+    f.aliasPos = false;
+    if (!tk.quoted) {
+      if (v === 'from') {
+        const p1 = toks[i - 1];
+        const p2 = toks[i - 2];
+        const distinctFrom = p1 && p1.t === 'ident' && p1.v === 'distinct' && p2 && p2.t === 'ident' && (p2.v === 'is' || p2.v === 'not');
+        if (!f.fnFrom && !distinctFrom) { f.inFrom = true; f.expectRef = true; }
+        continue;
+      }
+      if (v === 'join') { f.inFrom = true; f.expectRef = true; continue; }
+      if (v === 'table' && next && next.t === 'ident') { f.expectRef = true; continue; }
+      if (SQL_FROM_END.has(v)) f.inFrom = false;
+    }
+    if (next && next.t === '(' && !cteNameIdx.has(i)) {
+      const qualified = toks[i - 1] && toks[i - 1].t === '.';
+      if (qualified) unsafeFns.add(`…${v}`);
+      else if (!(SQL_PAREN_KEYWORDS.has(v) && !tk.quoted) && !SQL_SAFE_FUNCTIONS.has(v)) unsafeFns.add(v);
+    }
+  }
+  if (frames.length !== 1 && !out.problems.includes('unbalanced parentheses')) out.problems.push('unbalanced parentheses');
+
+  out.tables = [...tables];
+  out.patientTables = [...patient];
+  out.unsafeFunctions = [...unsafeFns];
+  out.metadataOnly = !out.problems.length && !out.patientTables.length && !out.unsafeFunctions.length && !out.unquotedVariables.length;
+  return out;
+}
+
+// Why a view is not metadata-only, in one line for the model and the user.
+function sqlPrivacyReason(a, viewType) {
+  if (viewType && viewType !== 'QUERY') return `it is a ${viewType} (a stored copy of its SQL's result); only QUERY views are checked`;
+  const parts = [];
+  if (a.patientTables.length) parts.push(`reads ${a.patientTables.slice(0, 6).join(', ')} (not metadata)`);
+  if (a.unsafeFunctions.length) parts.push(`calls ${a.unsafeFunctions.slice(0, 4).join(', ')}() (not on the safe-function list)`);
+  if (a.unquotedVariables.length) parts.push(`uses \${${a.unquotedVariables[0]}} outside a string literal`);
+  if (a.problems.length) parts.push(a.problems[0]);
+  return parts.join('; ') || 'it could not be checked';
+}
+
+// Query parameters a metadata-view read may carry. Anything else (criteria,
+// filter, format switches) keeps the read blocked.
+const SQL_VIEW_READ_PARAMS = new Set(['var', 'page', 'pagesize', 'paging', 'totalpages']);
+
+// Fetches the view's CURRENT definition and decides. → { metadataOnly, reason, view }
+async function sqlViewPrivacyVerdict(viewId) {
+  const def = await safeDhis2Fetch(`sqlViews/${viewId}?fields=id,displayName,type,sqlQuery`, { noTruncate: true });
+  if (!def || def._error || typeof def.sqlQuery !== 'string') {
+    return { metadataOnly: false, reason: `the view's SQL could not be read${def && def._error ? ` (${def._error})` : ''}`, view: null };
+  }
+  const a = analyzeSqlViewPrivacy(def.sqlQuery);
+  const metadataOnly = def.type === 'QUERY' && a.metadataOnly;
+  return { metadataOnly, reason: metadataOnly ? null : sqlPrivacyReason(a, def.type), view: def, analysis: a };
+}
+
+// The executeTool entry point: the synchronous gate, plus the metadata-only
+// SQL view exception for dhis2_query GET sqlViews/{id}/data.
+async function enforcePatientDataPrivacyGateAsync(name, args) {
+  const block = enforcePatientDataPrivacyGate(name, args);
+  if (!block || name !== 'dhis2_query') return block;
+  if (String(args.method || 'GET').toUpperCase() !== 'GET') return block;
+  const full = typeof appendQueryParamsToPath === 'function' ? appendQueryParamsToPath(args.path, args.query_params) : args.path;
+  const m = /^sqlViews\/([A-Za-z][A-Za-z0-9]{10})\/data(?:\.json)?$/i.exec(canonicalApiPath(full));
+  if (!m) return block;
+  const query = String(full).split('#')[0].split('?')[1] || '';
+  const params = [...new URLSearchParams(query).keys()].map((k) => k.toLowerCase());
+  if (params.some((k) => !SQL_VIEW_READ_PARAMS.has(k))) return block;
+  const verdict = await sqlViewPrivacyVerdict(m[1]);
+  if (verdict.metadataOnly) return null;
+  return {
+    ...block,
+    _error: `${PATIENT_DATA_REFUSAL} This SQL view is not metadata-only: ${verdict.reason}.`,
+    _hint: 'Only SQL views that read metadata tables alone can be read on a cloud model. To check that a view runs and see its column names and row count (no rows), use manage_sql_views(action="run", id). Do not retry this path.',
   };
 }
 

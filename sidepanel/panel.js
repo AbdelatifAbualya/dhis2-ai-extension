@@ -1664,6 +1664,7 @@ ${turnXml}
       manage_metadata_translations: { cls: 'tool-icon-create', icon: '\u{1F524}' },
       manage_memory: { cls: 'tool-icon-info', icon: '\u{1F9E0}' },
       manage_custom_app: { cls: 'tool-icon-create', icon: '\u{1F9E9}' },
+      manage_sql_views: { cls: 'tool-icon-api', icon: '\u{1F5C3}\uFE0F' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
     const iconInfo = iconMap[tool] || { cls: 'tool-icon-api', icon: '\u{1F6E0}️' };
@@ -1707,6 +1708,7 @@ ${turnXml}
       manage_metadata_translations: 'Translating metadata',
       manage_memory: 'Using learning memory',
       manage_custom_app: 'Building a DHIS2 app',
+      manage_sql_views: 'Working with SQL views',
       diagnose_save_error: 'Diagnosing save error',
     };
     // Fallback must never claim a specific tool. Labelling an unmapped tool
@@ -1995,6 +1997,15 @@ ${turnXml}
       if (args.needs_write_access) parts.push('writes data');
       if (args.target) parts.push(`→ ${String(args.target).replace(/_/g, ' ')}`);
       if (Array.isArray(args.field_map) && args.field_map.length) parts.push(`${args.field_map.length} mapped field(s)`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_sql_views') {
+      const parts = [args.action || 'list'];
+      if (args.name) parts.push(`"${String(args.name).slice(0, 40)}"`);
+      else if (args.id) parts.push(String(args.id).slice(0, 11));
+      if (Array.isArray(args.tables) && args.tables.length) parts.push(args.tables.slice(0, 4).join(', ') + (args.tables.length > 4 ? '…' : ''));
+      if (args.search) parts.push(`~${String(args.search).slice(0, 20)}`);
+      if (args.sql_query) parts.push('SQL');
+      if (args.sharing && args.sharing.public) parts.push(`sharing ${String(args.sharing.public).slice(0, 8)}`);
       detail = parts.join(', ');
     } else if (tool === 'manage_memory') {
       const parts = [args.action || 'search'];
