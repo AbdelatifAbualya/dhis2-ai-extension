@@ -2658,6 +2658,10 @@ async function safeDhis2Fetch(path, options = {}) {
     // so the request is same-origin (avoiding empty-body issues in MV3 service workers).
     // Fall back to direct service-worker fetch if no tab is available.
     let rawResp = null; // { ok, status, statusText, text }
+    // A deleted stage / rule … can no longer be asked which program it was in.
+    const captureDeletedFrom = isWrite && !options._captureBump
+      ? await captureProgramsOfDeletedObjects(method, cleanPath, bodyStr)
+      : null;
 
     if (isWrite) {
       rawResp = await fetchViaTab(fullUrl, method, headers, bodyStr);
@@ -2789,6 +2793,8 @@ async function safeDhis2Fetch(path, options = {}) {
         } : {}),
       };
     }
+
+    if (isWrite && !options._captureBump) noteCaptureMetadataWrite(method, cleanPath, bodyStr, captureDeletedFrom);
 
     if (rawResp.status === 204) return { success: true, message: 'Deleted successfully.' };
 
@@ -2939,6 +2945,174 @@ async function safeDhis2Fetch(path, options = {}) {
   } catch (err) {
     return { _error: `Fetch failed: ${err.message}`, _url: fullUrl };
   }
+}
+
+// ── Capture metadata freshness ──────────────────────────────────────────────
+// Capture (106) caches each program's metadata — stages and their data
+// elements, sections, custom forms, program rules / variables / indicators,
+// program attributes — in IndexedDB and reloads a program ONLY when
+// programs.version differs from the cached one (its getStalePrograms). DHIS2
+// does not raise that version when a stage, rule … changes (verified 2.42.5.1,
+// 2026-10-25: PUT programStages leaves it; only a program update raises it).
+// So after the assistant added a storage data element to three stages, every
+// Capture that had opened the program kept the old stages for good — reloading
+// did not help — and the form-field plugin mapped to the new element had that
+// alias silently dropped (setFieldValue refused, console-only): "I click FLAG
+// and nothing happens" (live thread 2026-10-25). Every successful write that
+// touches such metadata is noted here; executeTool raises each affected
+// program's version once when the tool call finishes.
+const CAPTURE_PROGRAM_REF_FIELDS = Object.freeze({
+  programStages: 'program[id]',
+  programStageSections: 'programStage[program[id]]',
+  programSections: 'program[id]',
+  programRules: 'program[id]',
+  programRuleVariables: 'program[id]',
+  programRuleActions: 'programRule[program[id]]',
+  programIndicators: 'program[id]',
+});
+// Objects Capture caches inside the programs that use them.
+const CAPTURE_USED_BY_PROGRAM_TYPES = new Set(['dataElements', 'trackedEntityAttributes', 'dataEntryForms']);
+const CAPTURE_BUMP_MAX_PROGRAMS = 20;
+let _captureMetaPending = null;
+
+function captureMetaPending() {
+  if (!_captureMetaPending) _captureMetaPending = { programs: new Set(), lookups: new Map(), skip: new Set() };
+  return _captureMetaPending;
+}
+
+function captureProgramIdOf(type, o) {
+  if (!o || typeof o !== 'object') return null;
+  if (type === 'programStageSections') return (o.programStage && o.programStage.program && o.programStage.program.id) || null;
+  if (type === 'programRuleActions') return (o.programRule && o.programRule.program && o.programRule.program.id) || null;
+  return (o.program && o.program.id) || null;
+}
+
+// The objects a write carries: [type, [objects]] pairs for a metadata import,
+// one pair for a single-object POST / PUT.
+function captureWrittenObjects(pathOnly, bodyStr) {
+  if (!bodyStr) return [];
+  let body;
+  try { body = JSON.parse(bodyStr); } catch { return []; }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
+  if (pathOnly === 'metadata') return Object.entries(body).filter(([, v]) => Array.isArray(v));
+  const m = pathOnly.match(/^([a-zA-Z]+)(?:\/([A-Za-z][A-Za-z0-9]{10}))?$/);
+  if (!m) return [];
+  return [[m[1], [{ ...body, id: body.id || m[2] }]]];
+}
+
+// Before a DELETE: the programs the deleted objects belong to.
+async function captureProgramsOfDeletedObjects(method, cleanPath, bodyStr) {
+  const pathOnly = cleanPath.split('?')[0];
+  const want = new Map();
+  if (method === 'DELETE') {
+    const m = pathOnly.match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
+    if (m && CAPTURE_PROGRAM_REF_FIELDS[m[1]]) want.set(m[1], [m[2]]);
+  } else if (method === 'POST' && pathOnly === 'metadata' && /importStrategy=DELETE/i.test(cleanPath)) {
+    for (const [type, objs] of captureWrittenObjects(pathOnly, bodyStr)) {
+      if (!CAPTURE_PROGRAM_REF_FIELDS[type]) continue;
+      want.set(type, objs.map((o) => o && o.id).filter((id) => typeof id === 'string').slice(0, 50));
+    }
+  }
+  if (!want.size) return null;
+  const out = new Set();
+  for (const [type, ids] of want) for (const id of await captureResolvePrograms(type, ids)) out.add(id);
+  return [...out];
+}
+
+async function captureResolvePrograms(type, ids) {
+  const list = [...new Set(ids)].filter((id) => /^[A-Za-z][A-Za-z0-9]{10}$/.test(id)).slice(0, 100);
+  if (!list.length) return [];
+  const inList = `[${list.join(',')}]`;
+  const out = new Set();
+  const opts = { noTruncate: true, _captureBump: true };
+  if (CAPTURE_PROGRAM_REF_FIELDS[type]) {
+    const r = await safeDhis2Fetch(`${type}?filter=id:in:${inList}&fields=id,${CAPTURE_PROGRAM_REF_FIELDS[type]}&paging=false`, opts);
+    for (const o of (r && r[type]) || []) { const p = captureProgramIdOf(type, o); if (p) out.add(p); }
+  } else if (type === 'dataElements' || type === 'dataEntryForms') {
+    const f = type === 'dataElements' ? 'programStageDataElements.dataElement.id' : 'dataEntryForm.id';
+    const r = await safeDhis2Fetch(`programStages?filter=${f}:in:${inList}&fields=program[id]&paging=false`, opts);
+    for (const s of (r && r.programStages) || []) if (s.program && s.program.id) out.add(s.program.id);
+    if (type === 'dataEntryForms') {
+      const p = await safeDhis2Fetch(`programs?filter=dataEntryForm.id:in:${inList}&fields=id&paging=false`, opts);
+      for (const x of (p && p.programs) || []) out.add(x.id);
+    }
+  } else if (type === 'trackedEntityAttributes') {
+    const r = await safeDhis2Fetch(`programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:in:${inList}&fields=id&paging=false`, opts);
+    for (const x of (r && r.programs) || []) out.add(x.id);
+  }
+  return [...out];
+}
+
+// After a successful write: remember which programs Capture must reload.
+// Programs the payload itself creates or updates are left alone — a new one
+// is in nobody's cache, and DHIS2 raises an updated one's version itself.
+function noteCaptureMetadataWrite(method, cleanPath, bodyStr, deletedFrom) {
+  try {
+    const pend = captureMetaPending();
+    for (const id of deletedFrom || []) pend.programs.add(id);
+    const pathOnly = cleanPath.split('?')[0];
+    if (method === 'DELETE' || /importStrategy=DELETE/i.test(cleanPath)) return;
+    const pm = pathOnly.match(/^programs\/([A-Za-z][A-Za-z0-9]{10})$/);
+    if (pm && method === 'PATCH') { pend.programs.add(pm[1]); return; }
+    const addLookup = (type, id) => {
+      if (!pend.lookups.has(type)) pend.lookups.set(type, new Set());
+      pend.lookups.get(type).add(id);
+    };
+    const relevant = (type) => !!CAPTURE_PROGRAM_REF_FIELDS[type] || CAPTURE_USED_BY_PROGRAM_TYPES.has(type);
+    let found = false;
+    for (const [type, objs] of captureWrittenObjects(pathOnly, bodyStr)) {
+      if (type === 'programs') { for (const o of objs) if (o && o.id) pend.skip.add(o.id); continue; }
+      if (!relevant(type)) continue;
+      for (const o of objs.slice(0, 200)) {
+        const p = CAPTURE_PROGRAM_REF_FIELDS[type] ? captureProgramIdOf(type, o) : null;
+        if (p) { pend.programs.add(p); found = true; } else if (o && typeof o.id === 'string') { addLookup(type, o.id); found = true; }
+      }
+    }
+    // PATCH bodies (JSON Patch arrays) and sub-resource writes name no program:
+    // look the object up by the id in the path.
+    const one = pathOnly.match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})(?:\/|$)/);
+    if (!found && one && relevant(one[1])) addLookup(one[1], one[2]);
+  } catch (e) {
+    console.warn('[capture-refresh] could not note a write:', e && e.message);
+  }
+}
+
+// Mark a program for a version bump (a placement that found Capture's copy of
+// it out of date).
+function noteCaptureProgramChanged(programId) {
+  if (programId) captureMetaPending().programs.add(programId);
+}
+
+// Raise programs.version (+1) of every program noted since the last flush.
+// → null when nothing was noted, else { bumped:[…], failed:[…], note }.
+async function flushCaptureProgramVersionBumps() {
+  const pend = _captureMetaPending;
+  _captureMetaPending = null;
+  if (!pend || (!pend.programs.size && !pend.lookups.size)) return null;
+  const programs = new Set(pend.programs);
+  for (const [type, ids] of pend.lookups) {
+    for (const id of await captureResolvePrograms(type, [...ids])) programs.add(id);
+  }
+  for (const id of pend.skip) programs.delete(id);
+  if (!programs.size) return null;
+  const bumped = [];
+  const failed = [];
+  for (const id of [...programs].slice(0, CAPTURE_BUMP_MAX_PROGRAMS)) {
+    const p = await safeDhis2Fetch(`programs/${id}?fields=id,displayName,version`, { noTruncate: true, _captureBump: true });
+    if (!p || p._error) { if (p && p._status !== 404) failed.push({ program_id: id, error: p._error }); continue; }
+    const from = Number(p.version) || 0;
+    const r = await safeDhis2Fetch(`programs/${id}`, { method: 'PATCH', body: [{ op: 'add', path: '/version', value: from + 1 }], _captureBump: true });
+    if (r && r._error) failed.push({ program_id: id, program_name: p.displayName, error: r._error });
+    else bumped.push({ program_id: id, program_name: p.displayName, version: `${from} → ${from + 1}` });
+  }
+  if (!bumped.length && !failed.length) return null;
+  return {
+    bumped,
+    failed: failed.length ? failed : undefined,
+    note: bumped.length
+      ? 'Program version raised so every Capture user reloads this program\'s stages, forms, rules and indicators (Capture caches them and refreshes only when the version changes). A Capture tab that is already open needs one reload.'
+      : 'Could not raise the program version — Capture users who already opened this program keep seeing the old stages/rules until it changes: ask an admin to save the program once in the Maintenance app.',
+  };
 }
 
 const TRACKER_BUNDLE_KEYS = ['events', 'trackedEntities', 'enrollments', 'relationships'];

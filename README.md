@@ -353,6 +353,79 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.28 — Plugins that work together, and Capture seeing metadata changes (2026-10-25)
+
+**The failing thread.** Asked for a form-field plugin with a red FLAG next to every data element of the MCH stages, plus an enrollment widget listing the flagged values, the chatbot needed five versions.
+- **v1.1: "I click FLAG and nothing happens."** The cause (reproduced in real Capture 106): the new storage data element had been added to the stages without raising `programs.version`. Capture caches each program and reloads it only on a version change, so it kept the old stages, even after a reload. It dropped the plugin's `flags` alias ("could not find programStageDataElement") and refused `setFieldValue` with a console-only error.
+- **v1.2:** the chatbot blamed `needs_write_access` (unrelated: `setFieldValue` is not a server write) and made the button flip locally, so it now *looked* flagged while nothing was stored.
+- **v2.0–2.1:** moved the state to one dataStore key holding every enrollment. The enrollment came from the parent URL, but with the wrong parameter name (`enrollment=`; Capture uses `enrollmentId=`, and only `eventId=` on the edit page).
+- **v2.2:** told the user the parent URL "cannot be read from an iframe" (false: same origin, verified) and shipped a global "active enrollment" pointer that the widget writes for the form plugin. Two users or tabs overwrite it; patient values sit in an unreserved namespace shared public read-write; the program's access control is bypassed.
+
+**Capture refresh, for every tool.** Any successful write that changes a program's stages, data elements, sections, custom forms, rules, rule variables / actions or indicators is noted in `safeDhis2Fetch`. When the outermost `executeTool` call finishes, each affected program's version is raised once, with a JSON patch on `/version`. The result reports `capture_refresh`.
+- Programs the same import creates or updates are left alone: a new program is uncached, and DHIS2 raises an updated program's version itself.
+- A deleted object's program is resolved before the delete.
+- Verified on 2.42.5.1: a stage PUT leaves the version unchanged; the patch raises it; Capture reloads.
+
+**Placement (`manage_custom_app`).**
+- `place` (form) also raises the version when Capture's copy is older than the last stage or rule change (`capture_cache`).
+- The plugin URL now carries `?programId=…&programStageId=…`: form-field plugins get no such prop, and the edit-event URL has no stage.
+- `place` warns when JSON state is written to a visible field (`replace_field:true`; never HIDEFIELD, which blanks the value).
+- `unplace` puts a plugin-owned field back in its own section, in metadata order, so the config returns to Capture's default. Before, every re-place added a section.
+- `placements` without a key lists every assistant-built plugin.
+- The alias checker resolves `fieldId: CONST` and accepts plugins that iterate `fieldsMetadata`.
+
+**Lint.**
+- Warns when `setFieldValue` is used without checking `fieldsMetadata`.
+- Warns when the code names a dataStore namespace (literal, `'dataStore/' + NS` or a template with `const NS`) that neither this app, an installed app, nor a preview in this conversation reserves. Unreserved entries are shared public read-write (verified). Replaying the thread's installed v2.2.0 code through `preview` now flags `ai-mch-flags` in both plugins.
+
+**Patient data never goes into the dataStore (user rule, 2026-10-25).** Enforced in code, not only in the manual.
+- `preview` REFUSES code that writes the dataStore or userDataStore when it can see patient data:
+  - every Capture plugin (its props are a patient's record);
+  - any file that reads `tracker/*`, `events`, `enrollments`, `relationships`, event / enrollment line-list analytics, or a SQL view.
+- A write is detected as:
+  - a mutation object (create / update / replace / json-patch) whose resource names the dataStore, directly, through a variable, or by shorthand;
+  - or a POST / PUT / PATCH request to it.
+- It has its own top-line error, so the model redesigns instead of debugging.
+- Still allowed:
+  - a Capture plugin READING its settings;
+  - `app.jsx` of an `app_and_plugin` writing them;
+  - dashboard per-item settings;
+  - plugins writing tracker data.
+- Replaying the thread's installed v2.2.0 code through `preview` now refuses both plugins.
+- `dhis2_query` refuses a dataStore / userDataStore write when its body carries tracker record fields (enrollment / event / tracked-entity ids, `dataValues` …). It also refuses any dataStore write after the turn has already read patient-level data. That tracking works whether or not learning memory is on.
+
+**Routing.** The custom-app section of the system prompt now also appears on follow-up turns in a thread that used `manage_custom_app`. Before, "I click FLAG and nothing happens" named no app, so the model got no guidance and diagnosed by guessing. The section adds two rules:
+- state the shared-data contract first;
+- diagnose a "does nothing" report with real reads (placements, source, stage fields) and claim only verified causes.
+
+**Manual (custom apps).**
+- Verified form-field facts:
+  - `fieldsMetadata` has no `id` or `displayName`; options are `{code, text}`;
+  - `values` holds only non-empty fields;
+  - Capture's address parameters for the new / edit / registration pages;
+  - view mode until "Edit event";
+  - Save happens in the background.
+- New section **"Plugins that work together"**:
+  - design the contract first;
+  - state about a record lives in tracker data;
+  - a namespace owned by one app;
+  - one dataStore key per record if dataStore is insisted on;
+  - never a shared "current record" pointer;
+  - widgets refetch after Capture's background save.
+- New section **"When a plugin does nothing"**: verify before naming a cause, the check order, and "placed" is not "working".
+
+**Verified.**
+- `npm run verify`: 687 checks, all green (37 new).
+- `npm run apps`: the full suite, 346 checks, all green against localhost 2.42.5.1 / Capture 106.2.2 (scenario 9 skipped: needs an LLM key). New scenario 14 drives the recommended design in real Capture:
+  - add the storage element with the real tool → version +1;
+  - install both plugins with no lint warnings;
+  - place them (storage field plugin-owned, URL context);
+  - flag → FLAGGED, then Save;
+  - the widget shows the card;
+  - the value is saved with the event;
+  - zero failed API calls;
+  - everything removed again.
+
 ### 2.8.27 — SQL views, a metadata-only privacy exception, and the "transfer history" thread (2026-10-23)
 
 **The failing thread.** Asked for "a dashboard plugin that shows the transfer history of all org units, filterable by date and org unit" (2.43.2 playground), the chatbot:

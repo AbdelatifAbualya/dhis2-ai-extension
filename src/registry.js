@@ -2438,7 +2438,7 @@ Actions:
 - rollback — reinstall a previous version from backup (latest by default, or version / backup_key).
 - place — show an installed plugin where users work: target "dashboard" (dashboard_id, or dashboard_name for a new dashboard), "enrollment_dashboard" / "enrollment_event_new" / "enrollment_event_edit" (program_id, column, position) for a Capture widget, or "form" (program_stage_id or program_id + field_map) for a Capture form-field plugin. Writes the Tracker Plugin Configurator's own configuration, backed up first.
 - unplace — take a plugin off dashboards / Capture (all, or one target). delete does this automatically.
-- placements — where a plugin is currently shown.
+- placements — where a plugin is currently shown (without key: every assistant-built plugin, with its form field maps).
 
 Files (strings of JSX): app.jsx (kind "app"), plugin.jsx (kind "plugin"), both for "app_and_plugin"; optional shared.jsx is loaded first and its top-level declarations are visible to both. Only the kit globals exist — React, ReactDOMClient, D2UI, D2Runtime, postRobot, echarts (auto-bundled when referenced), D2_APP_CONFIG — no imports, no npm packages.
 
@@ -3310,7 +3310,7 @@ ReactDOMClient.createRoot(document.getElementById('root')).render(<Provider conf
 - Resources are RELATIVE ('analytics', 'programs', 'dataStore/…') — never absolute URLs.
 - A Modal is open whenever it is rendered: render it only when needed ({target && <Modal onClose={…}>…</Modal>}) or pass hide={!open}. An always-rendered Modal's backdrop blocks every click in the app (the tool refuses it).
 - Mutation shapes the runtime REFUSES ("Invalid query", nothing is sent): type 'delete' WITH data, type 'create' WITH id, json-patch without an array. Deleting the last item of a list kept in one key: update the key with [] (or a separate { resource, type: 'delete' } with no data) — never one object whose type switches to 'delete' while it still carries data.
-- Saved data lives in the app's own namespace (D2_APP_CONFIG.namespace, needs_write_access:true). ONE key that may not exist yet: read \`{ s: { resource: \`dataStore/\${D2_APP_CONFIG.namespace}\`, params: { fields: '.', filter: '_:eq:notes' } } }\` → data.s.entries[0]?.value (HTTP 200 with entries [] when nothing is saved). All keys: params { fields: '.', pageSize: 200 } → entries [{ key, value }]. NEVER GET dataStore/<ns>/<key> (query or engine.fetch) — it is a 404 until the first save, a failed request on every first visit; the tool refuses it. Save with engine.mutate({ resource: \`dataStore/\${ns}/<key>\`, type: saved ? 'update' : 'create', data }) — 'create' on an existing key is a 409, 'update' on a missing one a 404, so track which applies.
+- Saved data lives in the app's own namespace (D2_APP_CONFIG.namespace, needs_write_access:true) — settings and app data only, NEVER patient data (refused: see "Plugins that work together"). ONE key that may not exist yet: read \`{ s: { resource: \`dataStore/\${D2_APP_CONFIG.namespace}\`, params: { fields: '.', filter: '_:eq:notes' } } }\` → data.s.entries[0]?.value (HTTP 200 with entries [] when nothing is saved). All keys: params { fields: '.', pageSize: 200 } → entries [{ key, value }]. NEVER GET dataStore/<ns>/<key> (query or engine.fetch) — it is a 404 until the first save, a failed request on every first visit; the tool refuses it. Save with engine.mutate({ resource: \`dataStore/\${ns}/<key>\`, type: saved ? 'update' : 'create', data }) — 'create' on an existing key is a 409, 'update' on a missing one a 404, so track which applies.
 - Analytics: resource 'analytics', params { dimension: ['dx:ID1;ID2', 'pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'] } → { headers:[{ name }], rows, metaData:{ items:{ <id>:{ name } } } }. Find columns by header name; values are STRINGS → Number(v). A dx with no data has NO row — show "No data" for it, never 0.
 - Event counts: resource \`analytics/events/aggregate/\${programId}\`, params { dimension: ['pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'], outputType: 'EVENT' } — a count with no events is the row ['0'], not an empty result.
 - Variables are read once per mount: render the data part in a child component with key={ou + '|' + pe} so a filter change remounts it and refetches (or call refetch(newVariables)).
@@ -3387,22 +3387,27 @@ function Plugin({ enrollmentId, setPluginHeight }) {
 - Height: report the height of #root as above (Capture plugin pages make #root display: flow-root, so every margin is inside it). Never report a wrapper's offsetHeight (its own margins are left out and Capture cuts them off) and never give the content height '100%' (it then reports the frame's own height and never shrinks).
 - Look: Capture draws its own widgets as cards — background white, border '1px solid var(--colors-grey400)', borderRadius 3, a header row (minHeight 44, padding '8px 8px 8px 12px', fontSize 15, fontWeight 500, color var(--colors-grey800)) and content padding '0 12px 12px'. Draw the same card so the plugin looks like part of Capture (the frame itself has no border).
 - Layout: the enrollment-dashboard column is only ~350–450 px wide. Show a LIST (name on one line, the details as a smaller line under it), not a multi-column table — long names overflow table cells. Let text wrap (overflowWrap: 'anywhere'). Leave out events that have no values (e.g. SCHEDULE events): one short line like "2 scheduled orders with nothing recorded yet" instead of an empty block each.
+- Data written elsewhere (another plugin, the event form): Capture shows the dashboard before an event save reaches the server — refetch as described under "Plugins that work together" (Freshness).
 - Data: the plugin reads the enrollment in the USER's browser with their own access. You never read patient rows to build or test it (the privacy gate refuses them on a cloud model): take the stage, data element and option-set UIDs from get_program_info, map option codes to names with optionSets/<id>?fields=options[code,displayName], and handle "no events yet".
 - Placement: after install, put it on the page with place(target "enrollment_dashboard", program_id, column "right" | "left", position "top" | "bottom") — or "enrollment_event_new" / "enrollment_event_edit" for the add-event / edit-event pages, which also pass programStageId and eventId. The tool writes Capture's own layout for that program (starting from Capture's default when the program has none) and backs it up. Tell the user to reload the Capture tab once. Never write dataStore/capture with dhis2_query — that is blocked; place is the only way.
 
 ### Capture form-field plugins (plugin.jsx, plugin_type "CAPTURE", placed with target "form")
-A form-field plugin sits INSIDE a data entry form (a tracker stage's event form, or a program's registration form) and reads / writes only the fields mapped to it. Verified props: { values, setFieldValue, setContextFieldValue, fieldsMetadata, errors, warnings, formSubmitted, viewMode, orgUnitId } plus setPluginHeight — no programId / enrollmentId. values, fieldsMetadata, errors and warnings are keyed by the ALIASES you choose (plugin_field in field_map); setFieldValue({ fieldId: '<alias>', value }) only accepts mapped aliases.
+A form-field plugin sits INSIDE a data entry form (a tracker stage's event form, or a program's registration form) and reads / writes only the fields mapped to it. Props, verified in Capture 106: { values, setFieldValue, setContextFieldValue, fieldsMetadata, errors, warnings, formSubmitted, viewMode, orgUnitId, setPluginHeight, alertsAdd } — NO programId, stage, enrollmentId, eventId or teiId. values, fieldsMetadata, errors and warnings are keyed by the ALIASES you choose (plugin_field in field_map); setFieldValue({ fieldId: '<alias>', value }) only accepts mapped aliases.
+- fieldsMetadata[alias] = { formName, name, shortName, description, type (the value type), compulsory, disabled, optionSet?: { options: [{ code, text }] } } — there is NO id and no displayName: label with formName || name, show an option's text for its code. When the code needs a field's UID, use the UID itself as the alias (plugin_field = field_id).
+- values holds only NON-EMPTY fields (an empty field is absent, not ''), plus context entries such as complete.
+- setFieldValue never fails loudly: a write to an alias Capture did not give the plugin is ignored with a console-only error. Before writing, check fieldsMetadata[alias] exists and otherwise SHOW a message ("The storage field is not in this form — reload Capture or re-place the plugin"). A control that silently does nothing is the worst outcome.
 \`\`\`
 // Aliases used here: weight, height (read) and bmi (written) — place with
 // field_map [{ plugin_field: 'weight', field_id: '<DE>' }, { plugin_field: 'height', field_id: '<DE>' }, { plugin_field: 'bmi', field_id: '<DE>' }]
-function Plugin({ values = {}, setFieldValue, viewMode, setPluginHeight }) {
+function Plugin({ values = {}, fieldsMetadata = {}, setFieldValue, viewMode, setPluginHeight }) {
   const w = parseFloat(values.weight);
   const h = parseFloat(values.height);
   const bmi = w > 0 && h > 0 ? (w / ((h / 100) ** 2)).toFixed(1) : '';
+  const canWrite = !!fieldsMetadata.bmi && typeof setFieldValue === 'function';
   useEffect(() => {                       // write only when it changed, never in view mode
-    if (viewMode || typeof setFieldValue !== 'function') return;
+    if (viewMode || !canWrite) return;
     if (String(values.bmi ?? '') !== bmi) setFieldValue({ fieldId: 'bmi', value: bmi });
-  }, [bmi, viewMode]);
+  }, [bmi, viewMode, canWrite]);
   useEffect(() => {                       // same height reporting as the enrollment widget
     const root = document.getElementById('root');
     if (typeof setPluginHeight !== 'function') return;
@@ -3410,14 +3415,42 @@ function Plugin({ values = {}, setFieldValue, viewMode, setPluginHeight }) {
     ro.observe(root);
     return () => ro.disconnect();
   }, [setPluginHeight]);
+  if (!canWrite && !viewMode) return <div style={{ color: 'var(--colors-red700)' }}>The BMI field is not available in this form.</div>;
   return <div style={{ padding: '4px 0' }}>{bmi ? 'BMI ' + bmi + ' kg/m²' : 'Enter weight and height to calculate BMI'}</div>;
 }
 \`\`\`
 - Value formats for setFieldValue: numbers, text and option codes are STRINGS ("42", "code1"); DATE "YYYY-MM-DD"; BOOLEAN 'true' | 'false'; TRUE_ONLY 'true'; AGE { date }; COORDINATE { latitude, longitude }; ORGANISATION_UNIT { id }. Clear a value with ''. values arrive in the same formats.
 - setContextFieldValue({ fieldId: 'occurredAt' | 'enrolledAt' | 'geometry', value }) sets the event / enrollment date or geometry.
-- Keep it compact (it sits between form fields), report its height like the enrollment widget, and do nothing that writes in viewMode.
-- field_map: map EXACTLY the aliases the code uses — the tool refuses a placement whose code writes an unmapped alias. field_id must be a data element of that stage (event form) or an attribute of the program (registration form); take them from get_program_info. replace_field:true takes the field out of its normal place (the plugin then draws its own input for it); the default false keeps the normal input visible — right for calculated fields the plugin fills.
+- setFieldValue only changes the form: the value reaches the server when the user SAVES the event, like any typed value. It is not a server write — needs_write_access is about engine.mutate / dataStore / API writes only and has nothing to do with it.
+- Keep it compact (it sits between form fields), report its height like the enrollment widget, and do nothing that writes in viewMode (an event opened from the enrollment dashboard starts in view mode until the user clicks "Edit event").
+- field_map: map EXACTLY the aliases the code uses — the tool refuses a placement whose code writes an unmapped alias. field_id must be a data element of that stage (event form) or an attribute of the program (registration form); take them from get_program_info. replace_field:true takes the field out of its normal place: the plugin owns it (draws its own control, or keeps it as hidden state) and its value is still saved with the event. The default false keeps the normal input visible — right for calculated fields the plugin fills.
+- A field that holds plugin STATE (JSON, flags, a checklist) → its own data element (LONG_TEXT) mapped with replace_field:true. Never hide it with a HIDEFIELD program rule: Capture BLANKS the value of every hidden field, so the state would be wiped on every edit.
+- Which record / stage the form is for: the placement opens the plugin as plugin.html?programId=…&programStageId=… (new URLSearchParams(window.location.search)). The record itself is not a prop. Prefer a design that does not need it (state in the event's own field, above). When it truly must know it, read Capture's address — the plugin frame is same-origin, so window.parent.location.hash is readable (verified):
+  add event: "#/enrollmentEventNew?enrollmentId=…&programId=…&stageId=…&teiId=…&orgUnitId=…" (no event id yet)
+  edit event: "#/enrollmentEventEdit?eventId=…&orgUnitId=…" (only the event — get its enrollment with tracker/events/<eventId>?fields=enrollment,trackedEntity,programStage)
+  registration: "#/new?programId=…&orgUnitId=…" (no record yet)
+  Parse it with new URLSearchParams(hash.slice(hash.indexOf('?') + 1)) — the param names are enrollmentId / eventId / teiId / stageId, never "enrollment=". It is Capture's internal URL, not the plugin contract: handle "not found" with a visible message, and re-read it when the props update.
 - place target "form" with program_stage_id (event form) or program_id (registration form); section = an existing section to put it in, else it gets its own section; position top | bottom.
+
+### Plugins that work together (shared state)
+When two or more plugins / apps cooperate ("flag in the form → list on the enrollment", "checklist here → summary there"), DESIGN THE CONTRACT BEFORE ANY CODE and say it to the user in 3–5 lines:
+1. What each plugin reads and writes, and WHERE that shared state lives.
+2. How each plugin knows which record it is on — from its verified props (enrollment widget: enrollmentId / teiId / programId; event-page widget: + eventId / programStageId; form-field plugin: none — see above), never from an assumed prop.
+3. When each plugin sees the other's change (save, reload, refetch).
+Where the state lives:
+- About a patient record (flags, review status, notes, scores) → TRACKER DATA: a data element on the event (written with setFieldValue, saved with the event), an attribute, or a note. It then has the program's access control (org units, sharing, ownership), the audit trail, analytics and offline support, and the enrollment widget finds it by reading the enrollment's events (tracker/events?enrollments=<enrollmentId>&fields=event,programStage,occurredAt,updatedAt,dataValues[dataElement,value]). This is the default.
+- Not about one record (settings, layouts, lookup lists, per-dashboard-item config) → the dataStore, in a namespace an app RESERVES (D2_APP_CONFIG.namespace — the app key). Plugins sharing it: one app owns the namespace (its key, from the default datastore_namespace) and the others read that namespace by that key. A namespace no app reserves is shared public read-write (verified).
+- PATIENT DATA NEVER GOES INTO THE DATASTORE — not values, not flags, not record ids (enrollment / event / tracked-entity ids), not a "current record" pointer. The tool REFUSES code that writes the dataStore / userDataStore from anything that can see patient data (every Capture plugin — its props are a patient's record —, and any file reading tracker/*, events, enrollments, relationships, analytics events/enrollments query or SQL views), and dhis2_query refuses such writes too. If the user asks for the dataStore for record data, say in one line why not (no org-unit access, sharing, ownership or audit; readable by other users) and build the tracker-data design. Settings a Capture plugin needs: written by app.jsx of an app_and_plugin (which never reads patient data), only READ by the plugin.
+- Never a shared "current record" pointer that one plugin writes for another (two users or two tabs overwrite it and data lands on the wrong patient) and never one key holding many records.
+- New data elements for the state: create them, add them to the stage(s), then place. The tool raises the program version after any stage / rule change (capture_refresh in the result) so every Capture reloads the program — without that a Capture that already opened the program never sees the new field, even after a reload, and the plugin's alias for it is silently dropped.
+- Freshness: Capture saves an event in the background and shows the enrollment dashboard BEFORE the save reaches the server (verified: the widget's first read ran while the save was still pending). A widget that reads saved data must refetch: a few times after mount (setTimeout at 2, 5, 10 and 20 s — a save can take seconds to land), on window focus / visibilitychange, and with a small Refresh button — and say "Showing saved data" so an unsaved change is not mistaken for a bug.
+
+### When a plugin "does nothing" / "is not saved" (diagnose before changing code)
+- Never state a cause you have not verified, and never claim a mechanism is impossible without evidence (e.g. "an iframe cannot read the parent URL" is false here). Say what you checked, what you could not check, and the next check.
+- Check, in this order, with real reads: (1) placements(key) — is the plugin in that form / page, with the field map you expect; (2) get_program_info / the stage — is every mapped field a data element of that stage; (3) capture_refresh in earlier results, or place again — Capture's copy of the program may predate a new field; (4) get_source — does the code check fieldsMetadata, show errors, skip writes in viewMode; (5) the user's exact steps: Edit event clicked? event saved? Capture reloaded after an update?
+- Ask the user for what only they can see: the plugin's own status line, a screenshot, the browser console line that starts with "setFieldValue:".
+- Fix the cause you verified — one change at a time — and state what it changes.
+- "Placed and configured" is not "working": after build or fix, say exactly what you verified (installed, placed, field map, version) and give the user a 3–5 step test with the expected result at each step.
 
 ### Charts (echarts)
 \`\`\`
@@ -3447,11 +3480,11 @@ Give the option grid { left: 8, right: 16, top: 24, bottom: 8, containLabel: tru
 - Warned (fix them): a metadata query without fields, fields using name instead of displayName, a delete without a confirmation Modal, a hard-coded server address.
 
 ### Workflow
-1. Discover the real metadata first (search_metadata, get_program_info) and run the exact queries the app will make with dhis2_query to see the response shape and confirm the numbers exist — never invent UIDs or response fields. Data no endpoint has (transfer history …) → manage_sql_views first; patient-level reads are refused to you, so confirm such a source with the tool's columns + row_count, not with rows.
+1. Discover the real metadata first (search_metadata, get_program_info) and run the exact queries the app will make with dhis2_query to see the response shape and confirm the numbers exist — never invent UIDs or response fields. Several plugins that work together: write their contract first (see "Plugins that work together") and build every piece from it. Data no endpoint has (transfer history …) → manage_sql_views first; patient-level reads are refused to you, so confirm such a source with the tool's columns + row_count, not with rows.
 2. preview. If it returns compile_errors / violations / problems / unknown_uids, fix exactly those and preview again; also fix every warning.
 3. Tell the user in 3–5 lines: what it shows, which data it reads, whether it writes anything, where it will appear. Ask for approval.
 4. After approval: create with the preview_token. Installing in the same turn as the preview is refused unless the user's own message asked to install ("create and install …") — so end the turn with the summary and the question. Report global_shell_url (apps) or the where_to_find steps.
-5. Placing a plugin: if the user asked for it to appear somewhere ("on this dashboard", "install it on a dashboard", "in the enrollment dashboard", "in this form"), place it right after create in the same approved turn; otherwise ASK where they want it and place it after they answer — the tool refuses a placement nobody asked for, and never create a dashboard nobody asked for. Use the page context for program / stage / dashboard ids when the user says "here". "On a dashboard" without a name: the dashboard open in the page context if any, else a new dashboard named after the plugin (dashboard_name) — say which. If place is refused, do not call it again in that turn: ask, and end the turn. Report the where_to_find text (Capture needs one reload).
+5. Placing a plugin: if the user asked for it to appear somewhere ("on this dashboard", "install it on a dashboard", "in the enrollment dashboard", "in this form"), place it right after create in the same approved turn; otherwise ASK where they want it and place it after they answer — the tool refuses a placement nobody asked for, and never create a dashboard nobody asked for. Use the page context for program / stage / dashboard ids when the user says "here". "On a dashboard" without a name: the dashboard open in the page context if any, else a new dashboard named after the plugin (dashboard_name) — say which. If place is refused, do not call it again in that turn: ask, and end the turn. Report the where_to_find text (Capture needs one reload) and any capture_refresh / capture_cache note, then the test steps (what to click, what should happen).
 6. Later changes: get_source → update with only the changed files (placements keep working — same key); "undo" → rollback; remove it from a page → unplace.`;
 
 // ── SQL views (manage_sql_views) ──
@@ -5060,11 +5093,17 @@ Reading, entering, clearing, completing or validating ONE aggregate form (datase
 
   // ── Custom apps & dashboard plugins — decide-time routing stub only; the
   //    how-to (globals, plugin handshake, layout, safety rules) is the manual. ──
-  if (detectCustomAppIntent(text)) {
+  // Also on follow-ups in a thread that built one ("I click FLAG and nothing
+  // happens" names no app — live 2026-10-25 — and the model then diagnosed by
+  // guessing instead of reading the plugin's source and placement).
+  const _customAppThread = typeof getThreadToolNames === 'function' && getThreadToolNames().has('manage_custom_app');
+  if (detectCustomAppIntent(text) || _customAppThread) {
     p += `
 ## Custom apps & dashboard plugins — use the **manage_custom_app** tool
 When the user asks for an app, plugin or widget, WRITE it (React JSX on the prebuilt runtime kit) and install it with **manage_custom_app** — no setup for the user. Flow: find the real UIDs and check the data exists → preview → summarise for the user and ask → create with the preview_token after "yes". A plain saved chart/pivot/map is manage_dashboards / manage_maps instead — offer that when the user did not ask for an app or plugin. NEVER POST /api/apps or DELETE apps/<key> via dhis2_query.
 Data that no Web API endpoint returns (e.g. tracker ownership TRANSFER history) comes from a SQL view: **manage_sql_views** (describe → create, which test-runs it) — never probe guessed endpoints for it.
+Several plugins that work together (flag here → list there): state the shared-data contract first — what each plugin reads / writes, where it lives (data about a patient record → that record's tracker data, e.g. a field on the event; settings → a namespace an app reserves), how each plugin knows its record from its VERIFIED props. Never a shared "current record" pointer; NEVER patient data (values, record ids, flags) in the dataStore — the tool refuses it. The manage_custom_app manual has the verified Capture facts.
+A user saying an assistant-built plugin "does nothing" / "is not saved": diagnose with real reads first — manage_custom_app placements + get_source, the stage's fields — and state only causes you verified (the manual's "When a plugin does nothing" list). Never claim something is impossible or "verified working" without evidence.
 `;
   }
 

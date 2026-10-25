@@ -11,12 +11,12 @@ function bmiCategory(b) {
   return 'obese';
 }
 
-function Plugin({ values = {}, setFieldValue, viewMode, setPluginHeight }) {
+function Plugin({ values = {}, fieldsMetadata = {}, setFieldValue, viewMode, setPluginHeight }) {
   const w = parseFloat(values.weight);
   const h = parseFloat(values.height);
   const bmi = w > 0 && h > 0 ? (w / ((h / 100) ** 2)).toFixed(1) : '';
   useEffect(() => {
-    if (viewMode || typeof setFieldValue !== 'function') return;
+    if (viewMode || typeof setFieldValue !== 'function' || !fieldsMetadata.bmi) return;
     if (String(values.bmi ?? '') !== bmi) setFieldValue({ fieldId: 'bmi', value: bmi });
   }, [bmi, viewMode]);
   useEffect(() => {

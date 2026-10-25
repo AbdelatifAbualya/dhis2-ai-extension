@@ -131,35 +131,42 @@ function formPluginElements(sections, key) {
   return out;
 }
 
-// Removes this app's plugin elements. Fields a plugin had taken out of the form
-// go back exactly where the plugin was; a section that held nothing but the
-// plugin goes too. → { sections, removed }
-function formWithoutPlugin(sections, key) {
+// Removes this app's plugin elements. Fields the plugin had taken out of the
+// form (replace_field) go back to their own metadata section, in metadata
+// order, when ctx (the form's metadata) is known — else where the plugin was.
+// A section that held nothing but the plugin goes too. → { sections, removed }
+// (Putting them back where the plugin was left the plugin's own section behind
+// for good, so the config never matched Capture's default again and every
+// re-place added another section — live 2026-10-25.)
+function formWithoutPlugin(sections, key, ctx) {
   const out = cloneJson(sections || []);
   let removed = 0;
-  const plainIds = () => new Set(out.flatMap((s) => (s.elements || []).filter((e) => e && e.type !== 'plugin').map((e) => e.id)));
-  const otherMapped = () => new Set(out.flatMap((s) => (s.elements || [])
-    .filter((e) => e && e.type === 'plugin' && !isPluginSourceOf(key, e.pluginSource))
-    .flatMap((e) => (e.fieldMap || []).map((f) => f.IdFromApp))));
+  const isMine = (e) => e && e.type === 'plugin' && isPluginSourceOf(key, e.pluginSource);
+  const restore = []; // { id, fallback: section }
   const emptied = new Set();
   for (const s of out) {
-    const next = [];
-    for (const e of s.elements || []) {
-      if (e && e.type === 'plugin' && isPluginSourceOf(key, e.pluginSource)) {
-        removed++;
-        const present = plainIds();
-        const mappedElsewhere = otherMapped();
-        for (const f of e.fieldMap || []) {
-          if (f && f.IdFromApp && !present.has(f.IdFromApp) && !mappedElsewhere.has(f.IdFromApp) && !next.some((n) => n.id === f.IdFromApp)) {
-            next.push({ id: f.IdFromApp, type: 'TrackedEntityAttribute' });
-          }
-        }
-        continue;
-      }
-      next.push(e);
+    const before = s.elements || [];
+    s.elements = before.filter((e) => !isMine(e));
+    for (const e of before.filter(isMine)) {
+      removed++;
+      for (const f of e.fieldMap || []) if (f && f.IdFromApp) restore.push({ id: f.IdFromApp, fallback: s });
     }
-    if (!next.length && (s.elements || []).length) emptied.add(s);
-    s.elements = next;
+    if (!s.elements.length && before.length) emptied.add(s);
+  }
+  const plain = new Set(out.flatMap((s) => s.elements.filter((e) => e && e.type !== 'plugin').map((e) => e.id)));
+  const mappedElsewhere = new Set(out.flatMap((s) => s.elements.filter((e) => e && e.type === 'plugin').flatMap((e) => (e.fieldMap || []).map((f) => f.IdFromApp))));
+  const metaSections = ctx ? (ctx.sections.length ? ctx.sections : [{ id: `main-${ctx.id}`, fieldIds: ctx.fieldIds }]) : [];
+  for (const { id, fallback } of restore) {
+    if (plain.has(id) || mappedElsewhere.has(id)) continue;
+    plain.add(id);
+    const meta = metaSections.find((m) => m.fieldIds.includes(id));
+    const home = (meta && out.find((x) => x.id === meta.id)) || fallback;
+    const order = meta && home.id === meta.id ? meta.fieldIds : null;
+    const el = { id, type: 'TrackedEntityAttribute' };
+    const pos = order ? home.elements.findIndex((e) => e && e.type !== 'plugin' && order.indexOf(e.id) > order.indexOf(id)) : -1;
+    if (pos === -1) home.elements.push(el);
+    else home.elements.splice(pos, 0, el);
+    emptied.delete(home);
   }
   return { sections: out.filter((s) => !emptied.has(s)), removed };
 }
@@ -168,7 +175,7 @@ function formWithoutPlugin(sections, key) {
 // this form is taken out first, so placing again just updates the mapping.
 function formWithPlugin(sections, ctx, opts) {
   const { key, name, source, fieldMap, section, sectionName, position } = opts;
-  const base = formWithoutPlugin(sections, key).sections;
+  const base = formWithoutPlugin(sections, key, ctx).sections;
   const element = {
     id: `${key}-${generateDhis2Uid().slice(0, 6)}`,
     name,
@@ -178,7 +185,12 @@ function formWithPlugin(sections, ctx, opts) {
   };
   // Fields the plugin replaces leave their normal place in the form.
   const replaced = new Set(fieldMap.filter((f) => f.replace_field === true).map((f) => f.field_id));
-  for (const s of base) s.elements = (s.elements || []).filter((e) => !(e && e.type !== 'plugin' && replaced.has(e.id)));
+  for (let i = base.length - 1; i >= 0; i--) {
+    const s = base[i];
+    const had = (s.elements || []).length;
+    s.elements = (s.elements || []).filter((e) => !(e && e.type !== 'plugin' && replaced.has(e.id)));
+    if (had && !s.elements.length) base.splice(i, 1); // a section that held only replaced fields
+  }
   if (section) {
     const want = String(section).trim().toLowerCase();
     const hit = base.find((s) => s.id === section || String(s.name || '').trim().toLowerCase() === want
@@ -197,6 +209,39 @@ function formWithPlugin(sections, ctx, opts) {
   return { sections: base };
 }
 
+// Form-field plugins get no programId / stage prop (Capture 106 passes only
+// values, fieldsMetadata, setFieldValue …), and the edit-event page URL has no
+// stage either — so the placement puts them in the plugin's own URL, the way
+// the Field Access Control plugin carries ?programStage=.
+function formPluginContextQuery(ctx) {
+  return ctx.kind === 'program_stage'
+    ? `programId=${encodeURIComponent(ctx.programId)}&programStageId=${encodeURIComponent(ctx.id)}`
+    : `programId=${encodeURIComponent(ctx.programId)}`;
+}
+
+function formPluginSource(source, ctx) {
+  return `${String(source).split('?')[0]}?${formPluginContextQuery(ctx)}`;
+}
+
+// Capture refreshes its cached copy of a program only when programs.version
+// changes. A stage or program rule edited after the program itself (outside
+// the assistant, e.g. in Maintenance) means Capture may still show the old one.
+// → the newest such change ("stage X (2026-…)") or null.
+async function captureCopyIsStale(programId) {
+  const p = await safeDhis2Fetch(`programs/${encodeURIComponent(programId)}?fields=lastUpdated,programStages[displayName,lastUpdated]`, { noTruncate: true });
+  if (!p || p._error || !p.lastUpdated) return null;
+  const newer = [];
+  for (const s of p.programStages || []) if (s.lastUpdated > p.lastUpdated) newer.push({ what: `stage "${s.displayName}"`, at: s.lastUpdated });
+  for (const type of ['programRules', 'programRuleVariables']) {
+    const r = await safeDhis2Fetch(`${type}?filter=program.id:eq:${encodeURIComponent(programId)}&fields=displayName,lastUpdated&order=lastUpdated:desc&pageSize=1`, { noTruncate: true });
+    const o = r && !r._error && Array.isArray(r[type]) ? r[type][0] : null;
+    if (o && o.lastUpdated > p.lastUpdated) newer.push({ what: `${type === 'programRules' ? 'rule' : 'rule variable'} "${o.displayName}"`, at: o.lastUpdated });
+  }
+  if (!newer.length) return null;
+  const last = newer.sort((a, b) => (a.at < b.at ? 1 : -1))[0];
+  return `the last change to its ${last.what} (${last.at})`;
+}
+
 // Aliases the plugin source reads (values.x / values['x']) and writes
 // (setFieldValue({ fieldId: 'x' })), checked against the field map: Capture
 // rejects a write to an unmapped alias and gives the plugin nothing for an
@@ -204,7 +249,15 @@ function formWithPlugin(sections, ctx, opts) {
 function pluginFieldAliasProblems(pluginSource, fieldMap) {
   const src = String(pluginSource || '');
   const mapped = new Set(fieldMap.map((f) => f.plugin_field));
-  const written = new Set([...src.matchAll(/fieldId\s*:\s*['"]([^'"]+)['"]/g)].map((m) => m[1]));
+  // fieldId: 'x', or fieldId: NAME where const NAME = 'x' (a storage alias
+  // kept in one constant — the FLAG plugin's "flags" went unchecked that way).
+  const constValue = (name) => { const m = new RegExp(`\\b(?:const|let|var)\\s+${name}\\s*=\\s*['"]([^'"]+)['"]`).exec(src); return m ? m[1] : null; };
+  const written = new Set([
+    ...[...src.matchAll(/fieldId\s*:\s*['"]([^'"]+)['"]/g)].map((m) => m[1]),
+    ...[...src.matchAll(/fieldId\s*:\s*([A-Za-z_$][\w$]*)\s*[,}]/g)].map((m) => constValue(m[1])).filter(Boolean),
+  ]);
+  // A plugin that walks fieldsMetadata / values uses every alias it is given.
+  const generic = /Object\s*\.\s*(?:keys|entries|values)\s*\(\s*(?:fieldsMetadata|values)\b/.test(src);
   const read = new Set([
     ...[...src.matchAll(/\bvalues\s*(?:\?\.)?\[\s*['"]([^'"]+)['"]\s*\]/g)].map((m) => m[1]),
     ...[...src.matchAll(/\bvalues\s*(?:\?\.|\.)\s*([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]),
@@ -213,7 +266,7 @@ function pluginFieldAliasProblems(pluginSource, fieldMap) {
   const warnings = [];
   for (const a of written) if (!mapped.has(a)) errors.push(`The plugin writes "${a}" (setFieldValue) but field_map has no plugin_field "${a}" — Capture would reject that write.`);
   for (const a of read) if (!mapped.has(a) && !written.has(a)) warnings.push(`The plugin reads values.${a} but field_map has no plugin_field "${a}" — it will always be empty.`);
-  for (const a of mapped) if (!written.has(a) && !read.has(a) && !src.includes(a)) warnings.push(`plugin_field "${a}" is mapped but the plugin code never uses it.`);
+  if (!generic) for (const a of mapped) if (!written.has(a) && !read.has(a) && !src.includes(a)) warnings.push(`plugin_field "${a}" is mapped but the plugin code never uses it.`);
   return { errors, warnings, writes: [...written] };
 }
 
@@ -403,9 +456,8 @@ function fieldMapProblem(fieldMap, ctx) {
 
 // ── Placement listing ───────────────────────────────────────────────────────
 
-async function listPluginPlacements(key) {
+async function listPluginPlacements(key, memo = {}) {
   const out = { dashboards: [], capture_pages: [], forms: [] };
-  const memo = {};
   const dash = await safeDhis2Fetch(`dashboards?filter=${encodeURIComponent(`dashboardItems.appKey:eq:${key}`)}&fields=id,displayName,dashboardItems[id,type,appKey]&paging=false`, { noTruncate: true });
   if (dash && dash._error) return { _error: `Could not list dashboards: ${dash._error}` };
   for (const d of (dash && dash.dashboards) || []) {
@@ -425,7 +477,7 @@ async function listPluginPlacements(key) {
   if (forms._error) return forms;
   for (const [ctxId, sections] of Object.entries(forms.value || {})) {
     for (const { section, element } of formPluginElements(sections, key)) {
-      out.forms.push({ context_id: ctxId, section_id: section.id, section_name: section.name || null, field_map: (element.fieldMap || []).map((f) => ({ plugin_field: f.IdFromPlugin, field_id: f.IdFromApp })) });
+      out.forms.push({ context_id: ctxId, section_id: section.id, section_name: section.name || null, plugin_source: element.pluginSource, field_map: (element.fieldMap || []).map((f) => ({ plugin_field: f.IdFromPlugin, field_id: f.IdFromApp })) });
     }
   }
   return out;
@@ -587,6 +639,14 @@ async function placeCustomAppPlugin(args) {
   const aliases = pluginFieldAliasProblems(pluginCode, fieldMap);
   if (aliases.errors.length) return { _error: aliases.errors.join(' '), _hint: 'Make field_map cover every alias the plugin writes (or change the plugin with update first).' };
   warnings.push(...aliases.warnings);
+  // A field the plugin fills with JSON is plugin state, not something users
+  // should see or type into (a visible raw-JSON "Flagged Fields" box, live
+  // 2026-10-25). replace_field:true makes it plugin-owned: out of the form,
+  // still saved with the event.
+  if (/JSON\s*\.\s*stringify/.test(pluginCode)) {
+    const shown = fieldMap.filter((f) => aliases.writes.includes(f.plugin_field) && !f.replace_field);
+    if (shown.length) warnings.push(`The plugin writes JSON into ${shown.map((f) => `"${f.plugin_field}"`).join(', ')}, which stays visible as a normal input — pass replace_field:true for a storage field only the plugin writes (it is still saved with the event). Never hide it with a HIDEFIELD program rule: Capture blanks the value of a hidden field.`);
+  }
   if (pluginCode && !/\b(?:values|setFieldValue)\b/.test(pluginCode)) {
     warnings.push('This plugin neither reads values nor calls setFieldValue — a form-field plugin gets its data through those props.');
   }
@@ -599,7 +659,7 @@ async function placeCustomAppPlugin(args) {
   const built = formWithPlugin(startedFromDefault ? defaultCaptureFormConfig(ctx) : current, ctx, {
     key: args.key,
     name: appName,
-    source,
+    source: formPluginSource(source, ctx),
     fieldMap,
     section: args.section || null,
     sectionName: args.section_name || null,
@@ -614,6 +674,8 @@ async function placeCustomAppPlugin(args) {
   const next = { ...cloneJson(cfg.value), [ctx.id]: built.sections };
   const w = await writeCaptureConfig(CAPTURE_FORMS_KEY, next, cfg.exists);
   if (w._error) return { ...w, backup };
+  const stale = await captureCopyIsStale(ctx.programId);
+  if (stale) noteCaptureProgramChanged(ctx.programId);
   return {
     success: true,
     action: 'place',
@@ -624,6 +686,8 @@ async function placeCustomAppPlugin(args) {
     started_from_capture_default: startedFromDefault,
     datastore_key: `${CAPTURE_NAMESPACE}/${CAPTURE_FORMS_KEY}`,
     backup: backup ? { key: backup.backup_key, restore_hint: `manage_backups(action="restore", backup_key="${backup.backup_key}")` } : { skipped: true },
+    plugin_url_context: `The plugin page is opened with ?${formPluginContextQuery(ctx)} — read it with new URLSearchParams(window.location.search).`,
+    capture_cache: stale ? `Capture's cached copy of "${ctx.programName}" was older than ${stale} — the program version is raised so Capture reloads it (without that, a newly added field would be missing from the plugin).` : undefined,
     warnings: warnings.length ? warnings : undefined,
     where_to_find: ctx.kind === 'program_stage'
       ? `Capture → ${ctx.programName} → open an enrollment → add a "${ctx.name}" event: "${appName}" is in the form. Reload the Capture tab once (it reads form configs when it loads).`
@@ -698,11 +762,12 @@ async function unplaceCustomAppPlugin(args, opts = {}) {
     for (const [ctxId, sections] of Object.entries(cfg.value)) {
       if (args.program_stage_id && ctxId !== args.program_stage_id) continue;
       if (args.program_id && !args.program_stage_id && ctxId !== args.program_id) continue;
-      const r = formWithoutPlugin(sections, key);
+      if (!formPluginElements(sections, key).length) continue;
+      const ctx = await captureFormContext(await formContextArgs(ctxId));
+      const r = formWithoutPlugin(sections, key, ctx._error ? null : ctx);
       if (!r.removed) continue;
       // Left exactly as Capture would draw it without a config → drop the
       // entry so the form follows the metadata again.
-      const ctx = await captureFormContext(await formContextArgs(ctxId));
       const entryRemoved = !ctx._error && canonicalJson(r.sections) === canonicalJson(defaultCaptureFormConfig(ctx));
       if (entryRemoved) delete next[ctxId];
       else next[ctxId] = r.sections;
@@ -740,7 +805,19 @@ async function formContextArgs(ctxId) {
 
 async function executeCustomAppPlacement(args) {
   if (args.action === 'placements') {
-    if (!args.key) return { _error: 'Pass key.' };
+    if (!args.key) {
+      // Every assistant-built plugin — what the user sees where.
+      const apps = await listInstalledApps();
+      if (apps._error) return apps;
+      const memo = {};
+      const plugins = [];
+      for (const app of apps.filter((a) => isAssistantBuiltApp(a) && summarizeInstalledApp(a).plugin_launch_url)) {
+        const list = await listPluginPlacements(app.key, memo);
+        if (list._error) return list;
+        plugins.push({ key: app.key, name: app.displayName || app.name, version: app.version, total: list.dashboards.length + list.capture_pages.length + list.forms.length, ...list });
+      }
+      return { plugins, _note: plugins.length ? undefined : 'No assistant-built plugins are installed.' };
+    }
     const problem = customAppKeyProblem(args.key);
     if (problem) return { _error: `Refused: ${problem}.`, _refused_not_managed: true };
     const list = await listPluginPlacements(args.key);

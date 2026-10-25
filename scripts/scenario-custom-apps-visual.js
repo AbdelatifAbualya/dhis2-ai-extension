@@ -1223,6 +1223,124 @@ async function main() {
       check('place + delete made zero failed API calls', a.failed.length + b.failed.length + del.failed.length === 0, [...a.failed, ...b.failed, ...del.failed].map((f) => `${f.status} ${f.method} ${f.url}`).join(' | '));
     }
 
+    // ── 14. Plugins that work together ────────────────────────────────────
+    // The design the manual now teaches, after a live thread (2026-10-25) took
+    // five versions: state about a record lives IN the record (a storage data
+    // element the form plugin owns via replace_field), the enrollment widget
+    // reads the enrollment's events, and the tool raises the program version
+    // when the stage changes so Capture actually sees the new field.
+    if (want(14)) {
+      scenario(14, 'Cooperating plugins — FLAG form-field plugin + flagged-values enrollment widget, state saved in the event (real Capture; the event is removed afterwards)');
+      const PROGRAM = 'nqT1hqxxjvz'; const STAGE = 'pP1KQ0hZmYZ'; const ENR = 'AAHn18XlSn4'; const TEI = 'jrHAwYS65H5'; const OU = 'd3V3O1ooYoL';
+      const FIELDS = { weight: 'eoCnd8XuOIr', height: 'DDbjsIbe1Oj', temperature: 'KA5fbw0sUQv' };
+      const STORE = (await api('GET', 'system/id?limit=1')).json.codes[0];
+      const eventsBefore = new Set(((await api('GET', `tracker/events?${qs({ enrollments: ENR, programStage: STAGE, fields: 'event', pageSize: 200 })}`)).json.events || []).map((e) => e.event));
+      const versionOf = async () => (await api('GET', `programs/${PROGRAM}?fields=version`)).json.version;
+      let saved = [];
+      try {
+        const de = await api('POST', 'dataElements', { id: STORE, name: 'ai-test Flag store', shortName: 'ai-test Flag store', domainType: 'TRACKER', valueType: 'LONG_TEXT', aggregationType: 'NONE' });
+        check('setup: a LONG_TEXT storage data element for the flags', de.ok, de.text.slice(0, 200));
+        const v0 = await versionOf();
+        userSays('Add the flag storage data element to the Initial Assessment stage');
+        const mark = API.length;
+        const add = await ctx.executeTool('create_metadata', { action: 'add_data_elements_to_stage', stage_id: STAGE, data_element_ids: [STORE], section_name: 'Section A: Initial Assessment (Nurse)' });
+        const v1 = await versionOf();
+        check('add_data_elements_to_stage raises the program version once, so every Capture reloads the stage (capture_refresh)', !add._error && v1 === v0 + 1 && add.capture_refresh && add.capture_refresh.bumped[0].program_id === PROGRAM, add._error || `${v0} → ${v1} ${JSON.stringify(add.capture_refresh)}`);
+        check('…with zero failed API calls', summarize(mark).failed.length === 0, summarize(mark).failed.map((f) => `${f.status} ${f.method} ${f.url}`).join(' | '));
+
+        const flag = await previewAndCreate({ name: 'AI test flag fields', key: 'ai-test-flag', kind: 'plugin', plugin_type: 'CAPTURE', datastore_namespace: false, files: { 'plugin.jsx': read('flag.capture-field.plugin.jsx') } });
+        check('install the FLAG form-field plugin, no lint warnings', flag.cr.r.success === true && !(flag.pv.r.warnings || []).length, flag.cr.r._error || JSON.stringify(flag.pv.r.warnings));
+        const widget = await previewAndCreate({ name: 'AI test flagged values', key: 'ai-test-flags', kind: 'plugin', plugin_type: 'CAPTURE', datastore_namespace: false, files: { 'plugin.jsx': read('flags.capture.plugin.jsx').split('__FLAG_DE__').join(STORE) } });
+        check('install the flagged-values enrollment widget, no lint warnings', widget.cr.r.success === true && !(widget.pv.r.warnings || []).length, widget.cr.r._error || JSON.stringify(widget.pv.r.warnings));
+        userSays('Put the flag plugin in the Initial Assessment form and the flagged values widget on the enrollment dashboard');
+        const shown = await tool({ action: 'place', key: 'ai-test-flag', target: 'form', program_stage_id: STAGE, field_map: [...Object.entries(FIELDS).map(([plugin_field, field_id]) => ({ plugin_field, field_id })), { plugin_field: 'flags', field_id: STORE }] });
+        check('placing with a visible JSON storage field is warned (replace_field)', shown.r.success === true && (shown.r.warnings || []).some((w) => /replace_field:true/.test(w)), JSON.stringify(shown.r.warnings));
+        const pf = await tool({ action: 'place', key: 'ai-test-flag', target: 'form', program_stage_id: STAGE, field_map: [...Object.entries(FIELDS).map(([plugin_field, field_id]) => ({ plugin_field, field_id })), { plugin_field: 'flags', field_id: STORE, replace_field: true }] });
+        const formCfg = ((await captureKey('dataEntryForms')) || {})[STAGE] || [];
+        const plug = formCfg.flatMap((s) => s.elements).find((e) => e.type === 'plugin');
+        check('place form: storage field owned by the plugin (not a plain form field), plugin URL carries program + stage', pf.r.success === true && !(pf.r.warnings || []).length
+          && !formCfg.some((s) => s.elements.some((e) => e.id === STORE)) && plug && plug.pluginSource.endsWith(`plugin.html?programId=${PROGRAM}&programStageId=${STAGE}`), pf.r._error || JSON.stringify(pf.r.warnings));
+        const pw2 = await tool({ action: 'place', key: 'ai-test-flags', target: 'enrollment_dashboard', program_id: PROGRAM, column: 'right', position: 'top' });
+        check('place the widget on the enrollment dashboard', pw2.r.success === true, pw2.r._error);
+        const all = await tool({ action: 'placements' });
+        check('placements without a key lists every assistant-built plugin', !all.r._error && ['ai-test-flag', 'ai-test-flags'].every((k) => (all.r.plugins || []).some((p) => p.key === k && p.total === 1)), all.r._error || JSON.stringify((all.r.plugins || []).map((p) => `${p.key}:${p.total}`)));
+        check('place / placements made zero failed API calls', [...shown.failed, ...pf.failed, ...pw2.failed, ...all.failed].length === 0, [...shown.failed, ...pf.failed, ...pw2.failed, ...all.failed].map((f) => `${f.status} ${f.method} ${f.url}`).join(' | '));
+
+        const context = await newContext(browser, { width: 1440, height: 1100 });
+        const page = await context.newPage();
+        const logF = collect(page, 'ai-test-flag');
+        const logW = collect(page, 'ai-test-flags');
+        let t0 = Date.now();
+        const since = () => ((Date.now() - t0) / 1000).toFixed(1);
+        page.on('response', (res) => {
+          if (res.request().method() === 'POST' && /\/tracker\?/.test(res.url())) note(`${since()} s after Save: Capture's event save answered HTTP ${res.status()}`);
+          if (res.url().includes('tracker/events') && res.request().frame().url().includes('ai-test-flags')) note(`${since()} s after Save: widget read the events (HTTP ${res.status()})`);
+        });
+        await page.goto(`${BASE}/dhis-web-capture/index.html#/enrollmentEventNew?enrollmentId=${ENR}&orgUnitId=${OU}&programId=${PROGRAM}&stageId=${STAGE}&teiId=${TEI}`);
+        const f = await waitFrame(page, 'ai-test-flag');
+        check('the FLAG plugin is in the real Capture form', !!f);
+        if (f) {
+          const capture = f.parentFrame();
+          await settled(f, 45000);
+          check('the storage field is not shown to the user', (await capture.locator(`[data-test="form-field-${STORE}"]`).count()) === 0);
+          const weight = capture.locator(`[data-test="form-field-${FIELDS.weight}"]`).locator('input').first();
+          await weight.fill('70');
+          await weight.press('Tab');
+          await page.waitForTimeout(1500);
+          const idx = await f.evaluate(() => [...document.querySelectorAll('button')].findIndex((b) => b.parentElement && b.parentElement.innerText.includes('Weight (kg)')));
+          await f.locator('button').nth(Math.max(0, idx)).click();
+          await page.waitForTimeout(1500);
+          const ptext = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+          check('FLAG → FLAGGED, with "save the event" guidance', /Weight \(kg\) 70 FLAGGED/.test(ptext) && /Flagged — save the event to keep it/.test(ptext), ptext);
+          await shot(page, 'FLAG plugin in the Capture form, Weight flagged', { group: 'cooperating plugins' });
+          const reportDate = capture.locator('[data-test="dataentry-field-occurredAt"] input').first();
+          await reportDate.fill(new Date().toISOString().slice(0, 10));
+          await reportDate.press('Tab');
+          await page.waitForTimeout(800);
+          t0 = Date.now();
+          await capture.getByRole('button', { name: /^Save/ }).first().click();
+          let wf = null;
+          for (let i = 0; i < 60 && !wf; i++) { await page.waitForTimeout(500); wf = page.frames().find((fr) => fr.url().includes('/api/apps/ai-test-flags/plugin.html')); }
+          check('after Save, Capture shows the enrollment dashboard with the widget', !!wf);
+          if (wf) {
+            let wtext = '';
+            for (let i = 0; i < 60 && !/Weight \(kg\): 70/.test(wtext); i++) { await page.waitForTimeout(500); wtext = (await wf.evaluate(() => document.body.innerText).catch(() => '')).replace(/\s+/g, ' '); }
+            check('the widget shows the flagged value once the save lands (it refetches; no manual reload)', /Weight \(kg\): 70/.test(wtext) && /Section|Initial Assessment|Stage/.test(wtext), wtext);
+            await shot(page, 'Flagged-values widget on the enrollment dashboard', { group: 'cooperating plugins' });
+          }
+          assertLogs(logF, 'FLAG plugin');
+          assertLogs(logW, 'flagged-values widget');
+        }
+        await context.close();
+        saved = ((await api('GET', `tracker/events?${qs({ enrollments: ENR, programStage: STAGE, fields: 'event,dataValues[dataElement,value]', pageSize: 200 })}`)).json.events || []).filter((e) => !eventsBefore.has(e.event));
+        const store = saved.flatMap((e) => e.dataValues || []).find((dv) => dv.dataElement === STORE);
+        check('the flag was saved WITH the event (tracker data, the program\'s access control)', saved.length === 1 && store && /"id":"weight"/.test(store.value) && /"value":"70"/.test(store.value), JSON.stringify(saved));
+      } finally {
+        // The event this scenario saved: drop its values first (a soft-deleted
+        // event that still references the data element blocks its deletion),
+        // then delete it; take the field off the stage; delete the field.
+        for (const e of saved) {
+          await api('POST', 'tracker?async=false&importStrategy=UPDATE', { events: [{ event: e.event, enrollment: ENR, program: PROGRAM, programStage: STAGE, orgUnit: OU, occurredAt: new Date().toISOString().slice(0, 10), status: 'ACTIVE', dataValues: (e.dataValues || []).map((dv) => ({ dataElement: dv.dataElement, value: null })) }] });
+          await api('POST', 'tracker?async=false&importStrategy=DELETE', { events: [{ event: e.event }] });
+        }
+        await tool({ action: 'unplace', key: 'ai-test-flag', skip_backup: true });
+        await tool({ action: 'unplace', key: 'ai-test-flags', skip_backup: true });
+        const st = (await api('GET', `programStages/${STAGE}?fields=:owner`)).json;
+        if (st && (st.programStageDataElements || []).some((p) => p.dataElement.id === STORE)) {
+          st.programStageDataElements = st.programStageDataElements.filter((p) => p.dataElement.id !== STORE);
+          for (const s of st.programStageSections || []) if (s.dataElements) s.dataElements = s.dataElements.filter((x) => x.id !== STORE);
+          await api('PUT', `programStages/${STAGE}?mergeMode=REPLACE`, st);
+          for (const s of (await api('GET', `programStageSections?${qs({ filter: `programStage.id:eq:${STAGE}`, fields: ':owner', paging: 'false' })}`)).json.programStageSections || []) {
+            if ((s.dataElements || []).some((x) => x.id === STORE)) { s.dataElements = s.dataElements.filter((x) => x.id !== STORE); await api('PUT', `programStageSections/${s.id}`, s); }
+          }
+          const v = await versionOf();
+          await api('PATCH', `programs/${PROGRAM}`, [{ op: 'add', path: '/version', value: v + 1 }], { 'Content-Type': 'application/json-patch+json' });
+        }
+        const del = await api('DELETE', `dataElements/${STORE}`);
+        if (!del.ok) note(`could not delete the storage data element ${STORE}: ${del.text.slice(0, 200)}`);
+      }
+    }
+
     // ── 9. End-to-end through the LLM ─────────────────────────────────────
     if (want(9)) {
       scenario(9, 'End-to-end through the agent loop with a real LLM');

@@ -597,6 +597,22 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     }
   }
 
+  // Patient data NEVER goes into the dataStore (user rule, 2026-10-25): it has
+  // no org-unit scoping, program sharing, ownership or audit, and a namespace
+  // nobody reserves is public read-write. A flag plugin kept every patient's
+  // flagged values in one dataStore key (live 2026-10-25). A file that can see
+  // patient data may READ the dataStore (settings) but never write it.
+  for (const [file, v] of Object.entries(views)) {
+    if (file === 'shared.jsx' && views['app.jsx'] && views['plugin.jsx']) continue; // judged inside each file's scope
+    const scopeCode = file === 'shared.jsx' ? v.code : `${views['shared.jsx'] ? views['shared.jsx'].code : ''}\n${v.code}`;
+    const scopeBare = file === 'shared.jsx' ? v.bare : `${sharedBare}\n${v.bare}`;
+    const write = customAppDataStoreWrite(scopeCode, scopeBare);
+    if (!write) continue;
+    const patient = customAppPatientDataSource(scopeCode, file, pluginType);
+    if (!patient) continue;
+    errors.push({ file, message: `Refused: this code writes the dataStore (${write}) and can see patient data (${patient}). Patient data never goes into the dataStore — it would bypass the program's org-unit access, sharing, ownership and audit, and an unreserved namespace is readable and writable by every user. Keep record data in tracker data: a form-field plugin writes it into a field of the event with setFieldValue (saved with the event); an app writes it with the tracker API (needs_write_access). The dataStore is for settings only, written by code that never reads patient data (e.g. app.jsx of an app_and_plugin, while the Capture plugin only reads those settings).` });
+  }
+
   if (!/\bcreateRoot\s*\(/.test(allBare)) {
     errors.push({ message: 'Nothing is rendered: call ReactDOMClient.createRoot(document.getElementById(\'root\')).render(…) in app.jsx / plugin.jsx.' });
   }
@@ -625,6 +641,12 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     if (pluginType === 'CAPTURE' && !/\b(?:enrollmentId|teiId)\b/.test(pluginCode) && !/\b(?:values|setFieldValue)\b/.test(pluginCode)) {
       warnings.push({ file: 'plugin.jsx', message: 'This Capture plugin reads neither enrollmentId / teiId (an enrollment-page widget gets { teiId, programId, enrollmentId, orgUnitId }) nor values / setFieldValue (a form-field plugin) — it cannot know which record or form it is in.' });
     }
+    // Capture drops a mapped field it does not know (e.g. its cached program
+    // predates the data element) and then ignores setFieldValue for that alias
+    // with a console-only error — a button that does nothing (live 2026-10-25).
+    if (pluginType === 'CAPTURE' && /\bsetFieldValue\b/.test(pluginCode) && !/\bfieldsMetadata\b/.test(pluginCode)) {
+      warnings.push({ file: 'plugin.jsx', message: 'The plugin calls setFieldValue but never looks at fieldsMetadata. Capture silently ignores a write to an alias it did not give the plugin (unmapped, or a field its cached program does not have yet) — check fieldsMetadata[alias] first and show a visible message when it is missing, instead of a control that does nothing.' });
+    }
   }
   // Conventions from the DHIS2 app-development skill (devotta-labs/dhis2-app-skills):
   // advisory only — they never block an install.
@@ -652,6 +674,51 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     warnings.push({ message: 'The code hard-codes a server address — use D2_APP_CONFIG.baseUrl so the app keeps working on any server.' });
   }
   return { errors, warnings };
+}
+
+// → a short description of the first dataStore / userDataStore WRITE in the
+// code, else null. A write = a mutation object (type create / update / replace
+// / json-patch) whose resource names the dataStore — directly, through a
+// variable, or by shorthand — or a POST / PUT / PATCH request to it.
+function customAppDataStoreWrite(code, bare) {
+  const isDs = (expr) => /\b(?:user)?[dD]ataStore\b/.test(expr);
+  const varExpr = (name) => {
+    const m = new RegExp(`\\b(?:const|let|var)\\s+${name.replace(/\$/g, '\\$')}\\s*=\\s*([^;\\n]+)`).exec(code);
+    return m ? m[1] : '';
+  };
+  for (const m of code.matchAll(/\btype\s*:\s*([^,}\n]*)/g)) {
+    if (!/['"`](?:create|update|replace|json-patch)['"`]/.test(m[1])) continue;
+    let depth = 0;
+    let open = -1;
+    for (let k = m.index - 1; k >= 0; k--) {
+      const ch = bare[k];
+      if (ch === '}') depth++;
+      else if (ch === '{') { if (!depth) { open = k; break; } depth--; }
+    }
+    if (open === -1) continue;
+    let close = open + 1;
+    for (depth = 0; close < bare.length; close++) {
+      const ch = bare[close];
+      if ('{[('.includes(ch)) depth++;
+      else if ('}])'.includes(ch)) { if (!depth) break; depth--; }
+    }
+    const obj = code.slice(open, close + 1);
+    const r = /(?:^|[{\s,])resource\s*(?::\s*([^,}\n]+))?\s*[,}]/.exec(obj);
+    if (!r) continue;
+    const expr = (r[1] || 'resource').trim();
+    if (isDs(expr) || (/^[A-Za-z_$][\w$]*$/.test(expr) && isDs(varExpr(expr)))) return 'a dataStore mutation';
+  }
+  if (/\bmethod\s*:\s*['"`](?:POST|PUT|PATCH)['"`]/i.test(code) && /['"`][^'"`]*\b(?:user)?[dD]ataStore\b/.test(code)) return 'a POST / PUT / PATCH request to the dataStore';
+  return null;
+}
+
+// → why this file can see patient-level data, else null.
+function customAppPatientDataSource(code, file, pluginType) {
+  if (pluginType === 'CAPTURE' && file !== 'app.jsx') return 'a Capture plugin runs on a patient\'s record — its props carry the record ids and form values';
+  const m = /['"`](tracker\/(?:events|trackedEntities|enrollments|relationships)|trackedEntityInstances|programStageInstances|enrollments|events|relationships|analytics\/(?:events|enrollments)\/query|audits\/tracked\w*)(?=['"`/?])/.exec(code);
+  if (m) return `it reads ${m[1]}`;
+  if (/['"`]sqlViews\//.test(code)) return 'it reads a SQL view (its rows can be patient rows)';
+  return null;
 }
 
 // UID-shaped string literals the code hard-codes. Word-like camelCase strings
@@ -1160,9 +1227,24 @@ async function prepareCustomAppBuild(spec, opts = {}) {
   spec.serverVersion = await customAppServerVersion();
 
   const lint = lintCustomAppCode(compiled, spec.kind, kit.meta, spec.pluginType);
+  // An app that writes the dataStore without a namespace of its own writes a
+  // namespace nobody reserved: DHIS2 creates those entries with public
+  // read-write sharing (verified 2.42.5.1: "rw------"), so every user can read
+  // and change them — patient values included (a flag plugin kept every
+  // enrollment's flagged values in one such key, live 2026-10-25).
+  const allCompiled = Object.values(compiled).join('\n');
+  const foreignNs = await customAppUnreservedNamespaces(allCompiled, spec);
+  if (foreignNs.length) {
+    lint.warnings.push({ message: `The code uses dataStore namespace ${foreignNs.map((n) => `"${n}"`).join(', ')}, which no installed app reserves — DHIS2 shares entries there public read-write, so every user can read and change them. Use D2_APP_CONFIG.namespace (this app's own), or the namespace of the app that owns the shared state (its key), and never keep patient values in the dataStore (they belong in tracker data: see "Plugins that work together").` });
+  } else if (/dataStore\//.test(allCompiled) && /\.\s*mutate\s*\(|\buseDataMutation\b/.test(allCompiled) && !spec.namespace && /D2_APP_CONFIG\s*\.\s*namespace/.test(allCompiled)) {
+    lint.warnings.push({ message: 'The code writes D2_APP_CONFIG.namespace but the app reserves no namespace (datastore_namespace:false), so it is null. Keep the default namespace for an app that saves data.' });
+  }
   if (lint.errors.length) {
+    const patientWrite = lint.errors.some((e) => /Patient data never goes into the dataStore/.test(e.message || ''));
     return {
-      _error: `The code would fail at runtime: ${lint.errors.length} problem(s).`,
+      _error: patientWrite
+        ? 'Refused: this code would write to the dataStore from code that can see patient data — patient data never goes into the dataStore. Redesign it (problems explain how); do not retry the same code.'
+        : `The code would fail at runtime: ${lint.errors.length} problem(s).`,
       problems: lint.errors,
       warnings: lint.warnings.length ? lint.warnings : undefined,
       _hint: 'Fix each listed problem and resend. Destructure every component/hook from its kit global: const { Card, DataTable } = D2UI; const { useDataQuery } = D2Runtime; const { useState } = React;',
@@ -1207,6 +1289,26 @@ async function prepareCustomAppBuild(spec, opts = {}) {
       api_resources: customAppApiResources(compiled),
     },
   };
+}
+
+// dataStore namespaces the code names itself ('dataStore/x…', 'dataStore/' + NS,
+// `dataStore/${NS}` with const NS = 'x') that neither this app nor any
+// installed app — nor an app previewed in this conversation — reserves.
+// D2_APP_CONFIG.namespace is always fine. A flag plugin hard-coded
+// "ai-mch-flags" and kept every patient's flags there (live 2026-10-25).
+async function customAppUnreservedNamespaces(code, spec) {
+  const constOf = (name) => { const m = new RegExp(`\\b(?:const|let|var)\\s+${name}\\s*=\\s*['"\`]([A-Za-z0-9_.-]+)['"\`]`).exec(code); return m ? m[1] : null; };
+  const names = new Set();
+  for (const m of code.matchAll(/dataStore\/([A-Za-z0-9_.-]+)/g)) names.add(m[1]);
+  for (const m of code.matchAll(/['"`]dataStore\/['"`]\s*\+\s*([A-Za-z_$][\w$]*)/g)) { const v = constOf(m[1]); if (v) names.add(v); }
+  for (const m of code.matchAll(/dataStore\/\$\{\s*([A-Za-z_$][\w$]*)\s*\}/g)) { const v = constOf(m[1]); if (v) names.add(v); }
+  names.delete(spec.namespace);
+  if (!names.size) return [];
+  const reserved = new Set();
+  const apps = await listInstalledApps();
+  if (Array.isArray(apps)) for (const a of apps) if (a.activities && a.activities.dhis && a.activities.dhis.namespace) reserved.add(a.activities.dhis.namespace);
+  for (const p of _customAppPreviews.values()) if (p && p.spec && p.spec.namespace) reserved.add(p.spec.namespace);
+  return [...names].filter((n) => !reserved.has(n));
 }
 
 // Normalise create/update/preview arguments into a build spec.

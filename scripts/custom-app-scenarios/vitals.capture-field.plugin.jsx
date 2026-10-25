@@ -12,7 +12,7 @@ function bmiCategory(b) {
   return 'obese';
 }
 
-function Plugin({ values = {}, setFieldValue, viewMode, setPluginHeight }) {
+function Plugin({ values = {}, fieldsMetadata = {}, setFieldValue, viewMode, setPluginHeight }) {
   const w = parseFloat(values.weight);
   const h = parseFloat(values.height);
   const t = parseFloat(values.temperature);
@@ -23,7 +23,7 @@ function Plugin({ values = {}, setFieldValue, viewMode, setPluginHeight }) {
   if (fever !== null) parts.push(fever ? `fever ${t} °C` : `no fever (${t} °C)`);
   const summary = parts.length ? `Vitals: ${parts.join(', ')}` : '';
   useEffect(() => {
-    if (viewMode || typeof setFieldValue !== 'function' || !summary) return;
+    if (viewMode || typeof setFieldValue !== 'function' || !fieldsMetadata.summary || !summary) return;
     if (String(values.summary ?? '') !== summary) setFieldValue({ fieldId: 'summary', value: summary });
   }, [summary, viewMode]);
   useEffect(() => {

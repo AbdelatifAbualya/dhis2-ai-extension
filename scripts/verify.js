@@ -2427,6 +2427,132 @@ async function runSqlViewChecks() {
   }
 }
 
+// Capture caches program metadata and reloads a program only when its version
+// changes; DHIS2 does not raise it for stage / rule edits (live 2026-10-25: a
+// form plugin's new storage field never reached Capture → "FLAG does nothing").
+async function runCaptureRefreshChecks() {
+  console.log('\nCapture metadata refresh (program version) & cooperating plugins:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const d = ctx.__dhis2();
+  const saved = { sdf: ctx.safeDhis2Fetch, baseUrl: d.baseUrl, apiVersion: d.apiVersion };
+  const calls = [];
+  const versions = { progA000001: 3, progB000001: 0, progNew0001: 0 };
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    const method = o.method || 'GET';
+    calls.push(`${method} ${p}`);
+    let m = p.match(/^programs\/(\w{11})\?fields=id,displayName,version/);
+    if (m) return { id: m[1], displayName: `Program ${m[1]}`, version: versions[m[1]] };
+    m = p.match(/^programs\/(\w{11})$/);
+    if (m && method === 'PATCH') { versions[m[1]] = o.body[0].value; return { status: 'OK' }; }
+    if (p.startsWith('programStages?filter=id:in:[stageA00001]')) return { programStages: [{ id: 'stageA00001', program: { id: 'progA000001' } }] };
+    if (p.startsWith('programStages?filter=programStageDataElements.dataElement.id:in:[deStore0001]')) return { programStages: [{ program: { id: 'progA000001' } }, { program: { id: 'progB000001' } }] };
+    if (p.startsWith('programRules?filter=id:in:[ruleGone001]')) return { programRules: [{ id: 'ruleGone001', program: { id: 'progB000001' } }] };
+    if (p.startsWith('system/info')) return { version: '2.42.5.1' };
+    return { _error: `unexpected ${method} ${p}` };
+  };
+  d.baseUrl = 'http://localhost:8081'; d.apiVersion = 42;
+  try {
+    await ctx.flushCaptureProgramVersionBumps();
+    ctx.noteCaptureMetadataWrite('PUT', 'programStages/stageA00001?mergeMode=REPLACE', JSON.stringify({ id: 'stageA00001', program: { id: 'progA000001' }, programStageDataElements: [] }));
+    let r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a stage PUT raises its program\'s version by one (Capture reloads it)', r && r.bumped.length === 1 && r.bumped[0].version === '3 → 4' && versions.progA000001 === 4);
+    truthy('…with a JSON Patch on /version, nothing else', calls.some((c) => c === 'PATCH programs/progA000001'));
+    truthy('…and once only: nothing pending afterwards', (await ctx.flushCaptureProgramVersionBumps()) === null);
+    ctx.noteCaptureMetadataWrite('PATCH', 'programStages/stageA00001', JSON.stringify([{ op: 'add', path: '/description', value: 'x' }]));
+    r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a JSON-Patch stage write (no program in the body) is looked up by its id', r && r.bumped[0].program_id === 'progA000001' && versions.progA000001 === 5);
+    ctx.noteCaptureMetadataWrite('POST', 'metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL', JSON.stringify({ programs: [{ id: 'progNew0001' }], programStages: [{ id: 'stageNew001', program: { id: 'progNew0001' } }], programRules: [{ id: 'ruleNew0001', program: { id: 'progNew0001' } }] }));
+    truthy('a program created / updated in the same import is left alone (new = uncached, updated = DHIS2 bumps it)', (await ctx.flushCaptureProgramVersionBumps()) === null && versions.progNew0001 === 0);
+    ctx.noteCaptureMetadataWrite('PUT', 'dataElements/deStore0001', JSON.stringify({ id: 'deStore0001', name: 'Flags', valueType: 'LONG_TEXT' }));
+    r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a data element change bumps every program whose stages use it', r && r.bumped.map((b) => b.program_id).sort().join() === 'progA000001,progB000001');
+    const pre = await ctx.captureProgramsOfDeletedObjects('DELETE', 'programRules/ruleGone001', null);
+    ctx.noteCaptureMetadataWrite('DELETE', 'programRules/ruleGone001', null, pre);
+    r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a deleted rule\'s program is resolved BEFORE the delete and bumped after', JSON.stringify(pre) === '["progB000001"]' && r && r.bumped[0].program_id === 'progB000001');
+    ctx.noteCaptureMetadataWrite('PUT', 'dataStore/capture/dataEntryForms', JSON.stringify({ x: [] }));
+    ctx.noteCaptureMetadataWrite('POST', 'tracker?async=false', JSON.stringify({ events: [{ event: 'e', programStage: 'stageA00001' }] }));
+    truthy('dataStore and tracker DATA writes never bump a program', (await ctx.flushCaptureProgramVersionBumps()) === null);
+    ctx.noteCaptureProgramChanged('progA000001');
+    const viaTool = await ctx.executeTool('dhis2_query', { path: 'system/info' });
+    truthy('executeTool runs the refresh when the call finishes and reports it as capture_refresh', viaTool && viaTool.capture_refresh && viaTool.capture_refresh.bumped[0].program_id === 'progA000001' && /reload/.test(viaTool.capture_refresh.note));
+  } finally {
+    ctx.safeDhis2Fetch = saved.sdf; d.baseUrl = saved.baseUrl; d.apiVersion = saved.apiVersion;
+    vm.runInContext('_captureMetaPending = null;', ctx);
+  }
+
+  // Form placement hands the plugin its program / stage in its own URL.
+  const src = 'http://localhost:8081/api/apps/ai-test-flag/plugin.html';
+  eq('form plugin URL carries programId + programStageId', ctx.formPluginSource(src, { kind: 'program_stage', id: 'stageA00001', programId: 'progA000001' }), `${src}?programId=progA000001&programStageId=stageA00001`);
+  eq('…registration form: programId only, and an old query is replaced', ctx.formPluginSource(`${src}?x=1`, { kind: 'program', id: 'progA000001', programId: 'progA000001' }), `${src}?programId=progA000001`);
+  truthy('the URL query does not stop the placement from being recognised as the app\'s', ctx.isPluginSourceOf('ai-test-flag', `${src}?programId=progA000001`));
+
+  // A plugin-owned (replace_field) field goes back to its own section on unplace.
+  const sctx = { id: 'stageA00001', kind: 'program_stage', programId: 'progA000001', fieldIds: ['deA00000001', 'deStore0001', 'deB00000001', 'deC00000001'],
+    fields: {}, sections: [{ id: 'secA0000001', name: 'A', fieldIds: ['deA00000001', 'deStore0001', 'deB00000001'] }, { id: 'secC0000001', name: 'C', fieldIds: ['deC00000001'] }] };
+  const sdef = ctx.defaultCaptureFormConfig(sctx);
+  const fmap = [{ plugin_field: 'a', field_id: 'deA00000001' }, { plugin_field: 'flags', field_id: 'deStore0001', replace_field: true }];
+  const once = ctx.formWithPlugin(sdef, sctx, { key: 'ai-test-flag', name: 'Flag', source: src, fieldMap: fmap, section: null, sectionName: null, position: 'bottom' });
+  truthy('replace_field takes the storage field out of its section; the plugin gets its own section', !once.sections[0].elements.some((e) => e.id === 'deStore0001') && once.sections.length === 3);
+  const twice = ctx.formWithPlugin(once.sections, sctx, { key: 'ai-test-flag', name: 'Flag', source: src, fieldMap: fmap, section: null, sectionName: null, position: 'bottom' });
+  truthy('placing again (upsert) leaves no empty or extra section behind', twice.sections.length === 3 && twice.sections.every((s) => s.elements.length));
+  const back = ctx.formWithoutPlugin(twice.sections, 'ai-test-flag', sctx);
+  truthy('unplace puts the field back in ITS section, in metadata order → exactly the default form (entry can be dropped)', back.removed === 1 && ctx.canonicalJson(back.sections) === ctx.canonicalJson(sdef));
+
+  // Lint for cooperating plugins.
+  const kit = await ctx.loadCustomAppKit().catch(() => null);
+  if (kit) {
+    const shake = "\nconst root = ReactDOMClient.createRoot(document.getElementById('root')); postRobot.send(window.parent, 'getPropsFromParent'); setPluginHeight;";
+    const lint = (code) => ctx.lintCustomAppCode({ 'plugin.jsx': code + shake }, 'plugin', kit.meta, 'CAPTURE');
+    truthy('form plugin writing without checking fieldsMetadata is warned', lint("const A = ({ values, setFieldValue }) => { setFieldValue({ fieldId: 'flags', value: '[]' }); };").warnings.some((w) => /never looks at fieldsMetadata/.test(w.message)));
+    truthy('…checking fieldsMetadata[alias] first is not', !lint("const A = ({ values, fieldsMetadata, setFieldValue }) => { if (fieldsMetadata.flags) setFieldValue({ fieldId: 'flags', value: '[]' }); };").warnings.some((w) => /fieldsMetadata/.test(w.message)));
+    // Patient data never goes into the dataStore.
+    const lintAs = (files, kind, type) => ctx.lintCustomAppCode(Object.fromEntries(Object.entries(files).map(([f, c]) => [f, c + (f === 'shared.jsx' ? '' : shake)])), kind, kit.meta, type);
+    const refusedPd = (r) => r.errors.some((e) => /Patient data never goes into the dataStore/.test(e.message));
+    const threadCode = "const NAMESPACE = 'ai-mch-flags'; const toggle = async (row) => { const resource = 'dataStore/' + NAMESPACE + '/flags'; await engine.mutate({ resource: resource, type: storeExists ? 'update' : 'create', data: payload }); }; const A = ({ values, setFieldValue }) => null;";
+    truthy('REFUSED: a Capture form plugin writing the dataStore (the thread\'s exact pattern: resource in a variable, ternary type)', refusedPd(lintAs({ 'plugin.jsx': threadCode }, 'plugin', 'CAPTURE')));
+    truthy('REFUSED: a Capture enrollment widget writing a dataStore key (shorthand resource)', refusedPd(lintAs({ 'plugin.jsx': "const A = ({ enrollmentId }) => null; const resource = `dataStore/${D2_APP_CONFIG.namespace}/active`; engine.mutate({ resource, type: 'update', data: { enrollmentId } });" }, 'plugin', 'CAPTURE')));
+    truthy('REFUSED: an app that reads tracker events and writes the dataStore', refusedPd(lintAs({ 'app.jsx': "const Q = { ev: { resource: 'tracker/events', params: { fields: 'event' } } }; const M = { resource: 'dataStore/ai-x/cache', type: 'create', data: ({ d }) => d };" }, 'app', null)));
+    truthy('REFUSED: a dashboard plugin reading line-list analytics and writing userDataStore', refusedPd(lintAs({ 'plugin.jsx': "const Q = { r: { resource: 'analytics/events/query/abcdefghijk' } }; engine.mutate({ resource: 'userDataStore/ns/k', type: 'update', data: rows });" }, 'plugin', 'DASHBOARD')));
+    truthy('allowed: a Capture plugin that only READS settings from the dataStore', !refusedPd(lintAs({ 'plugin.jsx': "const A = ({ enrollmentId }) => null; const S = { s: { resource: `dataStore/${D2_APP_CONFIG.namespace}`, params: { fields: '.', filter: '_:eq:settings' } } };" }, 'plugin', 'CAPTURE')));
+    truthy('allowed: app.jsx of an app_and_plugin writing settings for its Capture plugin', !refusedPd(lintAs({ 'app.jsx': "engine.mutate({ resource: `dataStore/${D2_APP_CONFIG.namespace}/settings`, type: 'update', data: s });", 'plugin.jsx': "const A = ({ enrollmentId }) => null;" }, 'app_and_plugin', 'CAPTURE')));
+    truthy('allowed: a dashboard plugin saving per-item settings (aggregate analytics only)', !refusedPd(lintAs({ 'plugin.jsx': "const Q = { a: { resource: 'analytics', params: {} } }; engine.mutate({ resource: `dataStore/${D2_APP_CONFIG.namespace}/${dashboardItemId}`, type: saved ? 'update' : 'create', data: settings });" }, 'plugin', 'DASHBOARD')));
+    truthy('allowed: a Capture plugin writing TRACKER data (not the dataStore)', !refusedPd(lintAs({ 'plugin.jsx': "const A = ({ values, setFieldValue }) => null; engine.mutate({ resource: 'tracker', type: 'create', params: { async: false }, data: { events: [] } });" }, 'plugin', 'CAPTURE')));
+  } else bad('runtime kit could not be loaded for the lint checks');
+  // …and the chatbot's own raw writes.
+  const d2 = ctx.__dhis2();
+  const savedTurn = { t: d2.turnCounter, p: d2.patientDataReadTurn };
+  truthy('dhis2_query dataStore write with tracker record fields is refused', /tracker record data \("enrollmentId"\)/.test(ctx.dataStorePatientDataReason({ active: { enrollmentId: 'abc', at: 'x' } }) || ''));
+  truthy('…nested values / events too', !!ctx.dataStorePatientDataReason(JSON.stringify({ x: { events: [{ dataValues: [] }] } })));
+  d2.turnCounter = 7; d2.patientDataReadTurn = 6;
+  truthy('a plain settings write is allowed', ctx.dataStorePatientDataReason({ columns: ['a'], showTotals: true }) === null);
+  d2.patientDataReadTurn = 7;
+  truthy('…but not in a turn that already read patient data', /already read patient-level data/.test(ctx.dataStorePatientDataReason({ columns: ['a'] }) || ''));
+  d2.turnCounter = savedTurn.t; d2.patientDataReadTurn = savedTurn.p;
+  const savedApps = ctx.listInstalledApps;
+  ctx.listInstalledApps = async () => [{ key: 'ai-owner', activities: { dhis: { namespace: 'ai-owner' } } }];
+  try {
+    const spec = { namespace: 'ai-me' };
+    eq('a hard-coded namespace nobody reserves is reported (const + concatenation)', await ctx.customAppUnreservedNamespaces("const NAMESPACE = 'ai-mch-flags'; const Q = { s: { resource: 'dataStore/' + NAMESPACE } };", spec), ['ai-mch-flags']);
+    eq('…and as a template / literal path', (await ctx.customAppUnreservedNamespaces("const NS = 'shared-x'; const a = `dataStore/${NS}/k`; const b = 'dataStore/other/k';", spec)).sort(), ['other', 'shared-x']);
+    eq('the app\'s own namespace, D2_APP_CONFIG.namespace and another app\'s reserved one are fine', await ctx.customAppUnreservedNamespaces("const a = `dataStore/${D2_APP_CONFIG.namespace}`; const b = 'dataStore/ai-owner/k'; const c = 'dataStore/ai-me';", spec), []);
+  } finally { ctx.listInstalledApps = savedApps; }
+  const dd = ctx.__dhis2();
+  const savedUsed = dd.toolsUsedThisThread;
+  dd.toolsUsedThisThread = ['manage_custom_app'];
+  const followUp = await ctx.buildSystemPrompt('I am hitting flag but nothing is happening');
+  dd.toolsUsedThisThread = [];
+  const unrelated = await ctx.buildSystemPrompt('I am hitting flag but nothing is happening');
+  dd.toolsUsedThisThread = savedUsed;
+  truthy('a bug report in a thread that built a plugin gets the diagnose-first + cooperating-plugins routing', /does nothing" \/ "is not saved": diagnose with real reads first/.test(followUp) && /shared-data contract first/.test(followUp));
+  truthy('…a thread that never built one does not', !/shared-data contract first/.test(unrelated));
+  const manual = vm.runInContext('KB_CUSTOM_APPS_DETAILS', ctx);
+  truthy('manual: cooperating plugins design the contract first and keep record data in tracker data', /### Plugins that work together/.test(manual) && /TRACKER DATA/.test(manual) && /PATIENT DATA NEVER GOES INTO THE DATASTORE/.test(manual) && /Never a shared "current record" pointer/.test(manual));
+  truthy('manual: verified form-field facts (no id in fieldsMetadata, Capture address params, HIDEFIELD blanks values, save is not a server write)', /there is NO id/.test(manual) && /enrollmentEventEdit\?eventId=/.test(manual) && /BLANKS the value/.test(manual) && /needs_write_access is about engine\.mutate/.test(manual));
+  truthy('manual: diagnose before changing code, and "placed" is not "working"', /### When a plugin "does nothing"/.test(manual) && /"Placed and configured" is not "working"/.test(manual));
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -2436,6 +2562,7 @@ setImmediate(async () => {
   if (loaded) await runPlacementChecks().catch((e) => bad(`placement checks threw: ${e && e.stack || e}`));
   if (loaded) await runSqlViewChecks().catch((e) => bad(`SQL view checks threw: ${e && e.stack || e}`));
   if (loaded) await runCustomAppChecks().catch((e) => bad(`custom-app checks threw: ${e && e.stack || e}`));
+  if (loaded) await runCaptureRefreshChecks().catch((e) => bad(`Capture refresh checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

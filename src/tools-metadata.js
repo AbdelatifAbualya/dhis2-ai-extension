@@ -80,7 +80,58 @@ async function fetchStageDetails(stageId) {
   };
 }
 
+// Why a dhis2_query dataStore write would store patient data, else null: the
+// body carries tracker record fields (a tracked entity / enrollment / event id
+// or its values), or this turn already read patient-level data.
+const DATASTORE_PATIENT_KEY_RE = /^(?:trackedEntit(?:y|ies|yId|yInstances?|yInstanceId)|teis?|teiIds?|enrollments?|enrollmentIds?|events?|eventIds?|dataValues|attributeValues)$/i;
+function dataStorePatientDataReason(body) {
+  let parsed = body;
+  if (typeof body === 'string') { try { parsed = JSON.parse(body); } catch { parsed = null; } }
+  let seen = 0;
+  const walk = (o, depth) => {
+    if (!o || typeof o !== 'object' || depth > 8 || ++seen > 5000) return null;
+    if (Array.isArray(o)) { for (const x of o) { const r = walk(x, depth + 1); if (r) return r; } return null; }
+    for (const [k, v] of Object.entries(o)) {
+      if (DATASTORE_PATIENT_KEY_RE.test(k)) return `the body carries tracker record data ("${k}")`;
+      const r = walk(v, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  };
+  const inBody = walk(parsed, 0);
+  if (inBody) return inBody;
+  if (dhis2.patientDataReadTurn != null && dhis2.patientDataReadTurn === (dhis2.turnCounter || 0)) return `this turn already read patient-level data (${dhis2.patientDataReadTool || 'a tracker read'})`;
+  return null;
+}
+
+// Tool calls can nest (a tool calling executeTool); the Capture refresh runs
+// once, when the outermost call finishes — see noteCaptureMetadataWrite.
+let _executeToolDepth = 0;
 async function executeTool(name, args) {
+  _executeToolDepth++;
+  let result;
+  try {
+    result = await executeToolCall(name, args);
+  } finally {
+    _executeToolDepth--;
+  }
+  // Remember that this turn has seen patient data (whether or not learning
+  // memory is on) — dataStore writes are refused for the rest of the turn.
+  try {
+    if (typeof memoryCallTouchesPatientData === 'function' && memoryCallTouchesPatientData(name, args, result)) {
+      dhis2.patientDataReadTurn = dhis2.turnCounter || 0;
+      dhis2.patientDataReadTool = name;
+    }
+  } catch { /* advisory bookkeeping only */ }
+  if (_executeToolDepth === 0) {
+    let refresh = null;
+    try { refresh = await flushCaptureProgramVersionBumps(); } catch (e) { console.warn('[capture-refresh]', e && e.message); }
+    if (refresh && result && typeof result === 'object' && !Array.isArray(result)) result.capture_refresh = refresh;
+  }
+  return result;
+}
+
+async function executeToolCall(name, args) {
   if (!TOOL_ROUTER[name]) {
     return { _error: `Unknown tool: ${name}` };
   }
@@ -235,6 +286,21 @@ async function executeTool(name, args) {
         // exact JSON" hint made the model promise a write it could never do.
         _hint: 'This block is unconditional: no user confirmation lifts it, so never offer to write it "if the user confirms". If a key is missing, open the relevant DHIS2 app and let it recreate the key on first use. To place a plugin the assistant built, use manage_custom_app(action="place") — it edits these keys safely (backup, exact Configurator format). Any other plugin is placed by the user in the Tracker Plugin Configurator app.',
       };
+    }
+
+    // Guard: patient data never goes into the dataStore (user rule, 2026-10-25)
+    // — it has no org-unit scoping, sharing, ownership or audit. Refused when
+    // the body carries tracker record fields, or this turn already read
+    // patient-level data (the memory module's per-turn taint).
+    if ((method === 'POST' || method === 'PUT' || method === 'PATCH') && /^(?:dataStore|userDataStore)(?:\/|\?|$)/i.test(safePath)) {
+      const why = dataStorePatientDataReason(args.body);
+      if (why) {
+        return {
+          _error: `Blocked: ${method} ${safePath.split('?')[0]} — ${why}. Patient data is never written to the dataStore: it would bypass the program's org-unit access, sharing, ownership and audit.`,
+          _hint: 'Keep record data in tracker data (the event / enrollment / attribute it belongs to). The dataStore is for settings and configuration only. No confirmation lifts this block.',
+          _scope: 'patient_data_datastore_block',
+        };
+      }
     }
 
     // Guard: bulk deletion via POST metadata?importStrategy=DELETE must be gated.
