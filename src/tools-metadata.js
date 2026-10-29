@@ -651,6 +651,59 @@ async function executeToolCall(name, args) {
       }
     }
 
+    // Guard: hand-assembled ANALYTICS OBJECTS. Charts, pivots, maps and line
+    // lists are only renderable when their data dimensions are stored in the
+    // exact shape the apps expect — a raw body that sets only columns/rows
+    // saves an object with NO data. The 2026-10-29 MNCH thread: on a
+    // "continue" turn the dedicated tools were not offered, so the model
+    // POSTed visualizations/maps/dashboards by hand — a chart of one org unit,
+    // a map whose layer had no data item at all (after a renderingStrategy
+    // 409 and a mapViews PATCH 405), and it reported both as "configured
+    // correctly". Each of these objects has a tool that builds and verifies it.
+    if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+      const resource = safePath.split('?')[0].split('/')[0];
+      const ANALYTICS_OBJECT_TOOL = {
+        visualizations: 'manage_dashboards(action="create_visualization", visualization:{ name, vis_type, data_items:[…], periods:[…], org_units:[…], layout? }) — PIVOT_TABLE for a table of org units × indicators',
+        charts: 'manage_dashboards(action="create_visualization", …)',
+        reportTables: 'manage_dashboards(action="create_visualization", visualization:{ vis_type:"PIVOT_TABLE", … })',
+        maps: 'manage_maps(action="create", name, data_item, org_unit_level, thematic_map_type:"CHOROPLETH"|"BUBBLE", period, legend_set_id?)',
+        mapViews: 'manage_maps(action="create", …) — a map layer cannot be edited on its own',
+        eventVisualizations: 'manage_line_lists(action="create"|"update", …)',
+        eventReports: 'manage_line_lists(action="create", …)',
+        eventCharts: 'manage_dashboards(action="create_visualization", …) with program-indicator data_items',
+      };
+      // A rename/description PATCH on an existing object is harmless — let it through.
+      const ownFieldsOnly = (() => {
+        if (method !== 'PATCH' || !/^[A-Za-z]+\/[A-Za-z][A-Za-z0-9]{10}(\?|$)/.test(safePath)) return false;
+        let b = args.body;
+        try { if (typeof b === 'string') b = JSON.parse(b); } catch { return false; }
+        const OWN = /^\/?(name|shortName|description|title|subtitle|code)$/;
+        if (Array.isArray(b)) return b.length > 0 && b.every(op => op && OWN.test(String(op.path || '')));
+        return !!b && typeof b === 'object' && Object.keys(b).length > 0 && Object.keys(b).every(k => OWN.test(k));
+      })();
+      let target = null;
+      if (ownFieldsOnly) target = null;
+      else if (ANALYTICS_OBJECT_TOOL[resource]) target = resource;
+      else if (method === 'POST' && resource === 'dashboards' && !/^dashboards\/[A-Za-z][A-Za-z0-9]{10}\//.test(safePath)) target = 'dashboards';
+      else if (method === 'POST' && resource === 'metadata' && !/importStrategy=DELETE/i.test(safePath)) {
+        try {
+          const parsedMeta = typeof args.body === 'string' ? JSON.parse(args.body) : args.body;
+          target = Object.keys(ANALYTICS_OBJECT_TOOL).concat('dashboards')
+            .find(k => parsedMeta && Array.isArray(parsedMeta[k]) && parsedMeta[k].length) || null;
+        } catch { /* non-JSON body — other guards decide */ }
+      }
+      if (target) {
+        const how = target === 'dashboards'
+          ? 'manage_dashboards(action="create_dashboard", dashboard:{ name }, items:[ { new_visualization:{…} } | { visualization_id } | { type:"MAP", map_id } | { type:"EVENT_VISUALIZATION", event_visualization_id } ]) — or action="add_items" for an existing dashboard'
+          : ANALYTICS_OBJECT_TOOL[target];
+        return {
+          _error: `Blocked: ${method} ${target} via dhis2_query. A hand-written ${target} body saves an object the apps cannot render correctly (no data dimensions, or the wrong layer shape) — and it looks like success. Nothing was sent.`,
+          _hint: `Use ${how}. That tool is available now — call it directly; it builds the exact structure DHIS2 needs, verifies every data item and reports the saved id. To change an existing chart/map, create the corrected one with the tool and swap it on the dashboard (manage_dashboards add_items + remove_item), then delete the old one with manage_metadata.`,
+          _redirect: target === 'maps' || target === 'mapViews' ? 'manage_maps' : (target === 'eventVisualizations' || target === 'eventReports') ? 'manage_line_lists' : 'manage_dashboards',
+        };
+      }
+    }
+
     // Guard: DASHBOARD DATA-LOSS PREVENTION. The single most destructive thing
     // the model has ever done: to "add a chart to a dashboard" it did a full
     // PUT /dashboards/{id} (or POST /metadata with a dashboards[] entry) whose
@@ -845,6 +898,12 @@ async function executeToolCall(name, args) {
         console.log(`[dhis2_query] Split packed analytics dimensions → ${packHeal.path}`);
         safePath = packHeal.path;
       }
+      const stageHeal = await healBareStageDimension(safePath);
+      if (stageHeal.refusal) return stageHeal.refusal;
+      if (stageHeal.healed) {
+        console.log(`[dhis2_query] Stage UID moved from dimension= to stage= → ${stageHeal.path}`);
+        safePath = stageHeal.path;
+      }
       // visualizations/<id>/data is the chart IMAGE (PNG), not its values
       // (live 2026-10-28: two "non-JSON response" errors) — read the values
       // the way get_visualization_details does.
@@ -873,6 +932,13 @@ async function executeToolCall(name, args) {
       if (dupHeal.healed) {
         console.log(`[dhis2_query] Merged repeated dx dimensions → ${dupHeal.path}`);
         safePath = dupHeal.path;
+      }
+      const multiStage = eventAnalyticsMultiStageRefusal(safePath);
+      if (multiStage) return multiStage;
+      const dateHeal = healAnalyticsPeriodAndDates(safePath);
+      if (dateHeal.healed) {
+        console.log(`[dhis2_query] Dropped startDate/endDate next to a period → ${dateHeal.path}`);
+        safePath = dateHeal.path;
       }
     }
 
@@ -958,7 +1024,21 @@ async function executeToolCall(name, args) {
 
   // ── count_records ──
   if (name === 'count_records') {
-    const pid = args.program_override || programId;
+    // Program: explicit (program_override / program_id), the page's, the
+    // program of the given stage, or the one this turn looked up with
+    // get_program_info. The RMNCH run (2026-10-29, Dashboard page) refused
+    // four counts with "no program in context" although the stage ids — and
+    // the program — were already known, and the 5th was blocked.
+    let pid = args.program_override || args.program_id || programId;
+    let pidSource = null;
+    if (!pid && args.stage_id && /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(args.stage_id))) {
+      const st = await safeDhis2Fetch(`programStages/${args.stage_id}?fields=program[id]`);
+      if (st?.program?.id) { pid = st.program.id; pidSource = 'the program of the given stage'; }
+    }
+    if (!pid && dhis2.lastProgramLookup?.id && dhis2.lastProgramLookup.turn === (dhis2.turnCounter || 0)) {
+      pid = dhis2.lastProgramLookup.id;
+      pidSource = `the program looked up earlier in this request (${dhis2.lastProgramLookup.name || pid})`;
+    }
     // No org unit anywhere → count across all of the user's own org units
     // (USER_ORGUNIT: one subtree-wide row per top unit, summed below) instead
     // of an error the model can only answer by guessing a UID — live
@@ -966,11 +1046,15 @@ async function executeToolCall(name, args) {
     const userRootsDefault = !(args.ou_override || orgUnitId);
     const originalOuid = args.ou_override || orgUnitId || 'USER_ORGUNIT';
     if (!pid) return {
-      _error: 'No program in context and no program_override given.',
+      _error: 'No program in context and no program_override given. Pass program_override="<program UID>" (the UID get_program_info / search_metadata returned).',
       _hint: 'Do NOT guess a program UID. Pick a tool that does not need one: manage_program_indicators(action="discover") for cross-program indicator questions, search_metadata(object_type="programs", name_filter="<keyword>") to find a specific program, or ask the user to open a program first.',
     };
 
-    const progName = dhis2.programMetadata?.displayName || pid;
+    // Name of the program actually counted (the page's metadata only describes
+    // the page program — it mislabelled counts of another program).
+    const progName = (pid === programId ? dhis2.programMetadata?.displayName : null)
+      || (dhis2.lastProgramLookup?.id === pid ? dhis2.lastProgramLookup.name : null)
+      || pid;
     const hasOuOverride = userRootsDefault || (typeof args.ou_override === 'string' && args.ou_override.trim().length > 0);
     const userWantsDescendants = userExplicitlyWantsDescendants(lastUserText);
     // Unless user explicitly asks broader scope, keep counts at selected OU only.
@@ -996,7 +1080,9 @@ async function executeToolCall(name, args) {
       }
     }
 
-    let stageName = 'All stages';
+    // Label the stage actually counted (the page metadata only knows the page
+    // program; another program's stage used to be labelled "All stages").
+    let stageName = args.stage_id ? `stage ${args.stage_id}` : 'All stages';
     if (args.stage_id && dhis2.programMetadata?.programStages) {
       const s = dhis2.programMetadata.programStages.find(s => s.id === args.stage_id);
       if (s) stageName = s.displayName;
@@ -1028,11 +1114,9 @@ async function executeToolCall(name, args) {
       // Attribute filters for tracked_entities
       if (args.filters?.length) {
         for (const f of args.filters) {
-          // Convert filter format: {attrId}:eq:{value} → dimension={attrId}:{value}
-          const parts = f.match(/^([^:]+):(eq|like|ilike):(.+)$/);
-          if (parts) {
-            path += `&dimension=${parts[1]}:${parts[3]}`;
-          }
+          // {attrId}:eq:{value} → dimension={attrId}:EQ:{value} (analytics needs the operator)
+          const dim = countRecordsFilterDimension(f, '');
+          if (dim) path += `&dimension=${encodeURIComponent(dim)}`;
         }
       }
 
@@ -1041,7 +1125,9 @@ async function executeToolCall(name, args) {
         return {
           _error: 'Unable to return a reliable org-unit-scoped count from analytics.',
           _details: result._error,
-          _hint: 'Rebuild analytics tables (or retry later). Tracker fallback is disabled for strict OU accuracy.',
+          _hint: /does not exist|E7144|E7131/i.test(String(result._error))
+            ? 'Analytics tables are missing for this program — they must be generated (Data Administration → Analytics Tables). Tracker fallback is disabled for strict OU accuracy.'
+            : 'DHIS2 rejected the query — read _details (usually a filter: "<deUid>:eq:<value>" with an option CODE, 1/0 for Yes/No). Do not blame analytics tables.',
           _method: 'analytics_error'
         };
       }
@@ -1088,12 +1174,9 @@ async function executeToolCall(name, args) {
 
       if (args.filters?.length) {
         for (const f of args.filters) {
-          const parts = f.match(/^([^:]+):(eq|like|ilike):(.+)$/);
-          if (parts) {
-            // For event filters, prefix with stage ID if available
-            const stagePrefix = args.stage_id ? `${args.stage_id}.` : '';
-            path += `&dimension=${stagePrefix}${parts[1]}:${parts[3]}`;
-          }
+          // For event filters, prefix with stage ID if available
+          const dim = countRecordsFilterDimension(f, args.stage_id ? `${args.stage_id}.` : '');
+          if (dim) path += `&dimension=${encodeURIComponent(dim)}`;
         }
       }
 
@@ -1102,7 +1185,9 @@ async function executeToolCall(name, args) {
         return {
           _error: 'Unable to return a reliable org-unit-scoped count from analytics.',
           _details: result._error,
-          _hint: 'Rebuild analytics tables (or retry later). Tracker fallback is disabled for strict OU accuracy.',
+          _hint: /does not exist|E7144|E7131/i.test(String(result._error))
+            ? 'Analytics tables are missing for this program — they must be generated (Data Administration → Analytics Tables). Tracker fallback is disabled for strict OU accuracy.'
+            : 'DHIS2 rejected the query — read _details (usually a filter: "<deUid>:eq:<value>" with an option CODE, 1/0 for Yes/No). Do not blame analytics tables.',
           _method: 'analytics_error'
         };
       }
@@ -1295,6 +1380,9 @@ async function executeToolCall(name, args) {
     if (!effProgramId) {
       return { _error: 'No program in context. Pass program_id or program_name to target a specific program.' };
     }
+    // Remember the program this turn looked up, so a follow-up count in the
+    // same turn does not dead-end on "no program in context" (count_records).
+    if (args.program_id || args.program_name) dhis2.lastProgramLookup = { id: effProgramId, name: effProgramName, turn: dhis2.turnCounter || 0 };
     // Stage-name guards below validate against dhis2.programMetadata, which is
     // loaded for the PAGE program only — skip them when targeting another one.
     const usingContextProgram = effProgramId === programId;
@@ -4713,6 +4801,52 @@ async function resolveDataItemTypes(uids) {
 // Build a complete, render-correct visualization object from a friendly spec.
 // typeMap must already contain a resolved type for every data_items UID.
 // Returns { ok:true, id, viz } or { _error }. Pure/synchronous.
+// "LAST_5_YEARS" reads like "the last five years, this one included", but
+// DHIS2's LAST_N_… periods are the N COMPLETED periods: on 2026-10-29
+// LAST_5_YEARS is 2021–2025. In the MNCH dashboard replay (2026-10-29) the
+// model chose LAST_5_YEARS "because there is little data" and every tile
+// showed 0 — all of the program's data is in 2026. When a saved chart/map's
+// periods ALL end before this year and its data shows nothing there while THIS
+// year has data, the result says so. Year-level keywords only (LAST_12_MONTHS
+// misses just the current month), so ordinary charts cost no extra call.
+const BEFORE_THIS_YEAR_PERIOD_RE = /^(?:LAST_YEAR|LAST_\d+_YEARS|LAST_FINANCIAL_YEAR|LAST_\d+_FINANCIAL_YEARS|MONTHS_LAST_YEAR|QUARTERS_LAST_YEAR)$/;
+async function periodsMissThisYearWarning(dataIds, periods) {
+  const ps = (Array.isArray(periods) ? periods : [periods]).filter(Boolean).map(p => String(p).trim().toUpperCase());
+  const ids = [...new Set((dataIds || []).filter(Boolean))];
+  if (!ps.length || !ids.length || !ps.every(p => BEFORE_THIS_YEAR_PERIOD_RE.test(p))) return null;
+  const q = (pe) => safeDhis2Fetch(`analytics?dimension=dx:${ids.join(';')}&filter=ou:USER_ORGUNIT&filter=pe:${pe}&skipMeta=true`);
+  const hasData = (r) => !r?._error && (r?.rows || []).some(row => row[row.length - 1] !== '' && Number(row[row.length - 1]) !== 0);
+  const chosen = await q(ps.join(';'));
+  if (chosen?._error || hasData(chosen)) return null;
+  const now = await q('THIS_YEAR');
+  if (!hasData(now)) return null;
+  const year = new Date().getFullYear();
+  return `${ps.join(' + ')} covers only COMPLETED periods (it ends on ${year - 1}-12-31) and this data shows nothing there — but it does have data in ${year}. As saved, the tile will show zeros/blank. DHIS2 "LAST_N_…" periods never include the current one: add THIS_YEAR (e.g. ["THIS_YEAR","LAST_5_YEARS"]) or use THIS_YEAR / LAST_12_MONTHS, then recreate it.`;
+}
+
+// overall_row: a table of org units WITH an overall row. DHIS2 pivot totals
+// add up (or average) the cells — wrong for percentages, and the RMNCH run
+// (2026-10-29) asked for "overall percentages from all records, not an
+// average of district percentages". The parent org unit as its OWN row is
+// computed by analytics from all records (23.6 % national next to the 13
+// districts, verified 2.43.2). So [<boundary uid>, "LEVEL-n"] is expanded to
+// the boundary + every level-n unit under it (explicit rows, no level).
+async function applyOverallRow(spec) {
+  if (!spec || spec.overall_row !== true) return null;
+  const ous = (Array.isArray(spec.org_units) ? spec.org_units : []).map(o => String(o).trim());
+  const lvl = ous.map(o => o.match(/^LEVEL-(\d{1,2})$/i)).find(Boolean);
+  const bounds = ous.filter(o => /^[A-Za-z][A-Za-z0-9]{10}$/.test(o));
+  if (!lvl || bounds.length !== 1) {
+    return { _error: 'overall_row needs org_units = [<ONE parent org-unit UID>, "LEVEL-<n>"] — the parent becomes the overall row, its level-n units the other rows.' };
+  }
+  const r = await safeDhis2Fetch(`organisationUnits?filter=path:like:${bounds[0]}&filter=level:eq:${lvl[1]}&fields=id&order=name:asc&paging=false`);
+  const kids = (r?.organisationUnits || []).map(o => o.id).filter(id => id !== bounds[0]);
+  if (r?._error || !kids.length) return { _error: `overall_row: no level-${lvl[1]} org units found under ${bounds[0]}${r?._error ? ` (${r._error})` : ''}.` };
+  if (kids.length > 300) return { _error: `overall_row: ${kids.length} level-${lvl[1]} units under ${bounds[0]} — too many explicit rows; use a higher level.` };
+  spec.org_units = [bounds[0], ...kids];
+  return { note: `Overall row added: the parent org unit is its own row, computed by DHIS2 from all records (not a sum or average of the ${kids.length} rows below it). The ${kids.length} level-${lvl[1]} units are saved explicitly, so a unit added later needs the table updated.` };
+}
+
 function buildVisualizationObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'visualization spec object is required.' };
   const type = String(spec.vis_type || spec.type || 'COLUMN').toUpperCase();
@@ -4790,11 +4924,35 @@ function buildVisualizationObject(spec, typeMap) {
 
   // Layout — store dimension lists; only include a dimension that has data.
   const hasData = { dx: dataDimensionItems.length > 0, pe: hasPe, ou: hasOu };
-  const layoutSpec = spec.layout && typeof spec.layout === 'object' ? spec.layout : vizDefaultLayout(type);
+  let layoutSpec = spec.layout && typeof spec.layout === 'object' ? spec.layout : vizDefaultLayout(type);
   const ALLOWED_DIMS = new Set(['dx', 'pe', 'ou']);
-  const axisDims = (dims) => (Array.isArray(dims) ? dims : [])
+  const axisDims = (dims) => (Array.isArray(dims) ? dims : (dims ? [dims] : []))
     .map(d => String(d).toLowerCase())
     .filter(d => ALLOWED_DIMS.has(d) && hasData[d]);
+  // In a DHIS2 CHART, rows are the CATEGORY (x-axis) and columns the SERIES
+  // (legend) — every stock chart on the demo DB is columns:[dx|ou],
+  // rows:[pe|ou]. "Columns" reads like "the x-axis", so models swap them: the
+  // RMNCH run (2026-10-29) saved a monthly line chart with the two indicators
+  // as the x-axis and twelve month-lines, and a "districts compared" stacked
+  // bar with districts as the stacks. Accept series/category names, and undo
+  // the swap that leaves ONLY data items on the x-axis while periods/org units
+  // become series (keep_layout:true keeps a deliberate one).
+  const isChart = !['PIVOT_TABLE', 'SINGLE_VALUE', 'GAUGE', 'PIE', 'RADAR'].includes(type);
+  if (spec.layout && typeof spec.layout === 'object' && (spec.layout.series || spec.layout.category || spec.layout.x_axis)) {
+    layoutSpec = {
+      columns: spec.layout.series ?? spec.layout.columns,
+      rows: spec.layout.category ?? spec.layout.x_axis ?? spec.layout.rows,
+      filters: spec.layout.filters ?? spec.layout.filter,
+    };
+  }
+  let layoutNote = null;
+  if (isChart && spec.keep_layout !== true) {
+    const cols = axisDims(layoutSpec.columns), rows = axisDims(layoutSpec.rows);
+    if (rows.length === 1 && rows[0] === 'dx' && !cols.includes('dx') && cols.some(d => d === 'pe' || d === 'ou')) {
+      layoutSpec = { columns: rows, rows: cols, filters: layoutSpec.filters };
+      layoutNote = `Layout corrected: a chart draws ROWS on the x-axis (category) and COLUMNS as series. As sent, only the data items were on the x-axis and ${cols.join(' + ')} became the series; swapped so ${cols.join(' + ')} is the x-axis and each data item is a series. Pass keep_layout:true to keep the original.`;
+    }
+  }
   // Guarantee every present dimension is placed exactly once; if a custom
   // layout omits one, fall back to the type default so no data is orphaned.
   const placed = new Set([...axisDims(layoutSpec.columns), ...axisDims(layoutSpec.rows), ...axisDims(layoutSpec.filters)]);
@@ -4855,7 +5013,10 @@ function buildVisualizationObject(spec, typeMap) {
   }
   if (spec.short_name) viz.shortName = String(spec.short_name).slice(0, 50);
   if (spec.description) viz.description = String(spec.description);
-  return { ok: true, id, viz };
+  const layout = isChart
+    ? { category_x_axis: rowDimensions, series: columnDimensions, filters: filterDimensions }
+    : { columns: columnDimensions, rows: rowDimensions, filters: filterDimensions };
+  return { ok: true, id, viz, layout, layoutNote };
 }
 
 // ── Thematic map authoring ──────────────────────────────────────────────────
@@ -4995,8 +5156,10 @@ async function executeManageMaps(args) {
     const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
     if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
     const newId = resp?.response?.uid || built.map.id;
+    const periodWarning = await periodsMissThisYearWarning([itemId], [built.map.mapViews[0].filters[0].items[0].id]);
     return {
       success: true,
+      ...(periodWarning ? { _warning: periodWarning } : {}),
       map_id: newId,
       name: built.map.name,
       layer: 'thematic',
@@ -5086,7 +5249,7 @@ async function executeManageDashboards(args) {
     if (!dId) return { _error: 'dashboard_id required for get' };
     const resp = await safeDhis2Fetch(
       `dashboards/${dId}?fields=id,displayName,description,` +
-      `dashboardItems[id,type,x,y,width,height,text,visualization[id,displayName,type],map[id,displayName]]`
+      `dashboardItems[id,type,x,y,width,height,text,appKey,visualization[id,displayName,type],map[id,displayName],eventVisualization[id,displayName]]`
     );
     if (resp?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
     if (resp?._error) return { _error: `Could not load dashboard ${dId}: ${resp._error}` };
@@ -5095,10 +5258,12 @@ async function executeManageDashboards(args) {
       type: it.type,
       visualization: it.visualization ? { id: it.visualization.id, name: it.visualization.displayName, type: it.visualization.type } : undefined,
       map: it.map ? { id: it.map.id, name: it.map.displayName } : undefined,
+      line_list: it.eventVisualization ? { id: it.eventVisualization.id, name: it.eventVisualization.displayName } : undefined,
+      app_key: it.appKey || undefined,
       text: it.text || undefined,
       layout: { x: it.x, y: it.y, width: it.width, height: it.height },
     }));
-    return { success: true, id: resp.id, name: resp.displayName, description: resp.description || null, item_count: items.length, items };
+    return { success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length, items };
   }
 
   // ── create_visualization ────────────────────────────────────────────────
@@ -5113,8 +5278,11 @@ async function executeManageDashboards(args) {
     if (unresolved.length) {
       return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${unresolved.join(', ')}.`, _hint: 'Resolve the correct UIDs with search_metadata first; never invent UIDs.' };
     }
+    const overall = await applyOverallRow(spec);
+    if (overall?._error) return overall;
     const built = buildVisualizationObject(spec, typeMap);
     if (built._error) return built;
+    if (overall?.note) built.overallNote = overall.note;
     const rootScope = await singleRootScopeRefusal(spec.org_units, `Visualization "${built.viz.name}"`);
     if (rootScope) return rootScope;
     const result = await postMetadataPayload({ visualizations: [built.viz] }, !!args.dry_run_only);
@@ -5122,6 +5290,7 @@ async function executeManageDashboards(args) {
     if (args.dry_run_only) {
       return { success: true, dry_run: true, message: `Validation passed for "${built.viz.name}". No visualization created (dry_run_only=true).`, would_create: { id: built.id, name: built.viz.name, type: built.viz.type } };
     }
+    const periodWarning = await periodsMissThisYearWarning(spec.data_items, spec.periods);
     return {
       success: true,
       action: 'create_visualization',
@@ -5129,8 +5298,11 @@ async function executeManageDashboards(args) {
       // multi-step caller can chain this UID into the next tool without digging
       // into the nested object. The nested `visualization` object is preserved.
       visualization_id: built.id,
-      visualization: { id: built.id, name: built.viz.name, type: built.viz.type, data_items: built.viz.dataDimensionItems.length },
+      visualization: { id: built.id, name: built.viz.name, type: built.viz.type, data_items: built.viz.dataDimensionItems.length, layout: built.layout },
       message: `Created ${built.viz.type} visualization "${built.viz.name}" (${built.id}).`,
+      ...(built.layoutNote ? { _layout_corrected: built.layoutNote } : {}),
+      ...(built.overallNote ? { overall_row: built.overallNote } : {}),
+      ...(periodWarning ? { _warning: periodWarning } : {}),
     };
   }
 
@@ -5170,12 +5342,17 @@ async function executeManageDashboards(args) {
     // Build inline visualizations.
     const newVisualizations = [];
     const inlineVizIdByIndex = {};
+    const layoutNotes = [];
     for (const { index, spec } of inlineSpecs) {
+      const overall = await applyOverallRow(spec);
+      if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
+      if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
       const built = buildVisualizationObject(spec, typeMap);
       if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
       const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
       if (rootScope) return rootScope;
       newVisualizations.push(built.viz);
+      if (built.layoutNote) layoutNotes.push(`"${built.viz.name}": ${built.layoutNote}`);
       inlineVizIdByIndex[index] = built.id;
     }
 
@@ -5265,16 +5442,37 @@ async function executeManageDashboards(args) {
         would_create: { dashboard_id: dashId, name: dashObj.name, items: dashboardItems.length, new_visualizations: newVisualizations.length },
       };
     }
+    // Same period check for the inline visualizations (one pair of queries per
+    // distinct period set).
+    const periodWarnings = [];
+    {
+      const byPeriods = new Map();
+      for (const { spec } of inlineSpecs) {
+        const key = JSON.stringify(spec.periods || []);
+        if (!byPeriods.has(key)) byPeriods.set(key, { periods: spec.periods || [], ids: [], names: [] });
+        const g = byPeriods.get(key);
+        g.ids.push(...(spec.data_items || [])); g.names.push(spec.name);
+      }
+      for (const g of byPeriods.values()) {
+        const w = await periodsMissThisYearWarning(g.ids, g.periods);
+        if (w) periodWarnings.push(`${g.names.map(n => `"${n}"`).join(', ')}: ${w}`);
+      }
+    }
     return {
       success: true,
       action: 'create_dashboard',
+      ...(periodWarnings.length ? { _warning: periodWarnings.join(' | ') } : {}),
       // Top-level dashboard_id mirrors the *_id convention so the final sharing
       // step (manage_metadata update_sharing) can chain it directly. The nested
       // `dashboard` object is preserved for any existing reader.
       dashboard_id: dashId,
+      // The link the user asked for — works on every version (2.42+ redirects
+      // /dhis-web-dashboard to the global-shell /apps/dashboard and keeps #/id).
+      dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dashId}`,
       dashboard: { id: dashId, name: dashObj.name },
       items: dashboardItems.length,
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
+      ...(layoutNotes.length ? { _layout_corrected: layoutNotes } : {}),
       message: `Created dashboard "${dashObj.name}" (${dashId}) with ${dashboardItems.length} item(s)${newVisualizations.length ? `, including ${newVisualizations.length} new visualization(s)` : ''}.`,
     };
   }
@@ -5318,12 +5516,17 @@ async function executeManageDashboards(args) {
     }
     const newVisualizations = [];
     const inlineVizIdByIndex = {};
+    const layoutNotes = [];
     for (const { index, spec } of inlineSpecs) {
+      const overall = await applyOverallRow(spec);
+      if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
+      if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
       const built = buildVisualizationObject(spec, typeMap);
       if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
       const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
       if (rootScope) return rootScope;
       newVisualizations.push(built.viz);
+      if (built.layoutNote) layoutNotes.push(`"${built.viz.name}": ${built.layoutNote}`);
       inlineVizIdByIndex[index] = built.id;
     }
 
@@ -5413,11 +5616,13 @@ async function executeManageDashboards(args) {
       success: true,
       action: 'add_items',
       dashboard_id: dId,
+      dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dId}`,
       dashboard_name: dashName,
       items_before: existingItems.length,
       items_added: newItems.length,
       items_after: after,
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
+      ...(layoutNotes.length ? { _layout_corrected: layoutNotes } : {}),
       added: summary,
       backup: backup.block,
       _note: (after !== null && after !== existingItems.length + newItems.length)

@@ -1641,6 +1641,7 @@ async function ensureConnected() {
 // truthy guard in recordKnownIdsFromResult and crashes the next .add() call
 // with "set.add is not a function". Counters/history reset every turn anyway.
 const PER_TURN_DHIS2_FIELDS = new Set([
+  'lastProgramLookup',
   'knownIds', 'knownIdsSeedSize', 'knownIcons',
   'recentCreations',
   'writeAuth',
@@ -1711,6 +1712,102 @@ function getThreadToolNames() {
     }
   }
   return out;
+}
+
+// An EVENT analytics query (aggregate or query) is about the events of ONE
+// stage: stage-qualified dimensions from two stages are a guaranteed 409
+// ("Multiple stages in stage-specific dimensions are not allowed", E7244 —
+// MNCH replay 2026-10-29). Refuse it before it is sent and say how to split
+// it; enrollment analytics, which does span stages, is untouched.
+function eventAnalyticsMultiStageRefusal(path) {
+  const p = String(path || '');
+  if (!/^analytics\/events\/(?:aggregate|query)\//.test(p)) return null;
+  const qs = p.split('?')[1] || '';
+  const stages = new Set();
+  for (const part of qs.split('&')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const key = part.slice(0, eq);
+    let val = part.slice(eq + 1);
+    try { val = decodeURIComponent(val); } catch { /* keep raw */ }
+    if (key === 'stage' && /^[A-Za-z][A-Za-z0-9]{10}$/.test(val)) stages.add(val);
+    if (key !== 'dimension' && key !== 'filter') continue;
+    // `dimension=stage:A;B;C` — several stages asked for at once (RMNCH run
+    // 2026-10-29: 409 "does not reference any … part of the program: stage").
+    const listed = val.match(/^(?:stage|programStage):(.+)$/i);
+    if (listed) { for (const id of listed[1].split(';')) if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(id.trim())) stages.add(id.trim()); continue; }
+    const m = val.match(/^([A-Za-z][A-Za-z0-9]{10})\.[A-Za-z][A-Za-z0-9]{10}(?::|$)/);
+    if (m) stages.add(m[1]);
+  }
+  if (stages.size < 2) return null;
+  return {
+    _error: `Not sent: an event analytics query covers ONE program stage, but this one mixes ${[...stages].join(', ')} (DHIS2 answers 409 "Multiple stages in stage-specific dimensions are not allowed").`,
+    _hint: 'Run one query per stage (stage=<stageUid> with only that stage\'s <stageUid>.<deUid> dimensions), or use analytics/enrollments/aggregate, which may combine stages. For indicator values use /analytics with dx:<programIndicatorUid>.',
+    _scope: 'event_analytics_multi_stage',
+  };
+}
+
+// /api/analytics refuses a period AND startDate/endDate together (409 E7105
+// "Periods and start and end dates cannot be specified simultaneously" — RMNCH
+// run 2026-10-29, after an events/aggregate query with both was routed here).
+// The period says the same thing more precisely, so the dates are dropped.
+function healAnalyticsPeriodAndDates(path) {
+  const p = String(path || '');
+  if (!/^analytics(?:\.json)?\?/.test(p)) return { path: p, healed: false };
+  const [base, qs] = [p.slice(0, p.indexOf('?')), p.slice(p.indexOf('?') + 1)];
+  const parts = qs.split('&');
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const hasPe = parts.some(x => /^(dimension|filter)=/i.test(x) && /^pe:/i.test(dec(x.replace(/^[^=]*=/, ''))));
+  const hasDates = parts.some(x => /^(startDate|endDate)=/i.test(x));
+  if (!hasPe || !hasDates) return { path: p, healed: false };
+  return { path: `${base}?${parts.filter(x => !/^(startDate|endDate)=/i.test(x)).join('&')}`, healed: true };
+}
+
+// count_records filters "<id>:<op>:<value>" → an analytics dimension
+// "<prefix><id>:<OP>:<value>". The operator is REQUIRED by analytics — the old
+// conversion dropped it ("de:true"), so every filtered count 409'd (RMNCH run
+// 2026-10-29). Yes/No values are 1/0 in analytics.
+function countRecordsFilterDimension(f, prefix = '') {
+  const m = String(f || '').match(/^([^:]+):(eq|ne|gt|ge|lt|le|like|ilike|in|!eq):(.+)$/i);
+  if (!m) return null;
+  const op = m[2].toLowerCase() === 'ilike' ? 'LIKE' : m[2].toUpperCase();
+  const val = m[3].replace(/^true$/i, '1').replace(/^false$/i, '0');
+  return `${prefix}${m[1]}:${op}:${val}`;
+}
+
+// ── Routing text for follow-up turns ────────────────────────────────────────
+// A follow-up turn ("continue", "yes go ahead", "do the rest") names no
+// feature, so the keyword router saw only that word and offered none of the
+// task's tools. Live 2026-10-29: after "Say continue and I will … create the
+// chart, the bubble map and the dashboard", the "continue" turn had no
+// manage_dashboards/manage_maps on the wire, so the model hand-POSTed a chart
+// of a single org unit and a map with no data item, and called both done.
+// Short messages are routed on themselves PLUS the last substantive request of
+// this conversation. Relevance only: write authorization and the save-failure
+// mode still read the current message alone.
+const FOLLOW_UP_ONLY_RE = /^\s*(?:(?:please|ok(?:ay)?|yes|yeah|sure|great|thanks|good)[,.!\s]+)*(?:continue|go\s+on|go\s+ahead|proceed|carry\s+on|keep\s+going|resume|yes|yeah|yep|ok(?:ay)?|sure|do\s+(?:it|that|this|the\s+rest)|finish(?:\s+(?:it|up|the\s+rest))?|next|try\s+again|retry|again)\b/i;
+
+function lastSubstantiveUserRequest(history = conversationHistory) {
+  const list = Array.isArray(history) ? history : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (!m || m.role !== 'user') continue;
+    const raw = typeof m.content === 'string'
+      ? m.content
+      : (Array.isArray(m.content) ? m.content.filter(p => p && p.type === 'text').map(p => p.text).join(' ') : '');
+    const t = String(raw || '').replace(/\[(?:Web Browsing Enabled|Attached Image Analysis)\][\s\S]*$/, '').trim();
+    if (!t) continue;
+    if (t.split(/\s+/).length <= 8 && FOLLOW_UP_ONLY_RE.test(t)) continue;
+    return t.slice(0, 3000);
+  }
+  return '';
+}
+
+function buildRoutingText(userText, history = conversationHistory) {
+  const cur = String(userText || '');
+  if (cur.trim().split(/\s+/).filter(Boolean).length > 25) return cur;
+  const prior = lastSubstantiveUserRequest(history);
+  return prior && prior !== cur.trim() ? `${cur}\n${prior}` : cur;
 }
 
 // The ONE case where the contextual set is a safety boundary rather than a
@@ -3151,6 +3248,11 @@ function noteCaptureMetadataWrite(method, cleanPath, bodyStr, deletedFrom) {
       if (type === 'programs') { for (const o of objs) if (o && o.id) pend.skip.add(o.id); continue; }
       if (!relevant(type)) continue;
       for (const o of objs.slice(0, 200)) {
+        // Capture shows only displayInForm program indicators. Analytics-only
+        // ones need no reload, and bumping would change the PROGRAM object
+        // when the user asked to leave program settings alone (live
+        // 2026-10-29: 14 dashboard indicators PATCHed programs/<id>.version).
+        if (type === 'programIndicators' && o && o.displayInForm !== true) continue;
         const p = CAPTURE_PROGRAM_REF_FIELDS[type] ? captureProgramIdOf(type, o) : null;
         if (p) { pend.programs.add(p); found = true; } else if (o && typeof o.id === 'string') { addLookup(type, o.id); found = true; }
       }
@@ -4215,6 +4317,49 @@ function healEventAnalyticsDxDimension(path) {
     return m[1].split(/;|%3B/i).filter(Boolean).map((it) => `${key}=${it}`).join('&');
   }).join('&');
   return { path: healed ? `${head}?${query}` : p, healed };
+}
+
+// A program-stage UID given as a bare `dimension=<stageUid>` on an event or
+// enrollment analytics endpoint is a 409 ("Item identifier does not reference
+// any data element, attribute or indicator part of the program" — RMNCH run
+// 2026-10-29). On the EVENT endpoints the stage is its own parameter, so it is
+// moved there; the ENROLLMENT endpoints have no stage parameter, so the query
+// is refused before it is sent, with the right shape.
+const _programStageIdsCache = new Map();
+async function healBareStageDimension(path) {
+  const p = String(path || '');
+  const m = p.match(/^(analytics\/(events|enrollments)\/(?:aggregate|query)\/([A-Za-z][A-Za-z0-9]{10})(?:\.json)?)\?(.*)$/);
+  if (!m) return { path: p };
+  const [, head, kind, pid, qs] = m;
+  const parts = qs.split('&');
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const bare = parts.filter(x => /^dimension=/i.test(x) && /^[A-Za-z][A-Za-z0-9]{10}$/.test(dec(x.slice(x.indexOf('=') + 1))));
+  if (!bare.length) return { path: p };
+  if (!_programStageIdsCache.has(pid)) {
+    const r = await safeDhis2Fetch(`programs/${pid}?fields=programStages[id]`);
+    _programStageIdsCache.set(pid, new Set(((r && !r._error && r.programStages) || []).map(s => s.id)));
+  }
+  const stageIds = _programStageIdsCache.get(pid);
+  const stageParts = bare.filter(x => stageIds.has(dec(x.slice(x.indexOf('=') + 1))));
+  if (!stageParts.length) return { path: p };
+  const stages = [...new Set(stageParts.map(x => dec(x.slice(x.indexOf('=') + 1))))];
+  const existing = parts.find(x => /^stage=/i.test(x));
+  if (existing) stages.push(dec(existing.slice(6)));
+  const distinct = [...new Set(stages)];
+  if (kind === 'enrollments' || distinct.length > 1) {
+    return {
+      path: p,
+      refusal: {
+        _error: `Not sent: ${distinct.join(', ')} ${distinct.length > 1 ? 'are program stages' : 'is a program stage'}, not a dimension — DHIS2 answers 409 for a stage UID in dimension=.`,
+        _hint: kind === 'enrollments'
+          ? 'Enrollment analytics has no stage parameter: qualify data elements as <stageUid>.<deUid> in dimension=, or count a stage\'s events with analytics/events/aggregate/<program>?stage=<stageUid>.'
+          : 'An event query covers ONE stage: pass it as stage=<stageUid> (one query per stage).',
+        _scope: 'stage_as_dimension',
+      },
+    };
+  }
+  const kept = parts.filter(x => !stageParts.includes(x) && !/^stage=/i.test(x));
+  return { path: `${head}?${[...kept, `stage=${distinct[0]}`].join('&')}`, healed: true };
 }
 
 // Program indicators asked for on an event/enrollment AGGREGATE endpoint

@@ -121,7 +121,7 @@ Examples:
           },
           program_override: {
             type: 'string',
-            description: 'Override program ID. Only if user asks about a DIFFERENT program.'
+            description: 'Program UID to count in — needed when no program page is open (e.g. on the Dashboard app) or the user asks about a different program. Use the UID get_program_info / search_metadata returned. (A stage_id alone is enough: its program is looked up.)'
           },
           ou_override: {
             type: 'string',
@@ -1236,12 +1236,13 @@ Actions:
               name: { type: 'string' },
               short_name: { type: 'string', description: 'Max 50 chars. Auto-derived from name if omitted.' },
               description: { type: 'string' },
-              expression: { type: 'string', description: 'What to aggregate. Count of enrollments/women → "V{enrollment_count}" (ENROLLMENT) or "V{event_count}" (EVENT). Coverage/PERCENTAGE in ONE indicator → "d2:condition(\\"<numerator condition>\\", 100, 0)" with aggregation_type "AVERAGE" (mean of the 0/100 flag over the filtered population = the %). Also: "d2:sum(#{stageId.deId})", "d2:count(#{stageId.deId})".' },
+              expression: { type: 'string', description: 'What to aggregate. Count of enrollments/women → "V{enrollment_count}" (ENROLLMENT, aggregation_type COUNT — SUM/AVERAGE on a count variable breaks analytics) or "V{event_count}" (EVENT only). Coverage/PERCENTAGE in ONE indicator → "d2:condition(\\"<numerator condition>\\", 100, 0)" with aggregation_type "AVERAGE" (mean of the 0/100 flag over the filtered population = the %). Also: "d2:sum(#{stageId.deId})", "d2:count(#{stageId.deId})".' },
               filter: { type: 'string', description: 'Condition selecting which events/enrollments count. For a percentage indicator this is the DENOMINATOR population (e.g. "#{stageId.gestAge} < 999" = women with a valid gestational age). Examples: "#{stageId.deId} == \'value\'", "d2:count(#{stageId.contactNo}) >= 4".' },
               analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'], description: 'EVENT=aggregate over events, ENROLLMENT=aggregate over enrollments/TEIs. Use ENROLLMENT for "per woman / per pregnancy" counts and coverage so a pregnancy is counted once, not once per visit.' },
               aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'], description: 'How to aggregate across rows. COUNT/SUM for counts; AVERAGE for a d2:condition(...,100,0) percentage indicator. Default: COUNT.' },
               decimals: { type: 'integer', description: 'Decimal places in output. Optional (e.g. 1 for a percentage).' },
-              display_in_form: { type: 'boolean', description: 'Show this indicator in the right-side "Indicators" widget of Tracker Capture / Capture data entry (DHIS2 displayInForm). Set true when the user wants the indicator visible during data entry. Default false.' }
+              display_in_form: { type: 'boolean', description: 'Show this indicator in the right-side "Indicators" widget of Tracker Capture / Capture data entry (DHIS2 displayInForm). Set true when the user wants the indicator visible during data entry. Default false.' },
+              events_in_period: { type: 'boolean', description: 'ENROLLMENT indicators only: ALSO require the EVENTS the expression/filter reads (d2:count / countIfValue / countIfCondition / #{stage.de}) to fall inside the reporting period, not just the enrollment date. Use when the question puts the visits in the period too — e.g. \"registrations that started this year AND had a low-Hb follow-up visit during the year\". Without it an enrollment indicator reads ALL events of the enrollment, whatever their date (live: 909 instead of the true 202 when visits are dated next year). Meant for whole-period figures (year, quarter); in a monthly breakdown it counts only events in the same month as the registration.' }
             }
           },
           indicators: {
@@ -1258,7 +1259,8 @@ Actions:
                 analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'] },
                 aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'] },
                 decimals: { type: 'integer' },
-                display_in_form: { type: 'boolean' }
+                display_in_form: { type: 'boolean' },
+                events_in_period: { type: 'boolean', description: 'ENROLLMENT only: the events read must also fall in the reporting period (see indicator.events_in_period).' }
               }
             }
           },
@@ -2100,19 +2102,23 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
               name: { type: 'string', description: 'Visualization display name (required).' },
               vis_type: { type: 'string', description: 'Chart type: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, STACKED_AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, YEAR_OVER_YEAR_COLUMN, SCATTER, BUBBLE. Default COLUMN.' },
               data_items: { type: 'array', items: { type: 'string' }, description: 'Indicator / dataElement / programIndicator UIDs to plot (the dx dimension). Types are auto-resolved and existence-verified.' },
-              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords and/or fixed ISO periods (202401, 2025Q1, 2025). A request phrased relative to today MUST use relative keywords so the saved chart rolls forward: "each quarter of this year and last year" = ["QUARTERS_THIS_YEAR","QUARTERS_LAST_YEAR"], "by month this year" = ["MONTHS_THIS_YEAR"], "last 12 months" = ["LAST_12_MONTHS"], "this year" = ["THIS_YEAR"], "last 4 quarters" = ["LAST_4_QUARTERS"]. Fixed periods only when the user names them.' },
+              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords and/or fixed ISO periods (202401, 2025Q1, 2025). A request phrased relative to today MUST use relative keywords so the saved chart rolls forward: "each quarter of this year and last year" = ["QUARTERS_THIS_YEAR","QUARTERS_LAST_YEAR"], "by month this year" = ["MONTHS_THIS_YEAR"], "last 12 months" = ["LAST_12_MONTHS"], "this year" = ["THIS_YEAR"], "last 4 quarters" = ["LAST_4_QUARTERS"]. Fixed periods only when the user names them. ⚠ LAST_N_YEARS / LAST_YEAR are COMPLETED years only — in 2026, LAST_5_YEARS is 2021–2025 and EXCLUDES 2026; for "the last five years" including this one pass ["THIS_YEAR","LAST_5_YEARS"].' },
               org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2). "The whole hierarchy" = ["USER_ORGUNIT"]; "facilities at level N" everywhere = ["USER_ORGUNIT","LEVEL-N"].' },
               short_name: { type: 'string', description: 'Optional short name (max 50 chars).' },
               description: { type: 'string', description: 'Optional description.' },
               layout: {
                 type: 'object',
-                description: 'Optional layout override — which dimensions sit on each axis. Each is a subset of ["dx","pe","ou"]. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → columns[dx] rows[pe] filters[ou].',
+                description: 'Optional layout — which of ["dx","pe","ou"] sits where. For CHARTS (COLUMN/BAR/LINE/AREA/STACKED_*) use category (the x-axis) + series (the legend): monthly trend of indicators = { category:["pe"], series:["dx"], filters:["ou"] }; districts compared by indicators = { category:["ou"], series:["dx"], filters:["pe"] }. (DHIS2 stores category as rows and series as columns — columns is NOT the x-axis; a chart with only dx on the x-axis is auto-corrected unless keep_layout:true.) Pivot tables use columns/rows as written: org units down the side = { rows:["ou"], columns:["dx"], filters:["pe"] }. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → series[dx] category[pe] filters[ou].',
                 properties: {
+                  category: { type: 'array', items: { type: 'string' }, description: 'Charts: the x-axis dimension(s).' },
+                  series: { type: 'array', items: { type: 'string' }, description: 'Charts: the legend / series dimension(s).' },
                   columns: { type: 'array', items: { type: 'string' } },
                   rows: { type: 'array', items: { type: 'string' } },
                   filters: { type: 'array', items: { type: 'string' } }
                 }
-              }
+              },
+              keep_layout: { type: 'boolean', description: 'Keep a chart layout that puts only the data items on the x-axis (normally auto-corrected).' },
+              overall_row: { type: 'boolean', description: 'Pivot of org units WITH an overall row: pass org_units [<parent uid>, "LEVEL-<n>"] and overall_row:true — the parent becomes its own row, computed from ALL records (correct for percentages; DHIS2 pivot totals only add up or average the cells). The level-n units are saved as explicit rows.' }
             }
           },
           dashboard: {
@@ -2175,7 +2181,7 @@ To place a new map on a dashboard, pass its map_id to manage_dashboards(action="
           data_item: { type: 'string', description: 'For create: the ONE indicator / data element / program indicator UID to shade the map by (the dx dimension). Type auto-resolved + existence-verified; the program is auto-attached for a program indicator.' },
           org_unit_level: { type: 'integer', description: 'For create: the org-unit LEVEL to shade (e.g. 2 = districts, 3 = chiefdoms). Every OU at this level under the boundary gets a colour.' },
           org_units: { type: 'array', items: { type: 'string' }, description: 'For create: boundary/parent org units — UIDs and/or USER_ORGUNIT / LEVEL-<n>. Combine with org_unit_level to shade that level within these parents. Defaults to shading the given level nationwide if omitted.' },
-          period: { type: 'string', description: 'For create: a single period — relative keyword (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) or fixed ISO (202401, 2025Q1, 2025). Default LAST_12_MONTHS.' },
+          period: { type: 'string', description: 'For create: a single period — relative keyword (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) or fixed ISO (202401, 2025Q1, 2025). Default LAST_12_MONTHS. LAST_N_YEARS / LAST_YEAR are completed years only and EXCLUDE the current year.' },
           legend_set_id: { type: 'string', description: 'For create (optional): a legend set UID for fixed colour bands (make one with manage_legend_sets). Omit for equal-interval auto colours.' },
           thematic_map_type: { type: 'string', enum: ['CHOROPLETH', 'BUBBLE'], description: 'For create: CHOROPLETH (shaded areas, default) or BUBBLE (proportional circles).' },
           classes: { type: 'integer', description: 'For create (optional): number of colour classes for auto (equal-interval) legends. Default 5.' },
@@ -2207,7 +2213,7 @@ COLUMN/FILTER SPEC — each entry is a string or object:
 - Data element / attribute / program indicator: pass the UID or EXACT display name — the type and (for DEs) the stage are auto-resolved; add program_stage_id only when a DE lives in several stages. Optional filter: {operator:"IN"|"EQ"|"NE"|"GT"|"GE"|"LT"|"LE"|"LIKE", value | values:[…]} — option-set values are auto-mapped NAME→CODE, booleans to 1/0.
 - Repeated events (ENROLLMENT output + repeatable stage only): add repeated_events:{ most_recent:2, oldest:2 } (or repetition_indexes:[1,2,-1,0]; 1=first, 0=latest, -1=second-latest) to a DE column to show one column per event occurrence.
 - Statuses: { dimension:"event_status"|"program_status", statuses:["ACTIVE","COMPLETED",…] }.
-⚠ Program-indicator columns are evaluated PER ROW: a rate/percentage PI with a division 409s the whole table when any row's denominator is 0 — the tool refuses those and tells you to build a count/flag PI with manage_program_indicators instead. PI analyticsType must match output_type (EVENT↔EVENT, ENROLLMENT↔ENROLLMENT), and count-style PIs need aggregation_type SUM (COUNT renders a constant 1 per row; NONE breaks the query and is refused).
+⚠ A line list is ONE ROW PER RECORD (event / enrollment / person). It cannot group rows by org unit, so "a table of org units with a % / count column" is NOT a line list — it is a PIVOT TABLE (manage_dashboards create_visualization, vis_type PIVOT_TABLE, layout rows:["ou"] columns:["dx"]); the tool refuses percentage and count-of-records PIs as columns for that reason. Program-indicator columns are evaluated PER ROW: a rate/percentage PI with a division 409s the whole table when any row's denominator is 0. PI analyticsType must match output_type (EVENT↔EVENT, ENROLLMENT↔ENROLLMENT), and per-record count PIs (d2:count…) need aggregation_type SUM (COUNT renders a constant 1 per row; NONE breaks the query and is refused).
 Legend: legend:{ legend_set_id | legend_set_name, style:"FILL"|"TEXT", strategy:"FIXED"|"BY_DATA_ITEM", show_key } — create the set first with manage_legend_sets.
 Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVENT_VISUALIZATION", event_visualization_id }]. For UI navigation help in the Line Listing app use line_listing_guide; for ad-hoc event/enrollment COUNTS use get_event_analytics — this tool SAVES reusable line lists.`,
       parameters: {
@@ -2238,7 +2244,7 @@ Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVEN
                 filter: { description: 'Condition on this dimension: { operator, value | values:[…] } or a raw "OP:value" string. Option-set values auto-map name→code; booleans → true/false.', type: 'object', properties: { operator: { type: 'string' }, value: {}, values: { type: 'array' } } },
                 repeated_events: { type: 'object', properties: { most_recent: { type: 'integer' }, oldest: { type: 'integer' } }, description: 'ENROLLMENT output + repeatable stage only: how many latest/earliest event occurrences of this DE to show as separate columns. Or pass repetition_indexes:[1,2,-1,0].' },
                 repetition_indexes: { type: 'array', items: { type: 'integer' }, description: 'Explicit occurrence indexes: 1=first, 2=second, …; 0=latest, -1=second-latest.' },
-                allow_risky_program_indicator: { type: 'boolean', description: 'Override the division-PI refusal for THIS column — only when certain the per-row denominator can never be 0.' }
+                allow_risky_program_indicator: { type: 'boolean', description: 'Override the division-PI or percentage-PI refusal for THIS column — only when certain the per-row denominator can never be 0, or when the user explicitly wants a 0/100 value per record.' }
               }
             },
             description: 'The table columns, in order. Strings allowed as shorthand for { dimension:"…" }. Must include an org-unit dimension and (for EVENT/ENROLLMENT) a time dimension somewhere in columns+filters.'
@@ -2814,7 +2820,22 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
 **aggregationType vs analyticsType:**
 - \`analyticsType\`: \`EVENT\` (one row per event) or \`ENROLLMENT\` (one row per enrollment, latest event values per stage).
 - \`aggregationType\`: \`COUNT\` for count-of-rows, \`SUM\`/\`AVERAGE\`/\`MIN\`/\`MAX\` for numeric aggregations.
-- "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{tei_count}\`. \`V{enrollment_count}\` is also valid; \`V{event_count}\` is for EVENT-type PIs.
+- "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{enrollment_count}\`, X in the filter (\`V{tei_count}\` counts distinct people the same way). \`V{event_count}\` is for EVENT-type PIs only.
+
+**Analytics-runtime traps — these SAVE and pass /description, then every chart/map/line list using them fails with "SQL syntax error (SqlState 42xxx)"** (verified live 2.42.5 + 2.43.2; the tool now refuses or heals them, and after every save it runs ONE aggregate analytics query to prove the indicator computes — a create that cannot compute is removed again and reported in failed[]):
+- \`V{tei_count}\` / \`V{enrollment_count}\` work ONLY as the whole expression with aggregation_type **COUNT** (SUM/AVERAGE → 42883/42702; the tool heals a bare one to COUNT and says so in auto_corrected).
+- \`V{event_count}\` inside an **ENROLLMENT** indicator → 42703. Count visits with an EVENT indicator (filter \`V{program_stage_id} == '<stageUid>'\` for one stage), or events-per-enrollment with \`d2:count(#{stage.de})\` + SUM.
+- \`d2:countIfValue\` / \`d2:countIfCondition\` on a TEXT/option data element → 42883 on 2.43 (countIfCondition fails on 2.42 too). Use \`d2:condition("#{stage.de} == 'CODE'", 1, 0)\` with SUM (a count) or \`…, 100, 0)\` with AVERAGE (a %).
+- An EVENT \`V{event_count}\` with no stage filter counts the events of EVERY stage — two "per-stage" counts then show the same number. Scope it: filter \`V{program_stage_id} == '<stageUid>'\`.
+- **Yes/No (BOOLEAN / TRUE_ONLY) data elements are 1 / 0 in analytics.** Compare them with \`== 1\` / \`== 0\` — \`== true\` / \`== false\` give SQL 42883 and \`== 'true'\` gives E7132 on every query (the tool heals these). "Unanswered" = \`!d2:hasValue(#{stage.de})\` — a separate count, never folded into No.
+
+**Which period does an ENROLLMENT indicator look at?** Its reporting period filters the ENROLLMENT date only; d2:count / countIfValue / countIfCondition / #{stage.de} read ALL events of the enrollment, whatever their date. When the question puts the visits in the period too ("registrations this year that had a low-Hb follow-up visit **during the year**"), pass \`events_in_period: true\` — it adds EVENT_DATE boundaries so only events in the period count (live 2.43.2: 202 true vs 909 without it, because visits dated next year were counted). Use it for whole-period numbers (year, quarter).
+
+**Per-visit figures are EVENT indicators:** "visits with X" = EVENT, \`V{event_count}\`, COUNT, filter \`V{program_stage_id} == '<stage>' && <X>\` (each visit counted, even several per woman); "% of visits with X among visits where it was recorded" = EVENT, \`d2:condition("<X>", 100, 0)\`, AVERAGE, filter \`V{program_stage_id} == '<stage>' && d2:hasValue(#{<stage>.<de>})\`; "average value at a visit type" = EVENT, \`#{<stage>.<de>}\`, AVERAGE, same filter. "Records per stage" (visit types / care activities) = one EVENT \`V{event_count}\` COUNT indicator per stage.
+
+**"% of women who attended <stage>"** (a stage of the program = a visit): ENROLLMENT, aggregation_type AVERAGE, expression \`d2:condition("d2:hasValue(#{<stageUid>.<deUid>})", 100, 0)\` with a data element that is always filled at that stage (hasValue IS valid inside the d2:condition string; only a bare top-level hasValue is filter-only). "Number of women who attended <stage>": ENROLLMENT, \`V{enrollment_count}\`, COUNT, filter \`d2:hasValue(#{<stageUid>.<deUid>})\`. Number of visits: EVENT, \`V{event_count}\`, filter \`V{program_stage_id} == '<stageUid>'\`.
+
+**When an indicator errors, fix its syntax/aggregation — NEVER switch it to a different data element or stage to make the error go away.** That silently changes what the number means (a 2026-10-29 thread "fixed" an ANC-visit count by counting a Weight field). If it cannot be fixed, say so and offer options.
 
 **PERCENTAGE / COVERAGE = ONE program indicator (NOT three).** A metric like "% of pregnant women whose first ANC was before 12 weeks" is **a SINGLE program indicator**, not a numerator PI + a denominator PI + a percentage object. Build it as:
 - \`analytics_type: "ENROLLMENT"\` (count each woman/pregnancy once, not once per visit),
@@ -3151,6 +3172,7 @@ To an aggregate **indicator**: pass the set's UID as \`legend_set_id\` to manage
 - "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].`;
 
 const KB_DASHBOARDS_DETAILS = `### Reporting what you built
+- Give the user the dashboard link the tool returns (\`dashboard_url\`) — never make one up.
 - After building charts / tables / dashboards, describe WHAT was built (items, data, periods, org units, sharing) and how to open it. Do NOT add a "what the data shows" analysis unless the user asked — every such figure has been wrong at least once (live 2026-10-28: a 2026 row read as the 12-month total; a partial query read as all facilities).
 - If the user does ask for figures: take each from ONE successful /analytics query of exactly that item's dx and org units, with the period as a FILTER (filter=pe:LAST_12_MONTHS gives the total; as a dimension it gives one row per month and no total). Never mix dimension= and filter= for the same dimension (409).
 - New or changed program indicators need NO analytics run — they are computed at query time from the existing tables. Never start one unless the user asks.
@@ -3160,9 +3182,9 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 
 ### Fields
 - **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
-- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, QUARTERS_THIS_YEAR, QUARTERS_LAST_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025). A request relative to today ("each quarter of this year and last year", "monthly this year") MUST use the relative keywords — a fixed list stops updating.
+- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, QUARTERS_THIS_YEAR, QUARTERS_LAST_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025). A request relative to today ("each quarter of this year and last year", "monthly this year") MUST use the relative keywords — a fixed list stops updating. ⚠ Every LAST_N_… keyword is the N COMPLETED periods and never includes the current one: in 2026, LAST_5_YEARS = 2021–2025 (none of 2026). To widen a range "to catch more data", ADD THIS_YEAR (["THIS_YEAR","LAST_5_YEARS"]); the tools warn when a chart's periods miss all of its data.
 - **org_units**: UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2 = all level-2 OUs).
-- **layout** (optional): which of dx/pe/ou sit on columns/rows/filters. Sensible per-type defaults apply (pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → cols[dx]/rows[pe]).
+- **layout** (optional): which of dx/pe/ou sit where. **Charts: give category (x-axis) and series (legend)** — monthly comparison of indicators = { category:["pe"], series:["dx"], filters:["ou"] }; districts compared = { category:["ou"], series:["dx"], filters:["pe"] }; stacked bars stack the SERIES. DHIS2 stores category as rows and series as columns, so "columns" is NOT the x-axis (the tool corrects a chart with only data items on the x-axis). Pivot tables: columns/rows as written. Defaults: pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → series[dx]/category[pe].
 
 ### Rules
 - data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped. NEVER invent visualization, map or data-item UIDs.
@@ -3173,6 +3195,9 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 ### Examples
 - "Build an ANC dashboard with a coverage chart, a pivot and a single value": create_dashboard dashboard:{ name:"ANC Programme" }, items:[ {new_visualization:{name:"ANC Coverage by Month",vis_type:"COLUMN",data_items:["<anc1>","<anc2>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC 1 This Year",vis_type:"SINGLE_VALUE",data_items:["<anc1>"],periods:["THIS_YEAR"],org_units:["<ou>"]}} ].
 - "Make me a column chart of malaria cases by district last year": create_visualization visualization:{ name:"Malaria cases by district", vis_type:"COLUMN", data_items:["<de>"], periods:["LAST_YEAR"], org_units:["LEVEL-2"] }.
+- "District table with an overall row / national total" (percentages included): create_visualization visualization:{ vis_type:"PIVOT_TABLE", data_items:[…], periods:["2026"], org_units:["<country uid>","LEVEL-2"], overall_row:true, layout:{ rows:["ou"], columns:["dx"], filters:["pe"] } } — the country row is computed from all records. Never describe a "Total" row the result does not report.
+- "A table of every facility with the % of women who attended ANC 1 and ANC 2-4" (one row per org unit — NOT a line list): create_visualization visualization:{ name:"ANC attendance by facility", vis_type:"PIVOT_TABLE", data_items:["<pi % ANC1>","<pi % ANC2-4>"], periods:["LAST_12_MONTHS"], org_units:["<country uid>","LEVEL-4"], layout:{ rows:["ou"], columns:["dx"], filters:["pe"] } }.
+- "Visits per district" as a chart: org units are CATEGORIES → vis_type COLUMN (or BAR), layout:{ category:["ou"], series:["dx"], filters:["pe"] }.
 - "Add a coverage chart to my National Overview dashboard": add_items dashboard_id:"<dashId>", items:[ { new_visualization:{ name:"ANC coverage", vis_type:"COLUMN", data_items:["<indicatorId>"], periods:["LAST_12_MONTHS"], org_units:["USER_ORGUNIT"] } } ] — this APPENDS; existing tiles are preserved and snapshotted.`;
 
 const KB_TRANSLATIONS_DETAILS = `### How the feature works (verified on 2.43 — the app fetches both keys at startup)
@@ -3219,6 +3244,8 @@ configure makes the plugin FUNCTION but does not place the widget. Relay the too
 const KB_LINE_LISTS_DETAILS = `## DHIS2 Line Lists (manage_line_lists)
 A **line list** is a saved row-per-record table (one row per event / enrollment / person) opened in the Line Listing app and embeddable on dashboards. It is stored as an \`eventVisualization\` with \`type: LINE_LIST\` — a DIFFERENT object from the aggregate \`visualizations\` that manage_dashboards creates. Aggregated charts/pivots → manage_dashboards; row-level tables → THIS tool.
 
+**It can NOT total records per org unit.** "A line-listing table with all the org units and a column for the % of women who …" is a request for a PIVOT TABLE (rows = org units, columns = indicators): build it with manage_dashboards(create_visualization, vis_type PIVOT_TABLE, data_items = the % / count program indicators, org_units = [boundary, "LEVEL-n"], layout {rows:["ou"], columns:["dx"], filters:["pe"]}) and tell the user why a line list could not do it. A % indicator as a line-list column shows only 0 or 100 per row, and a count of enrollments shows 1 per row — the tool refuses both.
+
 **Choosing output_type (the single most important decision):**
 - \`EVENT\` — one row per event of ONE program stage. Needs \`program_stage_id\` on multi-stage tracker programs. Columns: that stage's DEs + program attributes + EVENT-analytics PIs.
 - \`ENROLLMENT\` — one row per enrollment. Columns may come from ANY stage (auto-qualified), attributes, ENROLLMENT-analytics PIs, and repeatable-stage DEs can repeat: \`repeated_events:{ most_recent:2, oldest:2 }\` renders "Adherence [1] [2] [-1] [0]"-style columns. Use for treatment-monitoring / cohort registers.
@@ -3226,11 +3253,15 @@ A **line list** is a saved row-per-record table (one row per event / enrollment 
 
 **A senior implementor's workflow for a monitoring register:**
 1. get_program_info → real stage/DE/attribute names + UIDs.
-2. Row-level metrics DON'T exist as columns? Create ENROLLMENT-analytics PIs with manage_program_indicators — per-row-safe patterns: \`d2:count(#{stage.de})\` (visits recorded), \`d2:countIfValue(#{stage.de}, 'CODE')\` (e.g. poor-adherence months), \`d2:daysBetween(V{enrollment_date}, V{event_date})\`, \`d2:condition("…", 1, 0)\` flags. ⚠ NEVER put a rate/percentage PI (any division) in a line list — per-row zero denominators 409 the WHOLE table. The tool refuses them; that refusal is final unless the user insists (allow_risky_program_indicator). ⚠ **aggregation_type matters per row** (verified live on 2.42): give count-style PIs \`aggregation_type:"SUM"\` — with COUNT the line-list cell shows a constant 1 for every row (COUNT counts the one enrollment row, not the events), and with NONE the whole query fails with an SQL error (the tool refuses NONE PIs as columns and warns on COUNT+d2:count).
+2. Row-level metrics DON'T exist as columns? Create ENROLLMENT-analytics PIs with manage_program_indicators — per-row-safe patterns: \`d2:count(#{stage.de})\` (visits recorded), \`d2:countIfValue(#{stage.de}, 5)\` on a NUMERIC data element (on a text/option one it breaks analytics on 2.43 — use \`d2:condition("#{stage.de} == 'CODE'", 1, 0)\`), \`d2:daysBetween(V{enrollment_date}, V{event_date})\`, \`d2:condition("…", 1, 0)\` flags. ⚠ NEVER put a rate/percentage PI (any division) in a line list — per-row zero denominators 409 the WHOLE table. The tool refuses them; that refusal is final unless the user insists (allow_risky_program_indicator). ⚠ **aggregation_type matters per row** (verified live on 2.42): give count-style PIs \`aggregation_type:"SUM"\` — with COUNT the line-list cell shows a constant 1 for every row (COUNT counts the one enrollment row, not the events), and with NONE the whole query fails with an SQL error (the tool refuses NONE PIs as columns and warns on COUNT+d2:count).
 3. Colour-coding: manage_legend_sets(action=create) → pass legend:{ legend_set_id, strategy:"FIXED", style:"FILL" }. FILL = cell background (scorecard look). Legends colour NUMERIC columns (PIs, numeric DEs).
 4. create with data_check="require_rows" when the user expects data — an empty register usually means wrong period/org units or analytics tables not yet run (the result tells you which).
 5. Dashboard: manage_dashboards(action="create_dashboard"|"add_items") with items [{ type:"EVENT_VISUALIZATION", event_visualization_id:"<line_list_id>" }].
 
+**Same data element from several stages** (e.g. Hb at first ANC, at birth, at postpartum): one column per stage, each with its program_stage_id — that is allowed and each column is labelled by stage. Do NOT create program indicators to work around it.
+**Status columns**: { dimension:"program_status" } or { dimension:"event_status" } with no statuses shows the status of every row; pass statuses only to FILTER.
+**Visit dates of a stage inside an ENROLLMENT list: this ASSISTANT cannot save them yet** (only enrollment/incident date and last updated) — DHIS2 2.41+ itself CAN show a stage's latest visit date there. If asked, tell the user exactly that: "the date column can be added in the Line Listing app (the stage's Event date); I cannot save it yet", and offer an EVENT line list of that stage (one row per visit with its date). NEVER say DHIS2 cannot do it.
+**Row counts:** an ENROLLMENT list's validate/create probe reads one page of 100 — when row_count_is_lower_bound is set the list has AT LEAST that many rows; take exact counts from an aggregate (a program indicator on /analytics), never from row_count.
 **Filters** (on columns or the filters axis): option-set dims take option CODES (names auto-map; \`{operator:"IN", values:["CODE_A","CODE_B"]}\`), booleans take true/false, numerics EQ/NE/GT/GE/LT/LE, text LIKE/EQ. Multiple conditions on one dimension: \`{conditions:[{operator:"GE", value:5},{operator:"LT", value:10}]}\`.
 **Periods**: relative keywords (LAST_12_MONTHS, THIS_QUARTER, LAST_4_QUARTERS, THIS_YEAR, …) mix freely with fixed ISO (202605, 2026Q1, 2026). Time dimensions differ per output_type: EVENT has event_date/enrollment_date/incident_date/scheduled_date/last_updated; ENROLLMENT has enrollment_date/incident_date/last_updated.
 **Org units**: USER_ORGUNIT (+_CHILDREN/_GRANDCHILDREN), LEVEL-<n>, OU_GROUP-<uid>, explicit UIDs — combinable (e.g. LEVEL-4 under a parent UID).
@@ -3854,7 +3885,10 @@ function detectSqlViewIntent(t) {
     || /\b(?:history|log|list|report|records?)\s+of\s+(?:\w+\s+){0,2}transfers?\b/.test(t);
 }
 
-function getContextualTools(ctx, userText, browseWeb) {
+// userText may be the routing text (current message + the request it
+// continues, see buildRoutingText); currentText is the message itself, which
+// alone decides the read-only save-diagnosis strip.
+function getContextualTools(ctx, userText, browseWeb, currentText = null) {
   const appType = (ctx?.appType || '');
   const combinedText = String(userText || '').toLowerCase();
   const wantsProgramChangeHistory =
@@ -4074,7 +4108,7 @@ function getContextualTools(ctx, userText, browseWeb) {
   // diagnose, but cannot "fix" until the user gives explicit authorization on
   // a later turn. This blocks the failure mode where the model edited program
   // rules in response to a save error that had nothing to do with rules.
-  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(userText);
+  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(currentText ?? userText);
 
   // ── Factual context flags — derived from URL/app state only, no NLU ──
   const hasProgram    = !!ctx?.programId;
@@ -4423,13 +4457,17 @@ function getContextualTools(ctx, userText, browseWeb) {
 
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false) {
+async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false, routingText = null) {
   const ctx = dhis2.pageContext || {};
   const ou = dhis2.ouContext;
   const prog = dhis2.programMetadata;
 
   // Intent detection — used to conditionally include sections
-  const text = (userText || '').toLowerCase();
+  // Section selection reads the routing text (the current message + the task
+  // it continues — see buildRoutingText); the save-failure mode reads only the
+  // current message, exactly like the tool gate does.
+  const text = (routingText || userText || '').toLowerCase();
+  const currentText = (userText || '').toLowerCase();
   const isCreating  = /\b(create|build|design|new program|set up a program|make a program)\b/.test(text)
     || /\badd\b.{0,50}\b(data elements?|fields?|stages?|rules?|option sets?)\b/.test(text)
     || /\b(add|assign)\b.{1,80}\bto\b.{1,50}\bstage\b/.test(text);
@@ -4721,7 +4759,7 @@ Use importStrategy=CREATE_AND_UPDATE to create new records AND update existing o
   // show a 409 from the tracker API. This is the canonical KB the model must
   // consult BEFORE forming any hypothesis. It blocks the failure mode where
   // "error saving enrollment" was misdiagnosed as a program-rule issue.
-  const saveFailureMode = SAVE_FAILURE_RE.test(text);
+  const saveFailureMode = SAVE_FAILURE_RE.test(currentText);
   if (saveFailureMode) {
     p += `
 ## Save / Load failure diagnosis — investigate AUTOMATICALLY
@@ -4817,7 +4855,7 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
    - create_metadata(action="create_data_elements") → each new DE's id in \`summary.dataElements[].id\`
    - create_metadata / manage_datasets / manage_org_units / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
 5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. A new option set's \`option_set_id\` goes into a data element via create_metadata(action="create_data_elements", data_elements:[{ name, value_type, option_set_id:<option_set_id> }]) — pass \`option_set_id\` to REFERENCE the existing set (the DE valueType auto-aligns); NEVER re-inline the same options with \`option_set:{...}\` (that creates a DUPLICATE set). A new DE id then goes into manage_datasets(action="add_data_elements", dataset_id, data_element_ids:[<id>]). A new legend set's \`legend_set_id\` goes into an aggregate indicator via manage_indicators(action="create", indicator:{ …, legend_set_id:<legend_set_id> }) — so the indicator renders colour-coded (traffic-light) on the dashboard; NEVER attach a legend with a raw dhis2_query PATCH and NEVER via manage_metadata (it has no legend action). (This is exactly the verified provenance the Verify-before-call rule demands.)
-6. SHARE last: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). NEVER set sharing with a raw dhis2_query PUT — it fails.
+6. SHARE last — and ONLY when the user asked for sharing / public access / visibility to others: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). Never share on your own initiative (offer it in your answer instead), and never grant public WRITE ("rw…") unless the user asked for others to edit. NEVER set sharing with a raw dhis2_query PUT — it fails.
 
 ### Worked chain — "build a malaria dashboard that needs new indicators, then make it public"
 1. search_metadata(object_type="dataElements", query=…) → the data-element UIDs the indicator formulas need (e.g. malaria deaths, malaria cases).
@@ -4840,13 +4878,46 @@ This is the shape of a big coverage/monitoring build. Do it in a HANDFUL of batc
 4. manage_legend_sets(action="create", …) for the map/RAG colour bands → keep each \`legend_set_id\`.
 5. manage_maps(action="create", data_item:<a program_indicator_id>, org_unit_level:2, legend_set_id:<…>) for EACH thematic map → keep each \`map_id\`. (Maps are created one per call; there is no inline-map on a dashboard.)
 6. manage_dashboards(action="create_dashboard", dashboard:{ name }, items:[ …]) — build the WHOLE dashboard in ONE call: each chart/pivot/single-value tile as an inline \`new_visualization\` (data_items = the program_indicator_ids), each map as \`{ type:"MAP", map_id }\`, section headers as \`{ type:"TEXT", text:"## ANC coverage" }\`. Keep \`dashboard_id\`.
-7. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, …) LAST.
+7. ONLY if the user asked to share it: manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, …) LAST.
 
 ### Worked chain — "create an option set for RDT results, a data element that uses it, and add it to the monthly malaria dataset"
 1. manage_option_sets(action="create", option_set:{ name:"Malaria RDT Result", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INV",name:"Invalid"}] }) → keep the returned \`option_set_id\`.
 2. create_metadata(action="create_data_elements", data_elements:[{ name:"Malaria RDT outcome", value_type:"TEXT", domain_type:"AGGREGATE", option_set_id:<option_set_id> }]) → the DE REFERENCES the set just created (do NOT re-inline the options); keep the new DE id from \`summary.dataElements[0].id\`.
 3. manage_datasets(action="add_data_elements", dataset_id:<the dataset UID>, data_element_ids:[<DE id>]) — resolve the dataset UID first via search_metadata(object_type="dataSets") if you don't have it in context.
 Run all steps without pausing. Only ask the user when a step is genuinely ambiguous (e.g. which data element represents "malaria cases").
+`;
+  }
+
+  // ── Feasibility check for analytics outputs ──
+  // The 2026-10-29 MNCH thread asked for "a line listing table that has all
+  // the OUs, next to it a column for the % of women who attended ANC 1" — a
+  // pivot table in DHIS2 terms. The model forced it into a line list (one row
+  // per woman, showing 100), broke two indicators on the way, then swapped an
+  // indicator onto an unrelated data element to make an error go away. Teach
+  // the decide-time mapping: what each request IS in DHIS2, and what to do
+  // when the wording asks for something DHIS2 cannot do in that form.
+  const wantsAnalyticsOutputPrompt = wantsDashboardPrompt
+    || /\bline[-\s]?list(?:s|ing)?\b/i.test(text)
+    || (/\b(create|build|make|design|set\s*up|add)\b/i.test(text)
+        && /\b(maps?|charts?|graphs?|pivot|tables?|visuali[sz]ations?|bubble|choropleth)\b/i.test(text));
+  if (wantsAnalyticsOutputPrompt) {
+    p += `
+## Analytics outputs — first match each request to what DHIS2 can actually build
+Before creating anything, map EVERY table / chart / map the user asked for to the DHIS2 object that delivers it. When the wording asks for something DHIS2 cannot do in that form:
+- **Same information, different object** → build the object that DOES deliver it, and open your final answer with a short "Changed from your request" note: what was asked → why DHIS2 cannot do it that way → what you built instead → how to get the literal version if they still want it.
+- **No object delivers that information** (the data is not captured, the function does not exist, the dimension is not available) → build the rest, do NOT substitute something that measures a different thing, and explain the gap with 1–2 concrete options for the user to choose from.
+
+Common mismatches (DHIS2 facts):
+- **"A line list / table with the org units and a % (or count) column"** → a line list is ONE ROW PER RECORD (event / enrollment / person) and cannot total rows per org unit; a % indicator in it shows only 0 or 100 per row. Build a **PIVOT_TABLE** (manage_dashboards create_visualization): data_items = the program indicators, org_units = [boundary, "LEVEL-<n>"], layout { rows:["ou"], columns:["dx"], filters:["pe"] }. Use a line list only when the user wants the individual records.
+- **"A line chart across org units"** → a line joins points of a sequence (time); org units are categories. Build a COLUMN/BAR chart with org units as the category (layout { category:["ou"], series:["dx"], filters:["pe"] }), or a LINE over time with one line per org unit when a trend is wanted — say which you chose and why.
+- **An overall / total row for percentages** → DHIS2 pivot totals add up or average the cells; use overall_row:true (the parent org unit becomes its own row, computed from all records).
+- **"All org units" in a chart** → hundreds of facilities make an unreadable chart; use the district level for charts (state it), facility level is fine in a pivot or map.
+- **"A point on each org unit sized by a value"** → supported: manage_maps thematic_map_type "BUBBLE" at the requested level. Facilities without coordinates are not drawn — mention it.
+- **A metric the program does not capture** (e.g. "visits 2–4" when visits are not recorded that way) → say what IS captured and offer the closest true measure; never relabel another field.
+- **"The last N years" / "more data"** → DHIS2's LAST_N_YEARS is the N COMPLETED years and excludes the current one; to include this year add THIS_YEAR (["THIS_YEAR","LAST_5_YEARS"]). A chart whose periods miss all of its data shows zeros — the tools warn; recreate it with the right periods instead of telling the user it "will populate later".
+- **Program indicators**: fix a failing indicator's syntax/aggregation, never what it measures — switching it to another data element or stage to make an error go away is a wrong answer, not a workaround.
+
+Report only what a tool result shows: a chart, map or table is "built" when its tool returned its id, and "working" only when that tool (or manage_line_lists validate / get_visualization_details) said so.
 `;
   }
 

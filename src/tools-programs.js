@@ -3758,6 +3758,25 @@ async function executeManageMetadata(args) {
       cascade_deleted.push({ type, count: idsOfType.length });
     }
 
+    // Analytics favourites are deleted with a plain DELETE: on 2.43.2 the
+    // metadata-import DELETE of a visualization answers HTTP 500 "Unable to
+    // perform afterTransactionCompletion callback … no Session" although the
+    // object IS removed (verified 2026-10-29), so every cleanup logged a failed
+    // call. DELETE /visualizations/{id} returns 200 + an ObjectReport on 2.42.5
+    // and 2.43.2. Nothing to cascade for these types.
+    if (['visualizations', 'maps', 'eventVisualizations', 'eventReports', 'eventCharts', 'reportTables', 'charts'].includes(args.object_type)) {
+      const rawDel = await safeDhis2Fetch(`${args.object_type}/${args.object_id}`, { method: 'DELETE' });
+      if (rawDel?._error) {
+        return { _error: `Deletion failed: ${rawDel._error}`, ...(rawDel._hint ? { _hint: rawDel._hint } : {}), backup: backup.block };
+      }
+      return {
+        success: true,
+        deleted: { type: args.object_type, id: args.object_id, name: objName },
+        message: `Successfully deleted ${objName}.`,
+        backup: backup.block,
+      };
+    }
+
     // Attempt deletion via POST /api/metadata?importStrategy=DELETE
     const deletePayload = { [args.object_type]: [{ id: args.object_id }] };
     const delResp = await safeDhis2Fetch('metadata?importStrategy=DELETE&atomicMode=ALL', {
@@ -3973,6 +3992,22 @@ async function executeManageMetadata(args) {
     // the pre-write backup failed (live 2026-10-28, a line list shared as
     // "eventReports") and the model fell back to a raw sharing PATCH.
     if (/^event(?:Reports|Charts)$/.test(args.object_type) && Number(dhis2.apiVersion) >= 40) args.object_type = 'eventVisualizations';
+
+    // Sharing a dashboard / chart / map / line list changes who can see — or,
+    // with a "rw" public string, EDIT and DELETE — it. That is the user's call,
+    // never a default last step (MNCH replay 2026-10-29: asked only to build a
+    // dashboard, the model gave every user metadata write access to it). The
+    // request this turn continues must have asked for sharing / visibility.
+    if (['dashboards', 'visualizations', 'maps', 'eventVisualizations'].includes(args.object_type)) {
+      const asked = typeof buildRoutingText === 'function' ? buildRoutingText(lastUserText) : String(lastUserText || '');
+      if (!SHARING_REQUEST_RE.test(asked)) {
+        return {
+          _error: `Not changed: the user did not ask to share this ${args.object_type.replace(/s$/, '')}. Sharing decides who can see — and with public "rw" access edit or delete — it, so it is never a default step.`,
+          _hint: 'Leave sharing as created (the owner and admins can open it). In your answer you may OFFER to share it and ask with whom (everyone read-only = public_access "r-------").',
+          _scope: 'sharing_not_requested',
+        };
+      }
+    }
 
     // Map plural API type names to singular form for the sharing endpoint
     const sharingTypeMap = {
@@ -7240,12 +7275,16 @@ function lintProgramIndicatorExpression(text, kind) {
     }
   }
 
-  // d2:hasValue parses ONLY in filter context — in an expression the parser
-  // returns "not supported for this type of expression" (verified 2.42 + 2.43).
-  if (kind === 'expression' && /d2:hasValue\s*\(/.test(t)) {
+  // d2:hasValue parses ONLY in filter context — as a bare expression term the
+  // parser returns "Could not cast Boolean to Double" (verified 2.42 + 2.43).
+  // INSIDE d2:condition's quoted condition it is a boolean filter again and is
+  // valid: d2:condition("d2:hasValue(#{s.de})", 100, 0) parses and computes on
+  // 2.42.5 and 2.43.2 (2026-10-29) — the cleanest "% who attended stage X".
+  // So only an occurrence outside quoted strings is an error.
+  if (kind === 'expression' && /d2:hasValue\s*\(/.test(t.replace(/"[^"]*"|'[^']*'/g, '""'))) {
     return {
-      error: '`d2:hasValue(` is FILTER-only in the program-indicator grammar — the expression parser rejects it (verified live on 2.42 and 2.43).',
-      hint: 'Move the has-value check into the indicator\'s `filter`, or in the expression use a numeric proxy like `d2:count(#{stage.de}) > 0` inside a d2:condition.',
+      error: '`d2:hasValue(` is FILTER-only in the program-indicator grammar — as a bare expression term the parser rejects it (verified live on 2.42 and 2.43).',
+      hint: 'Move the has-value check into the indicator\'s `filter`, or wrap it in a condition: `d2:condition("d2:hasValue(#{stage.de})", 100, 0)` (AVERAGE → % of the filtered population) or `…, 1, 0)` (SUM → a count).',
     };
   }
 
@@ -7313,6 +7352,277 @@ function lintProgramIndicatorExpression(text, kind) {
   }
 
   return null;
+}
+
+// ── Analytics-runtime traps the PI validators do NOT catch ───────────────────
+// DHIS2's /expression/description endpoint and the metadata import both ACCEPT
+// these combinations: the indicator saves, then every analytics query that
+// uses it (pivot, chart, map, line-list column) fails with a bare "Query failed
+// because of a syntax error (SqlState: 42xxx)". Verified live on 2.42.5.1
+// (localhost) and 2.43.2.1 (play), 2026-10-29:
+//   V{tei_count}        + SUM / AVERAGE        → 42883 (the tei uid is text: sum(character))
+//   V{enrollment_count} + SUM / AVERAGE        → 42702 / 42883
+//   V{event_count} in an ENROLLMENT indicator   → 42703 (no such column)
+//   d2:countIfCondition(#{text/option DE}, …)  → 42883 (2.43) / "Expression violation" (2.42)
+//   d2:countIfValue(#{text/option DE}, …)      → 42883 on 2.43 (still works on 2.42)
+// The failed MNCH dashboard thread (2026-10-29) hit the first one, then spent
+// a whole turn guessing other causes and finally swapped the indicator onto an
+// unrelated data element. A bare count variable means "count" whatever
+// aggregation is set, so SUM/AVERAGE on it is healed to COUNT (same meaning,
+// the only one that runs); everything else is refused with the working form.
+const PI_NUMERIC_VALUE_TYPES = new Set([
+  'NUMBER', 'INTEGER', 'INTEGER_POSITIVE', 'INTEGER_NEGATIVE', 'INTEGER_ZERO_OR_POSITIVE',
+  'PERCENTAGE', 'UNIT_INTERVAL', 'BOOLEAN', 'TRUE_ONLY',
+]);
+
+// pi: { name, expression, filter, analyticsType, aggregationType } (mutated
+// only to heal aggregationType). stageById: Map stageUid → { displayName,
+// programStageDataElements:[{ dataElement:{ id, displayName, valueType } }] }
+// or null when the structure is unknown (the DE-type checks are then skipped).
+// Returns { corrections:[…], advisories:[…] } or { error, hint }.
+function piAnalyticsRuntimeTraps(pi, stageById, apiMinor) {
+  const expr = String(pi.expression || '').trim();
+  const filter = String(pi.filter || '');
+  const agg = String(pi.aggregationType || '').toUpperCase();
+  const corrections = [];
+  const advisories = [];
+
+  if (pi.analyticsType === 'ENROLLMENT' && /V\{event_count\}/.test(expr)) {
+    return {
+      error: `V{event_count} does not exist in an ENROLLMENT indicator — it saves, but every analytics query using it fails with "SQL syntax error (SqlState: 42703)".`,
+      hint: 'Count women/enrollments: expression "V{enrollment_count}" with aggregation_type COUNT. Count visits/events: analytics_type EVENT, expression "V{event_count}", filter "V{program_stage_id} == \'<stageUid>\'" to keep one stage. Events of one stage PER enrollment: "d2:count(#{<stageUid>.<deUid>})" with aggregation_type SUM.',
+    };
+  }
+  const bareCount = expr.match(/^V\{(tei_count|enrollment_count|event_count)\}$/);
+  // NONE: aggregate analytics answers HTTP 500 (NPE on getValue()) and the
+  // line-list query SQL 42601, on 2.42.5 and 2.43.2 — the indicator can never
+  // be shown anywhere. A bare count variable is healed below; anything else
+  // needs the author's choice of SUM / AVERAGE.
+  if (agg === 'NONE' && !(bareCount && bareCount[1] !== 'event_count')) {
+    return {
+      error: `aggregation_type NONE makes every analytics query on this indicator fail (aggregate analytics HTTP 500, line lists SQL 42601) — it could not be shown on any chart, map, table or line list.`,
+      hint: 'Use SUM for counts/totals (d2:count, d2:condition(…, 1, 0), numeric sums), AVERAGE for means and for percentages (d2:condition(…, 100, 0)), COUNT for V{enrollment_count}/V{tei_count}/V{event_count}.',
+    };
+  }
+  if (bareCount && bareCount[1] !== 'event_count' && agg !== 'COUNT') {
+    corrections.push({
+      field: 'aggregation_type', from: agg || '(none)', to: 'COUNT',
+      reason: `V{${bareCount[1]}} only runs with aggregation COUNT — with ${agg || 'that aggregation'} DHIS2 analytics fails with an SQL error (42883/42702). The meaning (a count of ${bareCount[1] === 'tei_count' ? 'people' : 'enrollments'}) is unchanged.`,
+    });
+    pi.aggregationType = 'COUNT';
+  } else if (!bareCount && /V\{(tei_count|enrollment_count)\}/.test(expr) && agg !== 'COUNT') {
+    return {
+      error: `V{tei_count} / V{enrollment_count} only work as the WHOLE expression with aggregation_type COUNT — inside arithmetic or with ${agg} DHIS2 analytics fails with an SQL error (42883/42702).`,
+      hint: 'Use expression "V{enrollment_count}" with aggregation_type COUNT (the population goes in filter). For a percentage use ONE indicator: expression d2:condition("<numerator condition>", 100, 0), aggregation_type AVERAGE.',
+    };
+  }
+
+  // "Missing" written as `#{s.de} == ''`: DHIS2 stores no empty values, so on
+  // a number / Yes-No field it is an "Expression violation" (E7132) on every
+  // query and on a text field it silently matches nothing (always 0) —
+  // verified 2.43.2, 2026-10-29 (the RMNCH "near-miss not answered" series).
+  // The working form is d2:hasValue; same meaning, so heal it (filter, and
+  // inside quoted d2:condition strings where hasValue is valid).
+  {
+    const emptyRe = /(#\{[A-Za-z][A-Za-z0-9]{10}\.[A-Za-z][A-Za-z0-9]{10}\})\s*(==|!=)\s*(?:''|"")/g;
+    const healEmpty = (text) => String(text || '').replace(emptyRe, (all, ref, op) => (op === '==' ? `!d2:hasValue(${ref})` : `d2:hasValue(${ref})`));
+    const healed = {
+      filter: healEmpty(pi.filter),
+      expression: String(pi.expression || '').replace(/"[^"]*"/g, (q) => healEmpty(q)),
+    };
+    for (const field of ['filter', 'expression']) {
+      const before = String(pi[field] || '');
+      if (healed[field] !== before) {
+        corrections.push({ field, from: before, to: healed[field], reason: 'A missing value is tested with d2:hasValue: `== \'\'` fails on number / Yes-No fields (E7132) and never matches on text fields (DHIS2 stores no empty values). Same meaning.' });
+        pi[field] = healed[field];
+      }
+    }
+  }
+
+  if (stageById) {
+    const deById = new Map();
+    for (const st of stageById.values()) {
+      for (const psde of (st.programStageDataElements || [])) {
+        if (psde?.dataElement?.id) deById.set(psde.dataElement.id, psde.dataElement);
+      }
+    }
+    const UID = '[A-Za-z][A-Za-z0-9]{10}';
+    // Yes/No data elements are stored as 1/0 in analytics: compared with
+    // true/false the SQL is invalid (42883), with 'true'/'false' it is an
+    // "Expression violation" (E7132) — on 2.42.5 and 2.43.2 alike; == 1 / == 0
+    // gives the right counts (523 / 503 near-miss Yes / No, live 2026-10-29).
+    // Same meaning, so heal it.
+    const boolRe = new RegExp(`(#\\{(${UID})\\.(${UID})\\})(\\s*(?:==|!=)\\s*)(['"]?)(true|false)\\5(?![A-Za-z0-9_])`, 'gi');
+    const healBool = (text) => String(text || '').replace(boolRe, (all, ref, _s, deId, op, _q, lit) => {
+      const de = deById.get(deId);
+      if (!de || !['BOOLEAN', 'TRUE_ONLY'].includes(de.valueType)) return all;
+      return `${ref}${op}${lit.toLowerCase() === 'true' ? '1' : '0'}`;
+    });
+    for (const field of ['expression', 'filter']) {
+      const before = String(pi[field] || '');
+      const after = healBool(before);
+      if (after !== before) {
+        corrections.push({ field, from: before, to: after, reason: 'Yes/No data elements are 1/0 in analytics: comparing them with true/false (or \'true\'/\'false\') makes every analytics query fail (SQL 42883 / E7132). Same meaning.' });
+        pi[field] = after;
+      }
+    }
+    const countIfRe = new RegExp(`d2:(countIfValue|countIfCondition)\\s*\\(\\s*#\\{(${UID})\\.(${UID})\\}`, 'g');
+    for (const text of [expr, filter]) {
+      for (const [, fn, stageId, deId] of text.matchAll(countIfRe)) {
+        const de = deById.get(deId);
+        if (!de || !de.valueType || PI_NUMERIC_VALUE_TYPES.has(de.valueType)) continue;
+        if (fn === 'countIfValue' && !(apiMinor >= 43)) continue; // still works on 2.42
+        return {
+          error: `d2:${fn} on "${de.displayName || deId}" (a ${de.valueType} data element) fails in DHIS2 analytics with an SQL error (42883) — it only works on numeric data elements${fn === 'countIfValue' ? ' on this DHIS2 version (2.43+)' : ''}.`,
+          hint: `Same meaning, working form: a per-enrollment flag d2:condition("#{${stageId}.${deId}} == 'CODE'", 1, 0) with aggregation_type SUM (= number of enrollments with that value) — or …, 100, 0) with AVERAGE for a percentage. To count EVENTS with that value: analytics_type EVENT, expression V{event_count}, filter "#{${stageId}.${deId}} == 'CODE'". Use the option CODE.`,
+        };
+      }
+    }
+
+    // An EVENT count with no stage scoping counts the events of EVERY stage.
+    // When the indicator is NAMED after one stage that is a wrong number, not a
+    // style choice (the thread's "ANC 1st visit count" and "ANC 2-4+ visit
+    // count" both returned all 9 events of the program).
+    const stageScoped = /#\{[A-Za-z][A-Za-z0-9]{10}\.|V\{program_stage_(?:id|name)\}|PS_EVENTDATE:/.test(`${expr} ${filter}`);
+    if (pi.analyticsType === 'EVENT' && /V\{event_count\}/.test(expr) && !stageScoped && stageById.size > 1) {
+      const words = (s) => new Set(String(s || '').toLowerCase().split(/[^a-z0-9+]+/).filter(w => w && !['the', 'of', 'and', 'a', 'an', 'visit', 'visits', 'stage'].includes(w)));
+      const nameWords = words(pi.name);
+      const named = [...stageById.values()].find(st => {
+        const sw = [...words(st.displayName)];
+        return sw.length > 0 && sw.every(w => nameWords.has(w));
+      });
+      if (named) {
+        return {
+          error: `"${pi.name}" is named after the stage "${named.displayName}", but V{event_count} with no stage filter counts the events of ALL ${stageById.size} stages of this program.`,
+          hint: `Add filter "V{program_stage_id} == '${[...stageById.entries()].find(([, st]) => st === named)[0]}'" to count only that stage's events.`,
+        };
+      }
+      advisories.push(`"${pi.name}" counts the events of ALL ${stageById.size} stages (no stage filter). If one stage was meant, add filter "V{program_stage_id} == '<stageUid>'".`);
+    }
+  }
+  return { corrections, advisories };
+}
+
+// Wording that asks for sharing / visibility of what was built.
+const SHARING_REQUEST_RE = /\b(?:shar(?:e|ed|es|ing)|public(?:ly)?|everyone|every\s+one|all\s+(?:the\s+)?users|other\s+users|my\s+(?:team|colleagues?)|colleagues?|user\s*groups?|access|permissions?|visible\s+to|(?:can(?:not|'?t)?|could)\s+see)\b/i;
+
+// Flag EXISTING indicators (list / get) that hit piAnalyticsRuntimeTraps —
+// they are reused by later build steps. Read-only: adds _problem / _fix to
+// each affected object, returns how many were flagged.
+async function annotateProgramIndicatorProblems(pis, programId) {
+  if (!Array.isArray(pis) || !pis.length || !programId) return 0;
+  const prog = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+  const stageById = (!prog?._error && Array.isArray(prog?.programStages)) ? new Map(prog.programStages.map(st => [st.id, st])) : null;
+  let flagged = 0;
+  for (const pi of pis) {
+    if (!pi) continue;
+    const copy = { name: pi.name || pi.displayName, expression: pi.expression, filter: pi.filter, analyticsType: pi.analyticsType, aggregationType: pi.aggregationType };
+    const tr = piAnalyticsRuntimeTraps(copy, stageById, Number(dhis2.apiVersion) || 0);
+    const problem = tr.error || (tr.corrections?.length ? tr.corrections[0].reason : null) || tr.advisories?.[0] || null;
+    if (!problem) continue;
+    pi._problem = problem;
+    if (tr.hint) pi._fix = tr.hint;
+    else if (tr.corrections?.length) pi._fix = `Re-save it once and the tool corrects it: manage_program_indicators(action="update", indicator_id="${pi.id}", indicator:{})`;
+    flagged++;
+  }
+  return flagged;
+}
+
+// What an analytics SQL failure of an indicator most likely means, for the
+// model and the user — never "try another data element".
+function piRuntimeErrorHint(pi) {
+  const traps = [];
+  const expr = String(pi?.expression || '');
+  if (/V\{(tei_count|enrollment_count)\}/.test(expr)) traps.push('V{tei_count}/V{enrollment_count} need aggregation_type COUNT');
+  if (/V\{event_count\}/.test(expr) && pi?.analyticsType === 'ENROLLMENT') traps.push('V{event_count} is invalid in an ENROLLMENT indicator');
+  if (String(pi?.aggregationType || '').toUpperCase() === 'NONE') traps.push('aggregation_type NONE cannot be computed — use SUM or AVERAGE');
+  if (/d2:countIf(Value|Condition)/.test(`${expr} ${pi?.filter || ''}`)) traps.push('d2:countIfValue/countIfCondition only work on NUMERIC data elements (2.43) — use d2:condition("#{s.de} == \'CODE\'", 1, 0) with SUM');
+  return `${traps.length ? `Likely cause: ${traps.join('; ')}. ` : ''}Fix the expression/aggregation so it still measures EXACTLY what the user asked for. NEVER switch the indicator to a different data element or stage to make an error go away — that silently changes what the number means; if it cannot be fixed, tell the user.`;
+}
+
+// The authoritative proof that an indicator WORKS is one aggregate analytics
+// query over it — the query a pivot/chart/map issues. Run right after saving so
+// "created" means "computes", not merely "parsed": in the 2026-10-29 thread two
+// indicators saved clean, were "verified" against a period with no data
+// (LAST_5_YEARS excludes this year), and broke a line list three calls later.
+// Aggregate values only — never patient rows. Skipped when the program's
+// analytics tables predate it (every query would fail for a reason that is not
+// the indicator's fault). Only SQL / expression failures count as broken.
+async function piRuntimeAnalyticsCheck(programId, ids) {
+  ids = [...new Set((ids || []).filter(Boolean))];
+  if (!ids.length) return null;
+  try {
+    if (programId && typeof lineListAnalyticsFresh === 'function') {
+      const fresh = await lineListAnalyticsFresh(programId);
+      if (fresh && fresh.fresh === false) {
+        return { skipped: true, reason: 'Analytics tables were generated before this program existed, so no indicator of it can be computed until the Analytics Tables job runs. Expressions were validated by DHIS2.' };
+      }
+    }
+  } catch { /* probe as usual */ }
+  // Periods as a DIMENSION: with `filter=pe:THIS_YEAR;LAST_5_YEARS` DHIS2
+  // answered 200 / 0.0 for an indicator that 409s with any single period or
+  // as a dimension (live 2.43.2, 2026-10-29) — the filter form hid it.
+  const PERIOD = 'THIS_YEAR;LAST_5_YEARS';
+  const query = (chunk) => safeDhis2Fetch(`analytics?dimension=dx:${chunk.join(';')}&dimension=pe:${PERIOD}&filter=ou:USER_ORGUNIT&skipMeta=true`);
+  const rowHasValue = (row) => { const v = row && row[row.length - 1]; return !!(row && row[0] && v !== '' && v != null); };
+  const isIndicatorFault = (r) => !!r?._error && /SqlState|syntax error|Expression violation|invalid types|division by zero|ctx\.uid0/i.test(String(r._error));
+  const withData = new Set();
+  const broken = [];
+  const skipped = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const chunk = ids.slice(i, i + 50);
+    const r = await query(chunk);
+    if (!r?._error) {
+      for (const row of (r?.rows || [])) if (rowHasValue(row)) withData.add(row[0]);
+      continue;
+    }
+    if (!isIndicatorFault(r)) { skipped.push({ ids: chunk, error: String(r._error).slice(0, 200) }); continue; }
+    if (chunk.length === 1) { broken.push({ id: chunk[0], error: String(r._error).slice(0, 240) }); continue; }
+    // Isolate the culprit(s): one query per indicator in this chunk.
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < chunk.length) {
+        const id = chunk[cursor++];
+        const one = await query([id]);
+        if (!one?._error) { for (const row of (one?.rows || [])) if (rowHasValue(row)) withData.add(row[0]); }
+        else if (isIndicatorFault(one)) broken.push({ id, error: String(one._error).slice(0, 240) });
+        else skipped.push({ ids: [id], error: String(one._error).slice(0, 200) });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, chunk.length) }, worker));
+  }
+  // A query with SEVERAL indicators answers 200 and simply leaves out one
+  // whose SQL fails (live 2.43.2, 2026-10-29: a `#{bool} == true` indicator
+  // came back as "no data" next to working ones — same-type or mixed — and
+  // 409'd only on its own). So every "no value" indicator of a multi-item
+  // query is re-asked alone; it is the only way to tell empty from broken.
+  // Capped so a program without data cannot cost hundreds of calls.
+  const RECHECK_MAX = 40;
+  let unverified = [];
+  if (ids.length > 1) {
+    let recheck = ids.filter(id => !withData.has(id) && !broken.some(b => b.id === id) && !skipped.some(sk => sk.ids.length === 1 && sk.ids[0] === id));
+    if (recheck.length > RECHECK_MAX) { unverified = recheck.slice(RECHECK_MAX); recheck = recheck.slice(0, RECHECK_MAX); }
+    let cur = 0;
+    const one = async () => {
+      while (cur < recheck.length) {
+        const id = recheck[cur++];
+        const r = await query([id]);
+        if (!r?._error) { for (const row of (r?.rows || [])) if (rowHasValue(row)) withData.add(row[0]); }
+        else if (isIndicatorFault(r)) broken.push({ id, error: String(r._error).slice(0, 240) });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, recheck.length) }, one));
+  }
+  return {
+    ok: broken.length === 0,
+    checked: ids.length,
+    query: `aggregate analytics, org unit USER_ORGUNIT, periods ${PERIOD.replace(';', ' + ')}`,
+    with_data: ids.filter(id => withData.has(id)),
+    no_data: ids.filter(id => !withData.has(id) && !broken.some(b => b.id === id)),
+    ...(broken.length ? { broken } : {}),
+    ...(skipped.length ? { skipped } : {}),
+    ...(unverified.length ? { unverified, unverified_note: `${unverified.length} indicator(s) returned no value and were not re-checked one by one — an empty result can also hide a failing indicator.` } : {}),
+  };
 }
 
 // applyRuleActionSugar — shared rewrite step for both create-rule paths.
@@ -8638,8 +8948,15 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     if (resp._error) return resp;
     const total = resp.pager?.total ?? 0;
     const pageCount = resp.pager?.pageCount ?? 1;
+    // Existing indicators are REUSED by later steps of a build. Flag the ones
+    // that cannot be computed, or that count something other than their name
+    // says (live 2026-10-29: "ANC 1st visit count" and "ANC 2-4+ visit count"
+    // both counted every stage's events and were reused onto a dashboard as
+    // two identical lines). Same checks as create; nothing is changed here.
+    const flagged = await annotateProgramIndicatorProblems(resp.programIndicators, programId);
     return {
       ...resp,
+      ...(flagged ? { _flagged: `${flagged} indicator(s) carry a _problem: they fail in analytics or count something other than their name says. Do NOT reuse them as they are — fix them (manage_program_indicators update, keeping what they measure) or create correct ones, and tell the user.` } : {}),
       _page: page,
       _has_more: page < pageCount,
       _total: total,
@@ -9085,8 +9402,39 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       return { _error: 'No indicators to update after fetch', fetch_errors: fetchErrors };
     }
 
-    // Optional server-side validation of the new expressions before committing.
+    // The same local lint + analytics-runtime traps as create/update: a fix
+    // that DHIS2's /description accepts can still break every chart (live
+    // 2026-10-29: `#{bool} == 'true'` passed validation, then every analytics
+    // query on the indicator 409'd). Healable forms are healed, the rest refused.
     const validationErrors = [];
+    {
+      const stageMaps = new Map();
+      for (let i = piObjects.length - 1; i >= 0; i--) {
+        const pi = piObjects[i];
+        const pid = pi.program?.id || programId;
+        let lintErr = null;
+        for (const [kind, text] of [['expression', pi.expression], ['filter', pi.filter]]) {
+          const l = text && String(text).trim() ? lintProgramIndicatorExpression(text, kind) : null;
+          if (l) { lintErr = { kind, reason: `${l.error} ${l.hint || ''}`.trim(), text }; break; }
+        }
+        if (!lintErr && pid) {
+          if (!stageMaps.has(pid)) {
+            const pr = await safeDhis2Fetch(`programs/${pid}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+            stageMaps.set(pid, (!pr?._error && Array.isArray(pr?.programStages)) ? new Map(pr.programStages.map(st => [st.id, st])) : null);
+          }
+          const tr = piAnalyticsRuntimeTraps(pi, stageMaps.get(pid), Number(dhis2.apiVersion) || 0);
+          if (tr.error) lintErr = { kind: 'expression', reason: `${tr.error} ${tr.hint || ''}`.trim(), text: pi.expression };
+          else if (tr.corrections?.length) {
+            const ch = changes.find(c => c.id === pi.id);
+            if (ch) { ch.auto_corrected = tr.corrections; ch.after = { expression: pi.expression || null, filter: pi.filter || null }; }
+          }
+        }
+        if (lintErr) {
+          validationErrors.push({ id: pi.id, name: pi.name, kind: lintErr.kind, rejected_value: String(lintErr.text || '').substring(0, 300), reason: lintErr.reason });
+          piObjects.splice(i, 1);
+        }
+      }
+    }
     if (validate) {
       for (let i = piObjects.length - 1; i >= 0; i--) {
         const pi = piObjects[i];
@@ -9140,8 +9488,24 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     if (!backup.ok) return backup.error;
 
     const result = await postMetadataPayload({ programIndicators: piObjects }, false);
+    // Saved ≠ works (see piRuntimeAnalyticsCheck): prove each fixed indicator
+    // computes; a fix that still fails is reported as a failure with its backup.
+    const runtimeCheck = result && result.success ? await piRuntimeAnalyticsCheck(programId || piObjects[0]?.program?.id, piObjects.map(p => p.id)) : null;
+    if (runtimeCheck?.broken?.length) {
+      const names = runtimeCheck.broken.map(b => `"${piObjects.find(p => p.id === b.id)?.name || b.id}" (${b.error})`).join('; ');
+      return {
+        ...result,
+        success: false,
+        _error: `Fix SAVED, but ${runtimeCheck.broken.length} indicator(s) still fail in DHIS2 analytics: ${names}. Restore them from the backup or correct them.`,
+        _hint: piRuntimeErrorHint(piObjects.find(p => p.id === runtimeCheck.broken[0].id)),
+        changes,
+        runtime_check: runtimeCheck,
+        backup: backup.block,
+      };
+    }
     return {
       ...result,
+      ...(runtimeCheck ? { runtime_check: runtimeCheck } : {}),
       summary: {
         fixed_count: piObjects.length,
         validation_performed: validate,
@@ -9159,9 +9523,11 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
   // ── get ──
   if (action === 'get') {
     if (!args.indicator_id) return { _error: 'indicator_id required for get' };
-    return safeDhis2Fetch(
+    const got = await safeDhis2Fetch(
       `programIndicators/${args.indicator_id}?fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,displayInForm,program[id,displayName],analyticsPeriodBoundaries[id,boundaryTarget,analyticsPeriodBoundaryType],categoryCombo[id,name],attributeCombo[id,name]`
     );
+    if (got && !got._error && got.program?.id) await annotateProgramIndicatorProblems([got], got.program.id);
+    return got;
   }
 
   // ── create ──
@@ -9201,6 +9567,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       );
       if (!backup.ok) return backup.error;
       const updateResult = await _buildAndPostProgramIndicator(existing.program?.id || programId, args.indicator_id, {
+        events_in_period: args.indicator.events_in_period,
         name:             args.indicator.name             ?? existing.name,
         short_name:       args.indicator.short_name       ?? existing.shortName,
         description:      args.indicator.description      ?? existing.description,
@@ -9214,7 +9581,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
         _attrComboId:     existing.attributeCombo?.id,
         // Changing the analytics type invalidates the old boundary pair — drop
         // it so the type-correct defaults regenerate.
-        _boundaries:      (args.indicator.analytics_type && args.indicator.analytics_type !== existing.analyticsType) ? null : existing.analyticsPeriodBoundaries,
+        _boundaries:      ((args.indicator.analytics_type && args.indicator.analytics_type !== existing.analyticsType) || typeof args.indicator.events_in_period === 'boolean') ? null : existing.analyticsPeriodBoundaries,
       }, args.dry_run_only);
       if (updateResult && typeof updateResult === 'object' && !Array.isArray(updateResult)) {
         updateResult.backup = backup.block;
@@ -9223,6 +9590,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     }
 
     return await _buildAndPostProgramIndicator(existing.program?.id || programId, args.indicator_id, {
+      events_in_period: args.indicator.events_in_period,
       name:             args.indicator.name             ?? existing.name,
       short_name:       args.indicator.short_name       ?? existing.shortName,
       description:      args.indicator.description      ?? existing.description,
@@ -9234,7 +9602,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       display_in_form:  args.indicator.display_in_form  ?? existing.displayInForm,
       _catComboId:      existing.categoryCombo?.id,
       _attrComboId:     existing.attributeCombo?.id,
-      _boundaries:      (args.indicator.analytics_type && args.indicator.analytics_type !== existing.analyticsType) ? null : existing.analyticsPeriodBoundaries,
+      _boundaries:      ((args.indicator.analytics_type && args.indicator.analytics_type !== existing.analyticsType) || typeof args.indicator.events_in_period === 'boolean') ? null : existing.analyticsPeriodBoundaries,
     }, args.dry_run_only);
   }
 
@@ -9289,6 +9657,22 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
   // PIs — mirror that.
   const analyticsType = indicator.analytics_type || 'EVENT';
   const boundaryTarget = analyticsType === 'ENROLLMENT' ? 'ENROLLMENT_DATE' : 'EVENT_DATE';
+  // events_in_period (ENROLLMENT only): the events an enrollment indicator
+  // reads must ALSO fall in the reporting period. Without an EVENT_DATE pair
+  // d2:countIfCondition & co. read every event of the enrollment, whatever its
+  // date — "registrations this year with a low-Hb visit during the year" came
+  // out 909 instead of 202 on play 2.43.2 (visits dated next year counted).
+  // Both pairs together verified on 2.42.5 and 2.43.2, 2026-10-29.
+  const defaultBoundaries = [
+    { boundaryTarget, analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
+    { boundaryTarget, analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
+  ];
+  if (analyticsType === 'ENROLLMENT' && indicator.events_in_period === true) {
+    defaultBoundaries.push(
+      { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
+      { boundaryTarget: 'EVENT_DATE', analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
+    );
+  }
   const pi = {
     id: uid,
     name: indicator.name,
@@ -9301,10 +9685,7 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
     categoryCombo:  { id: catComboId },
     attributeCombo: { id: indicator._attrComboId || catComboId },
     // Preserve existing boundaries on update; generate the type-correct pair on create
-    analyticsPeriodBoundaries: indicator._boundaries || [
-      { boundaryTarget, analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
-      { boundaryTarget, analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
-    ],
+    analyticsPeriodBoundaries: indicator._boundaries || defaultBoundaries,
   };
   if (indicator.description !== undefined) pi.description = indicator.description;
   if (indicator.decimals !== undefined) pi.decimals = indicator.decimals;
@@ -9343,20 +9724,22 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
   // 2026-07-19: a model reused a stage id from a trimmed conversation and
   // burned 4 rejections + a circuit-breaker disable). The precise listing lets
   // the model self-correct in ONE step.
+  let stageById = opts.progStagesById || null;
   if (programId) {
     const refRe = /#\{([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})\}/g;
     const refs = [];
     for (const text of [pi.expression, pi.filter]) {
       for (const m of String(text || '').matchAll(refRe)) refs.push({ stage: m[1], de: m[2], token: m[0] });
     }
-    if (refs.length) {
-      let stageById = opts.progStagesById || null;
-      if (!stageById) {
-        const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName]]]`);
-        if (!progResp?._error && Array.isArray(progResp?.programStages)) {
-          stageById = new Map(progResp.programStages.map(st => [st.id, st]));
-        }
+    // The structure also feeds the analytics-runtime trap check below (DE value
+    // types, stage names), so an unscoped V{event_count} needs it too.
+    if (!stageById && (refs.length || /V\{event_count\}/.test(pi.expression))) {
+      const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+      if (!progResp?._error && Array.isArray(progResp?.programStages)) {
+        stageById = new Map(progResp.programStages.map(st => [st.id, st]));
       }
+    }
+    if (refs.length) {
       if (stageById) {
         const problems = [];
         for (const r of [...new Map(refs.map(x => [x.token, x])).values()]) {
@@ -9379,6 +9762,18 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
         }
       }
     }
+  }
+
+  // Combinations the server accepts but analytics cannot run (see
+  // piAnalyticsRuntimeTraps). Heals a bare count variable's aggregation.
+  const traps = piAnalyticsRuntimeTraps(pi, stageById, Number(dhis2.apiVersion) || 0);
+  if (traps.error) {
+    return {
+      _error: `Program indicator ${indicatorId ? 'update' : 'create'} blocked: ${traps.error} Nothing was saved.`,
+      _hint: traps.hint,
+      expression: pi.expression,
+      ...(pi.filter ? { filter: pi.filter } : {}),
+    };
   }
 
   // Server-side validation — authoritative. Catches semantic errors the local
@@ -9413,9 +9808,10 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
   const precedenceAdvisories = [
     piMixedPrecedenceAdvisory('expression', pi.expression),
     piMixedPrecedenceAdvisory('filter', pi.filter),
+    ...traps.advisories,
   ].filter(Boolean);
 
-  return { pi, precedenceAdvisories };
+  return { pi, precedenceAdvisories, autoCorrections: traps.corrections };
 }
 
 // Commit ONE program indicator (create or update). Validates via
@@ -9423,11 +9819,11 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
 async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, dryRun) {
   const prepared = await _prepareProgramIndicatorObject(programId, indicatorId, indicator);
   if (prepared._error) return prepared;
-  const { pi, precedenceAdvisories } = prepared;
+  const { pi, precedenceAdvisories, autoCorrections } = prepared;
   const uid = pi.id;
 
   if (dryRun) {
-    return { success: true, phase: 'dry_run', message: 'Dry run only. No changes committed.', would_save: pi, ...(precedenceAdvisories.length ? { precedence_advisories: precedenceAdvisories } : {}) };
+    return { success: true, phase: 'dry_run', message: 'Dry run only. No changes committed.', would_save: pi, ...(autoCorrections?.length ? { auto_corrected: autoCorrections } : {}), ...(precedenceAdvisories.length ? { precedence_advisories: precedenceAdvisories } : {}) };
   }
 
   // For CREATE, pre-probe the server for shortName collisions. UPDATE keeps
@@ -9459,9 +9855,38 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
   const renamedFrom = pi._renamedFrom;
   delete pi._renamedFrom;
   const result = await postMetadataPayload({ programIndicators: [pi] }, false);
+
+  // Saved ≠ works: prove it computes (see piRuntimeAnalyticsCheck).
+  let runtimeCheck = null;
+  if (result && result.success) {
+    runtimeCheck = await piRuntimeAnalyticsCheck(programId, [uid]);
+    const broken = runtimeCheck?.broken?.[0];
+    if (broken && !indicatorId) {
+      const del = await safeDhis2Fetch(`programIndicators/${uid}`, { method: 'DELETE' });
+      return {
+        _error: `Program indicator "${pi.name}" saved, but DHIS2 analytics cannot compute it (${broken.error}). It would break every chart, map and line list that uses it, so it was ${del?._error ? 'NOT removed (delete failed — remove it with manage_program_indicators action=delete)' : 'removed again — nothing was left behind'}.`,
+        _hint: piRuntimeErrorHint(pi),
+        expression: pi.expression,
+        ...(pi.filter ? { filter: pi.filter } : {}),
+        aggregation_type: pi.aggregationType,
+      };
+    }
+    if (broken) {
+      return {
+        ...result,
+        success: false,
+        _error: `Update SAVED, but program indicator "${pi.name}" now fails in DHIS2 analytics (${broken.error}) — every chart, map and line list using it shows an error until it is fixed (or restored from the backup).`,
+        _hint: piRuntimeErrorHint(pi),
+        summary: { indicator: { id: uid, name: pi.name } },
+        runtime_check: runtimeCheck,
+      };
+    }
+  }
   const out = {
     ...result,
+    ...(autoCorrections?.length ? { auto_corrected: autoCorrections } : {}),
     ...(precedenceAdvisories.length ? { precedence_advisories: precedenceAdvisories } : {}),
+    ...(runtimeCheck ? { runtime_check: runtimeCheck } : {}),
     summary: {
       indicator: { id: uid, name: pi.name },
       ...(renamedFrom ? { name_auto_disambiguated: { from: renamedFrom, to: pi.name, reason: 'a program indicator with the requested name already exists (names are globally unique)' } } : {}),
@@ -9490,7 +9915,7 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
 async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun) {
   const catComboId = (await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1'))?.categoryCombos?.[0]?.id || 'bjDvmb4bfuf';
   let progStagesById = null;
-  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName]]]`);
+  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
   if (!progResp?._error && Array.isArray(progResp?.programStages)) {
     progStagesById = new Map(progResp.programStages.map(st => [st.id, st]));
   }
@@ -9517,6 +9942,7 @@ async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun
 
   const validPis = [];
   const validAdvisories = [];
+  const autoCorrected = [];
   const failed = [];
   for (let i = 0; i < indicators.length; i++) {
     const p = prepared[i];
@@ -9525,6 +9951,7 @@ async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun
     } else if (p && p.pi) {
       validPis.push(p.pi);
       if (p.precedenceAdvisories?.length) validAdvisories.push(...p.precedenceAdvisories);
+      if (p.autoCorrections?.length) autoCorrected.push({ name: p.pi.name, corrections: p.autoCorrections });
     }
   }
 
@@ -9535,6 +9962,7 @@ async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun
       message: `Dry run only. ${validPis.length} indicator(s) would be created, ${failed.length} rejected. Nothing committed.`,
       would_create: validPis.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
       ...(failed.length ? { failed } : {}),
+      ...(autoCorrected.length ? { auto_corrected: autoCorrected } : {}),
       ...(validAdvisories.length ? { precedence_advisories: validAdvisories } : {}),
     };
   }
@@ -9601,17 +10029,48 @@ async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun
     };
   }
 
+  // Saved ≠ works: one aggregate query proves every new indicator computes.
+  // A broken one is removed again (it would break every chart/map/line list
+  // that uses it) and reported under failed[] with the analytics error.
+  const runtimeCheck = await piRuntimeAnalyticsCheck(programId, validPis.map(p => p.id));
+  let working = validPis;
+  if (runtimeCheck?.broken?.length) {
+    const brokenIds = new Set(runtimeCheck.broken.map(b => b.id));
+    working = validPis.filter(p => !brokenIds.has(p.id));
+    for (const b of runtimeCheck.broken) {
+      const p = validPis.find(x => x.id === b.id);
+      const del = await safeDhis2Fetch(`programIndicators/${b.id}`, { method: 'DELETE' });
+      failed.push({
+        name: p?.name || b.id,
+        _error: `Saved, but DHIS2 analytics cannot compute it (${b.error}) — ${del?._error ? 'removing it FAILED, delete it with manage_program_indicators(action="delete")' : 'removed again so it cannot break a chart'}.`,
+        _hint: piRuntimeErrorHint(p),
+        expression: p?.expression,
+        filter: p?.filter || undefined,
+        aggregation_type: p?.aggregationType,
+      });
+    }
+    if (!working.length) {
+      return {
+        _error: `All ${validPis.length} program indicator(s) saved but none can be computed by DHIS2 analytics, so they were removed again — nothing was left behind.`,
+        failed,
+        runtime_check: runtimeCheck,
+      };
+    }
+  }
+
   return {
     success: true,
     action: 'create',
-    created_count: validPis.length,
-    created: validPis.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
+    created_count: working.length,
+    created: working.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
     // Flat UID list so the caller chains straight into visualization/map/dashboard data_items.
-    program_indicator_ids: validPis.map(p => p.id),
+    program_indicator_ids: working.map(p => p.id),
     ...(failed.length ? { failed_count: failed.length, failed } : {}),
     ...(renamed.length ? { name_auto_disambiguated: renamed } : {}),
+    ...(autoCorrected.length ? { auto_corrected: autoCorrected } : {}),
     ...(validAdvisories.length ? { precedence_advisories: validAdvisories } : {}),
-    summary: `Created ${validPis.length} program indicator(s) in one import${failed.length ? `; ${failed.length} rejected by validation (see failed[])` : ''}. Chain program_indicator_ids into visualizations/maps/dashboard data_items.`,
+    ...(runtimeCheck ? { runtime_check: runtimeCheck } : {}),
+    summary: `Created ${working.length} program indicator(s) in one import${failed.length ? `; ${failed.length} rejected (see failed[])` : ''}.${runtimeCheck && !runtimeCheck.skipped ? ' Each was computed once by DHIS2 analytics (runtime_check).' : ''} Chain program_indicator_ids into visualizations/maps/dashboard data_items.`,
   };
 }
 

@@ -242,7 +242,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   console.log(`[AgenticLoop] knownIds seeded with ${dhis2.knownIds.size} UID(s); knownIcons + recentCreations reset`);
   // ── Dynamic tool selection — send only tools relevant to this request ──
   await ensureMemoryLoaded(); // the memory on/off switch decides whether manage_memory is offered
-  const contextualTools = getContextualTools(ctx, userText, browseWeb);
+  // "continue" / "yes, do it" turns are routed with the request they continue.
+  const routingText = buildRoutingText(userText);
+  const contextualTools = getContextualTools(ctx, routingText, browseWeb, userText);
   const contextualToolNames = new Set(contextualTools.map(t => t.function.name));
   // Learning memory: start observing this turn (privacy taint is decided here
   // for patient-record pages and save-error diagnosis).
@@ -261,7 +263,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   const wireTools = toWireTools(stripUnavailableToolActions(contextualTools));
   const deliveredManuals = new Set();
 
-  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb);
+  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb, routingText);
 
   // If image is attached, analyze with a vision model first, then include description
   let userContent;

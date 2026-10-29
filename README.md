@@ -353,6 +353,75 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.30 — A dashboard request DHIS2 cannot build as worded (2026-10-29)
+
+**The report.** On the 2.43 playground, for "MNCH / PNC (Adult Woman)", the user asked for: a line-listing table of all org units with a column for the % of women who attended ANC 1 and one for ANC 2-4; a line of attended visits across all org units; and a bubble map sized by the % attending ANC 1-4. The thread hit 13 failed calls, ended its first turn at the 3-error limit, and after "continue" produced a one-row-per-woman list, a chart of one org unit, a map with no data, and an indicator switched to count a *Weight* field. Every cause below was reproduced live on 2.43.2 (play) and 2.42.5 (localhost) first.
+
+**Requests DHIS2 cannot build as worded.**
+- New system-prompt section for chart/table/map/dashboard builds. It maps each request to the DHIS2 object that delivers it:
+  - a table of org units with % columns → a pivot table, not a line list;
+  - a line "across org units" → a column chart, or a line over time;
+  - "all org units" in a chart → district level;
+  - a point per org unit sized by a value → a bubble map;
+  - "last N years" → add THIS_YEAR.
+- If another object gives the same information, the chatbot builds it and opens its answer with a "Changed from your request" note. If nothing can, it explains and offers options instead of substituting something else.
+- `manage_line_lists` refuses a percentage indicator column (it shows 0 or 100 per row) and a count-of-records column (1 on every row). It explains that a line list is one row per record and gives the exact pivot-table call. A list with only org-unit and indicator columns gets the same warning.
+
+**Program indicators that save but cannot be computed.** DHIS2's expression check and the metadata import accept these; analytics then fails with "SQL syntax error (SqlState 42xxx)" on every chart, map and line list. All verified on 2.42.5 and 2.43.2:
+- `V{tei_count}` / `V{enrollment_count}` with SUM or AVERAGE → healed to COUNT and reported. This was the thread's first failure.
+- `V{event_count}` in an ENROLLMENT indicator is refused.
+- `d2:countIfCondition` on a text/option data element is refused. `d2:countIfValue` on one is refused on 2.43+ (it still works on 2.42).
+- Aggregation NONE is refused (HTTP 500 / SQL 42601 everywhere).
+- An EVENT count named after one stage but counting every stage is refused, with the stage filter to add. The thread's two "visit count" indicators were identical for this reason.
+- After every create and update, ONE aggregate analytics query proves each indicator computes. A new one that cannot is deleted again and reported in `failed[]` with the cause. A missing analytics table is not blamed on the indicator.
+- `list` and `get` flag existing indicators with these problems, so a later build does not reuse them blindly.
+- `d2:hasValue` inside `d2:condition("…")` is accepted. The server parses it and it computes on both versions. It is the clean "% of women who attended stage X" pattern; only a bare top-level `d2:hasValue` is filter-only.
+- The manual says: fix an indicator's syntax or aggregation, never what it measures.
+
+**"continue" turns.** Tools were chosen from the user's message alone, so "continue" had no dashboard or map tools and the model hand-POSTed them. Short follow-ups are now routed with the last real request of the conversation. Write authorization and the save-failure mode still read only the current message.
+
+**Raw writes and other guards.**
+- `dhis2_query` refuses hand-built POST/PUT/PATCH of `visualizations`, `maps`, `mapViews`, `eventVisualizations` and legacy types, a new `dashboards`, and `/metadata` bundles carrying them. It names the tool to use. Rename-only PATCHes and bulk deletes still go through.
+- An event analytics query mixing two stages is refused before sending (409 E7244).
+- Sharing a dashboard, chart, map or line list is refused unless the user asked for it. In one replay the model gave every user metadata write access to a dashboard nobody asked to share; the multi-step playbook said "share last" unconditionally.
+- Charts, dashboards and maps whose periods all end before this year (LAST_5_YEARS = 2021–2025) and miss all their data get a warning. A replay chose LAST_5_YEARS "to catch more data", and every tile showed 0 because all the data is in 2026.
+
+**Smaller fixes.**
+- `manage_line_lists` accepts org units sent as `"LEVEL-4;<uid>"` or `org_unit_level`.
+- Its query-failure diagnosis names the known SQL causes and says not to probe row-level endpoints (blocked for cloud models).
+- `manage_metadata` deletes visualizations, maps and line lists with a plain DELETE. On 2.43.2 the metadata-import delete answers HTTP 500 ("no Session") although the object is removed.
+
+**Second test prompt — WHO RMNCH "Maternal Care and Follow-up" dashboard (2.43.2 play, deepseek).** Run 1 had 4 failed calls, stopped at the error limit with no dashboard, and reported 909 instead of 202. Fixed, all live-verified on 2.42.5 and 2.43.2:
+- Yes/No data elements compared with true/false (SQL 42883) or 'true'/'false' (E7132) are healed to 1/0 (523 / 503 near-miss Yes / No match the raw records).
+- `events_in_period:true` on ENROLLMENT indicators adds EVENT_DATE boundaries: "registrations this year with a low-Hb visit during the year" = 202 (true) instead of 909 (visits dated next year counted).
+- A multi-indicator analytics query answers 200 and silently drops a broken indicator; the post-save check now re-asks every "no value" indicator alone (max 40).
+- `bulk_fix_expressions` runs the same lint, traps and post-save check (it saved a breaking fix).
+- Analytics-only indicators no longer PATCH the program's version (the user asked to leave program settings unchanged).
+- Chart layout: `category` / `series` accepted; a chart with only data items on the x-axis (columns/rows swapped) is corrected with a note. DHIS2 charts draw rows on the x-axis.
+- `/analytics` with a period and start/end dates drops the dates (409 E7105); a stage UID as `dimension=` becomes `stage=` (events) or is refused (enrollments).
+- `count_records` finds the program from `stage_id`, `program_id` or this turn's `get_program_info`.
+- Dashboard results carry `dashboard_url`.
+- Run 3: all four numbers correct (2,002 / 1,156 / 23.6 % / 202), dashboard built, program unchanged, 1 failed exploratory call (stage as dimension), since fixed. Later replays also caught `dimension=stage:A;B;C` (now refused before sending).
+
+**Third test prompt — four tables added to that dashboard (district summary, registration register, low-Hb visits, near-miss births).** Its first run built all four, 0 failed calls, but with 4 line-list refusals, a pivot WITHOUT the overall row it described, and a wrong postpartum figure in the reply. Fixed:
+- **The same data element from several stages** ("Hb at first ANC", "Hb at birth", "Hb at postpartum") is allowed in one ENROLLMENT line list — DHIS2 stores one dataElementDimension per stage (verified 2.43.2). The old duplicate check refused it, so the model built program indicators as a workaround. Saved lists are read back per stage, repetitions included.
+- A status column with no statuses shows every status (only a status FILTER needs them).
+- **`overall_row:true`** on a pivot with `[<parent>, "LEVEL-n"]` makes the parent its own row, computed by analytics from all records. DHIS2 pivot totals only add up or average the cells, which is wrong for percentages. Verified: 23.6 % / 50.6 % national next to the 13 districts; averaging the districts gives 23.7 % / 50.2 %.
+- **Post-save indicator check:** `filter=pe:THIS_YEAR;LAST_5_YEARS` answered 200 / 0.0 for an indicator that 409s with any single period or as a dimension, so the check now uses periods as a dimension.
+- **"Missing" written as `#{de} == ''`** is healed to `!d2:hasValue(#{de})`. On number / Yes-No fields it is E7132, and on text it never matches, because DHIS2 stores no empty values.
+- **ENROLLMENT line-list row counts:** the probe reads one page of 100, because `totalPages=true` is an SQL error on 2.42 and 2.43. A full page is now reported as a lower bound ("at least 100") instead of the count (a 2,002-row register was reported as "100 rows").
+- **Stage visit dates in ENROLLMENT lists:** DHIS2 2.41+ supports them (analytics answers `<stage>.EVENT_DATE`), but this tool cannot save them yet. The refusal and the manual now say exactly that and point to the Line Listing app, instead of the model telling the user DHIS2 cannot do it.
+- **`count_records` filters:** `"<de>:eq:<value>"` was turned into `dimension=<de>:<value>` without the operator, so every filtered count 409'd. It is now `<de>:EQ:<value>`, Yes/No as 1/0 (live: 523 near-miss and 1,156 low-Hb visits). The error hint no longer blames analytics tables, and the counted stage is labelled.
+
+**Verified.**
+- `npm run verify`: 785 checks pass (41 new).
+- Final real-model run of the second and third prompts as two fresh turns of one conversation (deepseek-v4p1-flash-1017, play 2.43.2): 129 DHIS2 calls, 0 failed. Checked on the server: 2,002 / 1,156 / 23.6 % / 202; chart axes; the pivot's overall row (14 rows); the three line lists (per-stage Hb columns, the two latest follow-up visits, Hb < 11 lowest first, near-miss = Yes); no broken indicator; program version unchanged; dashboard not shared. Remaining model behaviour: it still probes patient-level endpoints a few times on a cloud model; the privacy gate refuses each one.
+- `scripts/scenario-mnch-dashboard.js` replays the build tool-by-tool on play 2.43.2: traps refused or healed, a pivot table, a column chart, a bubble map, a line list and a dashboard. 99 calls, 0 failed, nothing left behind.
+- `scripts/scenario-line-lists.js` on localhost 2.42: 123 calls, 0 failed.
+- `npm run apps`: 346/346.
+- The exact user prompt through the real chat loop with Fireworks `deepseek-v4p1-flash-1017`, on a clean 2.43.2 playground with the program as page context: 56 DHIS2 calls, 0 failed. It produced a pivot table (districts × % ANC 1 / % ANC 2-4), a visits chart, a bubble map, and a dashboard that was not shared. Its "Changed from your request" note explained the pivot table, the line across org units and the district-level map. Its 4 indicators were checked on the server, and the pivot returns 100 % / 100 % for Bo.
+- `scripts/llm-run.js` takes `LLM_PAGE_CONTEXT` to replay page-bound prompts.
+
 ### 2.8.29 — A weak model builds a whole NCD programme end to end without mistakes (2026-10-28)
 
 **The test.** On localhost:8081 (2.42.5) the chatbot, driven by Fireworks `deepseek-v4p1-flash-1017`, was asked in plain language to build an "NCD Hypertension and Diabetes Care" tracker program (3 stages, 6 rules, 7 indicators), then charts, a pivot, a single value, a pie, two line lists and a dashboard, then an enrollment widget, a form-field plugin, a dashboard plugin and an app. 40 patients were seeded through the tracker API (test scaffolding, deterministic). Every result was checked independently: every analytics value recomputed from the raw records, the rules driven in real Capture, the plugins and the app exercised in the real Capture / Dashboard / Line Listing apps. Each mistake below was reproduced, fixed in the tools, and the stage re-run until it came back clean (0 failed API calls).

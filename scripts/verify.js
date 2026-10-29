@@ -2837,6 +2837,294 @@ async function runRuleScopeAndTetSharingChecks() {
   truthy('manuals: one unscoped rule covers every stage; TrackedEntityType is data-shareable', /One rule covers every stage/.test(kb) && /Only Program, ProgramStage and TrackedEntityType are DATA-shareable/.test(kb));
 }
 
+
+// The 2026-10-29 MNCH dashboard thread: a "continue" turn without the
+// dashboard/map tools, program indicators that save but break analytics,
+// a line list asked to do a pivot table's job, raw chart/map POSTs.
+async function runDashboardThreadChecks() {
+  console.log('\nMNCH dashboard thread (routing, indicator runtime traps, line-list limits, raw analytics writes):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const savedApi = d.apiVersion;
+
+  // Routing: "continue" carries the request it continues.
+  const ask = 'Please create a dashboard for this program, it should have different maps, visualizations and tables, first create a line listing table that has all the OUs, then a visualization, lastly create a map with a point on each OU sized by the percentage.';
+  vm.runInContext(`conversationHistory = ${JSON.stringify([{ role: 'user', content: ask }, { role: 'assistant', content: 'Say continue and I will finish.' }])};`, ctx);
+  const routing = ctx.buildRoutingText('continue');
+  const names = ctx.getContextualTools({}, routing, false, 'continue').map((t) => t.function.name);
+  truthy('a "continue" turn is routed with the request it continues (dashboards, maps, line lists offered)', routing.includes('line listing table') && ['manage_dashboards', 'manage_maps', 'manage_line_lists'].every((n) => names.includes(n)));
+  truthy('…a long new request is routed on itself only', ctx.buildRoutingText('x '.repeat(40)).trim() === 'x '.repeat(40).trim());
+  vm.runInContext(`conversationHistory = ${JSON.stringify([{ role: 'user', content: ask }, { role: 'user', content: 'continue' }])};`, ctx);
+  truthy('…bare follow-ups are skipped when looking for the request', ctx.buildRoutingText('yes go ahead').includes('line listing table'));
+  vm.runInContext('conversationHistory = [];', ctx);
+
+  // Program-indicator analytics-runtime traps (verified live 2.42.5 + 2.43.2).
+  const stageById = new Map([
+    ['eaDHS084uMp', { displayName: 'ANC 1st visit', programStageDataElements: [{ dataElement: { id: 'UXz7xuGCEhU', displayName: 'Weight', valueType: 'NUMBER' } }] }],
+    ['grIfo3oOf4Y', { displayName: 'ANC Visit (2-4+)', programStageDataElements: [{ dataElement: { id: 'g9eOBujte1U', displayName: 'ANC Visit', valueType: 'TEXT' } }] }],
+  ]);
+  const trap = (pi, v = 43) => ctx.piAnalyticsRuntimeTraps({ name: 'x', filter: '', ...pi }, stageById, v);
+  const healed = { expression: 'V{tei_count}', analyticsType: 'ENROLLMENT', aggregationType: 'SUM' };
+  const r1 = ctx.piAnalyticsRuntimeTraps(healed, stageById, 43);
+  truthy('V{tei_count} + SUM (SQL 42883) is healed to COUNT and reported', !r1.error && healed.aggregationType === 'COUNT' && r1.corrections.length === 1);
+  truthy('…aggregation NONE (HTTP 500 / SQL 42601 in every analytics query) is refused, except a bare count variable which heals to COUNT', !!trap({ expression: 'd2:count(#{eaDHS084uMp.UXz7xuGCEhU})', analyticsType: 'ENROLLMENT', aggregationType: 'NONE' }).error && (() => { const pi = { name: 'x', filter: '', expression: 'V{enrollment_count}', analyticsType: 'ENROLLMENT', aggregationType: 'NONE' }; const r = ctx.piAnalyticsRuntimeTraps(pi, stageById, 43); return !r.error && pi.aggregationType === 'COUNT'; })());
+  truthy('…V{enrollment_count} inside arithmetic with SUM is refused', !!trap({ expression: 'V{enrollment_count} * 100', analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error);
+  truthy('…V{event_count} in an ENROLLMENT indicator (42703) is refused', /42703/.test(trap({ expression: 'V{event_count}', analyticsType: 'ENROLLMENT', aggregationType: 'COUNT' }).error || ''));
+  truthy('…d2:countIfValue on a TEXT data element is refused on 2.43, allowed on 2.42', !!trap({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error && !trap({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }, 42).error);
+  truthy('…d2:countIfCondition on a TEXT data element is refused on every version', !!trap({ expression: "d2:countIfCondition(#{grIfo3oOf4Y.g9eOBujte1U}, \"== '2'\")", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }, 42).error);
+  truthy('…numeric countIfValue and V{event_count} SUM in an EVENT indicator pass', !trap({ expression: 'd2:countIfValue(#{eaDHS084uMp.UXz7xuGCEhU}, 3000)', analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error && !trap({ expression: 'V{event_count}', analyticsType: 'EVENT', aggregationType: 'SUM', filter: "V{program_stage_id} == 'eaDHS084uMp'" }).error);
+  truthy('…an EVENT count named after one stage but counting every stage is refused with the stage filter', /V\{program_stage_id\} == 'grIfo3oOf4Y'/.test(trap({ name: 'ANC 2-4+ visit count', expression: 'V{event_count}', analyticsType: 'EVENT', aggregationType: 'COUNT' }).hint || ''));
+  truthy('…an unscoped EVENT count with a generic name only gets an advisory', (() => { const r = trap({ name: 'All visits', expression: 'V{event_count}', analyticsType: 'EVENT', aggregationType: 'COUNT' }); return !r.error && r.advisories.length === 1; })());
+
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('programs/') ? { programStages: [...stageById.entries()].map(([id, st]) => ({ id, ...st })) } : { _error: 'x' });
+    try {
+      const pis = [
+        { id: 'w3OTpzL30uY', name: 'ANC 1st visit count', expression: 'V{event_count}', filter: '', analyticsType: 'EVENT', aggregationType: 'COUNT' },
+        { id: 'fgjdNH53Rh6', name: 'ANC 1st visit coverage (%)', expression: 'd2:condition("d2:hasValue(#{eaDHS084uMp.UXz7xuGCEhU})", 100, 0)', filter: '', analyticsType: 'ENROLLMENT', aggregationType: 'AVERAGE' },
+      ];
+      const n = await ctx.annotateProgramIndicatorProblems(pis, 'uy2gU8kT1jF');
+      truthy('list/get flag an EXISTING indicator that counts every stage (so it is not reused blindly); a sound one is untouched', n === 1 && /ALL 2 stages/.test(pis[0]._problem || '') && !pis[1]._problem);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  // d2:hasValue inside d2:condition is valid (server-verified); bare is not.
+  truthy('PI lint: d2:hasValue inside d2:condition passes, a bare top-level d2:hasValue is still refused',
+    ctx.lintProgramIndicatorExpression('d2:condition("d2:hasValue(#{eaDHS084uMp.UXz7xuGCEhU})", 100, 0)', 'expression') === null
+    && !!ctx.lintProgramIndicatorExpression('d2:hasValue(#{eaDHS084uMp.UXz7xuGCEhU})', 'expression'));
+
+  // Runtime proof after save: the broken one of two is isolated.
+  {
+    const saved = ctx.safeDhis2Fetch; const calls = [];
+    ctx.safeDhis2Fetch = async (p) => {
+      calls.push(p);
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-29T01:00:00.000' };
+      if (p.startsWith('programs/progRt00001')) return { id: 'progRt00001', created: '2020-01-01T00:00:00.000' };
+      if (p.startsWith('analytics?')) {
+        const dx = decodeURIComponent(p).match(/dx:([^&]+)/)[1].split(';');
+        if (dx.includes('piBroken001')) return { _error: 'DHIS2 API 409: Query failed because of a syntax error (SqlState: 42883)', _status: 409 };
+        return { rows: dx.map((id) => [id, '1.0']) };
+      }
+      return { _error: 'unexpected ' + p };
+    };
+    try {
+      const rc = await ctx.piRuntimeAnalyticsCheck('progRt00001', ['piGood00001', 'piBroken001']);
+      truthy('post-save analytics check isolates the indicator that cannot be computed', rc && rc.ok === false && rc.broken.length === 1 && rc.broken[0].id === 'piBroken001' && rc.with_data.includes('piGood00001'));
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-29T01:00:00.000' };
+      if (p.startsWith('programs/progRt00002')) return { id: 'progRt00002', created: '2020-01-01T00:00:00.000' };
+      return { _error: 'DHIS2 API 409: Query failed because a referenced table does not exist (E7144)', _status: 409 };
+    };
+    try {
+      const rc = await ctx.piRuntimeAnalyticsCheck('progRt00002', ['piGood00001']);
+      truthy('…a missing analytics table is not blamed on the indicator', rc && rc.ok === true && rc.skipped && rc.skipped.length === 1);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  // Line lists: what a column can show per row.
+  const llCtx = {
+    stages: [{ id: 'grIfo3oOf4Y', name: 'ANC Visit (2-4+)', deIds: ['g9eOBujte1U'] }],
+    des: new Map([['g9eOBujte1U', { id: 'g9eOBujte1U', name: 'ANC Visit', valueType: 'TEXT' }]]),
+  };
+  const rowProblem = (pi) => ctx.lineListPiRowLevelProblem({ id: 'piX0000000a', name: 'p', filter: '', analyticsType: 'ENROLLMENT', ...pi }, llCtx, 'ENROLLMENT');
+  const pct = rowProblem({ expression: 'd2:condition("d2:hasValue(#{grIfo3oOf4Y.g9eOBujte1U})", 100, 0)', aggregationType: 'AVERAGE' });
+  truthy('line list: a percentage indicator column is refused with the pivot-table alternative', pct && /PERCENTAGE/.test(pct._error) && /PIVOT_TABLE/.test(pct._hint) && pct.overridable === true);
+  truthy('…a count-of-records column (1 on every row) is refused, not overridable', (() => { const r = rowProblem({ expression: 'V{enrollment_count}', aggregationType: 'COUNT' }); return r && /1 on every row/.test(r._error) && !r.overridable; })());
+  d.apiVersion = '43';
+  truthy('…an analytics-runtime trap is refused with its real cause before any probe (2.43)', /countIfValue/.test((rowProblem({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", aggregationType: 'SUM' }) || {})._error || ''));
+  truthy('…a per-record count (d2:count, SUM) is fine', rowProblem({ expression: 'd2:count(#{grIfo3oOf4Y.g9eOBujte1U})', aggregationType: 'SUM' }) === null);
+  {
+    const ouCtx = { program: { name: 'P' }, stagesById: new Map(), teas: new Map(), des: new Map(), pis: new Map(), teaByName: new Map(), deByName: new Map(), piByName: new Map() };
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('organisationUnits?') ? { organisationUnits: [{ id: 'ImspTQPwCqd' }] } : { _error: 'x' });
+    try {
+      const joined = await ctx.lineListResolveDimension({ dimension: 'ou', org_units: ['LEVEL-4;ImspTQPwCqd'] }, ouCtx, 'ENROLLMENT', new Map(), 'column');
+      const lvl = await ctx.lineListResolveDimension({ dimension: 'ou', org_unit_level: 4 }, ouCtx, 'ENROLLMENT', new Map(), 'column');
+      truthy('…org units sent as "LEVEL-4;<uid>" or as org_unit_level are healed, not refused', joined.kind === 'ou' && joined.items.join(',') === 'LEVEL-4,ImspTQPwCqd' && lvl.kind === 'ou' && lvl.items[0] === 'LEVEL-4');
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  // dhis2_query: hand-built charts / maps / line lists / dashboards are refused.
+  {
+    const saved = ctx.safeDhis2Fetch; const savedWa = d.writeAuth; let sent = 0;
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    ctx.safeDhis2Fetch = async () => { sent++; return { status: 'OK' }; };
+    try {
+      const viz = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'visualizations', body: { name: 'x', type: 'LINE', columns: [{ dimension: 'ou', items: [{ id: 'ImspTQPwCqd' }] }] } });
+      const map = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'maps', body: { name: 'x', mapViews: [] } });
+      const mv = await ctx.executeTool('dhis2_query', { method: 'PATCH', path: 'mapViews/JHamZu0r4rx', body: { thematicMapType: 'BUBBLE' } });
+      const dash = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'dashboards', body: { name: 'x', dashboardItems: [] } });
+      const meta = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'metadata', body: { maps: [{ name: 'x' }] } });
+      truthy('dhis2_query refuses hand-built visualizations / maps / map layers / dashboards / metadata bundles and names the tool (nothing sent)',
+        sent === 0 && viz._redirect === 'manage_dashboards' && map._redirect === 'manage_maps' && mv._redirect === 'manage_maps' && dash._redirect === 'manage_dashboards' && meta._redirect === 'manage_maps');
+      sent = 0;
+      const rename = await ctx.executeTool('dhis2_query', { method: 'PATCH', path: 'visualizations/p3QxBYDESIE', body: { name: 'Renamed' } });
+      truthy('…a rename-only PATCH still goes through', !rename._redirect && sent > 0);
+    } finally { ctx.safeDhis2Fetch = saved; d.writeAuth = savedWa; }
+  }
+
+  // LAST_N_YEARS excludes the current year: a chart that misses all its data says so.
+  {
+    const saved = ctx.safeDhis2Fetch; let calls = 0;
+    ctx.safeDhis2Fetch = async (p) => { calls++; return /pe:THIS_YEAR/.test(decodeURIComponent(p)) ? { rows: [['piA0000000a', '100.0']] } : { rows: [['piA0000000a', '0.0']] }; };
+    try {
+      const w = await ctx.periodsMissThisYearWarning(['piA0000000a'], ['LAST_5_YEARS']);
+      const callsAfterFirst = calls;
+      const none = await ctx.periodsMissThisYearWarning(['piA0000000a'], ['LAST_12_MONTHS']);
+      const withThis = await ctx.periodsMissThisYearWarning(['piA0000000a'], ['THIS_YEAR', 'LAST_5_YEARS']);
+      truthy('a chart on LAST_5_YEARS whose data is all in the current year gets a warning; LAST_12_MONTHS / THIS_YEAR+LAST_5_YEARS cost no call', /COMPLETED/.test(w || '') && /THIS_YEAR/.test(w || '') && none === null && withThis === null && calls === callsAfterFirst);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  truthy('an event analytics query mixing two stages is refused before it is sent (409 E7244); one stage or enrollment analytics passes',
+    !!ctx.eventAnalyticsMultiStageRefusal('analytics/events/aggregate/uy2gU8kT1jF?dimension=ou%3AImspTQPwCqd&dimension=eaDHS084uMp.UXz7xuGCEhU&dimension=grIfo3oOf4Y.g9eOBujte1U&stage=eaDHS084uMp')
+    && ctx.eventAnalyticsMultiStageRefusal('analytics/events/aggregate/uy2gU8kT1jF?dimension=ou%3AImspTQPwCqd&dimension=eaDHS084uMp.UXz7xuGCEhU&stage=eaDHS084uMp') === null
+    && ctx.eventAnalyticsMultiStageRefusal('analytics/enrollments/aggregate/uy2gU8kT1jF?dimension=eaDHS084uMp.UXz7xuGCEhU&dimension=grIfo3oOf4Y.g9eOBujte1U') === null
+    && !!ctx.eventAnalyticsMultiStageRefusal('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=stage%3AWZbXY0S00lP%3BedqlbukwRfQ%3BPFDfvmGpsR3'));
+  {
+    const saved = ctx.safeDhis2Fetch; const savedWa = d.writeAuth; let sent = 0;
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    ctx.safeDhis2Fetch = async () => { sent++; return { object: { publicAccess: 'rw------', userGroupAccesses: [], userAccesses: [] } }; };
+    try {
+      vm.runInContext(`conversationHistory = []; lastUserText = ${JSON.stringify(ask)};`, ctx);
+      const r = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'rwr-----' });
+      truthy('sharing a dashboard the user never asked to share is refused (nothing sent)', r._scope === 'sharing_not_requested' && sent === 0);
+      vm.runInContext('lastUserText = "build the dashboard and make it public for everyone";', ctx);
+      const r2 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'r-------' });
+      truthy('…and allowed when the user asked for it', r2._scope !== 'sharing_not_requested' && sent > 0);
+    } finally { ctx.safeDhis2Fetch = saved; d.writeAuth = savedWa; vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx); }
+  }
+
+  // RMNCH dashboard run (2026-10-29): Yes/No comparisons, events in the period,
+  // swallowed failures in multi-indicator queries, no program PATCH.
+  {
+    const boolStages = new Map([['PFDfvmGpsR3', { displayName: 'Care at birth', programStageDataElements: [
+      { dataElement: { id: 'FIHEeJwfhZH', displayName: 'Maternal near-miss', valueType: 'BOOLEAN' } },
+      { dataElement: { id: 'vANAXwtLwcT', displayName: 'Hemoglobin value', valueType: 'NUMBER' } },
+    ] }]]);
+    const yes = { name: 'Near-miss Yes', expression: 'd2:condition("#{PFDfvmGpsR3.FIHEeJwfhZH} == true", 1, 0)', filter: "V{program_stage_id} == 'PFDfvmGpsR3' && #{PFDfvmGpsR3.FIHEeJwfhZH} != 'false'", analyticsType: 'EVENT', aggregationType: 'SUM' };
+    const r = ctx.piAnalyticsRuntimeTraps(yes, boolStages, 43);
+    truthy('a Yes/No data element compared with true / \'false\' (SQL 42883 / E7132) is healed to 1 / 0 in expression and filter, and reported',
+      !r.error && yes.expression === 'd2:condition("#{PFDfvmGpsR3.FIHEeJwfhZH} == 1", 1, 0)' && /FIHEeJwfhZH\} != 0$/.test(yes.filter) && r.corrections.length === 2);
+    const un = { name: 'Not answered', expression: 'V{event_count}', filter: "V{program_stage_id} == 'PFDfvmGpsR3' && #{PFDfvmGpsR3.FIHEeJwfhZH} == ''", analyticsType: 'EVENT', aggregationType: 'COUNT' };
+    const ru = ctx.piAnalyticsRuntimeTraps(un, boolStages, 43);
+    truthy('"missing" written as == \'\' (E7132 on number / Yes-No, always 0 on text) is healed to !d2:hasValue(…)', !ru.error && /&& !d2:hasValue\(#\{PFDfvmGpsR3\.FIHEeJwfhZH\}\)$/.test(un.filter));
+    const num = { name: 'x', expression: 'd2:condition("#{PFDfvmGpsR3.vANAXwtLwcT} == 1", 1, 0)', filter: '', analyticsType: 'EVENT', aggregationType: 'SUM' };
+    truthy('…a numeric data element is left alone', ctx.piAnalyticsRuntimeTraps(num, boolStages, 43).corrections.length === 0);
+  }
+  {
+    const saved = { sdf: ctx.safeDhis2Fetch, val: ctx.validateProgramIndicatorExpressionResilient };
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('categoryCombos') ? { categoryCombos: [{ id: 'bjDvmb4bfuf' }] }
+      : { programStages: [{ id: 'edqlbukwRfQ', displayName: 'Second antenatal care visit', programStageDataElements: [{ dataElement: { id: 'vANAXwtLwcT', displayName: 'Hemoglobin value', valueType: 'NUMBER' } }] }] });
+    ctx.validateProgramIndicatorExpressionResilient = async () => ({ status: 'OK' });
+    try {
+      const a = await ctx._prepareProgramIndicatorObject('WSGAb5XwJ3Y', null, { name: 'x', analytics_type: 'ENROLLMENT', aggregation_type: 'COUNT', expression: 'V{enrollment_count}', filter: "d2:countIfCondition(#{edqlbukwRfQ.vANAXwtLwcT}, '< 11') > 0", events_in_period: true });
+      const b = await ctx._prepareProgramIndicatorObject('WSGAb5XwJ3Y', null, { name: 'y', analytics_type: 'ENROLLMENT', aggregation_type: 'COUNT', expression: 'V{enrollment_count}' });
+      const t = (pi) => (pi?.analyticsPeriodBoundaries || []).map((x) => x.boundaryTarget).sort().join(',');
+      truthy('events_in_period adds EVENT_DATE boundaries to an enrollment indicator (202, not 909); without it only ENROLLMENT_DATE', t(a.pi) === 'ENROLLMENT_DATE,ENROLLMENT_DATE,EVENT_DATE,EVENT_DATE' && t(b.pi) === 'ENROLLMENT_DATE,ENROLLMENT_DATE');
+    } finally { ctx.safeDhis2Fetch = saved.sdf; ctx.validateProgramIndicatorExpressionResilient = saved.val; }
+  }
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-29T01:00:00.000' };
+      if (p.startsWith('programs/progRt00003')) return { id: 'progRt00003', created: '2020-01-01T00:00:00.000' };
+      const dx = decodeURIComponent(p).match(/dx:([^&]+)/)[1].split(';');
+      if (dx.length === 1 && dx[0] === 'piSwallow01') return { _error: 'DHIS2 API 409: Query failed because of a syntax error (SqlState: 42883)', _status: 409 };
+      return { rows: dx.filter((id) => id !== 'piSwallow01').map((id) => [id, '5.0']) };
+    };
+    try {
+      const rc = await ctx.piRuntimeAnalyticsCheck('progRt00003', ['piGood00002', 'piSwallow01']);
+      truthy('an indicator a multi-item query silently leaves out is re-asked alone and caught', rc.ok === false && rc.broken.length === 1 && rc.broken[0].id === 'piSwallow01');
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+  {
+    vm.runInContext('_captureMetaPending = null;', ctx);
+    ctx.noteCaptureMetadataWrite('POST', 'metadata', JSON.stringify({ programIndicators: [{ id: 'piA0000000b', program: { id: 'WSGAb5XwJ3Y' }, displayInForm: false }] }), []);
+    const none = ctx.captureMetaPending().programs.size === 0;
+    ctx.noteCaptureMetadataWrite('POST', 'metadata', JSON.stringify({ programIndicators: [{ id: 'piA0000000c', program: { id: 'WSGAb5XwJ3Y' }, displayInForm: true }] }), []);
+    const one = ctx.captureMetaPending().programs.has('WSGAb5XwJ3Y');
+    vm.runInContext('_captureMetaPending = null;', ctx);
+    truthy('analytics-only indicators do not bump the program version (no program PATCH); a displayInForm one still does', none && one);
+  }
+
+  {
+    const h = ctx.healAnalyticsPeriodAndDates('analytics?dimension=dx%3AaTzpJgBMnGk&dimension=ou%3AImspTQPwCqd&dimension=pe%3A2026&startDate=2026-01-01&endDate=2026-12-31');
+    const keep = ctx.healAnalyticsPeriodAndDates('analytics?dimension=dx%3AaTzpJgBMnGk&dimension=ou%3AImspTQPwCqd&startDate=2026-01-01&endDate=2026-12-31');
+    truthy('/analytics with a period AND start/end dates (409 E7105) drops the dates; dates alone are kept', h.healed && !/startDate|endDate/.test(h.path) && /pe%3A2026/.test(h.path) && !keep.healed);
+  }
+  {
+    const typeMap = { piA0000000d: 'PROGRAM_INDICATOR', piA0000000e: 'PROGRAM_INDICATOR' };
+    const swapped = ctx.buildVisualizationObject({ name: 'Avg Hb by month', vis_type: 'LINE', data_items: ['piA0000000d', 'piA0000000e'], periods: ['202601', '202602'], org_units: ['ImspTQPwCqd'], layout: { columns: ['pe'], rows: ['dx'], filters: ['ou'] } }, typeMap);
+    const named = ctx.buildVisualizationObject({ name: 'Near-miss by district', vis_type: 'STACKED_BAR', data_items: ['piA0000000d', 'piA0000000e'], periods: ['2026'], org_units: ['ImspTQPwCqd', 'LEVEL-2'], layout: { category: ['ou'], series: ['dx'], filters: ['pe'] } }, typeMap);
+    const pivot = ctx.buildVisualizationObject({ name: 'Table', vis_type: 'PIVOT_TABLE', data_items: ['piA0000000d'], periods: ['2026'], org_units: ['ImspTQPwCqd', 'LEVEL-2'], layout: { rows: ['ou'], columns: ['dx'], filters: ['pe'] } }, typeMap);
+    truthy('chart layout: data items alone on the x-axis (columns:[pe], rows:[dx]) is swapped back with a note; category/series names map to rows/columns; pivots untouched',
+      swapped.viz.rowDimensions.join() === 'pe' && swapped.viz.columnDimensions.join() === 'dx' && /Layout corrected/.test(swapped.layoutNote || '')
+      && named.viz.rowDimensions.join() === 'ou' && named.viz.columnDimensions.join() === 'dx' && !named.layoutNote
+      && pivot.viz.rowDimensions.join() === 'ou' && !pivot.layoutNote);
+  }
+
+  {
+    const saved = ctx.safeDhis2Fetch; const seen = [];
+    ctx.safeDhis2Fetch = async (p) => { seen.push(p); if (p.startsWith('programStages/')) return { program: { id: 'WSGAb5XwJ3Y' } }; return { _error: 'stop here', _status: 400 }; };
+    const dd = ctx.__dhis2(); const savedPc = dd.pageContext; dd.pageContext = { appType: 'Dashboard' };
+    try {
+      const r = await ctx.executeTool('count_records', { record_type: 'events', stage_id: 'edqlbukwRfQ', ou_override: 'ImspTQPwCqd' });
+      truthy('count_records with only a stage_id (no program page) finds the stage\'s program instead of "no program in context"', !/No program in context/.test(r?._error || '') && seen.some((p) => p.startsWith('programStages/edqlbukwRfQ')));
+    } finally { ctx.safeDhis2Fetch = saved; dd.pageContext = savedPc; }
+  }
+
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('programs/WSGAb5XwJ3Y') ? { programStages: [{ id: 'WZbXY0S00lP' }, { id: 'edqlbukwRfQ' }] } : { _error: 'x' });
+    try {
+      const ev = await ctx.healBareStageDimension('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=pe%3A2026&dimension=WZbXY0S00lP');
+      const en = await ctx.healBareStageDimension('analytics/enrollments/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=WZbXY0S00lP');
+      const de = await ctx.healBareStageDimension('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=vANAXwtLwcT&stage=WZbXY0S00lP');
+      truthy('a stage UID sent as dimension= (409 E7224) becomes stage= on event analytics, is refused on enrollment analytics, and a data element is left alone',
+        ev.healed && /stage=WZbXY0S00lP$/.test(ev.path) && !/dimension=WZbXY0S00lP/.test(ev.path) && en.refusal && en.refusal._scope === 'stage_as_dimension' && !de.healed && !de.refusal);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('organisationUnits?') ? { organisationUnits: [{ id: 'O6uvpzGd5pu' }, { id: 'fdc6uOvgoji' }] } : { _error: 'x' });
+    try {
+      const spec = { name: 't', vis_type: 'PIVOT_TABLE', org_units: ['ImspTQPwCqd', 'LEVEL-2'], overall_row: true };
+      const r = await ctx.applyOverallRow(spec);
+      const bad = await ctx.applyOverallRow({ org_units: ['LEVEL-2'], overall_row: true });
+      truthy('overall_row turns [parent, LEVEL-n] into the parent as its own row + explicit level-n rows (percent totals computed from all records)', r && r.note && spec.org_units.join() === 'ImspTQPwCqd,O6uvpzGd5pu,fdc6uOvgoji' && !!bad._error);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+  {
+    const llCtx2 = {
+      program: { name: 'P', programType: 'WITH_REGISTRATION' },
+      stages: [{ id: 'WZbXY0S00lP', name: 'First ANC', repeatable: false, deIds: ['vANAXwtLwcT'] }, { id: 'PFDfvmGpsR3', name: 'Care at birth', repeatable: false, deIds: ['vANAXwtLwcT'] }],
+      stagesById: new Map([['WZbXY0S00lP', { id: 'WZbXY0S00lP', name: 'First ANC', repeatable: false, deIds: ['vANAXwtLwcT'] }], ['PFDfvmGpsR3', { id: 'PFDfvmGpsR3', name: 'Care at birth', repeatable: false, deIds: ['vANAXwtLwcT'] }]]),
+      stagesByName: new Map(), teas: new Map(), teaByName: new Map(), pis: new Map(), piByName: new Map(),
+      des: new Map([['vANAXwtLwcT', { id: 'vANAXwtLwcT', name: 'Hemoglobin value', valueType: 'NUMBER', stageIds: ['WZbXY0S00lP', 'PFDfvmGpsR3'] }]]), deByName: new Map(),
+    };
+    const st = await ctx.lineListResolveDimension({ dimension: 'program_status' }, llCtx2, 'ENROLLMENT', new Map(), 'column');
+    const a = await ctx.lineListResolveDimension({ dimension: 'vANAXwtLwcT', program_stage_id: 'WZbXY0S00lP' }, llCtx2, 'ENROLLMENT', new Map(), 'column');
+    const b = await ctx.lineListResolveDimension({ dimension: 'vANAXwtLwcT', program_stage_id: 'PFDfvmGpsR3' }, llCtx2, 'ENROLLMENT', new Map(), 'column');
+    truthy('line list: a status column with no statuses shows every status; the same data element from two stages resolves to two stage-qualified columns',
+      st.kind === 'status' && st.items.length === 3 && a.stageId === 'WZbXY0S00lP' && b.stageId === 'PFDfvmGpsR3');
+  }
+
+  truthy('count_records filters keep the analytics operator (the old "de:value" form 409\'d) and Yes/No becomes 1/0',
+    ctx.countRecordsFilterDimension('FIHEeJwfhZH:eq:true', 'PFDfvmGpsR3.') === 'PFDfvmGpsR3.FIHEeJwfhZH:EQ:1' && ctx.countRecordsFilterDimension('vANAXwtLwcT:lt:11') === 'vANAXwtLwcT:LT:11' && ctx.countRecordsFilterDimension('nonsense') === null);
+
+  // The system prompt teaches the feasibility check on analytics builds.
+  const sp = await ctx.buildSystemPrompt('continue', false, false, ask);
+  truthy('system prompt: the analytics feasibility section rides on a "continue" turn of a dashboard build', /first match each request to what DHIS2 can actually build/.test(sp) && /PIVOT_TABLE/.test(sp));
+  d.apiVersion = savedApi;
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -2848,6 +3136,7 @@ setImmediate(async () => {
   if (loaded) await runCustomAppChecks().catch((e) => bad(`custom-app checks threw: ${e && e.stack || e}`));
   if (loaded) await runCaptureRefreshChecks().catch((e) => bad(`Capture refresh checks threw: ${e && e.stack || e}`));
   if (loaded) await runRuleScopeAndTetSharingChecks().catch((e) => bad(`rule scope / TET sharing checks threw: ${e && e.stack || e}`));
+  if (loaded) await runDashboardThreadChecks().catch((e) => bad(`dashboard-thread checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');
