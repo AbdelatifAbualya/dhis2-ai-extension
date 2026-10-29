@@ -127,6 +127,7 @@
   // ── Init ─────────────────────────────────────────────────────────────────
   async function init() {
     setupListeners();
+    setupMemoryUi();
     updateWebBrowseIndicator();
     await loadUiPreferences();
     setStatus('connecting', 'Connecting to DHIS2...');
@@ -386,10 +387,13 @@
       }
     });
 
-    // Listen for screenshot result from background
+    // Listen for screenshot result from background. Screenshot errors get their
+    // own message type: AI_ERROR would also end a reply that is still streaming.
     chrome.runtime.onMessage.addListener((msg) => {
       if (msg.type === 'SCREENSHOT_RESULT' && msg.dataUrl) {
         setPendingImage(msg.dataUrl);
+      } else if (msg.type === 'SCREENSHOT_ERROR' && msg.error) {
+        addMessage('error', msg.error);
       }
     });
 
@@ -485,6 +489,9 @@
         isSending = false;
         chatInput.disabled = false;
         chatInput.focus();
+        break;
+      case 'AI_MEMORY_LEARNED':
+        showMemoryLearned(msg);
         break;
       case 'AI_ERROR':
         removeThinking();
@@ -1652,6 +1659,12 @@ ${turnXml}
       manage_maps: { cls: 'tool-icon-create', icon: '\u{1F5FA}' },
       manage_line_lists: { cls: 'tool-icon-create', icon: '\u{1F4CB}' },
       manage_backups: { cls: 'tool-icon-backup', icon: '\u{1F4BE}' },
+      manage_users: { cls: 'tool-icon-create', icon: '\u{1F465}' },
+      manage_data_values: { cls: 'tool-icon-dataset', icon: '\u{1F522}' },
+      manage_metadata_translations: { cls: 'tool-icon-create', icon: '\u{1F524}' },
+      manage_memory: { cls: 'tool-icon-info', icon: '\u{1F9E0}' },
+      manage_custom_app: { cls: 'tool-icon-create', icon: '\u{1F9E9}' },
+      manage_sql_views: { cls: 'tool-icon-api', icon: '\u{1F5C3}\uFE0F' },
       diagnose_save_error: { cls: 'tool-icon-warning', icon: '\u{1F50D}' },
     };
     const iconInfo = iconMap[tool] || { cls: 'tool-icon-api', icon: '\u{1F6E0}️' };
@@ -1690,6 +1703,12 @@ ${turnXml}
       manage_maps: 'Building maps',
       manage_line_lists: 'Building line lists',
       manage_backups: 'Managing backups',
+      manage_users: 'Managing users & roles',
+      manage_data_values: 'Working on data values',
+      manage_metadata_translations: 'Translating metadata',
+      manage_memory: 'Using learning memory',
+      manage_custom_app: 'Building a DHIS2 app',
+      manage_sql_views: 'Working with SQL views',
       diagnose_save_error: 'Diagnosing save error',
     };
     // Fallback must never claim a specific tool. Labelling an unmapped tool
@@ -1944,6 +1963,62 @@ ${turnXml}
       if (args.org_unit_level != null) parts.push(`level ${args.org_unit_level}`);
       if (args.thematic_map_type) parts.push(String(args.thematic_map_type));
       if (args.name_filter) parts.push(`name~${String(args.name_filter).slice(0, 20)}`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_users') {
+      const parts = [args.action || 'list'];
+      if (args.username) parts.push(`user: ${String(args.username).slice(0, 30)}`);
+      else if (args.user_id) parts.push(`user: ${String(args.user_id).slice(0, 30)}`);
+      if (args.name) parts.push(`"${String(args.name).slice(0, 30)}"`);
+      if (args.role_id) parts.push(`role: ${String(args.role_id).slice(0, 30)}`);
+      if (args.group_id) parts.push(`group: ${String(args.group_id).slice(0, 30)}`);
+      const n = (k) => (Array.isArray(args[k]) ? args[k].length : 0);
+      if (n('roles') || n('add_roles') || n('remove_roles')) parts.push(`roles ${n('roles') || ''}${n('add_roles') ? `+${n('add_roles')}` : ''}${n('remove_roles') ? `-${n('remove_roles')}` : ''}`);
+      if (n('authorities') || n('add_authorities') || n('remove_authorities')) parts.push(`authorities ${n('authorities') || ''}${n('add_authorities') ? `+${n('add_authorities')}` : ''}${n('remove_authorities') ? `-${n('remove_authorities')}` : ''}`);
+      if (n('add_members') || n('remove_members') || n('members')) parts.push(`members ${n('members') || ''}${n('add_members') ? `+${n('add_members')}` : ''}${n('remove_members') ? `-${n('remove_members')}` : ''}`);
+      if (args.query) parts.push(`~${String(args.query).slice(0, 20)}`);
+      if (args.password || args.generate_password) parts.push('password');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_data_values') {
+      const parts = [args.action || 'get'];
+      if (args.dataset_id) parts.push(`dataset: ${String(args.dataset_id).slice(0, 30)}`);
+      if (args.period) parts.push(String(args.period).slice(0, 16));
+      if (args.org_unit_id) parts.push(`ou: ${String(args.org_unit_id).slice(0, 30)}`);
+      if (Array.isArray(args.values)) parts.push(`${args.values.length} value(s)`);
+      if (args.all) parts.push('ALL values');
+      if (args.dry_run) parts.push('DRY RUN');
+      detail = parts.join(', ');
+    } else if (tool === 'manage_custom_app') {
+      const parts = [args.action || 'list'];
+      if (args.key) parts.push(String(args.key).slice(0, 40));
+      else if (args.name) parts.push(`"${String(args.name).slice(0, 40)}"`);
+      if (args.kind) parts.push(String(args.kind) + (args.plugin_type ? ` (${String(args.plugin_type).toLowerCase()})` : ''));
+      if (args.files && typeof args.files === 'object') parts.push(Object.keys(args.files).join(' + '));
+      if (args.preview_token) parts.push('approved preview');
+      if (args.needs_write_access) parts.push('writes data');
+      if (args.target) parts.push(`→ ${String(args.target).replace(/_/g, ' ')}`);
+      if (Array.isArray(args.field_map) && args.field_map.length) parts.push(`${args.field_map.length} mapped field(s)`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_sql_views') {
+      const parts = [args.action || 'list'];
+      if (args.name) parts.push(`"${String(args.name).slice(0, 40)}"`);
+      else if (args.id) parts.push(String(args.id).slice(0, 11));
+      if (Array.isArray(args.tables) && args.tables.length) parts.push(args.tables.slice(0, 4).join(', ') + (args.tables.length > 4 ? '…' : ''));
+      if (args.search) parts.push(`~${String(args.search).slice(0, 20)}`);
+      if (args.sql_query) parts.push('SQL');
+      if (args.sharing && args.sharing.public) parts.push(`sharing ${String(args.sharing.public).slice(0, 8)}`);
+      detail = parts.join(', ');
+    } else if (tool === 'manage_memory') {
+      const parts = [args.action || 'search'];
+      if (args.title) parts.push(`"${String(args.title).slice(0, 50)}"`);
+      else if (args.query) parts.push(`"${String(args.query).slice(0, 40)}"`);
+      if (args.area) parts.push(String(args.area));
+      detail = parts.join(', ');
+    } else if (tool === 'manage_metadata_translations') {
+      const parts = [args.action || 'get'];
+      if (args.locale) parts.push(String(args.locale).slice(0, 10));
+      if (Array.isArray(args.items)) parts.push(`${args.items.length} object(s)`);
+      else if (args.object_type) parts.push(`${String(args.object_type).slice(0, 24)}${args.object_id ? ` ${String(args.object_id).slice(0, 11)}` : ''}`);
+      if (args.language) parts.push(`${args.language}${args.country ? '_' + args.country : ''}`);
       detail = parts.join(', ');
     } else if (tool === 'manage_line_lists') {
       const parts = [args.action || 'list'];
@@ -2243,7 +2318,8 @@ ${turnXml}
           if (!Array.isArray(params)) params = [params];
           let html = `<div style="font-weight:600;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid #f0f0f0">${esc(params[0].axisValueLabel || '')}</div>`;
           params.forEach(p => {
-            const val = formatNumber(p.value, spec.y_axis?.format);
+            // formatNumber passes non-numeric values through as-is; this is HTML.
+            const val = esc(formatNumber(p.value, spec.y_axis?.format));
             html += `<div style="display:flex;align-items:center;gap:6px;padding:2px 0">
               ${p.marker}<span style="flex:1">${esc(p.seriesName)}</span><strong style="margin-left:8px">${val}</strong>
             </div>`;
@@ -2524,7 +2600,7 @@ ${turnXml}
       html += `<tr><td><strong>${esc(cat)}</strong></td>`;
       spec.series.forEach(s => {
         const v = s.data[i];
-        html += `<td>${v != null ? formatNumber(v, spec.y_axis?.format) : '-'}</td>`;
+        html += `<td>${v != null ? esc(formatNumber(v, spec.y_axis?.format)) : '-'}</td>`;
       });
       html += '</tr>';
     });
@@ -2640,10 +2716,13 @@ ${turnXml}
     // Horizontal rule
     h = h.replace(/^---$/gm, '<hr>');
 
-    // URLs (block javascript: and data: URIs for safety)
+    // URLs. Model output can carry text from DHIS2 metadata or web pages, and
+    // esc() leaves quotes alone, so a quote in the href could add attributes to
+    // the <a>. Only plain http(s)/mailto links are linked, quotes encoded.
     h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, href) => {
-      if (/^\s*(javascript|data|vbscript):/i.test(href)) return text;
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+      href = href.trim();
+      if (!/^(https?:\/\/|mailto:)/i.test(href)) return text;
+      return `<a href="${href.replace(/"/g, '&quot;').replace(/'/g, '&#39;')}" target="_blank" rel="noopener noreferrer">${text}</a>`;
     });
     h = h.replace(/(^|[^"=])(https?:\/\/[^\s<)"]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
 
@@ -2694,6 +2773,194 @@ ${turnXml}
     });
   }
 
+  // ── Learning memory (settings toggle + viewer) ───────────────────────────
+  // The background worker owns the store (chrome.storage.local); the panel only
+  // talks to it through MEMORY_* messages. Every string from a lesson is put in
+  // the DOM with textContent — lesson text can come from the model.
+  const memToggle = $('memory-enabled-toggle');
+  const memStatusText = $('memory-status-text');
+  const memOverlay = $('memory-overlay');
+  const memList = $('memory-list');
+  const memSearch = $('memory-search');
+  const memAreaFilter = $('memory-area-filter');
+  const memCount = $('memory-count');
+  const memDisabledNote = $('memory-disabled-note');
+  let memCache = { enabled: true, entries: [], areas: {} };
+
+  function memRequest(msg) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(msg, (resp) => { void chrome.runtime.lastError; resolve(resp || {}); });
+      } catch { resolve({}); }
+    });
+  }
+
+  async function refreshMemory() {
+    const r = await memRequest({ type: 'MEMORY_GET' });
+    if (!r || r.error) return;
+    memCache = { enabled: r.enabled !== false, entries: r.entries || [], areas: r.areas || {}, max: r.max };
+    if (memToggle) memToggle.checked = memCache.enabled;
+    const n = memCache.entries.length;
+    if (memStatusText) memStatusText.textContent = `${memCache.enabled ? 'On' : 'Off'} — ${n} lesson${n === 1 ? '' : 's'} stored`;
+    fillAreaSelect(memAreaFilter, true);
+    fillAreaSelect($('memory-add-area'), false);
+    renderMemoryList();
+  }
+
+  function fillAreaSelect(sel, withAll) {
+    if (!sel) return;
+    const keep = sel.value;
+    sel.textContent = '';
+    if (withAll) sel.appendChild(new Option('All areas', ''));
+    for (const [k, label] of Object.entries(memCache.areas)) {
+      const count = memCache.entries.filter(e => e.area === k).length;
+      if (withAll && !count) continue;
+      sel.appendChild(new Option(withAll ? `${label} (${count})` : label, k));
+    }
+    if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  }
+
+  function memEl(tag, cls, text) {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text != null) el.textContent = text;
+    return el;
+  }
+
+  function renderMemoryList() {
+    if (!memList) return;
+    const q = (memSearch?.value || '').trim().toLowerCase();
+    const area = memAreaFilter?.value || '';
+    const rows = memCache.entries.filter(e => (!area || e.area === area)
+      && (!q || [e.title, e.problem, e.solution, e.endpoint, (e.tools || []).join(' ')].join(' ').toLowerCase().includes(q)));
+    memList.textContent = '';
+    if (memCount) memCount.textContent = `${memCache.entries.length}${memCache.max ? ` / ${memCache.max}` : ''}`;
+    memDisabledNote?.classList.toggle('hidden', memCache.enabled);
+    if (!rows.length) {
+      memList.appendChild(memEl('div', 'memory-empty', memCache.entries.length
+        ? 'No lesson matches this filter.'
+        : 'Nothing learned yet. When the assistant hits a DHIS2 error and finds the fix, the lesson appears here — and is reused automatically on related tasks.'));
+      return;
+    }
+    for (const e of rows) {
+      const card = memEl('div', 'memory-card');
+      const head = memEl('div', 'memory-card-head');
+      head.appendChild(memEl('div', 'memory-card-title', e.title));
+      const del = memEl('button', 'memory-del', 'Delete');
+      del.type = 'button';
+      del.title = 'Delete this lesson';
+      del.addEventListener('click', async () => {
+        del.disabled = true;
+        await memRequest({ type: 'MEMORY_DELETE', id: e.id });
+        refreshMemory();
+      });
+      head.appendChild(del);
+      card.appendChild(head);
+      const chips = memEl('div', 'memory-chips');
+      chips.appendChild(memEl('span', 'memory-chip', memCache.areas[e.area] || e.area));
+      const srcLabel = { auto: 'learned automatically', assistant: 'written by the assistant', user: 'your note' }[e.source] || e.source;
+      chips.appendChild(memEl('span', `memory-chip src-${e.source}`, srcLabel));
+      if (e.resolved === false) chips.appendChild(memEl('span', 'memory-chip unresolved', 'known issue'));
+      if (e.scope === 'instance') chips.appendChild(memEl('span', 'memory-chip', `only ${e.instance || 'this server'}`));
+      for (const t of (e.tools || []).slice(0, 3)) chips.appendChild(memEl('span', 'memory-chip', t));
+      if (e.endpoint) chips.appendChild(memEl('span', 'memory-chip', e.endpoint));
+      card.appendChild(chips);
+      if (e.problem) {
+        const p = memEl('div', 'memory-field');
+        p.appendChild(memEl('b', null, 'Problem: '));
+        p.appendChild(document.createTextNode(e.problem));
+        card.appendChild(p);
+      }
+      const sol = memEl('div', 'memory-field');
+      sol.appendChild(memEl('b', null, e.resolved === false ? 'Advice: ' : 'Fix: '));
+      sol.appendChild(document.createTextNode(e.solution));
+      card.appendChild(sol);
+      const updated = e.updated ? new Date(e.updated).toLocaleDateString() : '';
+      card.appendChild(memEl('div', 'memory-meta',
+        `Seen ${e.seen_count || 1}× · used ${e.used_count || 0}× · updated ${updated}${e.dhis2_version ? ` · DHIS2 ${e.dhis2_version}` : ''}`));
+      memList.appendChild(card);
+    }
+  }
+
+  function openMemoryViewer() {
+    memOverlay?.classList.remove('hidden');
+    refreshMemory();
+  }
+
+  function setupMemoryUi() {
+    if (!memToggle) return;
+    memToggle.addEventListener('change', async () => {
+      const r = await memRequest({ type: 'MEMORY_SET_ENABLED', enabled: memToggle.checked });
+      if (r && r.enabled !== undefined) memToggle.checked = r.enabled;
+      refreshMemory();
+    });
+    $('btn-view-memory')?.addEventListener('click', openMemoryViewer);
+    $('btn-close-memory')?.addEventListener('click', () => memOverlay.classList.add('hidden'));
+    memOverlay?.addEventListener('click', (e) => { if (e.target === memOverlay) memOverlay.classList.add('hidden'); });
+    memSearch?.addEventListener('input', renderMemoryList);
+    memAreaFilter?.addEventListener('change', renderMemoryList);
+    btnSettings?.addEventListener('click', refreshMemory);
+
+    // Clear all: two clicks (no blocking confirm() dialog).
+    const btnClearMem = $('btn-memory-clear');
+    let clearTimer = null;
+    btnClearMem?.addEventListener('click', async () => {
+      if (!btnClearMem.classList.contains('confirming')) {
+        btnClearMem.classList.add('confirming');
+        btnClearMem.textContent = 'Click again to delete all';
+        clearTimer = setTimeout(() => { btnClearMem.classList.remove('confirming'); btnClearMem.textContent = 'Clear all'; }, 4000);
+        return;
+      }
+      clearTimeout(clearTimer);
+      btnClearMem.classList.remove('confirming');
+      btnClearMem.textContent = 'Clear all';
+      await memRequest({ type: 'MEMORY_CLEAR' });
+      refreshMemory();
+    });
+
+    $('btn-memory-export')?.addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify({ exported: new Date().toISOString(), entries: memCache.entries }, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `dhis2-assistant-memory-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    });
+
+    $('btn-memory-add')?.addEventListener('click', async () => {
+      const status = $('memory-add-status');
+      const note = {
+        area: $('memory-add-area')?.value || 'api_general',
+        title: $('memory-add-title')?.value.trim(),
+        problem: $('memory-add-problem')?.value.trim(),
+        solution: $('memory-add-solution')?.value.trim(),
+        scope: $('memory-add-instance')?.checked ? 'instance' : 'general',
+      };
+      const r = await memRequest({ type: 'MEMORY_ADD_NOTE', note });
+      if (status) {
+        status.className = `memory-add-status ${r.error ? 'err' : 'ok'}`;
+        status.textContent = r.error ? r.error : (r.merged ? 'Merged into a matching lesson.' : 'Note saved.');
+      }
+      if (!r.error) {
+        for (const id of ['memory-add-title', 'memory-add-problem', 'memory-add-solution']) { const el = $(id); if (el) el.value = ''; }
+        refreshMemory();
+      }
+    });
+    refreshMemory();
+  }
+
+  function showMemoryLearned(msg) {
+    if (!messagesDiv || !msg?.count) return;
+    const el = memEl('div', 'memory-learned',
+      `\u{1F9E0} Learned ${msg.count} lesson${msg.count === 1 ? '' : 's'} for next time${msg.titles?.length ? `: ${msg.titles[0]}${msg.count > 1 ? ' …' : ''}` : ''}`);
+    el.title = 'Open Learning memory';
+    el.addEventListener('click', openMemoryViewer);
+    messagesDiv.appendChild(el);
+    if (messagesArea) messagesArea.scrollTop = messagesArea.scrollHeight;
+  }
   // ── Boot ─────────────────────────────────────────────────────────────────
+  // Started last, after every const above has been initialised (the memory UI
+  // block declares its element refs at the end of this IIFE).
   init();
 })();

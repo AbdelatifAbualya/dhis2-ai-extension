@@ -16,6 +16,9 @@
 
      src/core.js            provider config · global state · write-auth & safety
                             gates · DHIS2 transport & backups · context/init
+     src/memory.js          learning memory (lessons about DHIS2/API behaviour;
+                            never patient data) · manage_memory tool — loaded
+                            right after core.js (registry's TOOLS uses its areas)
      src/registry.js        tool schemas · knowledge-base · manuals · tool
                             selection · system-prompt builder
      src/providers.js       LLM provider streaming · image · web search ·
@@ -28,16 +31,36 @@
                             indicators, notifications) · plugins · standalone
      src/tools-linelists.js line-listing authoring (eventVisualizations of type
                             LINE_LIST: resolve/validate/probe/CRUD)
+     src/tools-admin.js     administration tools (users/roles/groups, aggregate
+                            data values, metadata translations) · schema-aware
+                            PATCH pre-check for dhis2_query
+     src/tools-sqlviews.js  manage_sql_views — SQL views: data no Web API
+                            endpoint has (transfer history), real DB columns
+     src/tools-apps.js      manage_custom_app — AI-built DHIS2 apps & dashboard
+                            plugins (validate · safety-scan · package · install)
+     src/tools-apps-placement.js  manage_custom_app place / unplace / placements
+                            (dashboards · Capture pages · Capture form fields)
      src/agent.js           agentic loop · feedback · keepalive · message router
                             and every chrome.* event listener
+
+   Two third-party libraries load first (vendored, built by the dev-only
+   scripts/build-runtime-kit.js): libs/sucrase.min.js (JSX → JS, self.sucrase)
+   and libs/fflate.min.js (zip, self.fflate) — used only by tools-apps.js.
    ══════════════════════════════════════════════════════════════════════════════ */
 
 importScripts(
+  'libs/sucrase.min.js',
+  'libs/fflate.min.js',
   'src/core.js',
+  'src/memory.js',
   'src/registry.js',
   'src/providers.js',
   'src/tools-metadata.js',
   'src/tools-programs.js',
   'src/tools-linelists.js',
+  'src/tools-admin.js',
+  'src/tools-sqlviews.js',
+  'src/tools-apps.js',
+  'src/tools-apps-placement.js',
   'src/agent.js',
 );

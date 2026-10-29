@@ -12,7 +12,9 @@ const promptFiles = process.argv.slice(2);
 if (!promptFiles.length) { console.error('usage: llm-run.js <prompt-file> …'); process.exit(2); }
 
 (async () => {
-  const { ctx } = loadLLM({ appType: 'Maintenance' });
+  // LLM_PAGE_CONTEXT replays a page-bound prompt ("this program"), e.g.
+  // '{"appType":"Capture","programId":"uy2gU8kT1jF"}'. Default: Maintenance.
+  const { ctx } = loadLLM(process.env.LLM_PAGE_CONTEXT ? JSON.parse(process.env.LLM_PAGE_CONTEXT) : { appType: 'Maintenance' });
   // Give core.js's async startup credential load a tick to resolve.
   await new Promise(r => setTimeout(r, 50));
 

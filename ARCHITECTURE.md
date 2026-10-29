@@ -14,28 +14,36 @@ is the source that ships. Three runtime pieces:
 | Background service worker | `background.js` → `src/*.js` | All AI + DHIS2 logic: LLM streaming, the agentic loop, 30+ tools, safety gates, metadata/tracker writes. |
 | Side panel | `sidepanel/panel.{html,css,js}` | The chat UI, streaming display, tool cards, charts, exports. |
 
-## The background worker is 7 modules, not one file
+## The background worker is 11 modules (+ 2 vendored libs), not one file
 
 `background.js` used to be a single ~26k-line service worker. It is now a thin
-loader that pulls in seven focused modules **in order** with the synchronous
-`importScripts()` API:
+loader that pulls in two vendored libraries and twelve focused modules **in order**
+with the synchronous `importScripts()` API:
 
 ```
-background.js  (loader — 40 lines)
+background.js  (loader)
 └─ importScripts(
-     src/core.js            ── provider config · global state · write-auth &
-     src/registry.js           safety gates · DHIS2 transport & backups · context
-     src/providers.js          / tool schemas · KB · manuals · tool selection ·
-     src/tools-metadata.js     system prompt / LLM streaming · image · web search ·
-     src/tools-programs.js     read helpers · privacy gate / executeTool + standard
-     src/tools-linelists.js    metadata tools / program-authoring tools /
-     src/agent.js              line-list authoring / agent loop · feedback ·
-   )                           keepalive · message router
+     libs/sucrase.min.js     JSX → JS compiler (self.sucrase) — used by tools-apps.js
+     libs/fflate.min.js      zip (self.fflate) — used by tools-apps.js
+     src/core.js             provider config · global state · write-auth & safety gates ·
+                             DHIS2 transport & backups · context
+     src/memory.js           learning memory (lessons, privacy taint, retrieval, manage_memory)
+     src/registry.js         tool schemas · KB · manuals · tool selection · system prompt
+     src/providers.js        LLM streaming · image · web search · read helpers · privacy gate
+     src/tools-metadata.js   executeTool + standard metadata tools
+     src/tools-programs.js   program-authoring tools
+     src/tools-linelists.js  line-list authoring
+     src/tools-admin.js      users · data values · metadata translations · PATCH pre-check
+     src/tools-sqlviews.js   manage_sql_views — SQL views (data no endpoint has, real DB columns)
+     src/tools-apps.js       manage_custom_app — AI-built DHIS2 apps & dashboard plugins
+     src/tools-apps-placement.js  manage_custom_app place / unplace / placements
+     src/agent.js            agent loop · feedback · keepalive · message router
+   )
 ```
 
 ### Why `importScripts` and not ES modules?
 
-The seven modules share **one classic-worker global scope**, exactly as when this
+The modules share **one classic-worker global scope**, exactly as when this
 was a single file. A `const` or `function` declared in `core.js` is visible to
 every later module with no `import`/`export`. That is deliberate:
 
@@ -57,12 +65,17 @@ know a moved declaration has no load-time dependents.
 | Module | ~lines | Contents |
 | --- | --- | --- |
 | `src/core.js` | 3.6k | `DEFAULT_PROVIDER_CONFIG` & provider URL helpers; the `dhis2` state object and conversation globals; the **write-authorization** gate (`classifyWriteAuthorization`, `requireWriteAuth`); UID recognition/harvesting; repeated-failure & HTTP circuit breakers; inspect capture; text/URL/UID utils (`lowercaseText`, `normalizeSearchTokens`, `extractContext`…); connection & state persistence; the DHIS2 transport choke point (`safeDhis2Fetch`, `dhis2Fetch`, `fetchViaTab`); backups (`snapshotBeforeWrite`, `restoreFromBackup`); tracker-write & analytics helpers; `initializeFromUrl`; line-listing routing. |
+| `src/memory.js` | 0.8k | The **learning memory**: lesson store in `chrome.storage.local` (`dhis2AiMemory`, on/off `memoryEnabled`), privacy scrubbing + patient-data taint, per-turn observation (`memoryBeginTurn` / `memoryObserveCall` / `memoryEndTurn` — failure→fix pairs become lessons), task-aware retrieval (`buildMemoryPromptBlock`, `memoryLessonsFor`), the `manage_memory` tool and the panel's `MEMORY_*` API. Loaded right after `core.js` because `TOOLS` uses its area list. |
 | `src/registry.js` | 4.2k | The `TOOLS` schema array (what the model sees); the knowledge-base `KB_*` strings and per-tool manuals; the parallel tool lists (`TOOL_ROUTER`, `MANUAL_TOOLS`, `TOOL_SUMMARIES`, `MANUAL_EXTRAS`); `getContextualTools` (deterministic tool selection) and `buildSystemPrompt`. |
-| `src/providers.js` | 2.0k | LLM streaming for every provider (`callProviderStreaming`, OpenAI-compatible + Anthropic adapters, stall guard); `analyzeImage`; `tavilySearch`; read/analytics tool helpers (recent-changes, enrollment abnormalities); the **patient-data privacy gate** (`pathReadsPatientData`, `enforcePatientDataPrivacyGate`, `PATIENT_DATA_TOOL_NAMES`). |
+| `src/providers.js` | 2.0k | LLM streaming for every provider (`callProviderStreaming`, OpenAI-compatible + Anthropic adapters, stall guard); `analyzeImage`; `tavilySearch`; read/analytics tool helpers (recent-changes, enrollment abnormalities); the **patient-data privacy gate** (`canonicalApiPath`, `pathReadsPatientData`, `enforcePatientDataPrivacyGate`, `PATIENT_DATA_TOOL_NAMES`) and its one exception, SQL views that read only metadata (`analyzeSqlViewPrivacy` — a fail-closed SQL table/function/variable analyzer — `sqlViewPrivacyVerdict`, `enforcePatientDataPrivacyGateAsync`). |
 | `src/tools-metadata.js` | 6.8k | `executeTool` (the dispatcher) plus the standard-metadata tool implementations: validation rules, org units, indicators, option sets, legend sets, visualizations, maps, dashboards, datasets, backups, generic create-metadata, custom forms. |
 | `src/tools-programs.js` | 8.0k | The program-authoring tools: full program/stage creation, program rules (+ linters), program indicators (+ linters), program notifications, custom translations, growth-chart plugin, standalone metadata/architect helpers. |
 | `src/tools-linelists.js` | 0.7k | `manage_line_lists` — Line Listing authoring (eventVisualizations of type LINE_LIST): program-metadata dimension resolution, filter/repetition/legend/PI linting, the pre-save analytics probe, CRUD + validate. |
-| `src/agent.js` | 1.7k | The agentic loop (`runAgenticLoop`, `_runAgenticLoopInner`); feedback storage; the bounded keepalive lease; screenshot cropping; `broadcast`; the `chrome.runtime.onMessage` router and every other `chrome.*` event listener. |
+| `src/tools-admin.js` | 1.3k | Administration tools: `manage_users` (users, roles with authority validation, groups), `manage_data_values` (one aggregate form: get/set/delete/complete/validate with client-side period/OU/disaggregation/value checks), `manage_metadata_translations` (merge-safe object translations); shared id-or-name resolution, the schema cache, and `precheckPatchAgainstSchema` used by `dhis2_query`. |
+| `src/tools-sqlviews.js` | 0.5k | `manage_sql_views`: list / get / describe (real columns from `information_schema` via a temporary view) / create / update (each RUNS the view once; a failing view is removed or put back) / delete / run. Client-side pre-checks for every read-time refusal DHIS2 gives (illegal words anywhere in the text, protected tables, 2.41/2.43 table renames, variables, unreadable sharing). What the model sees of a run is decided by `analyzeSqlViewPrivacy` (`providers.js`). |
+| `src/tools-apps.js` | 1.4k | `manage_custom_app`: key rules, the runtime kit loader (`libs/d2-kit/` via `fetch(chrome.runtime.getURL(…))`), Sucrase compile + JSX tag/bracket diagnosis, the static safety scan, the runtime-error lint (kit export lists in `KIT_VERSION.json`), hard-coded-UID verification, packaging (manifest, HTML, `app-config.js`, embedded `src/`), install/verify through `uploadAppZip` (`core.js`), app backups in the shared backup namespace, preview tokens, update/rollback/delete. Only ever touches `ai-*` apps carrying the assistant's marker. |
+| `src/tools-apps-placement.js` | 0.6k | `manage_custom_app` `place` / `unplace` / `placements`. Dashboard plugins go onto dashboards through `manage_dashboards` (`APP` items). Capture plugins are written into Capture's own configuration in the `capture` dataStore namespace, in the Tracker Plugin Configurator's exact format (verified against the Capture 106 bundle): enrollment-page layouts per program (starting from Capture's default page when a program has none), and stage / registration forms with a field map. Every write is backed up (`capture_config` entries that `manage_backups` restores) and read back with jsonb-key-order-insensitive comparison. `unplace` restores replaced fields and drops entries that are back to Capture's default. |
+| `src/agent.js` | 1.7k | The agentic loop (`runAgenticLoop`, `_runAgenticLoopInner`); feedback storage; the bounded keepalive lease; screenshot capture (selection overlay with in-page tab-capture fallback) and cropping; `broadcast`; the `chrome.runtime.onMessage` router and every other `chrome.*` event listener. |
 
 ## The safety gates (do not weaken these to simplify anything)
 
@@ -72,9 +85,12 @@ assistant can be trusted to touch a live DHIS2 server:
 - **Write authorization** — `classifyWriteAuthorization` / `requireWriteAuth`
   (`core.js`). Default is read-only; a destructive action needs explicit user
   intent, and a bare "yes" is scoped to the previously proposed action.
-- **Patient-data privacy** — `enforcePatientDataPrivacyGate` (`providers.js`).
-  Row-level tracker/analytics reads are blocked for remote model providers at
-  the execution choke point.
+- **Patient-data privacy** — `enforcePatientDataPrivacyGateAsync` (`providers.js`).
+  Row-level tracker/analytics reads and tracker audit trails are blocked for
+  remote model providers at the execution choke point. The only exception is a
+  QUERY SQL view whose CURRENT SQL reads metadata tables alone (decided by
+  `analyzeSqlViewPrivacy`, fail closed); `manage_sql_views` shows any other view
+  as column names + row count only.
 - **Verified IDs & preflight** — `core.js`. The model cannot invent a DHIS2 UID
   and use it in a destructive call.
 - **Backups first** — `ensureBackupOrBail` / `snapshotBeforeWrite` (`core.js`).
@@ -111,12 +127,23 @@ npm run verify      # or: node scripts/verify.js
 ```
 
 It has **no dependencies**. It (1) `node --check`s every runtime file, (2) loads
-all seven modules in `importScripts` order under a minimal `chrome` shim to prove
+all modules (and the two vendored libs) in `importScripts` order under a minimal `chrome` shim to prove
 the split is internally consistent, and (3) exercises the safety-critical pure
 functions. A red result means a gate changed shape or a module stopped loading.
 
 Then do a real reload: `chrome://extensions` → refresh the extension card →
 reload the DHIS2 tab. Node checks are necessary, not sufficient.
+
+### Vendored files and the one dev-time build
+
+The extension never runs npm. `libs/d2-kit/` (the runtime kit packed into every
+AI-built app), `libs/sucrase.min.js` and `libs/fflate.min.js` are **committed
+output** of `scripts/build-runtime-kit.js`, a dev-only script that installs exact
+pinned versions in a temp dir and bundles them with esbuild. Run it only when
+bumping a pin; the output is reproducible byte for byte. `npm run apps`
+(`scripts/scenario-custom-apps-visual.js`) is the live + visual acceptance suite
+for `manage_custom_app` (needs a local DHIS2, Chrome and an existing Playwright
+install).
 
 ## Deferred (intentionally not done in this pass)
 

@@ -1774,3 +1774,53 @@ body.theme-dark .md-table tbody tr:nth-child(even) td {
 .msg-assistant .msg-image {
   border-color: var(--border);
 }
+
+/* ── Learning memory (settings toggle + viewer) ─────────────────────────── */
+.memory-toggle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.memory-status-text { font-size: 12px; color: var(--text-secondary); flex: 1; }
+.memory-switch { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; margin: 0 !important; }
+.memory-switch input { opacity: 0; width: 0; height: 0; }
+.memory-slider { position: absolute; inset: 0; cursor: pointer; background: var(--border); border-radius: 20px; transition: background 0.15s; }
+.memory-slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: transform 0.15s; box-shadow: var(--shadow-sm); }
+.memory-switch input:checked + .memory-slider { background: var(--primary); }
+.memory-switch input:checked + .memory-slider::before { transform: translateX(16px); }
+.memory-switch input:focus-visible + .memory-slider { outline: 2px solid var(--primary); outline-offset: 2px; }
+.btn-secondary { background: var(--surface); color: var(--text); }
+.btn-secondary:hover { background: var(--bg); }
+.btn-small { padding: 5px 10px; font-size: 12px; }
+.btn-danger { background: var(--surface); color: var(--error); border-color: var(--error); }
+.btn-danger:hover, .btn-danger.confirming { background: var(--error); color: #fff; }
+.memory-modal { max-width: 560px; height: 86vh; }
+.memory-count { font-size: 12px; font-weight: 500; color: var(--text-muted); margin-left: 4px; }
+.memory-toolbar { display: flex; gap: 8px; padding: 10px 20px 0; }
+.memory-toolbar .settings-input { flex: 1; min-width: 0; }
+.memory-toolbar .settings-select { width: 42%; }
+.memory-body { padding-top: 12px; }
+.memory-note { font-size: 12px; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--warning-light); color: var(--text); margin-bottom: 10px; }
+.memory-empty { font-size: 13px; color: var(--text-muted); text-align: center; padding: 24px 8px; line-height: 1.5; }
+.memory-list { display: flex; flex-direction: column; gap: 8px; }
+.memory-card { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--surface); }
+.memory-card-head { display: flex; align-items: flex-start; gap: 8px; }
+.memory-card-title { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; line-height: 1.35; word-break: break-word; }
+.memory-del { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px; flex-shrink: 0; }
+.memory-del:hover { color: var(--error); background: var(--error-light); }
+.memory-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 4px; }
+.memory-chip { font-size: 10.5px; padding: 1px 7px; border-radius: 10px; background: var(--bg); color: var(--text-secondary); border: 1px solid var(--border-light); }
+.memory-chip.src-assistant { background: var(--primary-light); color: var(--primary-dark); }
+.memory-chip.src-user { background: var(--success-light); color: var(--text); }
+.memory-chip.unresolved { background: var(--warning-light); color: var(--text); }
+.memory-field { font-size: 12px; color: var(--text-secondary); margin-top: 4px; line-height: 1.45; word-break: break-word; }
+.memory-field b { color: var(--text); font-weight: 600; }
+.memory-meta { font-size: 10.5px; color: var(--text-muted); margin-top: 6px; }
+.memory-add { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+.memory-add summary { font-size: 12.5px; font-weight: 500; cursor: pointer; color: var(--primary); }
+.memory-add-body { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.memory-add-body textarea { resize: vertical; font-family: var(--font); }
+.memory-add-scope { font-size: 12px; color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+.memory-add-status { font-size: 12px; min-height: 16px; }
+.memory-add-status.err { color: var(--error); }
+.memory-add-status.ok { color: var(--success); }
+.memory-footer { display: flex; gap: 8px; }
+.memory-footer .btn { flex: 1; }
+.memory-learned { align-self: center; font-size: 11.5px; color: var(--text-secondary); background: var(--primary-light); border: 1px solid var(--border-light); border-radius: 12px; padding: 4px 10px; margin: 2px auto 6px; max-width: 92%; cursor: pointer; }
+.memory-learned:hover { border-color: var(--primary); }

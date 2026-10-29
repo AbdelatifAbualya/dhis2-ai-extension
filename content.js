@@ -72,10 +72,19 @@
   };
 
   // Also poll for URL changes every 2 seconds as a fallback
-  // (some SPAs change the URL without triggering standard events)
+  // (some SPAs change the URL without triggering standard events).
+  // Hidden tabs stay quiet: the background only follows the focused tab, and
+  // every message wakes its service worker. Catch up when the tab is shown.
   let lastPolledUrl = window.location.href;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !contextAlive) return;
+    lastPolledUrl = window.location.href;
+    lastNotifiedUrl = '';
+    notifyBackground();
+    checkActiveStage();
+  });
   timerHandles.push(setInterval(() => {
-    if (!contextAlive) return;
+    if (!contextAlive || document.hidden) return;
     const current = window.location.href;
     if (current !== lastPolledUrl) {
       lastPolledUrl = current;
@@ -205,7 +214,7 @@
   // Run stage detection every 3 seconds on Capture pages
   // (lightweight — no-op on non-Capture pages)
   timerHandles.push(setInterval(() => {
-    if (!contextAlive) return;
+    if (!contextAlive || document.hidden) return;
     checkActiveStage();
   }, 3000));
   // Also run once on load after a short delay (DOM needs time to render)

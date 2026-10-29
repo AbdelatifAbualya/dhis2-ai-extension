@@ -47,8 +47,16 @@ const LLMLOG = [];   // provider calls: { status }
 const events = [];   // broadcast events (AI_TOOL_CALL / AI_TOOL_DONE / …)
 
 const realFetch = global.fetch;
+// chrome.runtime.getURL(p) → EXT_ORIGIN + p, served from disk like the browser
+// serves an extension's own files (manage_custom_app reads its runtime kit).
+const EXT_ORIGIN = 'chrome-extension://llm-harness/';
 async function shimFetch(url, opts = {}) {
   const u = String(url);
+  if (u.startsWith(EXT_ORIGIN)) {
+    const abs = path.join(ROOT, decodeURIComponent(u.slice(EXT_ORIGIN.length).split(/[?#]/)[0]));
+    if (!abs.startsWith(ROOT + path.sep) || !fs.existsSync(abs)) return new Response('not found', { status: 404 });
+    return new Response(fs.readFileSync(abs), { status: 200 });
+  }
   const isDhis2 = u.startsWith(BASE + '/');
   const method = ((opts && opts.method) || 'GET').toUpperCase();
   // Only the DHIS2 instance gets basic auth injected; provider calls keep
@@ -108,7 +116,7 @@ const sessionStore = {
 };
 const chrome = {
   runtime: { id: 'llm-harness', onMessage: evt(), onInstalled: evt(), onStartup: evt(),
-             getURL: (p) => p, getPlatformInfo: () => Promise.resolve({ os: 'linux' }),
+             getURL: (p) => EXT_ORIGIN + String(p).replace(/^\//, ''), getPlatformInfo: () => Promise.resolve({ os: 'linux' }),
              sendMessage: () => Promise.resolve() },
   storage: { local: localStore, session: sessionStore, onChanged: evt() },
   tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve([]), sendMessage: () => Promise.resolve() },
@@ -120,11 +128,11 @@ const chrome = {
 
 function loadLLM(pageContext = { appType: 'Maintenance' }) {
   const loaderSrc = fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8');
-  const modules = [...loaderSrc.matchAll(/'(src\/[^']+\.js)'/g)].map((m) => m[1]);
+  const modules = [...loaderSrc.matchAll(/'((?:src|libs)\/[^']+\.js)'/g)].map((m) => m[1]);
   if (!modules.length) throw new Error('background.js declares no src/*.js modules');
   const sandbox = {
     chrome, console, fetch: shimFetch,
-    URL, URLSearchParams, TextEncoder, TextDecoder,
+    URL, URLSearchParams, TextEncoder, TextDecoder, FormData, Blob, Response,
     setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
     AbortSignal, AbortController, Promise,
     atob: (s) => Buffer.from(s, 'base64').toString('binary'),
@@ -137,7 +145,7 @@ function loadLLM(pageContext = { appType: 'Maintenance' }) {
   const boot = `\n;dhis2.baseUrl=${JSON.stringify(BASE)};dhis2.apiVersion=${APIVER};`
     + `dhis2.pageContext=${JSON.stringify(pageContext)};`
     + `dhis2.knownIds=new Set();dhis2.programMetadata=null;`
-    + `globalThis.__getDhis2=()=>dhis2;`;
+    + `globalThis.__getDhis2=()=>dhis2;globalThis.__memoryState=()=>memoryState;`;
   const bundle = modules.map((m) => `\n//# ${m}\n` + fs.readFileSync(path.join(ROOT, m), 'utf8')).join('\n') + boot;
   vm.runInContext(bundle, ctx, { filename: 'background.bundle.js' });
 

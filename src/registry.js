@@ -31,7 +31,9 @@ For counting only: add totalPages=true&pageSize=1 and read pager.total from resu
 For tracker filters: use filter={attributeId}:eq:{value} NOT dimension syntax.
 For analytics dimension filters: use dimension={stageId}.{dataElementId}:{optionCode}
 Always use option CODE (not displayName) in filters.
-⚠️ NEVER use PUT/PATCH/POST on sharing endpoints (e.g. {type}/{id}/sharing or sharing?type=...) — these will fail with 405/500. Use manage_metadata(action=update_sharing) instead.`,
+⚠️ NEVER use PUT/PATCH/POST on sharing endpoints (e.g. {type}/{id}/sharing or sharing?type=...) — these will fail with 405/500. Use manage_metadata(action=update_sharing) instead.
+- Data with NO Web API endpoint (tracker ownership-TRANSFER history, …) → manage_sql_views, not guessed endpoints: tracker/ownership/transfer is write-only (PUT), tracker/ownership does not exist. schemas/{name} covers METADATA types only, by singular camelCase name (schemas/dataElement); enrollments, events and tracked entities are not schemas — manage_sql_views(describe) shows real database columns.
+- SQL views: create/change them with manage_sql_views. GET sqlViews/{id}/data works here only for a view that reads metadata tables alone (on a cloud model).`,
       parameters: {
         type: 'object',
         properties: {
@@ -119,7 +121,7 @@ Examples:
           },
           program_override: {
             type: 'string',
-            description: 'Override program ID. Only if user asks about a DIFFERENT program.'
+            description: 'Program UID to count in — needed when no program page is open (e.g. on the Dashboard app) or the user asks about a different program. Use the UID get_program_info / search_metadata returned. (A stage_id alone is enough: its program is looked up.)'
           },
           ou_override: {
             type: 'string',
@@ -336,7 +338,11 @@ For cross-program comparisons such as "which program has the most program indica
           },
           page_size: {
             type: 'number',
-            description: 'Max results. Default: 50.'
+            description: 'Max results per page. Default: 50 (max 500).'
+          },
+          page: {
+            type: 'number',
+            description: 'Page number for long lists (1 = first). The result says "_more" when there are more pages. Never put paging into filters.'
           }
         },
         required: ['object_type']
@@ -858,6 +864,8 @@ If user enabled web browsing from UI, this tool should usually be called before 
                 name: { type: 'string' },
                 description: { type: 'string' },
                 condition: { type: 'string', description: 'Rule condition using #{variable_name} syntax' },
+                program_stage_name: { type: 'string', description: 'OPTIONAL: evaluate this rule ONLY in this stage (stage NAME; program_stage_id on an existing program). Leave out for a rule that applies wherever its fields appear — one unscoped rule already covers a data element shared by several stages; never make one copy per stage without it.' },
+                program_stage_id: { type: 'string', description: 'OPTIONAL rule-level stage ID (existing program, add_program_rules) — same meaning as program_stage_name.' },
                 actions: {
                   type: 'array',
                   items: {
@@ -1129,6 +1137,8 @@ Actions:
               condition: { type: 'string', description: 'd2 expression. Use #{varName} for DE variables, A{attrName} for TEA attributes. Examples: numeric: "d2:hasValue(#{queue_number}) && #{queue_number} > 0". Boolean/TRUE_ONLY yes: "#{flag} == true". Boolean empty-or-no: "!d2:hasValue(#{flag}) || #{flag} != true". Option set (with use_code_for_option_set=true): "#{status} == \'APPROVED\'". Never quote true/false and never compare booleans with == false.' },
               description: { type: 'string' },
               priority: { type: 'integer', description: 'Lower number = higher priority. Optional.' },
+              program_stage_id: { type: 'string', description: 'OPTIONAL rule-level stage: the rule is evaluated ONLY in this stage\'s events. Leave it out for a rule that should run in every stage that has its fields — ONE unscoped rule already covers a data element shared by several stages (never create one copy per stage without this field, or each copy fires in every stage and the user sees the message twice). When every action names the same stage via its own program_stage_id, the tool scopes the rule to that stage automatically. On update, pass "" to make a scoped rule program-wide.' },
+              program_stage_name: { type: 'string', description: 'Rule-level stage by NAME (alternative to program_stage_id).' },
               variables: {
                 type: 'array',
                 description: 'OPTIONAL. Program rule variables to create alongside this rule. Usually unnecessary — the tool auto-creates a PRV for any #{name} in the condition/actions whose sanitized name matches a program data element\'s displayName, picking DATAELEMENT_CURRENT_EVENT when the rule acts on the same stage and DATAELEMENT_NEWEST_EVENT_PROGRAM otherwise, inheriting valueType + option-set from the DE. Supply this array only to (a) override the auto-chosen source_type, (b) reference a DE whose displayName does not match your #{name} token, or (c) create a TEI_ATTRIBUTE variable with a custom name.',
@@ -1158,7 +1168,7 @@ Actions:
                     exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE referenced in the condition).' },
                     data_element_id: { type: 'string', description: 'Target data element ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD' },
                     tei_attribute_id: { type: 'string', description: 'Target TEA ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD on attributes' },
-                    program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE and stage-scoped actions)' },
+                    program_stage_id: { type: 'string', description: 'Target stage ID for HIDEPROGRAMSTAGE / CREATEEVENT. On a field action it means "this rule is for that stage": when every action of the rule names the same stage, the rule is scoped to it (see the rule-level program_stage_id).' },
                     program_stage_name: { type: 'string', description: 'Target stage NAME (alternative to program_stage_id — resolved to the stage id automatically)' },
                     program_stage_section_id: { type: 'string', description: 'Target section ID (for HIDESECTION)' },
                     evaluation_time: { type: 'string', enum: ['ON_DATA_ENTRY', 'ON_COMPLETE', 'ALWAYS'], description: 'When action fires. Default: ON_DATA_ENTRY' }
@@ -1226,12 +1236,13 @@ Actions:
               name: { type: 'string' },
               short_name: { type: 'string', description: 'Max 50 chars. Auto-derived from name if omitted.' },
               description: { type: 'string' },
-              expression: { type: 'string', description: 'What to aggregate. Count of enrollments/women → "V{enrollment_count}" (ENROLLMENT) or "V{event_count}" (EVENT). Coverage/PERCENTAGE in ONE indicator → "d2:condition(\\"<numerator condition>\\", 100, 0)" with aggregation_type "AVERAGE" (mean of the 0/100 flag over the filtered population = the %). Also: "d2:sum(#{stageId.deId})", "d2:count(#{stageId.deId})".' },
+              expression: { type: 'string', description: 'What to aggregate. Count of enrollments/women → "V{enrollment_count}" (ENROLLMENT, aggregation_type COUNT — SUM/AVERAGE on a count variable breaks analytics) or "V{event_count}" (EVENT only). Coverage/PERCENTAGE in ONE indicator → "d2:condition(\\"<numerator condition>\\", 100, 0)" with aggregation_type "AVERAGE" (mean of the 0/100 flag over the filtered population = the %). Also: "d2:sum(#{stageId.deId})", "d2:count(#{stageId.deId})".' },
               filter: { type: 'string', description: 'Condition selecting which events/enrollments count. For a percentage indicator this is the DENOMINATOR population (e.g. "#{stageId.gestAge} < 999" = women with a valid gestational age). Examples: "#{stageId.deId} == \'value\'", "d2:count(#{stageId.contactNo}) >= 4".' },
               analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'], description: 'EVENT=aggregate over events, ENROLLMENT=aggregate over enrollments/TEIs. Use ENROLLMENT for "per woman / per pregnancy" counts and coverage so a pregnancy is counted once, not once per visit.' },
               aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'], description: 'How to aggregate across rows. COUNT/SUM for counts; AVERAGE for a d2:condition(...,100,0) percentage indicator. Default: COUNT.' },
               decimals: { type: 'integer', description: 'Decimal places in output. Optional (e.g. 1 for a percentage).' },
-              display_in_form: { type: 'boolean', description: 'Show this indicator in the right-side "Indicators" widget of Tracker Capture / Capture data entry (DHIS2 displayInForm). Set true when the user wants the indicator visible during data entry. Default false.' }
+              display_in_form: { type: 'boolean', description: 'Show this indicator in the right-side "Indicators" widget of Tracker Capture / Capture data entry (DHIS2 displayInForm). Set true when the user wants the indicator visible during data entry. Default false.' },
+              events_in_period: { type: 'boolean', description: 'ENROLLMENT indicators only: ALSO require the EVENTS the expression/filter reads (d2:count / countIfValue / countIfCondition / #{stage.de}) to fall inside the reporting period, not just the enrollment date. Use when the question puts the visits in the period too — e.g. \"registrations that started this year AND had a low-Hb follow-up visit during the year\". Without it an enrollment indicator reads ALL events of the enrollment, whatever their date (live: 909 instead of the true 202 when visits are dated next year). Meant for whole-period figures (year, quarter); in a monthly breakdown it counts only events in the same month as the registration.' }
             }
           },
           indicators: {
@@ -1248,7 +1259,8 @@ Actions:
                 analytics_type: { type: 'string', enum: ['EVENT', 'ENROLLMENT'] },
                 aggregation_type: { type: 'string', enum: ['COUNT', 'SUM', 'AVERAGE', 'MIN', 'MAX', 'STDDEV', 'VARIANCE', 'NONE'] },
                 decimals: { type: 'integer' },
-                display_in_form: { type: 'boolean' }
+                display_in_form: { type: 'boolean' },
+                events_in_period: { type: 'boolean', description: 'ENROLLMENT only: the events read must also fall in the reporting period (see indicator.events_in_period).' }
               }
             }
           },
@@ -1300,8 +1312,8 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
           },
           object_type: {
             type: 'string',
-            enum: ['dataElements', 'optionSets', 'options', 'trackedEntityAttributes', 'programStages', 'categoryOptions', 'categories', 'categoryCombos', 'indicators', 'dataElementGroups', 'indicatorGroups', 'programs', 'dataSets', 'dashboards', 'visualizations', 'maps', 'eventReports', 'eventCharts'],
-            description: 'The DHIS2 metadata type (plural form). Required for delete, check_references, and update_sharing.'
+            enum: ['dataElements', 'optionSets', 'options', 'trackedEntityAttributes', 'programStages', 'categoryOptions', 'categories', 'categoryCombos', 'indicators', 'dataElementGroups', 'indicatorGroups', 'programs', 'dataSets', 'dashboards', 'visualizations', 'maps', 'eventVisualizations', 'eventReports', 'eventCharts'],
+            description: 'The DHIS2 metadata type (plural form). Required for delete, check_references, and update_sharing. Line lists (and, since 2.40, event reports / event charts) are eventVisualizations.'
           },
           object_id: {
             type: 'string',
@@ -1373,6 +1385,10 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
           cascade_to_stages: {
             type: 'boolean',
             description: 'For update_sharing on object_type="programs": also apply the same access to every PROGRAM STAGE of that program. Default TRUE — sharing a program always implies sharing its stages, and stage DATA access is what actually allows event capture. Set false only for metadata-visibility-only changes.'
+          },
+          cascade_to_tracked_entity_type: {
+            type: 'boolean',
+            description: 'For update_sharing on a tracker program: also ADD the program\'s data access (public, groups, users) to its tracked entity type — registration needs it. Default TRUE; only data bits are added, nothing is removed.'
           },
           user_group_accesses: {
             type: 'array',
@@ -2063,7 +2079,7 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
 Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
 - create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (aggregate indicator / AGGREGATE-domain dataElement / programIndicator UIDs — types are auto-resolved AND verified), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed. ⚠ data_items must be AGGREGATE dimensions: a TRACKER data element or a tracked-entity attribute CANNOT be plotted directly (the tile renders an error) — first create a PROGRAM INDICATOR (manage_program_indicators) that aggregates it, then plot that program indicator's UID. The tool refuses a raw tracker data element with this guidance.
 - create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
-- add_items: add chart(s)/map(s)/line-list(s)/text to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, { type:"EVENT_VISUALIZATION", event_visualization_id } to embed a saved line list from manage_line_lists, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
+- add_items: add chart(s)/map(s)/line-list(s)/text/app plugins to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, { type:"EVENT_VISUALIZATION", event_visualization_id } to embed a saved line list from manage_line_lists, { type:"APP", app_key } to embed an installed dashboard plugin, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
 - remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
 - list / get: list dashboards (optional name filter) / read one dashboard with its items (each item's id, type, and referenced visualization/map).
 Every mutating action is backed up first (undo via manage_backups). For sharing use manage_metadata(action=update_sharing). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
@@ -2086,19 +2102,23 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
               name: { type: 'string', description: 'Visualization display name (required).' },
               vis_type: { type: 'string', description: 'Chart type: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, STACKED_AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, YEAR_OVER_YEAR_COLUMN, SCATTER, BUBBLE. Default COLUMN.' },
               data_items: { type: 'array', items: { type: 'string' }, description: 'Indicator / dataElement / programIndicator UIDs to plot (the dx dimension). Types are auto-resolved and existence-verified.' },
-              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) and/or fixed ISO periods (202401, 2025Q1, 2025).' },
-              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2).' },
+              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords and/or fixed ISO periods (202401, 2025Q1, 2025). A request phrased relative to today MUST use relative keywords so the saved chart rolls forward: "each quarter of this year and last year" = ["QUARTERS_THIS_YEAR","QUARTERS_LAST_YEAR"], "by month this year" = ["MONTHS_THIS_YEAR"], "last 12 months" = ["LAST_12_MONTHS"], "this year" = ["THIS_YEAR"], "last 4 quarters" = ["LAST_4_QUARTERS"]. Fixed periods only when the user names them. ⚠ LAST_N_YEARS / LAST_YEAR are COMPLETED years only — in 2026, LAST_5_YEARS is 2021–2025 and EXCLUDES 2026; for "the last five years" including this one pass ["THIS_YEAR","LAST_5_YEARS"].' },
+              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2). "The whole hierarchy" = ["USER_ORGUNIT"]; "facilities at level N" everywhere = ["USER_ORGUNIT","LEVEL-N"].' },
               short_name: { type: 'string', description: 'Optional short name (max 50 chars).' },
               description: { type: 'string', description: 'Optional description.' },
               layout: {
                 type: 'object',
-                description: 'Optional layout override — which dimensions sit on each axis. Each is a subset of ["dx","pe","ou"]. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → columns[dx] rows[pe] filters[ou].',
+                description: 'Optional layout — which of ["dx","pe","ou"] sits where. For CHARTS (COLUMN/BAR/LINE/AREA/STACKED_*) use category (the x-axis) + series (the legend): monthly trend of indicators = { category:["pe"], series:["dx"], filters:["ou"] }; districts compared by indicators = { category:["ou"], series:["dx"], filters:["pe"] }. (DHIS2 stores category as rows and series as columns — columns is NOT the x-axis; a chart with only dx on the x-axis is auto-corrected unless keep_layout:true.) Pivot tables use columns/rows as written: org units down the side = { rows:["ou"], columns:["dx"], filters:["pe"] }. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → series[dx] category[pe] filters[ou].',
                 properties: {
+                  category: { type: 'array', items: { type: 'string' }, description: 'Charts: the x-axis dimension(s).' },
+                  series: { type: 'array', items: { type: 'string' }, description: 'Charts: the legend / series dimension(s).' },
                   columns: { type: 'array', items: { type: 'string' } },
                   rows: { type: 'array', items: { type: 'string' } },
                   filters: { type: 'array', items: { type: 'string' } }
                 }
-              }
+              },
+              keep_layout: { type: 'boolean', description: 'Keep a chart layout that puts only the data items on the x-axis (normally auto-corrected).' },
+              overall_row: { type: 'boolean', description: 'Pivot of org units WITH an overall row: pass org_units [<parent uid>, "LEVEL-<n>"] and overall_row:true — the parent becomes its own row, computed from ALL records (correct for percentages; DHIS2 pivot totals only add up or average the cells). The level-n units are saved as explicit rows.' }
             }
           },
           dashboard: {
@@ -2115,7 +2135,8 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
             items: {
               type: 'object',
               properties: {
-                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'EVENT_VISUALIZATION', 'TEXT'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map, EVENT_VISUALIZATION to embed a saved line list (create with manage_line_lists).' },
+                type: { type: 'string', enum: ['VISUALIZATION', 'MAP', 'EVENT_VISUALIZATION', 'TEXT', 'APP'], description: 'Item type. Default VISUALIZATION. Use TEXT for a free-text tile, MAP to embed an existing map, EVENT_VISUALIZATION to embed a saved line list (create with manage_line_lists), APP to embed an installed dashboard plugin (app_key).' },
+                app_key: { type: 'string', description: 'Key of an INSTALLED dashboard plugin (type APP), e.g. one built with manage_custom_app. Verified against /api/apps.' },
                 visualization_id: { type: 'string', description: 'UID of an EXISTING visualization to embed (type VISUALIZATION).' },
                 map_id: { type: 'string', description: 'UID of an EXISTING map to embed (type MAP).' },
                 event_visualization_id: { type: 'string', description: 'UID of an EXISTING saved line list / event visualization to embed (type EVENT_VISUALIZATION). line_list_id is accepted as an alias.' },
@@ -2160,7 +2181,7 @@ To place a new map on a dashboard, pass its map_id to manage_dashboards(action="
           data_item: { type: 'string', description: 'For create: the ONE indicator / data element / program indicator UID to shade the map by (the dx dimension). Type auto-resolved + existence-verified; the program is auto-attached for a program indicator.' },
           org_unit_level: { type: 'integer', description: 'For create: the org-unit LEVEL to shade (e.g. 2 = districts, 3 = chiefdoms). Every OU at this level under the boundary gets a colour.' },
           org_units: { type: 'array', items: { type: 'string' }, description: 'For create: boundary/parent org units — UIDs and/or USER_ORGUNIT / LEVEL-<n>. Combine with org_unit_level to shade that level within these parents. Defaults to shading the given level nationwide if omitted.' },
-          period: { type: 'string', description: 'For create: a single period — relative keyword (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) or fixed ISO (202401, 2025Q1, 2025). Default LAST_12_MONTHS.' },
+          period: { type: 'string', description: 'For create: a single period — relative keyword (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) or fixed ISO (202401, 2025Q1, 2025). Default LAST_12_MONTHS. LAST_N_YEARS / LAST_YEAR are completed years only and EXCLUDE the current year.' },
           legend_set_id: { type: 'string', description: 'For create (optional): a legend set UID for fixed colour bands (make one with manage_legend_sets). Omit for equal-interval auto colours.' },
           thematic_map_type: { type: 'string', enum: ['CHOROPLETH', 'BUBBLE'], description: 'For create: CHOROPLETH (shaded areas, default) or BUBBLE (proportional circles).' },
           classes: { type: 'integer', description: 'For create (optional): number of colour classes for auto (equal-interval) legends. Default 5.' },
@@ -2192,7 +2213,7 @@ COLUMN/FILTER SPEC — each entry is a string or object:
 - Data element / attribute / program indicator: pass the UID or EXACT display name — the type and (for DEs) the stage are auto-resolved; add program_stage_id only when a DE lives in several stages. Optional filter: {operator:"IN"|"EQ"|"NE"|"GT"|"GE"|"LT"|"LE"|"LIKE", value | values:[…]} — option-set values are auto-mapped NAME→CODE, booleans to 1/0.
 - Repeated events (ENROLLMENT output + repeatable stage only): add repeated_events:{ most_recent:2, oldest:2 } (or repetition_indexes:[1,2,-1,0]; 1=first, 0=latest, -1=second-latest) to a DE column to show one column per event occurrence.
 - Statuses: { dimension:"event_status"|"program_status", statuses:["ACTIVE","COMPLETED",…] }.
-⚠ Program-indicator columns are evaluated PER ROW: a rate/percentage PI with a division 409s the whole table when any row's denominator is 0 — the tool refuses those and tells you to build a count/flag PI with manage_program_indicators instead. PI analyticsType must match output_type (EVENT↔EVENT, ENROLLMENT↔ENROLLMENT), and count-style PIs need aggregation_type SUM (COUNT renders a constant 1 per row; NONE breaks the query and is refused).
+⚠ A line list is ONE ROW PER RECORD (event / enrollment / person). It cannot group rows by org unit, so "a table of org units with a % / count column" is NOT a line list — it is a PIVOT TABLE (manage_dashboards create_visualization, vis_type PIVOT_TABLE, layout rows:["ou"] columns:["dx"]); the tool refuses percentage and count-of-records PIs as columns for that reason. Program-indicator columns are evaluated PER ROW: a rate/percentage PI with a division 409s the whole table when any row's denominator is 0. PI analyticsType must match output_type (EVENT↔EVENT, ENROLLMENT↔ENROLLMENT), and per-record count PIs (d2:count…) need aggregation_type SUM (COUNT renders a constant 1 per row; NONE breaks the query and is refused).
 Legend: legend:{ legend_set_id | legend_set_name, style:"FILL"|"TEXT", strategy:"FIXED"|"BY_DATA_ITEM", show_key } — create the set first with manage_legend_sets.
 Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVENT_VISUALIZATION", event_visualization_id }]. For UI navigation help in the Line Listing app use line_listing_guide; for ad-hoc event/enrollment COUNTS use get_event_analytics — this tool SAVES reusable line lists.`,
       parameters: {
@@ -2223,7 +2244,7 @@ Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVEN
                 filter: { description: 'Condition on this dimension: { operator, value | values:[…] } or a raw "OP:value" string. Option-set values auto-map name→code; booleans → true/false.', type: 'object', properties: { operator: { type: 'string' }, value: {}, values: { type: 'array' } } },
                 repeated_events: { type: 'object', properties: { most_recent: { type: 'integer' }, oldest: { type: 'integer' } }, description: 'ENROLLMENT output + repeatable stage only: how many latest/earliest event occurrences of this DE to show as separate columns. Or pass repetition_indexes:[1,2,-1,0].' },
                 repetition_indexes: { type: 'array', items: { type: 'integer' }, description: 'Explicit occurrence indexes: 1=first, 2=second, …; 0=latest, -1=second-latest.' },
-                allow_risky_program_indicator: { type: 'boolean', description: 'Override the division-PI refusal for THIS column — only when certain the per-row denominator can never be 0.' }
+                allow_risky_program_indicator: { type: 'boolean', description: 'Override the division-PI or percentage-PI refusal for THIS column — only when certain the per-row denominator can never be 0, or when the user explicitly wants a 0/100 value per record.' }
               }
             },
             description: 'The table columns, in order. Strings allowed as shorthand for { dimension:"…" }. Must include an org-unit dimension and (for EVENT/ENROLLMENT) a time dimension somewhere in columns+filters.'
@@ -2244,6 +2265,309 @@ Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVEN
   {
     type: 'function',
     function: {
+      name: 'manage_users',
+      description: `Administer DHIS2 USERS, USER ROLES, USER GROUPS and AUTHORITIES. Use this for every "create a user / add a data clerk account / reset a password / disable an account / give X access to the Capture app / put these users in a group / create a role that can enter data" request — NEVER raw dhis2_query POST /users or /userRoles.
+
+Users — list (query, role, group, org_unit, disabled filters), get, create, update, disable, enable, delete:
+- create needs username (4–255 chars, no spaces), first_name, surname, ≥1 role (roles:[names or UIDs]), and a password that meets the server policy (8–72 chars, upper + lower case, a digit, a special character) — OR generate_password:true to create a strong random one that is returned ONCE. Pass org_units (capture/data-entry org units — without them the user can do nothing), optional data_view_org_units (analytics), search_org_units (tracker search), groups, email, phone_number. Names resolve to UIDs automatically; duplicates are refused before sending. The tool validates via /metadata VALIDATE because POST /users IGNORES ?dryRun and would really create the account.
+- update: first_name / surname / email / phone_number / password / disabled, roles (replace) or add_roles / remove_roles, org_units (replace) or add_org_units / remove_org_units, data_view_org_units, search_org_units, add_groups / remove_groups. Group membership is written through the group endpoint — PATCHing /userGroups on a user is a 500 / silent no-op in DHIS2.
+- disable / enable: toggle the account (preferred over delete — a restored user has no password).
+Roles — list_roles, get_role (flags authority strings DHIS2 does not recognise), create_role (name + authorities), update_role (authorities replace / add_authorities / remove_authorities, name, description), delete_role (refused while assigned). Authorities are validated against /api/authorities: pass exact ids ("F_DATAVALUE_ADD"), human names ("Add data value"), or app names ("Capture" → M_dhis-web-capture). DHIS2 itself silently stores misspelled authorities that grant nothing — this tool refuses them with suggestions.
+Groups — list_groups, create_group (name + members), update_group (add_members / remove_members / name), delete_group.
+list_authorities (query="data value") finds authority ids.
+Every update/delete auto-snapshots a backup first.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'get', 'create', 'update', 'disable', 'enable', 'delete', 'list_roles', 'get_role', 'create_role', 'update_role', 'delete_role', 'list_groups', 'create_group', 'update_group', 'delete_group', 'list_authorities'], description: 'Which user-administration operation to perform.' },
+          user_id: { type: 'string', description: 'User UID (get/update/disable/enable/delete). A username is also accepted here.' },
+          username: { type: 'string', description: 'For create: the login name. For get/update/…: alternative to user_id.' },
+          first_name: { type: 'string' },
+          surname: { type: 'string' },
+          email: { type: 'string' },
+          phone_number: { type: 'string' },
+          password: { type: 'string', description: 'Initial (create) or new (update) password. Must satisfy the server password policy.' },
+          generate_password: { type: 'boolean', description: 'For create without a password: generate a strong random one (returned once).' },
+          disabled: { type: 'boolean', description: 'For create/update: account disabled flag. For list: filter.' },
+          account_expiry: { type: 'string', description: 'Optional ISO date after which the account expires.' },
+          roles: { type: 'array', items: { type: 'string' }, description: 'User role names or UIDs. For create: required (≥1). For update: REPLACES all roles.' },
+          add_roles: { type: 'array', items: { type: 'string' } },
+          remove_roles: { type: 'array', items: { type: 'string' } },
+          groups: { type: 'array', items: { type: 'string' }, description: 'For create: user groups to join (names or UIDs).' },
+          add_groups: { type: 'array', items: { type: 'string' } },
+          remove_groups: { type: 'array', items: { type: 'string' } },
+          org_units: { type: 'array', items: { type: 'string' }, description: 'Capture / data-entry org units (names or UIDs). For update: REPLACES them.' },
+          add_org_units: { type: 'array', items: { type: 'string' } },
+          remove_org_units: { type: 'array', items: { type: 'string' } },
+          data_view_org_units: { type: 'array', items: { type: 'string' }, description: 'Analytics (data view) org units.' },
+          search_org_units: { type: 'array', items: { type: 'string' }, description: 'Tracker search org units.' },
+          query: { type: 'string', description: 'For list / list_roles / list_groups / list_authorities: free-text filter.' },
+          role: { type: 'string', description: 'For list: only users holding this role (name or UID).' },
+          group: { type: 'string', description: 'For list: only members of this group (name or UID).' },
+          org_unit: { type: 'string', description: 'For list: only users assigned to this org unit (name or UID).' },
+          limit: { type: 'integer', description: 'For list: max rows (default 50, max 200).' },
+          role_id: { type: 'string', description: 'Role UID or exact name (get_role/update_role/delete_role).' },
+          group_id: { type: 'string', description: 'Group UID or exact name (update_group/delete_group).' },
+          name: { type: 'string', description: 'For create_role / create_group: the name. For update_role / update_group: a new name.' },
+          description: { type: 'string', description: 'For create_role / update_role.' },
+          code: { type: 'string', description: 'For create_group: optional code.' },
+          authorities: { type: 'array', items: { type: 'string' }, description: 'For create_role (required) / update_role (REPLACES): authority ids, names, or app names.' },
+          add_authorities: { type: 'array', items: { type: 'string' } },
+          remove_authorities: { type: 'array', items: { type: 'string' }, description: 'Authorities to remove (raw strings accepted — use this to clean unrecognised ones).' },
+          members: { type: 'array', items: { type: 'string' }, description: 'For create_group: user UIDs or usernames.' },
+          add_members: { type: 'array', items: { type: 'string' } },
+          remove_members: { type: 'array', items: { type: 'string' } },
+          dry_run: { type: 'boolean', description: 'For create / create_role / create_group: validate only.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the auto-backup before update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_data_values',
+      description: `Read and write AGGREGATE DATA VALUES — the numbers entered in the Data Entry app — for ONE form = dataset × period × org unit. Use it for "enter 12 malaria cases for January at Ngelehun", "what was reported for ANC in March", "clear the September form", "mark the form complete", "run validation on this form". NEVER hand-write /dataValueSets or /dataValues bodies via dhis2_query for single-form entry.
+
+Actions:
+- get — every value in the form with data-element / disaggregation NAMES, plus empty cells, completion and lock status.
+- set — write values:[{ data_element, category_option_combo?, value, comment? }]. data_element = name, form name, code or UID (resolved inside the dataset). category_option_combo is REQUIRED for disaggregated elements and accepts the disaggregation name ("Female, <5") or option names in any order; omit it for non-disaggregated elements. Values are checked against the value type (integers, ≥0, percentages, booleans yes/no, dates) and option sets (code OR option name) BEFORE sending. Previous cell values are returned as an undo record. dry_run:true validates without saving.
+- delete — values:[{ data_element, category_option_combo? }] or all:true + confirm_all:true to clear the whole form (previous values returned for undo).
+- complete / incomplete — mark the form complete / reopen it.
+- validate — run the dataset's validation rules for this form and list violations.
+Addressing: dataset_id (UID or name), period (DHIS2 id like 202601 / 2026Q1 / 2026W3 — friendly "January 2026", "Q1 2026", "2026-01" are converted for the dataset's period type), org_unit_id (UID or name), attribute_option_combo only for datasets with an attribute category combo.
+Silent DHIS2 traps refused BEFORE writing (the server would store them invisibly with status SUCCESS): a period of the wrong type, an org unit the dataset is not assigned to, a disaggregated element without its category option combo. Also refused: periods not yet open (openFuturePeriods=0 means only ENDED periods accept data — not the current month) and LOCKED forms. A partial import is reported cell by cell (the HTTP 409 does not mean nothing was saved).`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['get', 'set', 'delete', 'complete', 'incomplete', 'validate'], description: 'get=read the form; set=write values; delete=clear values; complete/incomplete=completion registration; validate=run validation rules on the form.' },
+          dataset_id: { type: 'string', description: 'Dataset UID or exact name.' },
+          period: { type: 'string', description: 'Period id for the dataset period type (202601, 2026Q1, 2026W3, 2026 …) or a friendly form ("January 2026").' },
+          org_unit_id: { type: 'string', description: 'Org unit UID or exact name. Must be assigned to the dataset.' },
+          attribute_option_combo: { type: 'string', description: 'Only for datasets with an attribute category combo: the attribute option combo name or UID.' },
+          values: {
+            type: 'array',
+            description: 'For set/delete: the cells.',
+            items: {
+              type: 'object',
+              properties: {
+                data_element: { type: 'string', description: 'Data element name / form name / code / UID (within this dataset).' },
+                category_option_combo: { type: 'string', description: 'Disaggregation name ("Female, <5") or UID. Required only for disaggregated data elements.' },
+                value: { type: 'string', description: 'For set: the value (numbers as strings are fine; option sets accept the code or option name; booleans yes/no).' },
+                comment: { type: 'string' },
+              },
+              required: ['data_element'],
+            },
+          },
+          all: { type: 'boolean', description: 'For delete: clear every value of the form (requires confirm_all:true).' },
+          confirm_all: { type: 'boolean', description: 'For delete with all:true — only after the user explicitly confirmed.' },
+          dry_run: { type: 'boolean', description: 'For set: validate on the server without saving.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_metadata_translations',
+      description: `Translate DHIS2 METADATA objects — the names, short names, form names, descriptions and labels of programs, stages, data elements, options, attributes, datasets, sections, indicators, org units, category options, etc. — into another language (shown to users who pick that Database locale). Use this for "translate the TB program into French", "add Arabic names to these data elements", "the option labels should show in Portuguese". This is NOT for an app's UI strings/buttons (that is manage_custom_translations).
+
+Actions:
+- list_locales — the server's database locales (translations can only be stored for these).
+- add_locale — add a database locale (language + optional country).
+- get — object(s) with their translatable properties, source values and existing translations (optionally one locale).
+- set — locale + translations:{ NAME:"…", SHORT_NAME:"…", FORM_NAME:"…", DESCRIPTION:"…" } for one object (object_type + object_id) or items:[{ object_type, object_id, translations }] for up to 100 objects in one call. Property keys may also be given as field names (name, shortName, formName, description) — they are validated against the object's schema. MERGES with existing translations.
+- remove — locale + optional properties[] (default: all of that locale's translations).
+Why not dhis2_query: PUT {type}/{id}/translations REPLACES the whole translation set (one raw PUT for French wipes the Arabic and Spanish translations), and DHIS2 silently accepts unknown locales and property keys that never render. The result also verifies the translated display name the way users see it.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list_locales', 'add_locale', 'get', 'set', 'remove'], description: 'Which translation operation to perform.' },
+          object_type: { type: 'string', description: 'API collection of the object, e.g. dataElements, programs, programStages, options, trackedEntityAttributes, dataSets, sections, programStageSections, indicators, programIndicators, organisationUnits, categoryOptions, optionSets.' },
+          object_id: { type: 'string', description: 'UID of the object.' },
+          locale: { type: 'string', description: 'Database locale, e.g. "fr", "ar", "pt_BR" (also "fr-FR" or the language name).' },
+          translations: { type: 'object', description: 'For set (single object): property → translated text, e.g. { "NAME": "Paludisme", "SHORT_NAME": "Palu" }.', additionalProperties: { type: 'string' } },
+          properties: { type: 'array', items: { type: 'string' }, description: 'For remove: which properties to remove (default all for the locale).' },
+          items: {
+            type: 'array',
+            description: 'Bulk form for get/set/remove: up to 100 objects.',
+            items: {
+              type: 'object',
+              properties: {
+                object_type: { type: 'string' },
+                object_id: { type: 'string' },
+                translations: { type: 'object', additionalProperties: { type: 'string' } },
+                properties: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['object_id'],
+            },
+          },
+          language: { type: 'string', description: 'For add_locale: ISO 639 language code ("fr").' },
+          country: { type: 'string', description: 'For add_locale: optional ISO 3166 country code ("FR").' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_memory',
+      description: `Your LEARNING MEMORY — lessons about DHIS2 / API behaviour that persist across conversations (stored only in this browser). Lessons relevant to the current request are already shown in the system prompt ("Learning memory"), alongside a tool's manual, and on a failed call; use this tool for anything else.
+- search — look up lessons before a step you are unsure of: query="dashboard add items", optional area / tool / endpoint.
+- record — save a lesson right after you hit an error and FOUND the fix (or learned a non-obvious rule of this DHIS2): area, tools, title (what to do, ≤12 words), problem (what failed and why, with the error), solution (the exact correct tool/endpoint/parameters). Optional endpoint (e.g. "dataStore/<ns>/<key>"), scope "instance" when it only applies to THIS server's configuration (default "general"), supersedes=<id> to replace a lesson that proved wrong.
+- list — what is stored (optionally per area).
+NEVER put patient or personal data in a lesson (no names, IDs, phone numbers, values from records) — only configuration and API knowledge. Recording is refused automatically in any turn that touched patient-level data.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['search', 'record', 'list'], description: 'search=find lessons; record=save a lesson; list=what is stored.' },
+          query: { type: 'string', description: 'For search: words describing the task or error.' },
+          area: { type: 'string', enum: MEMORY_AREA_KEYS, description: 'Task area the lesson belongs to (record: required; search/list: optional filter).' },
+          tool: { type: 'string', description: 'For search: only lessons about this tool.' },
+          tools: { type: 'array', items: { type: 'string' }, description: 'For record: the tool name(s) the lesson is about (e.g. ["manage_dashboards"] or ["dhis2_query"]).' },
+          endpoint: { type: 'string', description: 'Optional API path pattern the lesson is about, e.g. "dashboards/<uid>" or "analytics/events/aggregate".' },
+          title: { type: 'string', description: 'For record: the rule in one line, e.g. "Add tiles with add_items, never PUT the dashboard".' },
+          problem: { type: 'string', description: 'For record: what went wrong and the error it produced.' },
+          solution: { type: 'string', description: 'For record: exactly how to do it correctly next time.' },
+          scope: { type: 'string', enum: ['general', 'instance'], description: 'For record: general DHIS2 behaviour (default) or specific to this server.' },
+          supersedes: { type: 'string', description: 'For record: id of a stored lesson this one corrects (it is replaced).' },
+          limit: { type: 'integer', description: 'For search/list: max lessons to return.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_custom_app',
+      description: `Build, install and maintain CUSTOM DHIS2 APPS and DASHBOARD PLUGINS from code you write — "build a dashboard widget that shows ANC coverage by district", "make an app that lists programs with their stage counts", "a plugin that charts monthly enrollments". You write React JSX; the tool compiles it, checks it, packages it with a prebuilt runtime kit (React 18 + @dhis2/ui + @dhis2/app-runtime) and installs it on the user's DHIS2 server (POST /api/apps). Zero setup for the user. A saved chart/pivot/map is NOT an app — for those use manage_dashboards / manage_maps.
+
+Actions:
+- list — installed apps whose key starts with "ai-" (include_all:true for every app), with built_by_assistant, version, launch / plugin URLs.
+- get_source — the JSX source + AI manifest embedded in an assistant-built app (read before an update).
+- preview — compile + safety-scan + lint + verify every hard-coded UID + package WITHOUT installing. Returns the manifest, file list, the data resources the code reads, warnings and a preview_token. ALWAYS preview first and show the user a short summary before create.
+- create — install a NEW app (fails if the key exists). After the user approves a preview pass preview_token (installs exactly what was previewed) instead of resending the files.
+- update — change an assistant-built app: pass only the changed files (others are kept), version bumps (patch by default), the previous version is backed up first.
+- delete — back up, then uninstall (delete_app_data:true also deletes the app's dataStore namespace — ask first).
+- rollback — reinstall a previous version from backup (latest by default, or version / backup_key).
+- place — show an installed plugin where users work: target "dashboard" (dashboard_id, or dashboard_name for a new dashboard), "enrollment_dashboard" / "enrollment_event_new" / "enrollment_event_edit" (program_id, column, position) for a Capture widget, or "form" (program_stage_id or program_id + field_map) for a Capture form-field plugin. Writes the Tracker Plugin Configurator's own configuration, backed up first.
+- unplace — take a plugin off dashboards / Capture (all, or one target). delete does this automatically.
+- placements — where a plugin is currently shown (without key: every assistant-built plugin, with its form field maps).
+
+Files (strings of JSX): app.jsx (kind "app"), plugin.jsx (kind "plugin"), both for "app_and_plugin"; optional shared.jsx is loaded first and its top-level declarations are visible to both. Only the kit globals exist — React, ReactDOMClient, D2UI, D2Runtime, postRobot, echarts (auto-bundled when referenced), D2_APP_CONFIG — no imports, no npm packages.
+
+Guarantees: keys always start with "ai-"; apps not built by the assistant (no assistant marker + src/manifest.ai.json) are never updated or deleted; banned code (eval, new Function, cookies, localStorage, <script>, raw HTML injection, imports, requests to other servers) is refused; with needs_write_access:false any data mutation is refused; UIDs in the code that do not exist on the server are refused. Requires the App Management authority on the server.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'get_source', 'preview', 'create', 'update', 'delete', 'rollback', 'place', 'unplace', 'placements'], description: 'list / get_source / preview / placements are read-only; create / update / delete / rollback / place / unplace write to the server.' },
+          name: { type: 'string', description: 'Display name, e.g. "ANC coverage widget". The key is derived from it when key is omitted.' },
+          key: { type: 'string', description: 'App key: "ai-" + lower-case letters/digits/hyphens, max 40 chars. Required for update / delete / rollback / get_source.' },
+          description: { type: 'string', description: 'One-sentence description shown in DHIS2.' },
+          kind: { type: 'string', enum: ['app', 'plugin', 'app_and_plugin'], description: 'app = standalone page in the app menu; plugin = embeddable widget (dashboard item); app_and_plugin = both, sharing code.' },
+          plugin_type: { type: 'string', enum: ['DASHBOARD', 'CAPTURE'], description: 'Required when kind includes a plugin. DASHBOARD = a Dashboard app item. CAPTURE = a Capture enrollment-dashboard widget (props teiId, programId, enrollmentId, orgUnitId; the user places it with the Tracker Plugin Configurator).' },
+          files: {
+            type: 'object',
+            description: 'JSX source per file. create/preview: all files the kind needs. update: only the files that change (an empty string removes shared.jsx).',
+            properties: {
+              'app.jsx': { type: 'string' },
+              'plugin.jsx': { type: 'string' },
+              'shared.jsx': { type: 'string' },
+            },
+          },
+          needs_write_access: { type: 'boolean', description: 'Default false (read-only app: any mutation is refused). true ONLY when the app must save data (settings, notes…) — tell the user what it writes.' },
+          datastore_namespace: { type: 'boolean', description: 'Default true: reserve the dataStore namespace = key for the app (D2_APP_CONFIG.namespace). false if the app stores nothing.' },
+          prompt_summary: { type: 'string', description: 'One line: what the user asked for (stored with the source for later updates).' },
+          preview_token: { type: 'string', description: 'For create: the token returned by preview — installs exactly the previewed build.' },
+          version: { type: 'string', description: 'For update: explicit new version (default: bump). For rollback: the version to restore.' },
+          version_bump: { type: 'string', enum: ['patch', 'minor', 'major'], description: 'For update (default patch).' },
+          backup_key: { type: 'string', description: 'For rollback: a specific backup to restore.' },
+          include_all: { type: 'boolean', description: 'For list: include every installed app, not only ai-*.' },
+          delete_app_data: { type: 'boolean', description: 'For delete: also delete the app\'s dataStore namespace (its saved settings/notes). Only when the user asks.' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Skip the backup before update/delete/rollback/place/unplace. Only after the user is told the backup failed AND explicitly accepts.' },
+          target: { type: 'string', enum: ['dashboard', 'enrollment_dashboard', 'enrollment_event_new', 'enrollment_event_edit', 'form'], description: 'For place / unplace: where the plugin goes. dashboard = a Dashboard app item (DASHBOARD plugins). enrollment_dashboard / enrollment_event_new / enrollment_event_edit = a widget on that Capture page of one tracker program (CAPTURE plugins). form = a form-field plugin inside a Capture data entry form (CAPTURE plugins, needs field_map). unplace without target removes the plugin everywhere.' },
+          dashboard_id: { type: 'string', description: 'For place target "dashboard": an existing dashboard to add the plugin to.' },
+          dashboard_name: { type: 'string', description: 'For place target "dashboard": create a NEW dashboard with this name holding the plugin (when no dashboard_id).' },
+          width: { type: 'integer', description: 'For place target "dashboard": item width on the 58-column grid (default 29).' },
+          height: { type: 'integer', description: 'For place target "dashboard": item height (default 20).' },
+          program_id: { type: 'string', description: 'For place enrollment_* targets: the tracker program. For target "form": the program whose REGISTRATION form gets the plugin (instead of program_stage_id).' },
+          program_stage_id: { type: 'string', description: 'For place target "form": the tracker program stage whose event form gets the plugin.' },
+          column: { type: 'string', enum: ['left', 'right'], description: 'For enrollment_* targets: page column (default right).' },
+          position: { type: 'string', enum: ['top', 'bottom'], description: 'Where in the column (default top) / form or section (default bottom).' },
+          section: { type: 'string', description: 'For target "form": an existing form section (id or name) to put the plugin in. Omit to give the plugin its own section.' },
+          section_name: { type: 'string', description: 'For target "form" without section: title of the plugin\'s own section (default: the app name).' },
+          field_map: {
+            type: 'array',
+            description: 'For target "form": the fields the plugin may read and write. plugin_field = the alias the plugin code uses (values.<alias>, setFieldValue({ fieldId: "<alias>" })); field_id = the data element (stage form) or tracked entity attribute (registration form) UID. replace_field:true takes the field out of its normal place in the form (the plugin renders it instead); default false keeps it visible.',
+            items: {
+              type: 'object',
+              properties: {
+                plugin_field: { type: 'string' },
+                field_id: { type: 'string' },
+                replace_field: { type: 'boolean' },
+              },
+              required: ['plugin_field', 'field_id'],
+            },
+          },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manage_sql_views',
+      description: `DHIS2 SQL views — the platform's supported way to read data that NO Web API endpoint exposes, and the data source for a plugin/app that needs it. Use it for: tracker ownership-TRANSFER history (the programownershiphistory table — a "transfer" in DHIS2 tracker is the Capture "Transfer" action that moves a tracked entity's ownership to another org unit; there is NO readable transfer endpoint: tracker/ownership/transfer is write-only), other database-only facts, and real table/column names of THIS server.
+
+Actions:
+- list — saved SQL views (query filters by name).
+- get — one view: its SQL, variables, who can read its rows, and how a plugin reads it.
+- describe — the REAL columns of database tables on this server (tables:[…]) and/or table names containing a word (search:"ownership"). Read-only (uses a temporary view that is removed). ALWAYS describe before writing SQL against a table you have not described this conversation.
+- create — save a view and RUN it once (DHIS2 does not check SQL on save). SQL that fails is reported with the database error and the view is removed again. Default sharing "r-r-----" = every logged-in user can read its rows (a view with no data read gives HTTP 409 E4312 to everyone, superusers included).
+- update — change name / SQL / sharing; backed up first, re-run, put back as it was if the new SQL fails.
+- delete — backed up first.
+- run — run a view: column names + row count always; the rows themselves only when the view reads METADATA tables only (or on a local model). Patient-level rows are never shown on a cloud model.
+
+Never claim a view works or shows data unless create/update/run reported it: say the row_count (0 rows = "no transfers recorded yet"). NEVER create, change or read SQL views through dhis2_query.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'get', 'describe', 'create', 'update', 'delete', 'run'], description: 'list / get / describe / run are read-only; create / update / delete write to the server.' },
+          id: { type: 'string', description: 'The SQL view UID (get / update / delete / run).' },
+          name: { type: 'string', description: 'create: unique view name, e.g. "Transfer history (dashboard plugin)". update: new name.' },
+          description: { type: 'string', description: 'One sentence: what the view returns and which app uses it.' },
+          sql_query: { type: 'string', description: 'ONE read query (SELECT / WITH). Use \${name} variables inside string literals for values the reader supplies: \'\${startDate}\'. Never the words delete, alter, update, create, drop, commit, insert, rename, restore, write, grant, truncate, revoke — DHIS2 refuses them anywhere in the text.' },
+          type: { type: 'string', enum: ['QUERY', 'VIEW', 'MATERIALIZED_VIEW'], description: 'Default QUERY (runs fresh on every read; the only type with variables).' },
+          cache_strategy: { type: 'string', description: 'Default NO_CACHE (live data).' },
+          sharing: {
+            type: 'object',
+            description: 'Who may read the rows. Default {"public":"r-r-----"} (every logged-in user). For a restricted view: {"public":"r-------","user_groups":[{"id":"<group UID>","access":"r-r-----"}]}.',
+            properties: {
+              public: { type: 'string' },
+              user_groups: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, access: { type: 'string' } } } },
+            },
+          },
+          test_variables: { type: 'object', description: 'create / update: a value for EVERY \${variable} in the SQL, used for the test run, e.g. {"startDate":"2020-01-01","endDate":"2030-12-31","orgUnit":"ALL"}. Letters, digits, spaces, "_" and "-" only.' },
+          variables: { type: 'object', description: 'run: a value for every \${variable}.' },
+          tables: { type: 'array', items: { type: 'string' }, description: 'describe: database table names, e.g. ["programownershiphistory","trackedentityprogramowner","organisationunit"].' },
+          search: { type: 'string', description: 'describe: list tables whose name contains this word.' },
+          query: { type: 'string', description: 'list: filter by name.' },
+          page: { type: 'integer', description: 'list / run: page number.' },
+          page_size: { type: 'integer', description: 'run: rows per page (max 100; metadata-only views).' },
+          skip_backup: { type: 'boolean', description: 'DANGEROUS. Skip the backup before update/delete. Only after the user is told the backup failed AND explicitly accepts.' },
+        },
+        required: ['action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manage_backups',
       description: `List, inspect, restore, delete, or purge metadata backups created automatically before destructive operations.
 
@@ -2254,7 +2578,7 @@ Every update/delete on programs, data elements, OUs, program rules, indicators, 
 
 Backups are kept for ${BACKUP_RETENTION_DAYS} days by default. action=purge_old deletes anything older than retention_days (default ${BACKUP_RETENTION_DAYS}).
 
-Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL. Tombstone entries (objects that were already gone at snapshot time) are skipped. Restore is idempotent — running it twice is safe.`,
+Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL. Tombstone entries (objects that were already gone at snapshot time) are skipped. Restore is idempotent — running it twice is safe. App backups (keys "backup-…-app-<key>-…", made by manage_custom_app) hold an app's source: restoring one reinstalls that app version.`,
       parameters: {
         type: 'object',
         properties: {
@@ -2327,6 +2651,12 @@ const TOOL_ROUTER = Object.freeze({
   manage_maps: true,
   manage_line_lists: true,
   manage_backups: true,
+  manage_users: true,
+  manage_data_values: true,
+  manage_metadata_translations: true,
+  manage_memory: true,
+  manage_custom_app: true,
+  manage_sql_views: true,
 });
 
 // ── Lazy Tool Manuals (two-tier tool docs) ───────────────────────────────────
@@ -2372,6 +2702,8 @@ const WRITE_CAPABLE_TOOL_NAMES = new Set([
   'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
   'manage_dashboards', 'manage_maps', 'manage_line_lists',
   'manage_custom_translations', 'manage_growth_chart_plugin',
+  'manage_users', 'manage_data_values', 'manage_metadata_translations',
+  'manage_custom_app', 'manage_sql_views',
 ]);
 
 const MANUAL_TOOLS = new Set([
@@ -2392,6 +2724,11 @@ const MANUAL_TOOLS = new Set([
   'manage_line_lists',
   'manage_custom_translations',
   'manage_growth_chart_plugin',
+  'manage_users',
+  'manage_data_values',
+  'manage_metadata_translations',
+  'manage_custom_app',
+  'manage_sql_views',
 ]);
 
 // Short routing descriptions sent on the wire for MANUAL_TOOLS. These carry
@@ -2416,6 +2753,11 @@ const TOOL_SUMMARIES = {
   manage_dashboards: 'Build/inspect analytics dashboards and saved visualizations (charts, pivots, single-value tiles): list, get, create_visualization, create_dashboard (atomic, with inline new visualizations), add_items (the ONLY safe way to add to an EXISTING dashboard — a raw PUT wipes its tiles), remove_item, update, delete. NEVER hand-assemble visualizations/dashboards bodies via dhis2_query (they import as EMPTY charts). render_chart = inline chat preview; this tool SAVES to DHIS2.',
   manage_maps: 'Create/inspect/delete thematic maps (choropleth / bubble): list, get, create (one data_item UID + org_unit_level/org_units + period, optional legend_set_id), delete. NEVER hand-assemble /api/maps bodies via dhis2_query. Place a map on a dashboard via manage_dashboards(action=add_items, items=[{type:"MAP", map_id}]).',
   manage_line_lists: 'Author SAVED line lists — the row-per-record tables of the Line Listing app (eventVisualizations type LINE_LIST): list, get, create (EVENT / ENROLLMENT with cross-stage + repeated-event columns / TRACKED_ENTITY; dimensions by UID or exact name, auto stage/option-code resolution, filters, sorting, legend; the layout is PROVEN against analytics BEFORE saving), update, delete, validate (re-run its query → row_count). NEVER hand-assemble eventVisualizations bodies via dhis2_query (the app cannot open them). Dashboard placement: manage_dashboards items [{type:"EVENT_VISUALIZATION", event_visualization_id}]. line_listing_guide = app UI help; THIS tool saves the actual line lists.',
+  manage_users: 'Administer users, user roles, user groups and authorities: list, get, create (username + names + ≥1 role + policy-compliant password or generate_password, capture/data-view/search org units, groups — names resolve to UIDs), update (roles/org units/groups add/remove, password reset, profile), disable, enable, delete; list_roles, get_role, create_role, update_role, delete_role (authorities validated against /api/authorities — DHIS2 silently stores misspelled ones); list_groups, create_group, update_group (members), delete_group; list_authorities. NEVER POST /users or /userRoles via dhis2_query.',
+  manage_data_values: 'Aggregate data entry for ONE form (dataset × period × org unit): get (values with names, empty cells, completion/lock), set (values by data-element NAME + disaggregation name; value types, option sets, period type, org-unit assignment and period openness checked BEFORE sending — DHIS2 itself silently stores wrong-period / unassigned-OU / missing-disaggregation values), delete, complete, incomplete, validate (run validation rules). Returns previous values as an undo record. NEVER hand-write dataValueSets bodies via dhis2_query for single-form entry.',
+  manage_custom_app: 'Build and install CUSTOM DHIS2 apps, dashboard plugins and Capture plugins (enrollment widgets, form-field plugins) from JSX you write (React + @dhis2/ui runtime kit, no setup): list, get_source, preview (compile + safety scan + UID check, no install — ALWAYS first, then ask the user), create (after approval, with preview_token), update (changed files only, auto-backup + version bump), delete, rollback; place / unplace / placements put an installed plugin on a dashboard, on a Capture enrollment/event page, or into a Capture stage/registration form with a field map (writes the Tracker Plugin Configurator\'s config, backed up first). Keys always start with "ai-"; apps the assistant did not build are never touched. A saved chart/pivot is manage_dashboards, not an app. NEVER POST /api/apps, DELETE apps or write dataStore/capture via dhis2_query.',
+  manage_sql_views: 'DHIS2 SQL views — read data NO Web API endpoint exposes (tracker ownership-TRANSFER history = programownershiphistory table; the Capture "Transfer" action), the data source for plugins that need it, and the REAL table/column names of this server (describe). list / get / describe / run (columns + row count; rows only for metadata-only views) / create (runs the view once — DHIS2 does not check SQL on save — and removes it if it fails) / update / delete (backed up). NEVER probe guessed endpoints for such data, NEVER guess column names (describe first), NEVER create/read SQL views via dhis2_query.',
+  manage_metadata_translations: 'Translate METADATA objects (names, short names, form names, descriptions, labels of programs, stages, data elements, options, attributes, datasets, indicators, org units …) into a database locale: list_locales, add_locale, get, set (single object or items[] up to 100, MERGES with existing translations, keys validated against the schema), remove. NOT for app UI strings (manage_custom_translations). NEVER PUT {type}/{id}/translations via dhis2_query — it replaces every locale.',
 };
 
 // ── Deep how-to KB text that used to live in buildSystemPrompt ──
@@ -2430,11 +2772,12 @@ const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
 - Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, DISPLAYKEYVALUEPAIR, WARNINGONCOMPLETE, ERRORONCOMPLETE (⚠ SHOWWARNINGINFORMATION is NOT accepted by the server enum — it is auto-aliased to SHOWWARNING)
 - Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
 - ⛔ **There is NO "show field" action — visibility is ONE hide rule, never a show/hide pair.** Fields, sections and stages are visible by default; a HIDE action hides while its condition is TRUE and the engine re-shows AUTOMATICALLY the moment it turns false. Therefore "show X only when Y is Yes" = EXACTLY ONE rule: \`{ name: "Hide X when Y is not Yes", condition: "!d2:hasValue(#{y}) || #{y} != true", actions: [{ type: "HIDEFIELD", data_element_name: "X" }] }\`. NEVER ALSO create a second "Show X when Y is Yes" rule — a complementary twin hides the target in EVERY case (permanently hidden). NEVER put a HIDE action under the positive/"show" condition. NEVER combine HIDEFIELD and SETMANDATORYFIELD on the same field in one rule (hidden-AND-mandatory renders the field broken/un-selectable in Capture — this is exactly what breaks multi-select option sets). If X must be required when visible, that is a SEPARATE rule: \`{ name: "Require X when Y is Yes", condition: "#{y} == true", actions: [{ type: "SETMANDATORYFIELD", data_element_name: "X" }] }\`. The tool hard-refuses all three broken shapes (phase "lint") — emit the one-rule pattern from the start.
+- **One rule covers every stage.** A rule without a stage runs in EVERY stage (and an action on a data element applies wherever that data element appears), so "warn in both the screening and the follow-up visit" on a data element both stages share = ONE rule with no stage. Never create one copy per stage unless each copy gets its own rule-level \`program_stage_id\` (create_program: \`program_stage_name\`) — unscoped copies all fire in every stage and the user sees each message twice. Use the rule-level stage only when the rule must NOT run elsewhere (e.g. a check that only makes sense at the follow-up visit). The tool scopes a rule automatically when every action names the same stage (\`stage_scoped_rules\` in the result) and refuses duplicates whose variables read the same data element.
 - 🔎 **"Field shows but can't be used / options not selectable / field never appears" → run \`action=audit\` FIRST.** Its \`cross_rule_issues\` detects hide+mandate contradictions and complementary show/hide twins on existing programs. NEVER blame "a DHIS2 rendering issue" without audit evidence — these symptoms are almost always contradictory program rules.
 - **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
 - **DISPLAYTEXT** (instructions banner) takes \`content\` only — keep it static.
 - **DISPLAYKEYVALUEPAIR** shows a live value in the Feedback (default) or Indicators widget: \`content\` = the static label/key, \`data\` = the evaluated expression (e.g. \`{ type: "DISPLAYKEYVALUEPAIR", content: "BMI", data: "#{weight_kg} / ((#{height_cm}/100) * (#{height_cm}/100))" }\`). This is THE action for "display X in the Feedback widget" requests; add \`location: "indicators"\` to target the Indicators widget instead.
-- **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
+- **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored. Capture shows the assigned field READ-ONLY while the rule assigns it (verified 2.42 / Capture 106) — never tell the user it stays editable. For a yes/no (BOOLEAN) target assign \`true\` / \`false\`, never 'YES' / 'NO'.
 - **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
 - **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
 - **HIDEPROGRAMSTAGE** (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section. Two things you MUST know (verified live on Capture 2.40):
@@ -2477,7 +2820,22 @@ The PI grammar is **NOT** the program-rule grammar. They share \`#{}\` and \`d2:
 **aggregationType vs analyticsType:**
 - \`analyticsType\`: \`EVENT\` (one row per event) or \`ENROLLMENT\` (one row per enrollment, latest event values per stage).
 - \`aggregationType\`: \`COUNT\` for count-of-rows, \`SUM\`/\`AVERAGE\`/\`MIN\`/\`MAX\` for numeric aggregations.
-- "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{tei_count}\`. \`V{enrollment_count}\` is also valid; \`V{event_count}\` is for EVENT-type PIs.
+- "Count of women with X" → \`analyticsType=ENROLLMENT, aggregationType=COUNT, expression=V{enrollment_count}\`, X in the filter (\`V{tei_count}\` counts distinct people the same way). \`V{event_count}\` is for EVENT-type PIs only.
+
+**Analytics-runtime traps — these SAVE and pass /description, then every chart/map/line list using them fails with "SQL syntax error (SqlState 42xxx)"** (verified live 2.42.5 + 2.43.2; the tool now refuses or heals them, and after every save it runs ONE aggregate analytics query to prove the indicator computes — a create that cannot compute is removed again and reported in failed[]):
+- \`V{tei_count}\` / \`V{enrollment_count}\` work ONLY as the whole expression with aggregation_type **COUNT** (SUM/AVERAGE → 42883/42702; the tool heals a bare one to COUNT and says so in auto_corrected).
+- \`V{event_count}\` inside an **ENROLLMENT** indicator → 42703. Count visits with an EVENT indicator (filter \`V{program_stage_id} == '<stageUid>'\` for one stage), or events-per-enrollment with \`d2:count(#{stage.de})\` + SUM.
+- \`d2:countIfValue\` / \`d2:countIfCondition\` on a TEXT/option data element → 42883 on 2.43 (countIfCondition fails on 2.42 too). Use \`d2:condition("#{stage.de} == 'CODE'", 1, 0)\` with SUM (a count) or \`…, 100, 0)\` with AVERAGE (a %).
+- An EVENT \`V{event_count}\` with no stage filter counts the events of EVERY stage — two "per-stage" counts then show the same number. Scope it: filter \`V{program_stage_id} == '<stageUid>'\`.
+- **Yes/No (BOOLEAN / TRUE_ONLY) data elements are 1 / 0 in analytics.** Compare them with \`== 1\` / \`== 0\` — \`== true\` / \`== false\` give SQL 42883 and \`== 'true'\` gives E7132 on every query (the tool heals these). "Unanswered" = \`!d2:hasValue(#{stage.de})\` — a separate count, never folded into No.
+
+**Which period does an ENROLLMENT indicator look at?** Its reporting period filters the ENROLLMENT date only; d2:count / countIfValue / countIfCondition / #{stage.de} read ALL events of the enrollment, whatever their date. When the question puts the visits in the period too ("registrations this year that had a low-Hb follow-up visit **during the year**"), pass \`events_in_period: true\` — it adds EVENT_DATE boundaries so only events in the period count (live 2.43.2: 202 true vs 909 without it, because visits dated next year were counted). Use it for whole-period numbers (year, quarter).
+
+**Per-visit figures are EVENT indicators:** "visits with X" = EVENT, \`V{event_count}\`, COUNT, filter \`V{program_stage_id} == '<stage>' && <X>\` (each visit counted, even several per woman); "% of visits with X among visits where it was recorded" = EVENT, \`d2:condition("<X>", 100, 0)\`, AVERAGE, filter \`V{program_stage_id} == '<stage>' && d2:hasValue(#{<stage>.<de>})\`; "average value at a visit type" = EVENT, \`#{<stage>.<de>}\`, AVERAGE, same filter. "Records per stage" (visit types / care activities) = one EVENT \`V{event_count}\` COUNT indicator per stage.
+
+**"% of women who attended <stage>"** (a stage of the program = a visit): ENROLLMENT, aggregation_type AVERAGE, expression \`d2:condition("d2:hasValue(#{<stageUid>.<deUid>})", 100, 0)\` with a data element that is always filled at that stage (hasValue IS valid inside the d2:condition string; only a bare top-level hasValue is filter-only). "Number of women who attended <stage>": ENROLLMENT, \`V{enrollment_count}\`, COUNT, filter \`d2:hasValue(#{<stageUid>.<deUid>})\`. Number of visits: EVENT, \`V{event_count}\`, filter \`V{program_stage_id} == '<stageUid>'\`.
+
+**When an indicator errors, fix its syntax/aggregation — NEVER switch it to a different data element or stage to make the error go away.** That silently changes what the number means (a 2026-10-29 thread "fixed" an ANC-visit count by counting a Weight field). If it cannot be fixed, say so and offer options.
 
 **PERCENTAGE / COVERAGE = ONE program indicator (NOT three).** A metric like "% of pregnant women whose first ANC was before 12 weeks" is **a SINGLE program indicator**, not a numerator PI + a denominator PI + a percentage object. Build it as:
 - \`analytics_type: "ENROLLMENT"\` (count each woman/pregnancy once, not once per visit),
@@ -2495,7 +2853,7 @@ This is the pattern to use whenever the user asks for "the percentage/rate/cover
 - Every \`manage_program_indicators(action=create|update)\` call validates expression+filter via DHIS2's \`/programIndicators/expression/description\` and \`/filter/description\` endpoints BEFORE saving. If either returns \`status: ERROR\`, the create/update is refused and the parser's exact error string is returned to you in \`_error\` along with a hint in \`_hint\`. Read both, fix the expression, and retry — do NOT loop with the same broken filter.`;
 
 const KB_VALUE_TYPE_MAPPING = `**Value-type mapping** (use these exact DHIS2 valueTypes):
-- "Yes/No" / "boolean" → \`BOOLEAN\`
+- "Yes/No" / "yes/no" / "boolean" → \`BOOLEAN\` — NEVER TEXT + a two-option Yes/No option set (the tool converts one to BOOLEAN and rewrites the rules in the same call; a set with a third option such as "Unknown" stays an option set)
 - "Yes only" / "checkbox" → \`TRUE_ONLY\`
 - "date" → \`DATE\`
 - "date and time" → \`DATETIME\`
@@ -2625,7 +2983,7 @@ When a program/object doesn't appear in an app (Capture, Data Entry, etc.) or a 
 
 **A program's stages are shared WITH it.** A programStage carries its OWN sharing, and its DATA bits are what actually gate event capture — so a program shared \`"rwrw----"\` whose stages are still \`"rw------"\` looks correctly shared and still blocks enrollment/event entry. \`update_sharing\` on a program therefore cascades the same access to every stage automatically (\`cascade_to_stages\`, default true), and \`create_program\`/\`add_stage\` give new stages the program's sharing. Never share a program and leave its stages behind, and when data entry is blocked ALWAYS check the stages before looking anywhere else.
 
-**Only Program and ProgramStage are DATA-shareable.** DataElement, TrackedEntityAttribute, OptionSet, ProgramIndicator, Dashboard and Visualization have \`dataShareable:false\` in the DHIS2 schema: the server accepts a \`"rwrw----"\` PUT with HTTP 200 and silently stores \`"rw------"\`. \`update_sharing\` compares what you asked for against what was stored: the METADATA half still applies (so sharing a dashboard publicly works exactly as intended), and the reply carries \`_data_sharing_not_applicable\` explaining that the data bits were dropped because that class has no data sharing. Treat that note as DONE, not as a failure — do NOT retry it and do NOT repeat it across sibling objects. If you are chasing a DATA-access problem, it lives in the program, its stages, the tracked entity type, or the user's org units — never in these classes.
+**Only Program, ProgramStage and TrackedEntityType are DATA-shareable** (plus DataSet for aggregate). Tracker data entry needs data access on ALL THREE: the program, the stage, and the program's tracked entity type (E1001 / E1104 otherwise). \`create_program\` and \`update_sharing\` on a program add the program's data access to its tracked entity type automatically (data bits only — reported as \`tracked_entity_type_sharing\`; tell the user, since the type may be shared with other programs). DataElement, TrackedEntityAttribute, OptionSet, ProgramIndicator, Dashboard and Visualization have \`dataShareable:false\` in the DHIS2 schema: the server accepts a \`"rwrw----"\` PUT with HTTP 200 and silently stores \`"rw------"\`. \`update_sharing\` compares what you asked for against what was stored: the METADATA half still applies (so sharing a dashboard publicly works exactly as intended), and the reply carries \`_data_sharing_not_applicable\` explaining that the data bits were dropped because that class has no data sharing. Treat that note as DONE, not as a failure — do NOT retry it and do NOT repeat it across sibling objects. If you are chasing a DATA-access problem, it lives in the program, its stages, the tracked entity type, or the user's org units — never in these classes.
 
 ⚠️ **NEVER** use dhis2_query PUT/PATCH to modify sharing — it fails with 405/500. The DHIS2 sharing API is \`PUT /api/sharing?type={singularType}&id={id}\` — update_sharing handles this correctly.`;
 
@@ -2813,14 +3171,20 @@ To an aggregate **indicator**: pass the set's UID as \`legend_set_id\` to manage
 - "Create a stockout legend: 0 red, 1–10 amber, 11+ green": create legend_set:{ name:"Stock status", legends:[{name:"Out",startValue:0,endValue:1,color:"#D32F2F"},{name:"Low",startValue:1,endValue:11,color:"#FBC02D"},{name:"OK",startValue:11,endValue:1000000,color:"#388E3C"}] }.
 - "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].`;
 
-const KB_DASHBOARDS_DETAILS = `### Why a raw POST silently fails (and this tool does not)
+const KB_DASHBOARDS_DETAILS = `### Reporting what you built
+- Give the user the dashboard link the tool returns (\`dashboard_url\`) — never make one up.
+- After building charts / tables / dashboards, describe WHAT was built (items, data, periods, org units, sharing) and how to open it. Do NOT add a "what the data shows" analysis unless the user asked — every such figure has been wrong at least once (live 2026-10-28: a 2026 row read as the 12-month total; a partial query read as all facilities).
+- If the user does ask for figures: take each from ONE successful /analytics query of exactly that item's dx and org units, with the period as a FILTER (filter=pe:LAST_12_MONTHS gives the total; as a dimension it gives one row per month and no total). Never mix dimension= and filter= for the same dimension (409).
+- New or changed program indicators need NO analytics run — they are computed at query time from the existing tables. Never start one unless the user asks.
+
+### Why a raw POST silently fails (and this tool does not)
 DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/\`filterDimensions\` (lists of dimension ids) and its DATA as \`dataDimensionItems\` (typed dx items) + \`relativePeriods\`/\`periods\` (pe) + \`organisationUnits\`/\`organisationUnitLevels\`/\`userOrganisationUnit\` (ou). The \`columns\`/\`rows\`/\`filters\` arrays are DERIVED read-only views — a raw POST that only sets them imports an EMPTY, un-renderable chart. This tool assembles the correct structure (verified VALIDATE+COMMIT on the live server).
 
 ### Fields
 - **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
-- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025).
+- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, QUARTERS_THIS_YEAR, QUARTERS_LAST_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025). A request relative to today ("each quarter of this year and last year", "monthly this year") MUST use the relative keywords — a fixed list stops updating. ⚠ Every LAST_N_… keyword is the N COMPLETED periods and never includes the current one: in 2026, LAST_5_YEARS = 2021–2025 (none of 2026). To widen a range "to catch more data", ADD THIS_YEAR (["THIS_YEAR","LAST_5_YEARS"]); the tools warn when a chart's periods miss all of its data.
 - **org_units**: UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2 = all level-2 OUs).
-- **layout** (optional): which of dx/pe/ou sit on columns/rows/filters. Sensible per-type defaults apply (pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → cols[dx]/rows[pe]).
+- **layout** (optional): which of dx/pe/ou sit where. **Charts: give category (x-axis) and series (legend)** — monthly comparison of indicators = { category:["pe"], series:["dx"], filters:["ou"] }; districts compared = { category:["ou"], series:["dx"], filters:["pe"] }; stacked bars stack the SERIES. DHIS2 stores category as rows and series as columns, so "columns" is NOT the x-axis (the tool corrects a chart with only data items on the x-axis). Pivot tables: columns/rows as written. Defaults: pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → series[dx]/category[pe].
 
 ### Rules
 - data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped. NEVER invent visualization, map or data-item UIDs.
@@ -2831,6 +3195,9 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 ### Examples
 - "Build an ANC dashboard with a coverage chart, a pivot and a single value": create_dashboard dashboard:{ name:"ANC Programme" }, items:[ {new_visualization:{name:"ANC Coverage by Month",vis_type:"COLUMN",data_items:["<anc1>","<anc2>"],periods:["LAST_12_MONTHS"],org_units:["<ou>"]}}, {new_visualization:{name:"ANC 1 This Year",vis_type:"SINGLE_VALUE",data_items:["<anc1>"],periods:["THIS_YEAR"],org_units:["<ou>"]}} ].
 - "Make me a column chart of malaria cases by district last year": create_visualization visualization:{ name:"Malaria cases by district", vis_type:"COLUMN", data_items:["<de>"], periods:["LAST_YEAR"], org_units:["LEVEL-2"] }.
+- "District table with an overall row / national total" (percentages included): create_visualization visualization:{ vis_type:"PIVOT_TABLE", data_items:[…], periods:["2026"], org_units:["<country uid>","LEVEL-2"], overall_row:true, layout:{ rows:["ou"], columns:["dx"], filters:["pe"] } } — the country row is computed from all records. Never describe a "Total" row the result does not report.
+- "A table of every facility with the % of women who attended ANC 1 and ANC 2-4" (one row per org unit — NOT a line list): create_visualization visualization:{ name:"ANC attendance by facility", vis_type:"PIVOT_TABLE", data_items:["<pi % ANC1>","<pi % ANC2-4>"], periods:["LAST_12_MONTHS"], org_units:["<country uid>","LEVEL-4"], layout:{ rows:["ou"], columns:["dx"], filters:["pe"] } }.
+- "Visits per district" as a chart: org units are CATEGORIES → vis_type COLUMN (or BAR), layout:{ category:["ou"], series:["dx"], filters:["pe"] }.
 - "Add a coverage chart to my National Overview dashboard": add_items dashboard_id:"<dashId>", items:[ { new_visualization:{ name:"ANC coverage", vis_type:"COLUMN", data_items:["<indicatorId>"], periods:["LAST_12_MONTHS"], org_units:["USER_ORGUNIT"] } } ] — this APPENDS; existing tiles are preserved and snapshotted.`;
 
 const KB_TRANSLATIONS_DETAILS = `### How the feature works (verified on 2.43 — the app fetches both keys at startup)
@@ -2877,6 +3244,8 @@ configure makes the plugin FUNCTION but does not place the widget. Relay the too
 const KB_LINE_LISTS_DETAILS = `## DHIS2 Line Lists (manage_line_lists)
 A **line list** is a saved row-per-record table (one row per event / enrollment / person) opened in the Line Listing app and embeddable on dashboards. It is stored as an \`eventVisualization\` with \`type: LINE_LIST\` — a DIFFERENT object from the aggregate \`visualizations\` that manage_dashboards creates. Aggregated charts/pivots → manage_dashboards; row-level tables → THIS tool.
 
+**It can NOT total records per org unit.** "A line-listing table with all the org units and a column for the % of women who …" is a request for a PIVOT TABLE (rows = org units, columns = indicators): build it with manage_dashboards(create_visualization, vis_type PIVOT_TABLE, data_items = the % / count program indicators, org_units = [boundary, "LEVEL-n"], layout {rows:["ou"], columns:["dx"], filters:["pe"]}) and tell the user why a line list could not do it. A % indicator as a line-list column shows only 0 or 100 per row, and a count of enrollments shows 1 per row — the tool refuses both.
+
 **Choosing output_type (the single most important decision):**
 - \`EVENT\` — one row per event of ONE program stage. Needs \`program_stage_id\` on multi-stage tracker programs. Columns: that stage's DEs + program attributes + EVENT-analytics PIs.
 - \`ENROLLMENT\` — one row per enrollment. Columns may come from ANY stage (auto-qualified), attributes, ENROLLMENT-analytics PIs, and repeatable-stage DEs can repeat: \`repeated_events:{ most_recent:2, oldest:2 }\` renders "Adherence [1] [2] [-1] [0]"-style columns. Use for treatment-monitoring / cohort registers.
@@ -2884,11 +3253,15 @@ A **line list** is a saved row-per-record table (one row per event / enrollment 
 
 **A senior implementor's workflow for a monitoring register:**
 1. get_program_info → real stage/DE/attribute names + UIDs.
-2. Row-level metrics DON'T exist as columns? Create ENROLLMENT-analytics PIs with manage_program_indicators — per-row-safe patterns: \`d2:count(#{stage.de})\` (visits recorded), \`d2:countIfValue(#{stage.de}, 'CODE')\` (e.g. poor-adherence months), \`d2:daysBetween(V{enrollment_date}, V{event_date})\`, \`d2:condition("…", 1, 0)\` flags. ⚠ NEVER put a rate/percentage PI (any division) in a line list — per-row zero denominators 409 the WHOLE table. The tool refuses them; that refusal is final unless the user insists (allow_risky_program_indicator). ⚠ **aggregation_type matters per row** (verified live on 2.42): give count-style PIs \`aggregation_type:"SUM"\` — with COUNT the line-list cell shows a constant 1 for every row (COUNT counts the one enrollment row, not the events), and with NONE the whole query fails with an SQL error (the tool refuses NONE PIs as columns and warns on COUNT+d2:count).
+2. Row-level metrics DON'T exist as columns? Create ENROLLMENT-analytics PIs with manage_program_indicators — per-row-safe patterns: \`d2:count(#{stage.de})\` (visits recorded), \`d2:countIfValue(#{stage.de}, 5)\` on a NUMERIC data element (on a text/option one it breaks analytics on 2.43 — use \`d2:condition("#{stage.de} == 'CODE'", 1, 0)\`), \`d2:daysBetween(V{enrollment_date}, V{event_date})\`, \`d2:condition("…", 1, 0)\` flags. ⚠ NEVER put a rate/percentage PI (any division) in a line list — per-row zero denominators 409 the WHOLE table. The tool refuses them; that refusal is final unless the user insists (allow_risky_program_indicator). ⚠ **aggregation_type matters per row** (verified live on 2.42): give count-style PIs \`aggregation_type:"SUM"\` — with COUNT the line-list cell shows a constant 1 for every row (COUNT counts the one enrollment row, not the events), and with NONE the whole query fails with an SQL error (the tool refuses NONE PIs as columns and warns on COUNT+d2:count).
 3. Colour-coding: manage_legend_sets(action=create) → pass legend:{ legend_set_id, strategy:"FIXED", style:"FILL" }. FILL = cell background (scorecard look). Legends colour NUMERIC columns (PIs, numeric DEs).
 4. create with data_check="require_rows" when the user expects data — an empty register usually means wrong period/org units or analytics tables not yet run (the result tells you which).
 5. Dashboard: manage_dashboards(action="create_dashboard"|"add_items") with items [{ type:"EVENT_VISUALIZATION", event_visualization_id:"<line_list_id>" }].
 
+**Same data element from several stages** (e.g. Hb at first ANC, at birth, at postpartum): one column per stage, each with its program_stage_id — that is allowed and each column is labelled by stage. Do NOT create program indicators to work around it.
+**Status columns**: { dimension:"program_status" } or { dimension:"event_status" } with no statuses shows the status of every row; pass statuses only to FILTER.
+**Visit dates of a stage inside an ENROLLMENT list: this ASSISTANT cannot save them yet** (only enrollment/incident date and last updated) — DHIS2 2.41+ itself CAN show a stage's latest visit date there. If asked, tell the user exactly that: "the date column can be added in the Line Listing app (the stage's Event date); I cannot save it yet", and offer an EVENT line list of that stage (one row per visit with its date). NEVER say DHIS2 cannot do it.
+**Row counts:** an ENROLLMENT list's validate/create probe reads one page of 100 — when row_count_is_lower_bound is set the list has AT LEAST that many rows; take exact counts from an aggregate (a program indicator on /analytics), never from row_count.
 **Filters** (on columns or the filters axis): option-set dims take option CODES (names auto-map; \`{operator:"IN", values:["CODE_A","CODE_B"]}\`), booleans take true/false, numerics EQ/NE/GT/GE/LT/LE, text LIKE/EQ. Multiple conditions on one dimension: \`{conditions:[{operator:"GE", value:5},{operator:"LT", value:10}]}\`.
 **Periods**: relative keywords (LAST_12_MONTHS, THIS_QUARTER, LAST_4_QUARTERS, THIS_YEAR, …) mix freely with fixed ISO (202605, 2026Q1, 2026). Time dimensions differ per output_type: EVENT has event_date/enrollment_date/incident_date/scheduled_date/last_updated; ENROLLMENT has enrollment_date/incident_date/last_updated.
 **Org units**: USER_ORGUNIT (+_CHILDREN/_GRANDCHILDREN), LEVEL-<n>, OU_GROUP-<uid>, explicit UIDs — combinable (e.g. LEVEL-4 under a parent UID).
@@ -2896,6 +3269,334 @@ A **line list** is a saved row-per-record table (one row per event / enrollment 
 
 **Diagnosing "the line list shows an error / is empty"** → action=validate on the saved list: it re-runs the app's exact query and returns row_count or the offending dimension. Division-PI columns and analytics-tables-not-run are the two most common causes.
 **Zero-invention rule**: every dimension resolves against the program's real metadata at call time; a typo'd name returns the valid candidates instead of saving a broken list. Never invent UIDs; never POST/PUT eventVisualizations via dhis2_query.`;
+
+const KB_USERS_DETAILS = `### Typical requests → calls
+- "Create a data-entry account for Jane at Ngelehun": list_roles (pick the data-entry role) → create(username, first_name, surname, roles:[role], org_units:["Ngelehun CHC"], password | generate_password:true).
+- "Give the clerks access to Capture": find the role (list_roles / get_role) → update_role(add_authorities:["Capture"]) — app names resolve to M_dhis-web-<app>.
+- "Move Jane to Bo district": update(user_id, org_units:["Bo"]) (replace) or add_org_units / remove_org_units.
+- "Lock this account" → disable. "Reset her password" → update(password) — confirm the new password with the user first.
+### Rules
+- org_units = capture/data-entry scope (REQUIRED for the user to do anything); data_view_org_units = analytics scope (defaults to org_units); search_org_units = tracker search scope.
+- A user always keeps ≥1 role; a role always keeps ≥1 authority (both refused otherwise).
+- Never invent passwords silently: either the user gives one, or pass generate_password:true and relay the returned initial_password ONCE.
+- Never delete the signed-in account; prefer disable over delete.`;
+
+const KB_DATA_VALUES_DETAILS = `### Workflow
+1. Resolve the form: dataset (manage_datasets(action="list") or its name), period (in the dataset period type), org unit (must be assigned to the dataset).
+2. action="get" first when the user asks what is there or when you need the exact data-element / disaggregation names.
+3. action="set" with ALL the values of the request in ONE call. If problems[] comes back, NOTHING was written — fix exactly those entries and resend the whole call.
+4. Report what was saved; quote previous_values when existing values were overwritten (that is the undo record).
+### Rules
+- category_option_combo only for disaggregated data elements — use the names shown in valid_category_option_combos / get.
+- openFuturePeriods=0 → the CURRENT period is not open yet (only ended periods). Tell the user instead of retrying; only change openFuturePeriods if they ask.
+- Clearing a whole form (delete all:true) needs confirm_all:true AFTER the user saw the list of values.
+- Patient-level tracker data is NOT handled here — this tool is aggregate only.`;
+
+const KB_METADATA_TRANSLATIONS_DETAILS = `### Workflow for "translate <program/dataset> into <language>"
+1. list_locales — if the language is missing, ask the user, then add_locale.
+2. Gather the objects: get_program_info (program, stages, data elements, attributes, options) or manage_datasets(action="get").
+3. Write the translations yourself, then ONE set call with items:[{ object_type, object_id, translations:{ NAME, SHORT_NAME?, FORM_NAME? } }] (≤100 per call; split bigger jobs).
+4. Tell the user to pick the language under Profile → Settings → "Database locale" to see it.
+### Property keys (validated per object type)
+NAME, SHORT_NAME (≤50 chars), DESCRIPTION, FORM_NAME (the label in data-entry forms — translate it whenever the object has a form name). Programs also have labels such as ENROLLMENT_DATE_LABEL, INCIDENT_DATE_LABEL. get lists the exact keys for an object.`;
+
+// Custom apps / plugins (src/tools-apps.js). Runtime facts were observed on
+// DHIS2 2.42.5.1 + Dashboard app 101.6.1 (2026-10-21) — see the module header.
+// The "DHIS2 app conventions" block adapts the DHIS2 app-development agent
+// skill (github.com/devotta-labs/dhis2-app-skills, dhis2-app-dev @0ad888fd35,
+// the skill developers.dhis2.org recommends for AI-assisted app development)
+// to this no-build runtime: its App Platform tooling (pnpm scaffolding,
+// TanStack Query/Table, react-router, react-hook-form, d2-i18n, CSS modules,
+// eslint/tsc) does not exist in the kit, so each rule is restated with the
+// equivalent the kit does have. Rules, not copied code.
+const KB_CUSTOM_APPS_DETAILS = `### How the generated code runs
+- Only these globals exist: React, ReactDOMClient, D2UI (every @dhis2/ui export), D2Runtime (@dhis2/app-runtime: Provider, DataProvider, useDataQuery, useDataEngine, useAlert, useAlerts, useConfig…), postRobot, echarts (bundled automatically when the code references it) and D2_APP_CONFIG = { baseUrl, apiVersion, serverVersion: { major, minor, patch, full }, namespace, key, version }. No import / require / npm packages — so no react-router, TanStack Query/Table, react-hook-form, i18n library or CSS modules.
+- Destructure EVERY name you use at the top of the file — the tool refuses undeclared components/hooks and names the kit does not export:
+\`\`\`
+const { useState, useEffect, useRef, useMemo } = React;
+const { Provider, useDataQuery, useDataEngine, useAlert, useAlerts } = D2Runtime;
+const { Card, NoticeBox, CircularLoader, AlertBar, AlertStack, DataTable, DataTableHead, DataTableRow, DataTableColumnHeader, DataTableBody, DataTableCell } = D2UI;
+\`\`\`
+- Root of an APP (end of app.jsx). The runtime Provider gives data, useConfig() and useAlert(); <Alerts /> draws the alerts the way the DHIS2 app shell does:
+\`\`\`
+function Alerts() {
+  const alerts = useAlerts();
+  return (
+    <AlertStack>
+      {alerts.map(({ id, message, remove, options: { onHidden, ...props } }) => (
+        <AlertBar key={id} {...props} onHidden={() => { if (onHidden) onHidden(); remove(); }}>{message}</AlertBar>
+      ))}
+    </AlertStack>
+  );
+}
+const CONFIG = { baseUrl: D2_APP_CONFIG.baseUrl, apiVersion: D2_APP_CONFIG.apiVersion, serverVersion: D2_APP_CONFIG.serverVersion };
+ReactDOMClient.createRoot(document.getElementById('root')).render(<Provider config={CONFIG}><App /><Alerts /></Provider>);
+\`\`\`
+- Never render a HeaderBar — the DHIS2 Global Shell draws the header around every app. External links: target="_blank" rel="noopener noreferrer".
+
+### DHIS2 app conventions (the DHIS2 app-development skill, adapted to this runtime)
+- React 18 only: no Suspense for data fetching, no React 19 APIs (use, useFormStatus, useActionState, useOptimistic). Handle loading explicitly.
+- @dhis2/ui for every UI element — check it before building anything custom: DataTable*, Pagination, Transfer, OrganisationUnitTree, SingleSelectField / MultiSelectField, InputField, TextAreaField, Checkbox, Switch, Radio, Tag, Chip, Tooltip, Popover, Menu / MenuItem / FlyoutMenu, TabBar / Tab, Button / ButtonStrip / SplitButton / DropdownButton, Modal (ModalTitle / ModalContent / ModalActions), Card, NoticeBox, CircularLoader, Divider, Layer + Popper. Never hand-made look-alikes of these.
+- Show displayName (not name) for every DHIS2 object — it is translated. ALWAYS pass fields with exactly the properties you render.
+- The API contract comes from the server, not from memory: before writing a query, run the exact resource + params once with dhis2_query (GET) and read the real response shape (keys, pager, value types). The server the app installs on is the version that matters.
+- Lists: server-side paging (params page + pageSize → response pager { page, pageCount, total, pageSize }), server-side search (filter displayName:ilike:<text>, added only when there is text: ...(q ? { filter: \`displayName:ilike:\${q}\` } : {})) and server-side order (order: 'displayName:asc'). Never download a whole collection to filter or page it in the browser.
+- Tables: <DataTable layout="fixed">; Pagination (1-indexed) inside DataTableFoot > DataTableRow > DataTableCell colSpan={columns} — its pageSize must be one of 5, 10, 20, 30, 40, 50, 75, 100 (its page-size menu; 25 logs a console error on every render), and pass hidePageSizeSelect when there is no onPageSizeChange; an empty result is ONE row with one colSpan cell saying so; row actions → a small Button opening a FlyoutMenu (Layer + Popper) of MenuItems.
+- Writes: const engine = useDataEngine(); await engine.mutate({ resource, id, type: 'create' | 'update' | 'delete', data }). Keep a pending flag (Button loading / disabled while it runs), refetch the affected query afterwards, and report the outcome with useAlert:
+  const { show } = useAlert(({ msg }) => msg, ({ ok }) => (ok ? { success: true } : { critical: true })); … show({ msg: 'Note saved', ok: true }).
+- ALWAYS confirm before deleting: <Modal small> with ModalTitle, ModalContent naming the item, ModalActions > <ButtonStrip end> "Cancel" + <Button destructive>Delete</Button>.
+- Forms: @dhis2/ui inputs call onChange({ value }) — not an event; SingleSelectField uses selected + onChange({ selected }), and its choices are <SingleSelectOption value label /> CHILDREN — there is no items / options prop (it is ignored: an empty dropdown); option values are non-empty strings ('ALL' for an "All" choice, not ''). Validate before saving and show it on the field (error + validationText). Group buttons in ButtonStrip; a short form can live in a Modal.
+- Layout: a section ("widget") = white box, border 1px solid #d5dde5, radius 3px, header 16px / weight 500 / colour #404b5a with 16px padding, content padding 16px. Dashboard-style app pages: two columns flex 3 (main) : 1 (summaries), gap 16px — one column below ~800px.
+- Styling: DHIS2 design tokens — var(--colors-grey900), var(--spacers-dp16), var(--elevations-e100) — not hand-picked colours or spacing.
+- Version differences: gate version-specific params in ONE feature map on the server version: const FEATURES = { multiText: 41 }; const supports = (f) => !!D2_APP_CONFIG.serverVersion && D2_APP_CONFIG.serverVersion.minor >= FEATURES[f]; (inside Provider, useConfig().serverVersion is the same).
+- Several views: hash routes (location.hash = '#/details/' + id, re-render on 'hashchange') — changing the hash fires popstate, which keeps the Global Shell URL in sync. There is no router in the kit.
+- Strings: no i18n library — keep user-facing strings in one TEXT object per locale when the app must be multilingual (see Arabic below).
+- Metadata rarely changes: fetch it once (a module-level query) and reuse it; data and analytics refetch when filters change.
+
+### Reading data
+- Define every query ONCE at module level — the runtime keeps the FIRST query object it sees (an inline object that changes with props silently keeps returning the old data) — and pass changing values as variables:
+\`const PROGRAMS = { list: { resource: 'programs', params: { fields: 'id,displayName', paging: false } } };\` → useDataQuery(PROGRAMS) → data.list.programs
+\`const KPIS = { a: { resource: 'analytics', params: ({ ou, pe }) => ({ dimension: ['dx:ID1;ID2'], filter: [\`ou:\${ou}\`, \`pe:\${pe}\`] }) } };\` → useDataQuery(KPIS, { variables: { ou, pe } })
+- Resources are RELATIVE ('analytics', 'programs', 'dataStore/…') — never absolute URLs.
+- A Modal is open whenever it is rendered: render it only when needed ({target && <Modal onClose={…}>…</Modal>}) or pass hide={!open}. An always-rendered Modal's backdrop blocks every click in the app (the tool refuses it).
+- Mutation shapes the runtime REFUSES ("Invalid query", nothing is sent): type 'delete' WITH data, type 'create' WITH id, json-patch without an array. Deleting the last item of a list kept in one key: update the key with [] (or a separate { resource, type: 'delete' } with no data) — never one object whose type switches to 'delete' while it still carries data.
+- Saved data lives in the app's own namespace (D2_APP_CONFIG.namespace, needs_write_access:true) — settings and app data only, NEVER patient data (refused: see "Plugins that work together"). ONE key that may not exist yet: read \`{ s: { resource: \`dataStore/\${D2_APP_CONFIG.namespace}\`, params: { fields: '.', filter: '_:eq:notes' } } }\` → data.s.entries[0]?.value (HTTP 200 with entries [] when nothing is saved). All keys: params { fields: '.', pageSize: 200 } → entries [{ key, value }]. NEVER GET dataStore/<ns>/<key> (query or engine.fetch) — it is a 404 until the first save, a failed request on every first visit; the tool refuses it. Save with engine.mutate({ resource: \`dataStore/\${ns}/<key>\`, type: saved ? 'update' : 'create', data }) — 'create' on an existing key is a 409, 'update' on a missing one a 404, so track which applies.
+- Analytics: resource 'analytics', params { dimension: ['dx:ID1;ID2', 'pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'] } → { headers:[{ name }], rows, metaData:{ items:{ <id>:{ name } } } }. Find columns by header name; values are STRINGS → Number(v). A dx with no data has NO row — show "No data" for it, never 0. PROGRAM INDICATORS go here too (dx:PI1;PI2) — never through analytics/events|enrollments/aggregate, which refuse them (409 E7224; the preview refuses such code).
+- Event counts: resource \`analytics/events/aggregate/\${programId}\`, params { dimension: ['pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'], outputType: 'EVENT' } — a count with no events is the row ['0'], not an empty result.
+- Variables are read once per mount: render the data part in a child component with key={ou + '|' + pe} so a filter change remounts it and refetches (or call refetch(newVariables)).
+- States: loading → a centred <CircularLoader small />; error → <NoticeBox error title="Could not load …">{error.message}</NoticeBox>; empty → <NoticeBox title="No data">…</NoticeBox> or a muted message. Never a blank screen.
+
+### Data that no Web API endpoint has → a SQL view (manage_sql_views)
+- Some data has no endpoint at all — e.g. tracker ownership TRANSFER history (who moved which record from which org unit to which, when). Never probe guessed endpoints (tracker/ownership/transfer is write-only, audits/* and schemas/* do not have it) and never build on a proxy signal: create a QUERY SQL view with manage_sql_views (describe the tables → create with test_variables → it runs once and reports columns + row_count), then read it in the plugin. Its manual has the verified transfer-history SQL.
+- Read it with variables and server-side paging — never paging:false, never filter rows in the browser:
+\`\`\`
+const ROWS = { rows: { resource: 'sqlViews/<VIEW UID>/data', params: ({ startDate, endDate, orgUnit, page }) => ({
+  var: [\`startDate:\${startDate}\`, \`endDate:\${endDate}\`, \`orgUnit:\${orgUnit}\`], page, pageSize: 50 }) } };
+// data.rows.listGrid.headers[i].name → column index; data.rows.listGrid.rows → arrays of STRINGS; data.rows.pager → { page, pageCount, total }
+\`\`\`
+- Send EVERY variable on every request (missing one → HTTP 409 E4307). Dates as YYYY-MM-DD. Org unit: the dashboard's filter first (dashboardItemFilters.ou[0].id), else the user's pick, else 'ALL' — a "path like" filter in the SQL includes everything below the chosen unit. A user org-unit picker: OrganisationUnitTree with roots from { me: { resource: 'me', params: { fields: 'organisationUnits[id]' } } }.
+- Errors to show as a NoticeBox, not a crash: 409 with details.errorCode E4312 = "You do not have access to this data — ask an administrator to share the SQL view with you (data read)"; 404 = the view is missing or not shared. Every viewer needs data read on the view: tell the user who can read it (data_access in the manage_sql_views result).
+- The tool checks this at preview: the view exists, someone can read its rows, and every variable the view uses is sent.
+
+### Dashboard plugins (plugin.jsx, plugin_type "DASHBOARD")
+\`\`\`
+const { useRef, useEffect } = React;
+const { Provider } = D2Runtime;
+
+function Plugin({ dashboardItemFilters = {}, dashboardMode, dashboardItemId, setPluginHeight }) {
+  const ou = (dashboardItemFilters.ou || []).map((o) => o.id).join(';') || 'USER_ORGUNIT';
+  const pe = (dashboardItemFilters.pe || []).map((p) => p.id).join(';') || 'LAST_12_MONTHS';
+  const ref = useRef(null);
+  useEffect(() => {                       // only hosts that support resizing pass a function
+    if (typeof setPluginHeight !== 'function' || !ref.current) return;
+    const ro = new ResizeObserver(() => setPluginHeight(Math.ceil(ref.current.scrollHeight)));
+    ro.observe(ref.current);
+    return () => ro.disconnect();
+  }, [setPluginHeight]);
+  return (
+    <div ref={ref} style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: 12, boxSizing: 'border-box' }}>
+      <Content key={ou + '|' + pe} ou={ou} pe={pe} />
+    </div>
+  );
+}
+
+const CONFIG = { baseUrl: D2_APP_CONFIG.baseUrl, apiVersion: D2_APP_CONFIG.apiVersion, serverVersion: D2_APP_CONFIG.serverVersion };
+const root = ReactDOMClient.createRoot(document.getElementById('root'));
+// plugin + parentAlertsAdd: useAlert() messages appear in the dashboard, not inside the small item
+const render = (props) => root.render(
+  <Provider config={CONFIG} plugin parentAlertsAdd={props.alertsAdd}><Plugin {...props} /></Provider>);
+if (window.parent === window) render({});            // opened outside a dashboard
+else postRobot.send(window.parent, 'getPropsFromParent').then(({ data }) => render(data)).catch(() => render({}));
+postRobot.on('updated', ({ data }) => { render(data); });   // filter / mode changes — re-render, never reload
+\`\`\`
+- Props (Dashboard app 101.x): dashboardItemId, dashboardItemFilters, dashboardMode ('view' | 'edit' | 'print-layout'), setDashboardItemDetails, setInErrorState, alertsAdd, setPluginHeight, setPluginWidth.
+- Filters: dashboardItemFilters.ou = [{ id, name, path }], .pe = [{ id, name }]; other keys are dynamic dimensions. Join the ids with ";"; default ou 'USER_ORGUNIT', and a sensible default period. Say in the plugin which org unit / period it shows.
+- SIZE: the Dashboard app gives an item a FIXED size and passes setPluginHeight = null. The page fills the item (#root is 100% high): lay out with height '100%' + flex column; charts flex: 1; tiles gridTemplateColumns 'repeat(auto-fit, minmax(140px, 1fr))'. It must work from ~300 px wide (small items, phones) to full width with no horizontal scroll and nothing cut off.
+- Edit mode (dashboardMode === 'edit'): show a settings view. Per-item settings live in the app namespace under dashboardItemId (each copy of the plugin has its own id, so settings stay independent):
+  read: \`const SETTINGS = { s: { resource: \`dataStore/\${D2_APP_CONFIG.namespace}\`, params: ({ id }) => ({ fields: '.', filter: \`_:eq:\${id}\` }) } };\` → useDataQuery(SETTINGS, { variables: { id: dashboardItemId } }) → data.s.entries[0]?.value (HTTP 200 with entries [] when nothing is saved). NEVER GET dataStore/<ns>/<key> directly: that is a 404 (console error) on first use.
+  write: await engine.mutate({ resource: \`dataStore/\${D2_APP_CONFIG.namespace}/\${dashboardItemId}\`, type: saved ? 'update' : 'create', data: settings }) — 'create' on an existing key is a 409 and 'update' on a missing one a 404, so track which applies. Then refetch and show({ msg: 'Settings saved', ok: true }). Needs needs_write_access:true.
+
+### Capture enrollment plugins (plugin.jsx, plugin_type "CAPTURE")
+Verified on Capture 106 against the enrollment plugins already in use: same handshake as above (getPropsFromParent, then 'updated'); the props are { teiId, programId, enrollmentId, orgUnitId } plus setPluginHeight. Read exactly those — never guess other names or parse the page URL.
+Tracker LISTS (verified 2.42): tracker/events | enrollments | trackedEntities return a pager with NO pageCount / total unless you send totalPages: true (without it there is only pager.nextPage while more pages exist). Page with params { page, pageSize: 100, totalPages: true } and loop to pager.pageCount — reading pageCount without totalPages stops after the first page and silently drops records (live 2026-10-28: an "overdue patients" app lost the two most overdue). orgUnit, trackedEntity, enrollment, program and programStage are plain UID STRINGS there — nested fields such as orgUnit[id,displayName] are ignored; get org unit names with { resource: 'organisationUnits', params: { filter: \`id:in:[\${ids.join(',')}]\`, fields: 'id,displayName', paging: false } }.
+Tracker DATES (verified 2.42): event / enrollment timestamps — occurredAt, enrolledAt, scheduledAt, completedAt, createdAt, updatedAt — come back as "2026-01-23T00:00:00.000" (date AND time, no zone), while a DATE data value is "2026-01-23". Take the day with String(x).slice(0, 10) before any date math or display; never append 'T00:00:00' to a timestamp (that is "…000T00:00:00" = Invalid Date, so a "days since" shows "—" and the table prints the raw timestamp).
+\`\`\`
+const EVENTS = { ev: { resource: 'tracker/events', params: ({ enrollment, stage }) => ({
+  enrollments: enrollment, programStage: stage, order: 'occurredAt:desc', pageSize: 100,
+  fields: 'event,occurredAt,status,dataValues[dataElement,value]' }) } };
+function Plugin({ enrollmentId, setPluginHeight }) {
+  useEffect(() => {                       // Capture sizes the frame to the height you report
+    const root = document.getElementById('root');
+    if (typeof setPluginHeight !== 'function') return;
+    const ro = new ResizeObserver(() => setPluginHeight(Math.ceil(root.getBoundingClientRect().height)));
+    ro.observe(root);
+    return () => ro.disconnect();
+  }, [setPluginHeight]);
+  return <div style={{ padding: 8 }}>{enrollmentId ? <Orders enrollment={enrollmentId} /> : <NoticeBox title="Open an enrollment">…</NoticeBox>}</div>;
+}
+// Orders: useDataQuery(EVENTS, { variables: { enrollment, stage: '<stage UID>' } }) → data.ev.events
+\`\`\`
+- Height: report the height of #root as above (Capture plugin pages make #root display: flow-root, so every margin is inside it). Never report a wrapper's offsetHeight (its own margins are left out and Capture cuts them off) and never give the content height '100%' (it then reports the frame's own height and never shrinks).
+- Look: Capture draws its own widgets as cards — background white, border '1px solid var(--colors-grey400)', borderRadius 3, a header row (minHeight 44, padding '8px 8px 8px 12px', fontSize 15, fontWeight 500, color var(--colors-grey800)) and content padding '0 12px 12px'. Draw the same card so the plugin looks like part of Capture (the frame itself has no border).
+- Layout: the enrollment-dashboard column is only ~350–450 px wide. Show a LIST (name on one line, the details as a smaller line under it), not a multi-column table — long names overflow table cells. Let text wrap (overflowWrap: 'anywhere'). Leave out events that have no values (e.g. SCHEDULE events): one short line like "2 scheduled orders with nothing recorded yet" instead of an empty block each.
+- Data written elsewhere (another plugin, the event form): Capture shows the dashboard before an event save reaches the server — refetch as described under "Plugins that work together" (Freshness).
+- Data: the plugin reads the enrollment in the USER's browser with their own access. You never read patient rows to build or test it (the privacy gate refuses them on a cloud model): take the stage, data element and option-set UIDs from get_program_info, map option codes to names with optionSets/<id>?fields=options[code,displayName], and handle "no events yet".
+- Placement: after install, put it on the page with place(target "enrollment_dashboard", program_id, column "right" | "left", position "top" | "bottom") — or "enrollment_event_new" / "enrollment_event_edit" for the add-event / edit-event pages, which also pass programStageId and eventId. The tool writes Capture's own layout for that program (starting from Capture's default when the program has none) and backs it up. Tell the user to reload the Capture tab once. Never write dataStore/capture with dhis2_query — that is blocked; place is the only way.
+
+### Capture form-field plugins (plugin.jsx, plugin_type "CAPTURE", placed with target "form")
+A form-field plugin sits INSIDE a data entry form (a tracker stage's event form, or a program's registration form) and reads / writes only the fields mapped to it. Props, verified in Capture 106: { values, setFieldValue, setContextFieldValue, fieldsMetadata, errors, warnings, formSubmitted, viewMode, orgUnitId, setPluginHeight, alertsAdd } — NO programId, stage, enrollmentId, eventId or teiId. values, fieldsMetadata, errors and warnings are keyed by the ALIASES you choose (plugin_field in field_map); setFieldValue({ fieldId: '<alias>', value }) only accepts mapped aliases.
+- fieldsMetadata[alias] = { formName, name, shortName, description, type (the value type), compulsory, disabled, optionSet?: { options: [{ code, text }] } } — there is NO id and no displayName: label with formName || name, show an option's text for its code. When the code needs a field's UID, use the UID itself as the alias (plugin_field = field_id).
+- values holds only NON-EMPTY fields (an empty field is absent, not ''), plus context entries such as complete.
+- setFieldValue never fails loudly: a write to an alias Capture did not give the plugin is ignored with a console-only error. Before writing, check fieldsMetadata[alias] exists and otherwise SHOW a message ("The storage field is not in this form — reload Capture or re-place the plugin"). A control that silently does nothing is the worst outcome.
+\`\`\`
+// Aliases used here: weight, height (read) and bmi (written) — place with
+// field_map [{ plugin_field: 'weight', field_id: '<DE>' }, { plugin_field: 'height', field_id: '<DE>' }, { plugin_field: 'bmi', field_id: '<DE>' }]
+function Plugin({ values = {}, fieldsMetadata = {}, setFieldValue, viewMode, setPluginHeight }) {
+  const w = parseFloat(values.weight);
+  const h = parseFloat(values.height);
+  const bmi = w > 0 && h > 0 ? (w / ((h / 100) ** 2)).toFixed(1) : '';
+  const canWrite = !!fieldsMetadata.bmi && typeof setFieldValue === 'function';
+  useEffect(() => {                       // write only when it changed, never in view mode
+    if (viewMode || !canWrite) return;
+    if (String(values.bmi ?? '') !== bmi) setFieldValue({ fieldId: 'bmi', value: bmi });
+  }, [bmi, viewMode, canWrite]);
+  useEffect(() => {                       // same height reporting as the enrollment widget
+    const root = document.getElementById('root');
+    if (typeof setPluginHeight !== 'function') return;
+    const ro = new ResizeObserver(() => setPluginHeight(Math.ceil(root.getBoundingClientRect().height)));
+    ro.observe(root);
+    return () => ro.disconnect();
+  }, [setPluginHeight]);
+  if (!canWrite && !viewMode) return <div style={{ color: 'var(--colors-red700)' }}>The BMI field is not available in this form.</div>;
+  return <div style={{ padding: '4px 0' }}>{bmi ? 'BMI ' + bmi + ' kg/m²' : 'Enter weight and height to calculate BMI'}</div>;
+}
+\`\`\`
+- Value formats for setFieldValue: numbers, text and option codes are STRINGS ("42", "code1"); DATE "YYYY-MM-DD"; BOOLEAN 'true' | 'false'; TRUE_ONLY 'true'; AGE { date }; COORDINATE { latitude, longitude }; ORGANISATION_UNIT { id }. Clear a value with ''. values arrive in the same formats.
+- setContextFieldValue({ fieldId: 'occurredAt' | 'enrolledAt' | 'geometry', value }) sets the event / enrollment date or geometry.
+- setFieldValue only changes the form: the value reaches the server when the user SAVES the event, like any typed value. It is not a server write — needs_write_access is about engine.mutate / dataStore / API writes only and has nothing to do with it.
+- Keep it compact (it sits between form fields), report its height like the enrollment widget, and do nothing that writes in viewMode (an event opened from the enrollment dashboard starts in view mode until the user clicks "Edit event").
+- field_map: map EXACTLY the aliases the code uses — the tool refuses a placement whose code writes an unmapped alias. field_id must be a data element of that stage (event form) or an attribute of the program (registration form); take them from get_program_info. replace_field:true takes the field out of its normal place: the plugin owns it (draws its own control, or keeps it as hidden state) and its value is still saved with the event. The default false keeps the normal input visible — right for calculated fields the plugin fills.
+- A field that holds plugin STATE (JSON, flags, a checklist) → its own data element (LONG_TEXT) mapped with replace_field:true. Never hide it with a HIDEFIELD program rule: Capture BLANKS the value of every hidden field, so the state would be wiped on every edit.
+- Which record / stage the form is for: the placement opens the plugin as plugin.html?programId=…&programStageId=… (new URLSearchParams(window.location.search)). The record itself is not a prop. Prefer a design that does not need it (state in the event's own field, above). When it truly must know it, read Capture's address — the plugin frame is same-origin, so window.parent.location.hash is readable (verified):
+  add event: "#/enrollmentEventNew?enrollmentId=…&programId=…&stageId=…&teiId=…&orgUnitId=…" (no event id yet)
+  edit event: "#/enrollmentEventEdit?eventId=…&orgUnitId=…" (only the event — get its enrollment with tracker/events/<eventId>?fields=enrollment,trackedEntity,programStage)
+  registration: "#/new?programId=…&orgUnitId=…" (no record yet)
+  Parse it with new URLSearchParams(hash.slice(hash.indexOf('?') + 1)) — the param names are enrollmentId / eventId / teiId / stageId, never "enrollment=". It is Capture's internal URL, not the plugin contract: handle "not found" with a visible message, and re-read it when the props update.
+- place target "form" with program_stage_id (event form) or program_id (registration form); section = an existing section to put it in, else it gets its own section; position top | bottom.
+
+### Plugins that work together (shared state)
+When two or more plugins / apps cooperate ("flag in the form → list on the enrollment", "checklist here → summary there"), DESIGN THE CONTRACT BEFORE ANY CODE and say it to the user in 3–5 lines:
+1. What each plugin reads and writes, and WHERE that shared state lives.
+2. How each plugin knows which record it is on — from its verified props (enrollment widget: enrollmentId / teiId / programId; event-page widget: + eventId / programStageId; form-field plugin: none — see above), never from an assumed prop.
+3. When each plugin sees the other's change (save, reload, refetch).
+Where the state lives:
+- About a patient record (flags, review status, notes, scores) → TRACKER DATA: a data element on the event (written with setFieldValue, saved with the event), an attribute, or a note. It then has the program's access control (org units, sharing, ownership), the audit trail, analytics and offline support, and the enrollment widget finds it by reading the enrollment's events (tracker/events?enrollments=<enrollmentId>&fields=event,programStage,occurredAt,updatedAt,dataValues[dataElement,value]). This is the default.
+- Not about one record (settings, layouts, lookup lists, per-dashboard-item config) → the dataStore, in a namespace an app RESERVES (D2_APP_CONFIG.namespace — the app key). Plugins sharing it: one app owns the namespace (its key, from the default datastore_namespace) and the others read that namespace by that key. A namespace no app reserves is shared public read-write (verified).
+- PATIENT DATA NEVER GOES INTO THE DATASTORE — not values, not flags, not record ids (enrollment / event / tracked-entity ids), not a "current record" pointer. The tool REFUSES code that writes the dataStore / userDataStore from anything that can see patient data (every Capture plugin — its props are a patient's record —, and any file reading tracker/*, events, enrollments, relationships, analytics events/enrollments query or SQL views), and dhis2_query refuses such writes too. If the user asks for the dataStore for record data, say in one line why not (no org-unit access, sharing, ownership or audit; readable by other users) and build the tracker-data design. Settings a Capture plugin needs: written by app.jsx of an app_and_plugin (which never reads patient data), only READ by the plugin.
+- Never a shared "current record" pointer that one plugin writes for another (two users or two tabs overwrite it and data lands on the wrong patient) and never one key holding many records.
+- New data elements for the state: create them, add them to the stage(s), then place. The tool raises the program version after any stage / rule change (capture_refresh in the result) so every Capture reloads the program — without that a Capture that already opened the program never sees the new field, even after a reload, and the plugin's alias for it is silently dropped.
+- Freshness: Capture saves an event in the background and shows the enrollment dashboard BEFORE the save reaches the server (verified: the widget's first read ran while the save was still pending). A widget that reads saved data must refetch: a few times after mount (setTimeout at 2, 5, 10 and 20 s — a save can take seconds to land), on window focus / visibilitychange, and with a small Refresh button — and say "Showing saved data" so an unsaved change is not mistaken for a bug.
+
+### When a plugin "does nothing" / "is not saved" (diagnose before changing code)
+- Never state a cause you have not verified, and never claim a mechanism is impossible without evidence (e.g. "an iframe cannot read the parent URL" is false here). Say what you checked, what you could not check, and the next check.
+- Check, in this order, with real reads: (1) placements(key) — is the plugin in that form / page, with the field map you expect; (2) get_program_info / the stage — is every mapped field a data element of that stage; (3) capture_refresh in earlier results, or place again — Capture's copy of the program may predate a new field; (4) get_source — does the code check fieldsMetadata, show errors, skip writes in viewMode; (5) the user's exact steps: Edit event clicked? event saved? Capture reloaded after an update?
+- Ask the user for what only they can see: the plugin's own status line, a screenshot, the browser console line that starts with "setFieldValue:".
+- Fix the cause you verified — one change at a time — and state what it changes.
+- "Placed and configured" is not "working": after build or fix, say exactly what you verified (installed, placed, field map, version) and give the user a 3–5 step test with the expected result at each step. You never see the plugin run, so never present data values as what it "shows" or as "verified data" — a number you queried yourself is not proof the plugin's own query works (live 2026-10-28: a "verified" league table whose plugin query was refused by DHIS2 and showed nothing). Only quote values if the user asked, and then from ONE query that covers exactly what the plugin shows (all its org units). In test steps, name only org units whose place you saw in a result this turn (their path / parent): a facility is under the root in its path — on a multi-root instance never guess which root holds it.
+
+### Charts (echarts)
+\`\`\`
+function Chart({ option }) {
+  const el = useRef(null);
+  useEffect(() => {
+    const chart = echarts.init(el.current);
+    const ro = new ResizeObserver(() => chart.resize());
+    ro.observe(el.current);
+    return () => { ro.disconnect(); chart.dispose(); };
+  }, []);
+  useEffect(() => { const c = echarts.getInstanceByDom(el.current); if (c) c.setOption(option, true); }, [option]);
+  return <div ref={el} style={{ flex: 1, minHeight: 160, width: '100%' }} />;
+}
+\`\`\`
+Give the option grid { left: 8, right: 16, top: 24, bottom: 8, containLabel: true }, axis labels that fit (short labels, hideOverlap on narrow widths), the DHIS2 blue #147cd7 for a single series, and tooltip: { trigger: 'axis' }.
+
+### Arabic / right-to-left
+- Root element dir="rtl" lang="ar" when the labels are Arabic or the user's UI locale is right-to-left: useDataQuery({ me: { resource: 'me', params: { fields: 'settings' } } }) → me.settings.keyUiLocale ('ar', 'fa', 'ur', 'he', 'ps', 'ckb' are RTL). Use logical CSS (paddingInlineStart, marginInlineEnd, textAlign: 'start') so the layout mirrors. Arabic text renders with the system Arabic font.
+
+### Look & feel
+- KPI / single-value tiles: like DHIS2's single-value items — label (13px, grey700) above a large CENTRED number (fontSize 'clamp(24px, 10vmin, 44px)', weight 500, tabular-nums), the tile filling its grid cell; a missing value shows "No data" in grey, never 0.
+- App pages: padding clamp(12px, 4vw, 24px), a clear title (22px / 500) and a one-line description; plugins: padding 8–12px, no page title (the dashboard shows the item name). No fixed pixel widths that break a 360 px phone (use % / flex / grid, hide secondary table columns when narrow), no debug output, numbers formatted with toLocaleString().
+
+### What the tool refuses or warns about
+- Refused: eval / new Function / string timers, document.cookie, localStorage / sessionStorage / indexedDB (browser storage is shared by every DHIS2 app — use the app's dataStore namespace), <script> injection, dangerouslySetInnerHTML / innerHTML, import / require / export, requests to other servers, WebSocket / EventSource / sendBeacon; with needs_write_access:false (default) any mutation or non-GET request; UID-shaped strings that do not exist on the server; undeclared components/hooks, names the kit does not export, inline query objects, a HeaderBar.
+- Warned (fix them): a metadata query without fields, fields using name instead of displayName, a delete without a confirmation Modal, a hard-coded server address.
+
+### Workflow
+1. Discover the real metadata first (search_metadata, get_program_info) and run the exact queries the app will make with dhis2_query to see the response shape and confirm the numbers exist — never invent UIDs or response fields. Several plugins that work together: write their contract first (see "Plugins that work together") and build every piece from it. Data no endpoint has (transfer history …) → manage_sql_views first; patient-level reads are refused to you, so confirm such a source with the tool's columns + row_count, not with rows.
+2. preview. If it returns compile_errors / violations / problems / unknown_uids, fix exactly those and preview again; also fix every warning.
+3. Tell the user in 3–5 lines: what it shows, which data it reads, whether it writes anything, where it will appear. Ask for approval.
+4. After approval: create with the preview_token. Installing in the same turn as the preview is refused unless the user's own message asked to install ("create and install …") — so end the turn with the summary and the question. Report global_shell_url (apps) or the where_to_find steps.
+5. Placing a plugin: if the user asked for it to appear somewhere ("on this dashboard", "install it on a dashboard", "in the enrollment dashboard", "in this form"), place it right after create in the same approved turn; otherwise ASK where they want it and place it after they answer — the tool refuses a placement nobody asked for, and never create a dashboard nobody asked for. Use the page context for program / stage / dashboard ids when the user says "here". "On a dashboard" without a name: the dashboard open in the page context if any, else a new dashboard named after the plugin (dashboard_name) — say which. If place is refused, do not call it again in that turn: ask, and end the turn. Report the where_to_find text (Capture needs one reload) and any capture_refresh / capture_cache note, then the test steps (what to click, what should happen).
+6. Later changes: get_source → update with only the changed files (placements keep working — same key); "undo" → rollback; remove it from a page → unplace.`;
+
+// ── SQL views (manage_sql_views) ──
+// Table and column facts verified live 2026-10-23 on 2.42.5.1 (localhost) and
+// 2.43.2 (play.im.dhis2.org) through information_schema; the transfer recipe
+// is the one in the user's dhis2-plugin-skill (sql-view-data-source.md), run on
+// 2.42.5.1 against 14 real transfers.
+const KB_SQL_VIEWS_DETAILS = `### When a SQL view is the answer
+- The data has NO Web API endpoint. Known case: tracker ownership TRANSFER history. In DHIS2, "transfer" (tracker) = Capture → enrollment dashboard → Enrollment widget → Transfer, which calls PUT tracker/ownership/transfer?trackedEntity=…&program=…&ou=… (write-only: a GET is 405, tracker/ownership is 404). Each transfer writes one programownershiphistory row for the PREVIOUS owner and moves trackedentityprogramowner to the new org unit. No endpoint returns that history — a QUERY SQL view does. Do not search for "transfer" programs/stages/data elements first and do not probe endpoints: go straight to describe → create.
+- tracker/*, audits/*, schemas/* cannot show database tables: schemas/<name> covers METADATA types only (singular camelCase, e.g. schemas/dataElement); enrollment, event, trackedEntity are not schemas. Use describe for real columns.
+
+### Rules the server enforces (verified)
+- Saving does NOT check the SQL (a view on a missing table saves with 201). create/update here run the view once and tell you the real result — never say "DHIS2 validated the SQL on save".
+- One read query (SELECT / WITH). These words are refused ANYWHERE in the text, also inside strings and aliases: delete, alter, update, create, drop, commit, createdb, createuser, insert, rename, restore, write, grant, truncate, revoke (E4311). "lastupdated"/"updated_at" are fine.
+- Protected tables (E4310): users, userinfo, trackedentityattributevalue, oauth_access_token, oauth2client — so no person attributes and no user names from userinfo; the createdby columns of the tracker tables already hold the USERNAME.
+- Variables: \${name} inside a string literal ('\${startDate}'), name = letters/digits/_/-. Every reader must send a value for each (var=startDate:2026-01-01,endDate:2026-12-31) or gets E4307; values = letters, digits, spaces, "_" and "-" only (YYYY-MM-DD dates pass; no ":", ".", ","). Cast in SQL: cast('\${startDate}' as date). A sentinel like 'ALL' makes a filter optional: ('\${orgUnit}' = 'ALL' or ou.path like '%' || '\${orgUnit}' || '%').
+- Sharing: readers need DATA read (3rd character "r"). "r-r-----" = every logged-in user reads every row the view returns (variables are not access control); "rw------" means nobody can read rows — not even a superuser (409 E4312). Restrict with user_groups.
+- E7144 "referenced table does not exist … ensure analytics job was run" / E7145 "syntax error" on a SQL view = a wrong table or column name or a SQL error — not analytics; the tool's db_error has the real PostgreSQL message.
+
+### Tracker tables (2.41+; columns verified on 2.42.5.1 and 2.43.2)
+- Renamed in 2.41: trackedentityinstance → trackedentity, programinstance → enrollment, programstageinstance → event; columns trackedentityinstanceid → trackedentityid, programinstanceid → enrollmentid, programstageinstanceid → eventid, executiondate → occurreddate, duedate → scheduleddate. 2.43 splits event into trackerevent (tracker programs, has enrollmentid) and singleevent (event programs).
+- programownershiphistory: programownershiphistoryid, programid, trackedentityid, startdate, enddate, createdby (username), organisationunitid — one row per ENDED ownership: organisationunitid = the org unit transferred FROM, enddate = moment of the transfer.
+- trackedentityprogramowner: trackedentityprogramownerid, trackedentityid, programid, organisationunitid (CURRENT owner), created, lastupdated, createdby (username who made the latest change).
+- trackedentity: trackedentityid, uid, organisationunitid, trackedentitytypeid, deleted, created, lastupdated, inactive …
+- enrollment: enrollmentid, uid, trackedentityid, programid, organisationunitid (enrolling org unit), enrollmentdate, occurreddate, status, deleted …
+- organisationunit: organisationunitid, uid, name, path ("/<root uid>/…/<own uid>" — "path like '%<uid>%'" = that unit and everything below it), hierarchylevel, parentid. program / programstage: programid / programstageid, uid, name.
+- programtempownershipaudit: break-the-glass temporary access (programid, trackedentityid, created, accessedby, reason) — not a transfer.
+- Anything else: describe(search="…") then describe(tables=[…]).
+
+### Transfer history (tested on 2.42.5.1)
+\`\`\`
+with history as (
+  select h.programownershiphistoryid as transfer_id, h.trackedentityid, h.programid,
+         h.organisationunitid as from_ou_id, h.enddate as transferred_at,
+         lead(h.organisationunitid) over w as next_ou_id,
+         lead(h.createdby) over w as next_owner_createdby
+  from programownershiphistory h
+  window w as (partition by h.trackedentityid, h.programid order by h.enddate, h.programownershiphistoryid)
+)
+select to_char(t.transferred_at, 'YYYY-MM-DD HH24:MI') as transferred_at,
+       p.uid as program_id, p.name as program, te.uid as tracked_entity,
+       fo.uid as from_org_unit_id, fo.name as from_org_unit,
+       tu.uid as to_org_unit_id, tu.name as to_org_unit,
+       coalesce(t.next_owner_createdby, cur.createdby) as transferred_by
+from history t
+join program p on p.programid = t.programid
+join trackedentity te on te.trackedentityid = t.trackedentityid and te.deleted = false
+join organisationunit fo on fo.organisationunitid = t.from_ou_id
+left join trackedentityprogramowner cur on cur.trackedentityid = t.trackedentityid and cur.programid = t.programid
+left join organisationunit tu on tu.organisationunitid = coalesce(t.next_ou_id, cur.organisationunitid)
+where t.transferred_at >= cast('\${startDate}' as date)
+  and t.transferred_at < cast('\${endDate}' as date) + interval '1 day'
+  and ('\${orgUnit}' = 'ALL' or fo.path like '%' || '\${orgUnit}' || '%' or tu.path like '%' || '\${orgUnit}' || '%')
+order by t.transferred_at desc
+\`\`\`
+The destination and the acting user of a transfer come from the NEXT history row of the same tracked entity + program, or from the current owner row for the latest transfer. create it with test_variables {"startDate":"2000-01-01","endDate":"2099-12-31","orgUnit":"ALL"}; the result's row_count is the number of transfers recorded — 0 is a real answer ("no transfers yet on this server"), not a failure.
+
+### What you can see
+- On a cloud model a view that reads tracker tables returns only its column names and row count to you (create/update/run) — never its rows. A view that reads ONLY metadata tables (program, dataelement, organisationunit, optionset, information_schema, …) returns rows, also through dhis2_query GET sqlViews/<id>/data. The user sees every row in the plugin; you do not need to.
+- Before installing a plugin on a new view, tell the user who can read its rows (data_access in the result).`;
+
 
 const MANUAL_EXTRAS = {
   create_metadata: [KB_CREATE_PROGRAM_DETAILS, KB_VALUE_TYPE_MAPPING, KB_PROGRAM_RULE_SYNTAX, KB_PI_GRAMMAR].join('\n\n'),
@@ -2914,6 +3615,11 @@ const MANUAL_EXTRAS = {
   manage_line_lists: KB_LINE_LISTS_DETAILS,
   manage_custom_translations: KB_TRANSLATIONS_DETAILS,
   manage_growth_chart_plugin: KB_GROWTH_CHART_DETAILS,
+  manage_users: KB_USERS_DETAILS,
+  manage_data_values: KB_DATA_VALUES_DETAILS,
+  manage_metadata_translations: KB_METADATA_TRANSLATIONS_DETAILS,
+  manage_custom_app: KB_CUSTOM_APPS_DETAILS,
+  manage_sql_views: KB_SQL_VIEWS_DETAILS,
   // manage_maps: full description already covers usage; no extra KB.
 };
 
@@ -2998,6 +3704,29 @@ function slimSchemaProp(def) {
 // provider. Non-MANUAL_TOOLS pass through untouched; MANUAL_TOOLS get the slim
 // routing description + slimmed schema (with the `action` enum description
 // kept in full — it is routing information the model needs at decide time).
+// architect_metadata(browse_dhis2_docs) searches through Tavily. Without a
+// saved key every call failed ("No Tavily API key configured" — a user's
+// session, 2026-10-22), so the action and its parameter are not offered at all
+// until a key is saved.
+function stripUnavailableToolActions(tools) {
+  if (_hasTavilyKey) return tools;
+  return tools.map((t) => {
+    if (t?.function?.name !== 'architect_metadata') return t;
+    const f = t.function;
+    const props = { ...f.parameters.properties };
+    props.action = { ...props.action, enum: props.action.enum.filter((a) => a !== 'browse_dhis2_docs') };
+    delete props.docs_query;
+    return {
+      ...t,
+      function: {
+        ...f,
+        description: f.description.replace('; use browse_dhis2_docs when unsure', '').replace(/\n- browse_dhis2_docs:[^\n]*/, ''),
+        parameters: { ...f.parameters, properties: props },
+      },
+    };
+  });
+}
+
 function toWireTools(tools) {
   return tools.map(t => {
     const name = t?.function?.name;
@@ -3082,7 +3811,84 @@ function stubToolContentForHistory(content) {
 // Keeping the tool list small prevents context-window overflow and helps
 // the model make better routing decisions.  Every extra tool is wasted
 // context tokens and an invitation for the LLM to pick the wrong one.
-function getContextualTools(ctx, userText, browseWeb) {
+// Intent detection for the administration tools (src/tools-admin.js), shared by
+// getContextualTools (tool selection) and buildSystemPrompt (routing stubs) so
+// the two can never disagree. `t` must already be lower-cased.
+function detectAdminIntents(t) {
+  // ── User-administration intent (manage_users) ──
+  // Accounts, roles, groups, authorities, passwords. "users" alone is too
+  // common in sharing phrasings ("share with all users"), so it only counts
+  // next to an account-management verb; explicit role/group/authority/password
+  // nouns count on their own. Purely additive — sharing keeps manage_metadata.
+  const wantsUserAdminIntent =
+    /\buser\s*(?:roles?|groups?|accounts?|management|admin(?:istration)?|authorit(?:y|ies))\b/.test(t)
+    || /\b(?:authorit(?:y|ies)|passwords?|usernames?|log[\s-]?in\s+accounts?|user\s+names?)\b/.test(t)
+    || (/\b(?:create|add|new|register|disable|deactivate|enable|reactivate|lock|unlock|delete|remove|reset|invite|onboard|rename|list|show|find|which|who)\b/.test(t)
+        && /\b(?:users?|accounts?|data\s*(?:entry\s*)?clerks?|staff\s+accounts?|logins?)\b/.test(t)
+        && !/\b(?:share|sharing|public\s*access)\b/.test(t));
+  // ── Aggregate data-value intent (manage_data_values) ──
+  // Entering / reading / clearing / completing ONE aggregate form. Surfaced in
+  // the Data Entry apps, on explicit "data value(s)" wording, on entry verbs
+  // coupled with a dataset/form/period phrase, and on completion/validation of
+  // a form.
+  const wantsDataValuesIntent =
+    /\bdata\s*values?\b/.test(t)
+    || /\b(?:datavaluesets?|data\s*value\s*sets?)\b/.test(t)
+    || (/\b(?:enter|record|report|submit|input|key\s*in|fill\s*in|type\s*in|save)\b/.test(t)
+        && /\b(?:data\s*sets?|datasets?|forms?|monthly|weekly|quarterly|aggregate|period|20\d\d(?:0[1-9]|1[0-2])|20\d\dq[1-4]|january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(t)
+        && !/\b(?:enrol(?:l)?(?:ment)?s?|tracked\s*entit|tei|patients?|events?)\b/.test(t))
+    || /\b(?:mark|set)\b.{0,40}\b(?:form|data\s*set|dataset|report)\b.{0,30}\b(?:complete|completed|incomplete|uncomplete)\b/.test(t)
+    || /\bcomplete\s*(?:data\s*set\s*)?registrations?\b/.test(t)
+    || (/\b(?:clear|wipe|delete|remove)\b/.test(t) && /\b(?:values?|form)\b/.test(t) && /\b(?:data\s*sets?|datasets?|period|month|aggregate)\b/.test(t))
+    || (/\bvalidat(?:e|ion)\b/.test(t) && /\b(?:this|the)\s+form\b/.test(t));
+  // ── Metadata-object translation intent (manage_metadata_translations) ──
+  // "translate the TB program / these data elements / the option names into
+  // French". Disjoint from app-UI string translation (manage_custom_translations):
+  // a translation turn that names metadata objects and NO app-UI noun routes
+  // here ONLY.
+  const _translateWord = /\b(?:translat(?:e|ed|es|ing|ions?)|locali[sz](?:e|ation)|in\s+(?:french|arabic|spanish|portuguese|swahili|amharic|russian|chinese|hindi|lao|khmer|burmese|nepali|dari|pashto|farsi|persian|indonesian|vietnamese|tajik))\b/.test(t);
+  const _metadataNoun = /\b(?:programs?|programmes?|stages?|data\s*elements?|options?|option\s*sets?|attributes?|tracked\s*entity|data\s*sets?|datasets?|sections?|indicators?|org(?:anisation)?\s*units?|categor(?:y|ies)|category\s*options?|metadata|form\s*names?|short\s*names?|database\s*locales?|db\s*locales?)\b/.test(t);
+  const _appUiNoun = /\b(?:app|application|ui|interface|button|menu|screen|header|string|wording|capture\s+app|dashboard\s+app)\b/.test(t);
+  const wantsMetadataTranslationIntent =
+    /\b(?:database|db)\s*locales?\b/.test(t)
+    || (_translateWord && _metadataNoun);
+  const metadataTranslationOnly = wantsMetadataTranslationIntent && !_appUiNoun;
+  return { wantsUserAdminIntent, wantsDataValuesIntent, wantsMetadataTranslationIntent, metadataTranslationOnly };
+}
+
+// Intent detection for manage_custom_app (src/tools-apps.js), shared by
+// getContextualTools and buildSystemPrompt. `t` must already be lower-cased.
+// An EXISTING DHIS2 app named as the place of the work ("in the capture app,
+// create a program") is not a request to build an app, and the WHO growth
+// chart / App Hub installs have their own tool.
+const DHIS2_NAMED_APP_RE = /\b(?:capture|tracker\s*capture|maintenance|dashboard|data\s*visuali[sz]er|line[\s-]*listing|maps?|(?:aggregate\s+)?data\s*entry|import[\/\s-]*export|settings|user|reports?|app\s*management|scheduler|messaging|data\s*administration|usage\s*analytics|datastore|translations?|menu\s*management|data\s*quality|approval|sms\s*configuration|cache\s*cleaner|global\s*shell|login|tracker\s*plugin\s*configurator)\s+(?:app|application)s?\b/g;
+function detectCustomAppIntent(t) {
+  if (/\bgrowth\s*chart|\bapp\s*hub\b/.test(t)) return false;
+  if (/\b(?:custom|my|own|new|standalone|small|simple|little)\s+(?:dhis2\s+)?(?:apps?|applications?|plugins?|widgets?)\b/.test(t)
+    || /\b(?:dashboard|capture|enrollment|enrolment|form[-\s]?field|registration[-\s]?form)\s+(?:plugins?|widgets?)\b/.test(t)
+    || /\btracker\s+plugin\s+configurator\b/.test(t)
+    || /\b(?:place|add|put|pin|show)\b.{0,40}\b(?:plugins?|widgets?)\b.{0,40}\b(?:dashboard|capture|enrol?lment|form|stage)\b/.test(t)
+    || /\bplugins?\s+(?:for|on)\s+(?:the\s+|a\s+|my\s+)?dashboards?\b/.test(t)
+    || /\bai-[a-z0-9]+(?:-[a-z0-9]+)*\b/.test(t)
+    || /\bmanage_custom_app\b/.test(t)) return true;
+  const rest = t.replace(DHIS2_NAMED_APP_RE, ' ');
+  return /\b(?:build|make|create|write|develop|code|generate|scaffold|design|install|update|modify|change|edit|fix|improve|delete|remove|uninstall|roll\s*back|rollback|revert|undo|list|show)\b.{0,60}\b(?:apps?|applications?|plugins?|widgets?|mini[-\s]?apps?)\b/.test(rest);
+}
+
+// SQL views (src/tools-sqlviews.js): asked for by name, or the request is for
+// data that only the database has — tracker ownership TRANSFER history
+// ("show the transfers history that happened in all OU", live 2026-10-23).
+function detectSqlViewIntent(t) {
+  return /\bsql\b|\bsql\s*views?\b|\bsqlviews?\b|\bdatabase\s+(?:tables?|columns?|query|queries|views?)\b|\bprogramownershiphistory\b/.test(t)
+    || /\b(?:ownership|owner(?:ship)?\s+changes?)\b/.test(t)
+    || /\btransfer(?:s|red|ring)?\b[^.?!]{0,60}\b(?:history|histories|log|logs|list|report|records?|audit|trail|between|from|across)\b/.test(t)
+    || /\b(?:history|log|list|report|records?)\s+of\s+(?:\w+\s+){0,2}transfers?\b/.test(t);
+}
+
+// userText may be the routing text (current message + the request it
+// continues, see buildRoutingText); currentText is the message itself, which
+// alone decides the read-only save-diagnosis strip.
+function getContextualTools(ctx, userText, browseWeb, currentText = null) {
   const appType = (ctx?.appType || '');
   const combinedText = String(userText || '').toLowerCase();
   const wantsProgramChangeHistory =
@@ -3269,6 +4075,8 @@ function getContextualTools(ctx, userText, browseWeb) {
     || (/\b(register|listing|row[-\s]?level|record[-\s]?level)\b/.test(combinedText)
         && /\b(tracker|program|stage|enrollment|event|patient|case|cohort)\b/.test(combinedText)
         && /\b(create|build|make|design|set\s*up|save|generate|author|update|list)\b/.test(combinedText));
+  const { wantsUserAdminIntent, wantsDataValuesIntent, wantsMetadataTranslationIntent, metadataTranslationOnly } = detectAdminIntents(combinedText);
+  const wantsCustomAppIntent = detectCustomAppIntent(combinedText);
   const wantsAuthoring = wantsCreateIntent || wantsManageIntent;
   // Bounded gap: up to 3 words between keywords so we catch "fix the broken rule" without false-matching on
   // unrelated text that happens to contain both "rule" and "issue" paragraphs apart.
@@ -3300,7 +4108,7 @@ function getContextualTools(ctx, userText, browseWeb) {
   // diagnose, but cannot "fix" until the user gives explicit authorization on
   // a later turn. This blocks the failure mode where the model edited program
   // rules in response to a save error that had nothing to do with rules.
-  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(userText);
+  const saveDiagnosisReadOnly = isSaveDiagnosisReadOnly(currentText ?? userText);
 
   // ── Factual context flags — derived from URL/app state only, no NLU ──
   const hasProgram    = !!ctx?.programId;
@@ -3427,8 +4235,43 @@ function getContextualTools(ctx, userText, browseWeb) {
 
   // ── Custom-translation authoring — app UI string translation / re-labelling ──
   // App-agnostic: surface whenever the user expresses translation/relabel intent.
-  if (wantsTranslationIntent) {
+  if (wantsTranslationIntent && !metadataTranslationOnly) {
     selected.add('manage_custom_translations');
+  }
+
+  // ── Metadata-object translations — names/labels of programs, DEs, options… ──
+  if (wantsMetadataTranslationIntent) {
+    selected.add('manage_metadata_translations');
+    selected.add('get_program_info');
+    selected.add('search_metadata');
+  }
+
+  // ── User administration — accounts, roles, groups, authorities ──
+  if (wantsUserAdminIntent) {
+    selected.add('manage_users');
+    selected.add('search_metadata');
+  }
+
+  // ── Aggregate data values — one dataset × period × org-unit form ──
+  if (wantsDataValuesIntent || isAggDataEntry) {
+    selected.add('manage_data_values');
+    selected.add('manage_datasets');
+    selected.add('search_metadata');
+  }
+
+  // ── Custom apps & dashboard plugins — code the model writes, installed on
+  //    the server. Discovery companions: real UIDs come from search_metadata /
+  //    get_program_info / indicator lists, numbers from dhis2_query analytics. ──
+  if (wantsCustomAppIntent) {
+    selected.add('manage_custom_app');
+    selected.add('search_metadata');
+    selected.add('get_program_info');
+  }
+
+  // ── SQL views — data no Web API endpoint has (transfer history …), and the
+  //    data source a plugin may need, so it travels with custom-app work. ──
+  if (wantsCustomAppIntent || detectSqlViewIntent(combinedText)) {
+    selected.add('manage_sql_views');
   }
 
   // ── Growth-chart plugin setup — install + datastore config for the WHO chart ──
@@ -3576,6 +4419,11 @@ function getContextualTools(ctx, userText, browseWeb) {
     selected.add('manage_backups');
   }
 
+  // ── Learning memory — always available while the feature is switched on
+  //    (lessons are written/searched mid-task; the tool is read/append-only
+  //    and touches nothing on the DHIS2 server). ──
+  if (typeof isMemoryEnabled === 'function' && isMemoryEnabled()) selected.add('manage_memory');
+
   // ── Web browsing ──
   if (browseWeb) selected.add('browse_web');
 
@@ -3609,13 +4457,17 @@ function getContextualTools(ctx, userText, browseWeb) {
 
 // ── System Prompt Builder ────────────────────────────────────────────────────
 
-async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false) {
+async function buildSystemPrompt(userText = '', hasImage = false, browseWeb = false, routingText = null) {
   const ctx = dhis2.pageContext || {};
   const ou = dhis2.ouContext;
   const prog = dhis2.programMetadata;
 
   // Intent detection — used to conditionally include sections
-  const text = (userText || '').toLowerCase();
+  // Section selection reads the routing text (the current message + the task
+  // it continues — see buildRoutingText); the save-failure mode reads only the
+  // current message, exactly like the tool gate does.
+  const text = (routingText || userText || '').toLowerCase();
+  const currentText = (userText || '').toLowerCase();
   const isCreating  = /\b(create|build|design|new program|set up a program|make a program)\b/.test(text)
     || /\badd\b.{0,50}\b(data elements?|fields?|stages?|rules?|option sets?)\b/.test(text)
     || /\b(add|assign)\b.{1,80}\bto\b.{1,50}\bstage\b/.test(text);
@@ -3771,14 +4623,15 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 10.9.1. For "which OUs / districts / regions / facilities have the most data (or events, or values) for these indicators / programs" questions, ALWAYS call manage_program_indicators(action="rank_ou", indicator_ids=[...]) — pass the indicator_ids returned by the prior discover call. Do NOT hand-build analytics/events/query or analytics/events/aggregate URLs for this. The tool handles the OU dimension and LEVEL correctly (default level=2; pass level=3 for districts, 4 for facilities).
 10.9.2. HARD RULE — UIDs are NEVER invented. Any 11-char UID you put into a tool argument MUST come from either (a) the "Current Context" section below, or (b) a prior tool result in this conversation (discover, list, search_metadata, get_program_info, etc.). If you do not have a UID, use a tool that does not need one (discover, rank_ou, search_metadata). An analytics call with a guessed UID will be refused before it hits the server.
 10.9.3. HARD RULE — NAMED-TARGET FIDELITY. When the user names a specific program/dataset/object ("Using the X Tracker, create …") and your search finds NO match, that is a FULL STOP, not a licence to improvise: tell the user the named object does not exist on this instance, list the closest existing names you found, and ask whether to (a) create it, (b) build on one specific existing object, or (c) stop. NEVER silently pick "the closest match" and build the request on it — the extension refuses program-bound writes after a failed named-program search until the user decides. (If the user explicitly asked you to CREATE the named object, an empty search is expected — create it and continue.)
-11. ${isLocalProvider(getProviderConfig())
+11. ${providerRequestsStayLocal(getProviderConfig())
   ? 'Patient-level tracker data IS available because you are running on a LOCAL model (Ollama/localhost). When the user asks about a specific person/patient, their attributes, enrollments, or visits, you MAY use detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), and read tracker/events|enrollments|trackedEntities via dhis2_query. Handle this sensitive data responsibly and never expose more than asked.'
-  : 'Patient/TEI data lookup is HARD-BLOCKED on this (remote/cloud) model — the extension refuses every patient-level tracker read IN CODE, so do NOT attempt detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), or tracker/trackedEntities|events|enrollments reads via dhis2_query (even when a TEI ID is in the page URL); they are refused regardless of what you do. If the user asks about "this person/patient", their attributes, enrollments, or visits, explain that patient-level retrieval is permitted ONLY when the assistant runs on a local (Ollama) model, and offer program-level alternatives (count_records, get_event_analytics aggregate, get_program_info).'}
+  : 'Patient/TEI data lookup is HARD-BLOCKED on this (remote/cloud) model — the extension refuses every patient-level tracker read IN CODE, so do NOT attempt detect_enrollment_abnormalities, get_event_analytics(aggregate_type="query"), or tracker/trackedEntities|events|enrollments reads via dhis2_query (even when a TEI ID is in the page URL); they are refused regardless of what you do. If the user asks about "this person/patient", their attributes, enrollments, or visits, explain that patient-level retrieval is permitted ONLY when the assistant runs on a local (Ollama) model, and offer program-level alternatives (count_records, get_event_analytics aggregate, get_program_info). SQL views: one that reads ONLY metadata tables can be read normally; for one that reads tracker tables you get its column names and row count (manage_sql_views run), never its rows — enough to build and verify a plugin on it.'}
 12. NEVER show option codes like "M-360-8010" or data element IDs to the user. Always show resolved display names.
 13. When presenting aggregate / event analytics data, resolve any raw IDs (data element, org unit, program stage) via resolve_option_codes before showing them to the user.
 14. For any data element value that looks like a code (hyphens, letters+numbers) — resolve it using resolve_option_codes before displaying.
 14.1. For tracker write tasks, never invent TEI, enrollment, stage, or event IDs. Use the current context IDs exactly, or fetch them first.
 14.2. Never claim a tracker create/update/delete succeeded unless the tool result shows no validation errors and stats.created/stats.updated/stats.deleted is greater than 0.
+14.3. When you BUILD something (program, charts, dashboard, line list, plugin, app), report what you built — not your own reading of the data. Add NO data figures, "what the data shows" or data-quality findings ("one patient has no diagnosis", "facility X has no data") unless the user asked for them; each such claim has been wrong in practice. If the user asked, every figure must come from ONE successful query that directly proves it (totals with the period as a filter).
 15. For sharing/access issues (program not appearing, "can't see", no data access): check the access field first, then use manage_metadata(action=update_sharing) to fix. NEVER use dhis2_query PUT/PATCH for sharing — it will fail.
 16. Two-tier tool docs: authoring/write tools carry a short routing description; their FULL usage manual is delivered automatically as the result of your FIRST call to them each turn (that first call does not execute — it is not an error). When you receive a manual, read it, then immediately re-issue the corrected tool call. Never tell the user about manuals or this mechanism.
 19. VERIFY SAVED OUTPUTS WITH THEIR OWN TOOLS, NOT HAND-WRITTEN ANALYTICS URLS. To check that a saved line list returns rows use manage_line_lists(action="validate", …); for a saved visualization use get_visualization_details(include_analytics_preview=true); for a program indicator use manage_program_indicators(action="get"/"audit") or read the values through an existing visualization. Hand-assembling /api/analytics URLs is the single biggest source of 409s: \`;\` separates ITEMS INSIDE one dimension while separate dimensions each need their own \`dimension=\` parameter, \`dx:\` exists only on the aggregate /analytics endpoint (the event/enrollment endpoints take a bare UID), and every query needs a data dimension, a period and an org unit. If you must query analytics directly, send ONE \`dimension=\` per dimension and always include dx, pe and ou.
@@ -3871,11 +4724,18 @@ Use importStrategy=CREATE_AND_UPDATE to create new records AND update existing o
 `;
   }
 
+  // The user's top org units: on a multi-root instance "the whole hierarchy" is
+  // USER_ORGUNIT, never the first org unit the model happens to read
+  // (see singleRootScopeRefusal).
+  const userRoots = dhis2.baseUrl ? await userRootOrgUnits().catch(() => null) : null;
+  const rootsLine = Array.isArray(userRoots) && userRoots.length
+    ? `\n- Your top org units: ${userRoots.slice(0, 8).map(r => `${r.displayName} (${r.id})`).join(', ')}${userRoots.length > 8 ? ` +${userRoots.length - 8} more` : ''}${userRoots.length > 1 ? ` — ${userRoots.length} separate hierarchies. "The whole hierarchy" / "everywhere" / "all org units" = USER_ORGUNIT, which covers all of them; never treat one of them (or the first org unit of a program's list) as "the root". Facilities at level N everywhere = ["USER_ORGUNIT", "LEVEL-N"]. An empty analytics result for one of them says nothing about the others.` : ''}`
+    : '';
   p += `
 ## DHIS2 Instance
 - URL: ${dhis2.baseUrl}
 - Version: ${dhis2.systemInfo?.version || '?'}
-- API: ${dhis2.apiVersion}
+- API: ${dhis2.apiVersion}${rootsLine}
 `;
 
   // ── Contextual rules — only added when the relevant app/context is present ──
@@ -3899,7 +4759,7 @@ Use importStrategy=CREATE_AND_UPDATE to create new records AND update existing o
   // show a 409 from the tracker API. This is the canonical KB the model must
   // consult BEFORE forming any hypothesis. It blocks the failure mode where
   // "error saving enrollment" was misdiagnosed as a program-rule issue.
-  const saveFailureMode = SAVE_FAILURE_RE.test(text);
+  const saveFailureMode = SAVE_FAILURE_RE.test(currentText);
   if (saveFailureMode) {
     p += `
 ## Save / Load failure diagnosis — investigate AUTOMATICALLY
@@ -3995,7 +4855,7 @@ This request needs SEVERAL DEPENDENT steps to finish (e.g. a dashboard whose ind
    - create_metadata(action="create_data_elements") → each new DE's id in \`summary.dataElements[].id\`
    - create_metadata / manage_datasets / manage_org_units / manage_legend_sets / manage_validation_rules → the \`id\` (or \`*_id\`) in their result.
 5. CHAIN that UID into the next step — never re-type, summarise, or invent it. A new indicator's \`indicator_id\` — or a new program indicator's \`program_indicator_id\` — goes straight into the dashboard's \`new_visualization.data_items\` (data_items accepts aggregate-indicator, dataElement AND programIndicator UIDs interchangeably; the tool auto-resolves each UID's type, so a tracker program indicator plots on a dashboard exactly like an aggregate one). A saved visualization's id goes into a dashboard item's \`visualization_id\`. A new option set's \`option_set_id\` goes into a data element via create_metadata(action="create_data_elements", data_elements:[{ name, value_type, option_set_id:<option_set_id> }]) — pass \`option_set_id\` to REFERENCE the existing set (the DE valueType auto-aligns); NEVER re-inline the same options with \`option_set:{...}\` (that creates a DUPLICATE set). A new DE id then goes into manage_datasets(action="add_data_elements", dataset_id, data_element_ids:[<id>]). A new legend set's \`legend_set_id\` goes into an aggregate indicator via manage_indicators(action="create", indicator:{ …, legend_set_id:<legend_set_id> }) — so the indicator renders colour-coded (traffic-light) on the dashboard; NEVER attach a legend with a raw dhis2_query PATCH and NEVER via manage_metadata (it has no legend action). (This is exactly the verified provenance the Verify-before-call rule demands.)
-6. SHARE last: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). NEVER set sharing with a raw dhis2_query PUT — it fails.
+6. SHARE last — and ONLY when the user asked for sharing / public access / visibility to others: manage_metadata(action="update_sharing", object_type="dashboards"|"visualizations"|"indicators"|…, object_id=<the id you just created>, …). Never share on your own initiative (offer it in your answer instead), and never grant public WRITE ("rw…") unless the user asked for others to edit. NEVER set sharing with a raw dhis2_query PUT — it fails.
 
 ### Worked chain — "build a malaria dashboard that needs new indicators, then make it public"
 1. search_metadata(object_type="dataElements", query=…) → the data-element UIDs the indicator formulas need (e.g. malaria deaths, malaria cases).
@@ -4018,13 +4878,46 @@ This is the shape of a big coverage/monitoring build. Do it in a HANDFUL of batc
 4. manage_legend_sets(action="create", …) for the map/RAG colour bands → keep each \`legend_set_id\`.
 5. manage_maps(action="create", data_item:<a program_indicator_id>, org_unit_level:2, legend_set_id:<…>) for EACH thematic map → keep each \`map_id\`. (Maps are created one per call; there is no inline-map on a dashboard.)
 6. manage_dashboards(action="create_dashboard", dashboard:{ name }, items:[ …]) — build the WHOLE dashboard in ONE call: each chart/pivot/single-value tile as an inline \`new_visualization\` (data_items = the program_indicator_ids), each map as \`{ type:"MAP", map_id }\`, section headers as \`{ type:"TEXT", text:"## ANC coverage" }\`. Keep \`dashboard_id\`.
-7. manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, …) LAST.
+7. ONLY if the user asked to share it: manage_metadata(action="update_sharing", object_type="dashboards", object_id=<dashboard_id>, …) LAST.
 
 ### Worked chain — "create an option set for RDT results, a data element that uses it, and add it to the monthly malaria dataset"
 1. manage_option_sets(action="create", option_set:{ name:"Malaria RDT Result", options:[{code:"POS",name:"Positive"},{code:"NEG",name:"Negative"},{code:"INV",name:"Invalid"}] }) → keep the returned \`option_set_id\`.
 2. create_metadata(action="create_data_elements", data_elements:[{ name:"Malaria RDT outcome", value_type:"TEXT", domain_type:"AGGREGATE", option_set_id:<option_set_id> }]) → the DE REFERENCES the set just created (do NOT re-inline the options); keep the new DE id from \`summary.dataElements[0].id\`.
 3. manage_datasets(action="add_data_elements", dataset_id:<the dataset UID>, data_element_ids:[<DE id>]) — resolve the dataset UID first via search_metadata(object_type="dataSets") if you don't have it in context.
 Run all steps without pausing. Only ask the user when a step is genuinely ambiguous (e.g. which data element represents "malaria cases").
+`;
+  }
+
+  // ── Feasibility check for analytics outputs ──
+  // The 2026-10-29 MNCH thread asked for "a line listing table that has all
+  // the OUs, next to it a column for the % of women who attended ANC 1" — a
+  // pivot table in DHIS2 terms. The model forced it into a line list (one row
+  // per woman, showing 100), broke two indicators on the way, then swapped an
+  // indicator onto an unrelated data element to make an error go away. Teach
+  // the decide-time mapping: what each request IS in DHIS2, and what to do
+  // when the wording asks for something DHIS2 cannot do in that form.
+  const wantsAnalyticsOutputPrompt = wantsDashboardPrompt
+    || /\bline[-\s]?list(?:s|ing)?\b/i.test(text)
+    || (/\b(create|build|make|design|set\s*up|add)\b/i.test(text)
+        && /\b(maps?|charts?|graphs?|pivot|tables?|visuali[sz]ations?|bubble|choropleth)\b/i.test(text));
+  if (wantsAnalyticsOutputPrompt) {
+    p += `
+## Analytics outputs — first match each request to what DHIS2 can actually build
+Before creating anything, map EVERY table / chart / map the user asked for to the DHIS2 object that delivers it. When the wording asks for something DHIS2 cannot do in that form:
+- **Same information, different object** → build the object that DOES deliver it, and open your final answer with a short "Changed from your request" note: what was asked → why DHIS2 cannot do it that way → what you built instead → how to get the literal version if they still want it.
+- **No object delivers that information** (the data is not captured, the function does not exist, the dimension is not available) → build the rest, do NOT substitute something that measures a different thing, and explain the gap with 1–2 concrete options for the user to choose from.
+
+Common mismatches (DHIS2 facts):
+- **"A line list / table with the org units and a % (or count) column"** → a line list is ONE ROW PER RECORD (event / enrollment / person) and cannot total rows per org unit; a % indicator in it shows only 0 or 100 per row. Build a **PIVOT_TABLE** (manage_dashboards create_visualization): data_items = the program indicators, org_units = [boundary, "LEVEL-<n>"], layout { rows:["ou"], columns:["dx"], filters:["pe"] }. Use a line list only when the user wants the individual records.
+- **"A line chart across org units"** → a line joins points of a sequence (time); org units are categories. Build a COLUMN/BAR chart with org units as the category (layout { category:["ou"], series:["dx"], filters:["pe"] }), or a LINE over time with one line per org unit when a trend is wanted — say which you chose and why.
+- **An overall / total row for percentages** → DHIS2 pivot totals add up or average the cells; use overall_row:true (the parent org unit becomes its own row, computed from all records).
+- **"All org units" in a chart** → hundreds of facilities make an unreadable chart; use the district level for charts (state it), facility level is fine in a pivot or map.
+- **"A point on each org unit sized by a value"** → supported: manage_maps thematic_map_type "BUBBLE" at the requested level. Facilities without coordinates are not drawn — mention it.
+- **A metric the program does not capture** (e.g. "visits 2–4" when visits are not recorded that way) → say what IS captured and offer the closest true measure; never relabel another field.
+- **"The last N years" / "more data"** → DHIS2's LAST_N_YEARS is the N COMPLETED years and excludes the current one; to include this year add THIS_YEAR (["THIS_YEAR","LAST_5_YEARS"]). A chart whose periods miss all of its data shows zeros — the tools warn; recreate it with the right periods instead of telling the user it "will populate later".
+- **Program indicators**: fix a failing indicator's syntax/aggregation, never what it measures — switching it to another data element or stage to make an error go away is a wrong answer, not a workaround.
+
+Report only what a tool result shows: a chart, map or table is "built" when its tool returned its id, and "working" only when that tool (or manage_line_lists validate / get_visualization_details) said so.
 `;
   }
 
@@ -4267,10 +5160,57 @@ A CUSTOM form is hand-laid-out HTML for data entry, for BOTH dataSets (Aggregate
   }
 
   // ── Custom Translations KB — translate / re-label app UI strings (DHIS2 2.43+) ──
-  if (wantsTranslationPrompt) {
+  const adminIntents = detectAdminIntents(text);
+  if (wantsTranslationPrompt && !adminIntents.metadataTranslationOnly) {
     p += `
 ## DHIS2 Custom Translations — use the **manage_custom_translations** tool
 EXPERIMENTAL DHIS2 2.43+ feature: translate or re-label an app's UI strings via the "custom-translations" dataStore — no source-code changes. "Translate this app", "rename a button/label", "reword the UI" → **manage_custom_translations** (list/get/set/remove) — NEVER hand-write those dataStore keys via dhis2_query (the controller registry must stay in sync; the tool does that). Source strings must match the on-screen text EXACTLY.
+`;
+  }
+
+  // ── Metadata-object translations / user administration / aggregate data
+  //    values (src/tools-admin.js) — decide-time routing stubs only; the
+  //    how-to lives in each tool's manual. ──
+  if (adminIntents.wantsMetadataTranslationIntent) {
+    p += `
+## Translating METADATA — use the **manage_metadata_translations** tool
+Names / short names / form names / descriptions of programs, stages, data elements, options, attributes, datasets, indicators, org units … are translated per object into a DATABASE locale with **manage_metadata_translations** (list_locales → set with items[] in ONE call; it MERGES). NEVER PUT {type}/{id}/translations via dhis2_query (it replaces every other locale). App UI strings/buttons are a different feature (manage_custom_translations).
+`;
+  }
+  if (adminIntents.wantsUserAdminIntent) {
+    p += `
+## Users, roles & groups — use the **manage_users** tool
+Accounts (create/update/disable/enable/delete, password reset, org-unit scopes), user roles (authorities validated against the server) and user groups (membership) go through **manage_users** — NEVER raw POST /users or /userRoles via dhis2_query. Whether a user can SEE a program/dataset is sharing (manage_metadata(action=update_sharing)) plus org-unit assignment — not a role change unless the user lacks the app authority.
+`;
+  }
+  if (adminIntents.wantsDataValuesIntent || inAggDataEntryCtx) {
+    p += `
+## Aggregate data values — use the **manage_data_values** tool
+Reading, entering, clearing, completing or validating ONE aggregate form (dataset × period × org unit) goes through **manage_data_values** — values by data-element NAME + disaggregation name; it refuses the values DHIS2 would silently store invisibly (wrong period type, unassigned org unit, missing disaggregation). Totals across org units/periods are ANALYTICS (dhis2_query analytics), not this tool.
+`;
+  }
+
+  // ── Custom apps & dashboard plugins — decide-time routing stub only; the
+  //    how-to (globals, plugin handshake, layout, safety rules) is the manual. ──
+  // Also on follow-ups in a thread that built one ("I click FLAG and nothing
+  // happens" names no app — live 2026-10-25 — and the model then diagnosed by
+  // guessing instead of reading the plugin's source and placement).
+  const _customAppThread = typeof getThreadToolNames === 'function' && getThreadToolNames().has('manage_custom_app');
+  if (detectCustomAppIntent(text) || _customAppThread) {
+    p += `
+## Custom apps & dashboard plugins — use the **manage_custom_app** tool
+When the user asks for an app, plugin or widget, WRITE it (React JSX on the prebuilt runtime kit) and install it with **manage_custom_app** — no setup for the user. Flow: find the real UIDs and check the data exists → preview → summarise for the user and ask → create with the preview_token after "yes". A plain saved chart/pivot/map is manage_dashboards / manage_maps instead — offer that when the user did not ask for an app or plugin. NEVER POST /api/apps or DELETE apps/<key> via dhis2_query.
+Data that no Web API endpoint returns (e.g. tracker ownership TRANSFER history) comes from a SQL view: **manage_sql_views** (describe → create, which test-runs it) — never probe guessed endpoints for it.
+Several plugins that work together (flag here → list there): state the shared-data contract first — what each plugin reads / writes, where it lives (data about a patient record → that record's tracker data, e.g. a field on the event; settings → a namespace an app reserves), how each plugin knows its record from its VERIFIED props. Never a shared "current record" pointer; NEVER patient data (values, record ids, flags) in the dataStore — the tool refuses it. The manage_custom_app manual has the verified Capture facts.
+A user saying an assistant-built plugin "does nothing" / "is not saved": diagnose with real reads first — manage_custom_app placements + get_source, the stage's fields — and state only causes you verified (the manual's "When a plugin does nothing" list). Never claim something is impossible or "verified working" without evidence.
+`;
+  }
+
+  // ── SQL views — data only the database has ──
+  if (detectSqlViewIntent(text)) {
+    p += `
+## Database-only data — use the **manage_sql_views** tool
+A "transfer" in DHIS2 tracker is an OWNERSHIP transfer (Capture → Enrollment → Transfer): each one is a row in the programownershiphistory table, and NO Web API endpoint returns that history (tracker/ownership/transfer is write-only). Read it — or anything else only the database has — with a QUERY SQL view: manage_sql_views(describe → create, which runs the view once and reports its columns and row count). Do not search programs/stages/data elements for "transfer" and do not probe tracker/ownership, audits or schemas endpoints.
 `;
   }
 

@@ -229,10 +229,57 @@
             <input type="password" id="tavily-api-key-input" class="settings-input" placeholder="tvly-..." autocomplete="off">
             <p class="form-hint">Used by the Browse Web tool. Get your key at <a href="https://app.tavily.com/" target="_blank" rel="noopener">app.tavily.com</a>.</p>
           </div>
+          <div class="form-group memory-settings">
+            <label for="memory-enabled-toggle">Learning memory</label>
+            <div class="memory-toggle-row">
+              <label class="memory-switch">
+                <input type="checkbox" id="memory-enabled-toggle" checked>
+                <span class="memory-slider" aria-hidden="true"></span>
+              </label>
+              <span id="memory-status-text" class="memory-status-text">On</span>
+              <button id="btn-view-memory" class="btn btn-secondary btn-small" type="button">View memories</button>
+            </div>
+            <p class="form-hint">When on, the assistant remembers how it solved DHIS2 problems (endpoints, parameters, configuration rules) and reuses those lessons on related tasks so it never repeats a mistake. Stored only in this browser. Patient data is never stored.</p>
+          </div>
           <div id="key-status" class="key-status hidden"></div>
         </div>
         <div class="settings-footer">
           <button id="btn-save-settings" class="btn btn-primary">Save Settings</button>
+        </div>
+      </div>
+    </div>
+    <!-- Learning-memory viewer -->
+    <div id="memory-overlay" class="settings-overlay hidden">
+      <div class="settings-modal memory-modal">
+        <div class="settings-header">
+          <h3>Learning memory <span id="memory-count" class="memory-count"></span></h3>
+          <button id="btn-close-memory" class="close-btn" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="memory-toolbar">
+          <input type="search" id="memory-search" class="settings-input" placeholder="Search lessons…" autocomplete="off">
+          <select id="memory-area-filter" class="settings-select"><option value="">All areas</option></select>
+        </div>
+        <div class="settings-body memory-body">
+          <div id="memory-disabled-note" class="memory-note hidden">Learning memory is switched off — nothing new is learned and stored lessons are not used. Switch it on in Settings.</div>
+          <div id="memory-list" class="memory-list"></div>
+          <details id="memory-add" class="memory-add">
+            <summary>Add a note yourself</summary>
+            <div class="memory-add-body">
+              <select id="memory-add-area" class="settings-select"></select>
+              <input type="text" id="memory-add-title" class="settings-input" placeholder="Rule in one line, e.g. Use org-unit level 3 for districts" maxlength="140">
+              <textarea id="memory-add-problem" class="settings-input" rows="2" placeholder="Context / what goes wrong (optional)" maxlength="700"></textarea>
+              <textarea id="memory-add-solution" class="settings-input" rows="3" placeholder="What the assistant should do" maxlength="900"></textarea>
+              <label class="memory-add-scope"><input type="checkbox" id="memory-add-instance"> Only for this DHIS2 server</label>
+              <button id="btn-memory-add" class="btn btn-primary" type="button">Save note</button>
+              <div id="memory-add-status" class="memory-add-status"></div>
+            </div>
+          </details>
+        </div>
+        <div class="settings-footer memory-footer">
+          <button id="btn-memory-export" class="btn btn-secondary" type="button">Export</button>
+          <button id="btn-memory-clear" class="btn btn-danger" type="button">Clear all</button>
         </div>
       </div>
     </div>

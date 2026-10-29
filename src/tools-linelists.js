@@ -99,7 +99,7 @@ async function loadLineListProgramContext(programId) {
   if (progResp?._error) return { _error: `Could not load program ${programId}: ${progResp._error}` };
 
   const piResp = await safeDhis2Fetch(
-    `programIndicators?filter=program.id:eq:${programId}&fields=id,displayName,analyticsType,aggregationType,expression&pageSize=200`
+    `programIndicators?filter=program.id:eq:${programId}&fields=id,displayName,analyticsType,aggregationType,expression,filter&pageSize=200`
   );
   if (piResp?._error) return { _error: `Could not load program indicators for ${programId}: ${piResp._error}` };
 
@@ -111,7 +111,7 @@ async function loadLineListProgramContext(programId) {
     deByName: new Map(),       // lower(name) → deId (null when ambiguous across DEs)
     teas: new Map(),           // teaId → { id, name, valueType, optionSetId }
     teaByName: new Map(),
-    pis: new Map(),            // piId → { id, name, analyticsType, expression }
+    pis: new Map(),            // piId → { id, name, analyticsType, aggregationType, expression, filter }
     piByName: new Map(),
   };
   for (const st of progResp.programStages || []) {
@@ -140,7 +140,7 @@ async function loadLineListProgramContext(programId) {
     ctx.teaByName.set(lowercaseText(tea.displayName), tea.id);
   }
   for (const pi of piResp.programIndicators || []) {
-    ctx.pis.set(pi.id, { id: pi.id, name: pi.displayName, analyticsType: pi.analyticsType, aggregationType: pi.aggregationType, expression: pi.expression || '' });
+    ctx.pis.set(pi.id, { id: pi.id, name: pi.displayName, analyticsType: pi.analyticsType, aggregationType: pi.aggregationType, expression: pi.expression || '', filter: pi.filter || '' });
     ctx.piByName.set(lowercaseText(pi.displayName), pi.id);
   }
   return ctx;
@@ -269,14 +269,31 @@ function lineListNearestDimensions(dimToken, ctx) {
 }
 
 async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis) {
-  const raw = typeof spec === 'string' ? { dimension: spec } : (spec || {});
-  const dimToken = String(raw.dimension || raw.id || raw.name || '').trim();
+  const raw = typeof spec === 'string' ? { dimension: spec } : { ...(spec || {}) };
+  let dimToken = String(raw.dimension || raw.id || raw.name || '').trim();
+  // DHIS2's own stage-qualified form "<stageUid>.<deUid>" (what a saved line
+  // list stores) — live 2026-10-28 it was refused as "not a dimension".
+  const qualified = dimToken.match(/^([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})$/);
+  if (qualified && ctx.stagesById.has(qualified[1])) {
+    if (!raw.program_stage_id && !raw.stage_id && !raw.program_stage && !raw.stage) raw.program_stage_id = qualified[1];
+    dimToken = qualified[2];
+  }
   if (!dimToken) return { _error: `A ${axis} entry is missing its "dimension" (pass a keyword like "ou"/"event_date", a UID, or an exact DE/attribute/program-indicator name).` };
   const lower = lowercaseText(dimToken);
 
   // 1. Org units
   if (['ou', 'org_unit', 'orgunit', 'org_units', 'organisation_unit', 'organisation unit', 'organisation units', 'org unit', 'org units'].includes(lower)) {
-    const items = (raw.org_units || raw.items || []).map(v => String(typeof v === 'object' ? v.id : v).trim()).filter(Boolean);
+    // Heal the two shapes models send (2026-10-29 thread, two refusals in a
+    // row): analytics-URL style joined items ("LEVEL-4;ImspTQPwCqd") and a
+    // level given as its own field. Same meaning, so no reason to refuse.
+    const rawItems = raw.org_units || raw.items || raw.org_unit || raw.values || [];
+    const items = (Array.isArray(rawItems) ? rawItems : [rawItems])
+      .flatMap(v => String(typeof v === 'object' && v ? v.id : v).split(/[;,]/))
+      .map(v => v.trim())
+      .filter(Boolean)
+      .map(v => (/^(user_orgunit(_children|_grandchildren)?|level-\d{1,2})$/i.test(v) ? v.toUpperCase() : v));
+    const lvl = raw.org_unit_level ?? raw.level ?? raw.ou_level;
+    if (lvl != null && /^\d{1,2}$/.test(String(lvl).trim()) && !items.some(v => /^LEVEL-/.test(v))) items.push(`LEVEL-${String(lvl).trim()}`);
     if (!items.length) return { _error: `The org-unit ${axis} needs org_units[] — UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-<n>, OU_GROUP-<uid>.` };
     const uids = [];
     for (const it of items) {
@@ -315,6 +332,15 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
     if (ot === outputType) continue;
     for (const [canonical, aliases] of Object.entries(dims)) {
       if (canonical === dimToken || aliases.includes(lower)) {
+        // A stage's visit date in an ENROLLMENT list exists in DHIS2 2.41+
+        // (analytics answers <stage>.EVENT_DATE, verified 2.43.2) but this
+        // tool cannot save it yet — say exactly that, never "DHIS2 can't".
+        if (outputType === 'ENROLLMENT' && /event|scheduled/i.test(canonical)) {
+          return {
+            _error: `This assistant cannot yet save a stage's visit date ("${dimToken}") in an ENROLLMENT line list. DHIS2 2.41+ itself can show the latest visit date of a stage there.`,
+            _hint: 'Save the list without it and tell the user exactly that: the date column can be added in the Line Listing app (the stage\'s "Event date" under the program dimensions), or offer an EVENT line list of that stage (one row per visit with its own date). Do not say DHIS2 cannot do it.',
+          };
+        }
         return { _error: `Time dimension "${dimToken}" is not available for ${outputType} line lists. Available: ${Object.keys(timeDims).join(', ')}.` };
       }
     }
@@ -328,6 +354,9 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
     const dimension = isEvent ? 'eventStatus' : 'programStatus';
     const valid = isEvent ? LINE_LIST_EVENT_STATUSES : LINE_LIST_PROGRAM_STATUSES;
     const statuses = (raw.statuses || raw.items || []).map(v => String(typeof v === 'object' ? v.id : v).trim().toUpperCase()).filter(Boolean);
+    // A status COLUMN with no statuses = "show the status" → every status
+    // (same saved shape as an explicit full list). A FILTER still needs them.
+    if (!statuses.length && axis === 'column') statuses.push(...valid);
     if (!statuses.length) return { _error: `The ${dimension} ${axis} needs statuses[] — one or more of: ${[...valid].join(', ')}.` };
     const bad = statuses.filter(s => !valid.has(s));
     if (bad.length) return { _error: `Invalid ${dimension} value(s): ${bad.join(', ')}. Valid: ${[...valid].join(', ')}.` };
@@ -401,6 +430,11 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
       if (!target.stageIds.includes(stage.id)) return { _error: `Data element "${target.name}" is not in stage "${stage.name}". It belongs to: ${target.stageIds.map(id => ctx.stagesById.get(id)?.name || id).join(', ')}.` };
     } else if (target.stageIds.length === 1) {
       stage = ctx.stagesById.get(target.stageIds[0]);
+    } else if (ctx.listStageId && target.stageIds.includes(ctx.listStageId)) {
+      // An EVENT list is ONE stage: a data element several stages share is read
+      // from the list's own stage (live 2026-10-28: "Systolic" in Screening and
+      // Follow-up refused although the list was on Follow-up).
+      stage = ctx.stagesById.get(ctx.listStageId);
     } else {
       return { _error: `Data element "${target.name}" appears in ${target.stageIds.length} stages (${target.stageIds.map(id => ctx.stagesById.get(id)?.name || id).join(', ')}) — pass program_stage_id to disambiguate.` };
     }
@@ -435,6 +469,11 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
         _error: `Program indicator "${target.name}" has aggregationType NONE — as a line-list column that generates invalid SQL and DHIS2 rejects the ENTIRE query.`,
         _hint: `Set its aggregation to SUM first: manage_program_indicators(action="update", indicator_id="${target.id}", indicator:{ aggregation_type:"SUM" }), then retry.`,
       };
+    }
+    const rowLevel = lineListPiRowLevelProblem(target, ctx, outputType);
+    if (rowLevel && !(rowLevel.overridable && spec?.allow_risky_program_indicator === true)) {
+      const { overridable, ...refusal } = rowLevel;
+      return refusal;
     }
   }
 
@@ -476,6 +515,54 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
     filter: filterRes.filter,
     items: [],
   };
+}
+
+// What a line list CAN show per row. A line list is one row per event /
+// enrollment / person — it never groups rows by org unit — so a percentage or
+// a count of enrollments is not something a column can show (2026-10-29
+// thread: "a table of all OUs with % attended ANC 1 and % attended ANC 2-4" was
+// built as a line list, two indicators broke its query, and the result was one
+// row per woman showing 100). Those asks are a PIVOT TABLE. Also refuses the
+// analytics-runtime traps (piAnalyticsRuntimeTraps) BEFORE the probe, with the
+// real cause, instead of a bare "SQL syntax error (42883)".
+function lineListPiRowLevelProblem(target, ctx, outputType) {
+  const expr = String(target.expression || '').trim();
+  const pivotHint = `For one row per org unit with %/count columns build a PIVOT TABLE instead: manage_dashboards(action="create_visualization", visualization:{ name, vis_type:"PIVOT_TABLE", data_items:["${target.id}", …], org_units:["<boundary uid or USER_ORGUNIT>","LEVEL-<n>"], periods:["LAST_12_MONTHS"], layout:{ rows:["ou"], columns:["dx"], filters:["pe"] } }). Tell the user why: a line list lists individual records and cannot total them per org unit.`;
+  const bareCount = expr.match(/^V\{(tei_count|enrollment_count|event_count)\}$/);
+  if (bareCount) {
+    return {
+      _error: `Program indicator "${target.name}" is a count (${bareCount[0]}). A line list has one row per ${outputType === 'EVENT' ? 'event' : 'enrollment'}, so this column would show 1 on every row — a line list cannot count records per org unit.`,
+      _hint: pivotHint,
+      _scope: 'line_list_cannot_aggregate',
+    };
+  }
+  if (/^d2:condition\s*\(.*,\s*100(?:\.0+)?\s*,\s*0(?:\.0+)?\s*\)$/s.test(expr) || (target.aggregationType === 'AVERAGE' && /\b100\b/.test(expr))) {
+    return {
+      _error: `Program indicator "${target.name}" is a PERCENTAGE. In a line list each row is ONE ${outputType === 'EVENT' ? 'event' : 'enrollment'}, so it shows 100 or 0 on every row — never a percentage per org unit (line lists cannot group rows by org unit).`,
+      _hint: `${pivotHint} If the user really wants one row per record with a yes/no flag, use a 1/0 flag indicator (d2:condition("…", 1, 0), aggregation_type SUM) as the column, or pass allow_risky_program_indicator:true on this column.`,
+      _scope: 'line_list_cannot_aggregate',
+      overridable: true,
+    };
+  }
+  const stageById = new Map(ctx.stages.map(st => [st.id, {
+    displayName: st.name,
+    programStageDataElements: st.deIds.map(id => ({ dataElement: { id, displayName: ctx.des.get(id)?.name, valueType: ctx.des.get(id)?.valueType } })),
+  }]));
+  const probe = { name: target.name, expression: expr, filter: target.filter || '', analyticsType: target.analyticsType, aggregationType: target.aggregationType };
+  const traps = typeof piAnalyticsRuntimeTraps === 'function' ? piAnalyticsRuntimeTraps(probe, stageById, Number(dhis2.apiVersion) || 0) : { corrections: [] };
+  if (traps.error) {
+    return {
+      _error: `Program indicator "${target.name}" cannot be computed by DHIS2 analytics: ${traps.error}`,
+      _hint: `Fix the indicator first with manage_program_indicators(action="update", indicator_id="${target.id}", …): ${traps.hint} Keep it measuring the same data element — never swap it for another one to dodge the error.`,
+    };
+  }
+  if (traps.corrections?.length) {
+    return {
+      _error: `Program indicator "${target.name}" cannot be computed by DHIS2 analytics as saved: ${traps.corrections.map(c => c.reason).join(' ')}`,
+      _hint: `Re-save it once and the tool corrects it: manage_program_indicators(action="update", indicator_id="${target.id}", indicator:{}) — then retry this line list.`,
+    };
+  }
+  return null;
 }
 
 // Build the saved-payload dimension object for one resolved dim.
@@ -560,6 +647,25 @@ async function lineListAnalyticsFresh(programId) {
   return out;
 }
 
+// A 0-row list is not proof of stale analytics: the data may simply live
+// under other org units (live 2026-10-28: a list scoped to one of three roots
+// was empty while the other two held 40 enrollments, and the model told the
+// user to run analytics). Re-probe the same query across all of the user's org
+// units before saying anything about analytics.
+async function lineListEmptyWarning(probePath) {
+  const base = 'The saved list currently shows 0 rows.';
+  if (!probePath || /[?&](?:dimension|filter)=ou:USER_ORGUNIT(?:&|$)/.test(probePath)) {
+    return `${base} The query itself is valid; there is no matching data for these periods and filters across the user's org units (or analytics tables predate the data). Do not guess a cause — check system/info lastAnalyticsTableSuccess before mentioning analytics.`;
+  }
+  const wide = probePath.replace(/([?&](?:dimension|filter)=ou:)[^&]*/, '$1USER_ORGUNIT');
+  if (wide === probePath) return base;
+  const r = await lineListRunProbe(wide);
+  if (r.ok && r.row_count > 0) {
+    return `${base} The SAME query across all of the user's org units (USER_ORGUNIT) returns ${r.row_count} row(s) — the data lives under OTHER org units than the ones this list is scoped to. Analytics tables are fine. If the user asked for the whole hierarchy, update the list's org units to ["USER_ORGUNIT"].`;
+  }
+  return `${base} Across all of the user's org units it is empty too, so this is not an org-unit problem: either no data matches these periods/filters, or analytics tables predate the data — check system/info lastAnalyticsTableSuccess before saying which.`;
+}
+
 async function lineListRunProbe(probePath) {
   const resp = await safeDhis2Fetch(probePath);
   if (resp?._error) {
@@ -567,12 +673,17 @@ async function lineListRunProbe(probePath) {
   }
   // The analytics query endpoints put the pager under metaData (2.40+);
   // fall back to the visible first page when no total is available.
-  const rowCount = resp.metaData?.pager?.total
-    ?? resp.pager?.total
-    ?? (Array.isArray(resp.rows) ? resp.rows.length : 0);
+  const total = resp.metaData?.pager?.total ?? resp.pager?.total;
+  const rowCount = total ?? (Array.isArray(resp.rows) ? resp.rows.length : 0);
+  // ENROLLMENT probes read one capped page (totalPages=true is a server SQL
+  // error, 42703, on 2.42.5 AND 2.43.2): a full page is a LOWER bound, not the
+  // count — the RMNCH run reported a 2,002-row register as "100 rows".
+  const pageSize = Number((String(probePath).match(/[?&]pageSize=(\d+)/) || [])[1]) || null;
+  const capped = total == null && pageSize != null && rowCount >= pageSize;
   return {
     ok: true,
     row_count: rowCount,
+    ...(capped ? { row_count_is_lower_bound: true, row_count_note: `At least ${rowCount} rows — only the first page was read (DHIS2 cannot count enrollment-list rows). For the exact number use an aggregate count (e.g. a program indicator on /analytics), never this figure.` } : {}),
     headers: (resp.headers || []).map(h => h.column || h.name),
   };
 }
@@ -584,6 +695,10 @@ function lineListDiagnoseProbeError(error, dims) {
   if (/division by zero|Expression violation/i.test(msg)) {
     const piDims = dims.filter(d => d.kind === 'pi');
     hints.push(`A program-indicator column fails per-row evaluation${piDims.length ? ` (candidates: ${piDims.map(d => d.label).join(', ')})` : ''}. Replace rate/division PIs with count/flag PIs (see manage_program_indicators).`);
+  }
+  if (/SqlState|syntax error|invalid types/i.test(msg)) {
+    const piDims = dims.filter(d => d.kind === 'pi');
+    hints.push(`DHIS2 generated invalid SQL for this layout${piDims.length ? ` — almost always a program-indicator column (${piDims.map(d => d.label).join(', ')})` : ''}. Known causes: V{tei_count}/V{enrollment_count} with an aggregation other than COUNT; V{event_count} in an ENROLLMENT indicator; d2:countIfValue/countIfCondition on a text/option data element (2.43). Read each candidate with manage_program_indicators(action="get") and fix THAT indicator's expression/aggregation — keep it measuring the same data element; never swap it for another one to dodge the error. Do NOT probe analytics/enrollments|events/query yourself: row-level queries are blocked for cloud models and the result would not tell you more.`);
   }
   const badItem = msg.match(/Query item or filter is invalid: `?([^`\s]+)/);
   if (badItem) {
@@ -599,7 +714,10 @@ function lineListDiagnoseProbeError(error, dims) {
 function lineListSummarizeSaved(ev) {
   const typed = new Map(); // dimension uid → { name, filter, stage, kind }
   for (const d of ev.dataElementDimensions || []) {
-    typed.set(d.dataElement?.id, { kind: 'data_element', name: d.dataElement?.displayName || d.dataElement?.name, filter: d.filter || null, stage: d.programStage?.id || null, value_type: d.dataElement?.valueType });
+    const entry = { kind: 'data_element', name: d.dataElement?.displayName || d.dataElement?.name, filter: d.filter || null, stage: d.programStage?.id || null, value_type: d.dataElement?.valueType };
+    // Keyed per stage too: one data element may be a column of several stages.
+    if (d.programStage?.id) typed.set(`${d.programStage.id}.${d.dataElement?.id}`, entry);
+    typed.set(d.dataElement?.id, entry);
   }
   for (const d of ev.attributeDimensions || []) {
     typed.set(d.attribute?.id, { kind: 'attribute', name: d.attribute?.displayName || d.attribute?.name, filter: d.filter || null, value_type: d.attribute?.valueType });
@@ -610,17 +728,21 @@ function lineListSummarizeSaved(ev) {
   const simple = new Map();
   for (const s of ev.simpleDimensions || []) simple.set(s.dimension, s.values || []);
   const reps = new Map();
-  for (const r of ev.repetitions || []) reps.set(r.dimension, r.indexes || []);
+  for (const r of ev.repetitions || []) {
+    if (r.programStage) reps.set(`${r.programStage}.${r.dimension}`, r.indexes || []);
+    reps.set(r.dimension, r.indexes || []);
+  }
 
   const axis = (list) => (list || []).map(c => {
     const id = c.id || c.dimension;
     if (simple.has(id)) return { dimension: id, items: simple.get(id) };
-    const t = typed.get(id);
+    const t = (c.programStage?.id && typed.get(`${c.programStage.id}.${id}`)) || typed.get(id);
     if (t) {
       const o = { dimension: id, type: t.kind, name: t.name };
       if (t.stage) o.program_stage_id = t.stage;
       if (t.filter) o.filter = t.filter;
-      if (reps.has(id)) o.repetition_indexes = reps.get(id);
+      const repKey = t.stage && reps.has(`${t.stage}.${id}`) ? `${t.stage}.${id}` : (t.stage ? null : id);
+      if (repKey && reps.has(repKey)) o.repetition_indexes = reps.get(repKey);
       return o;
     }
     return { dimension: id };
@@ -644,7 +766,7 @@ function lineListSummarizeSaved(ev) {
 const LINE_LIST_GET_FIELDS =
   'id,name,displayName,description,type,outputType,lastUpdated,'
   + 'program%5Bid,displayName%5D,programStage%5Bid,displayName%5D,trackedEntityType%5Bid%5D,'
-  + 'columns%5Bid%5D,filters%5Bid%5D,rows%5Bid%5D,sorting,legend,completedOnly,'
+  + 'columns%5Bid,programStage%5Bid%5D%5D,filters%5Bid,programStage%5Bid%5D%5D,rows%5Bid%5D,sorting,legend,completedOnly,'
   + 'simpleDimensions,repetitions,'
   + 'dataElementDimensions%5BdataElement%5Bid,displayName,valueType%5D,programStage%5Bid%5D,filter%5D,'
   + 'attributeDimensions%5Battribute%5Bid,displayName,valueType%5D,filter%5D,'
@@ -711,6 +833,7 @@ async function lineListBuildFromSpec(args, { requireName }) {
   }
 
   // Resolve every column / filter spec.
+  ctx.listStageId = outputType === 'EVENT' && stageObj ? stageObj.id : null;
   const optionCache = new Map();
   const resolveAxis = async (specs, axis) => {
     const out = [];
@@ -737,7 +860,13 @@ async function lineListBuildFromSpec(args, { requireName }) {
 
   if (!columns.length) return { _error: 'columns[] is required — at least one column (org unit, time, data element, attribute or program indicator).' };
   const allDims = [...columns, ...filters];
-  const dupes = allDims.map(d => d.dimension).filter((v, i, a) => a.indexOf(v) !== i);
+  // The same data element from DIFFERENT stages is a different column
+  // ("Hb at first ANC", "Hb at birth care"): DHIS2 stores one
+  // dataElementDimension per stage and the query is stage-qualified (verified
+  // 2.43.2, 2026-10-29). Only a true repeat of the same stage is a duplicate —
+  // the old check refused the RMNCH register outright.
+  const dimKey = (d) => (d.kind === 'de' && d.stageId ? `${d.stageId}.${d.dimension}` : d.dimension);
+  const dupes = allDims.map(dimKey).filter((v, i, a) => a.indexOf(v) !== i);
   if (dupes.length) return { _error: `Dimension(s) appear more than once across columns+filters: ${[...new Set(dupes)].join(', ')}. Each dimension can appear on ONE axis only.` };
 
   if (!allDims.some(d => d.kind === 'ou')) {
@@ -828,6 +957,12 @@ async function lineListBuildFromSpec(args, { requireName }) {
       warnings.push(`Program indicator "${pi.name}" uses aggregationType COUNT — in a line list that renders a constant 1 on every row instead of the d2:count result. If it should show the per-case count, change it to SUM: manage_program_indicators(action="update", indicator_id="${pi.id}", indicator:{ aggregation_type:"SUM" }).`);
     }
   }
+  // Org unit + indicator columns only reads like "a table of org units", but
+  // it is still one row per record.
+  if (columns.some(d => d.kind === 'pi') && !columns.some(d => d.kind === 'de' || d.kind === 'tea')) {
+    const rowNoun = outputType === 'EVENT' ? 'event' : outputType === 'ENROLLMENT' ? 'enrollment' : 'person';
+    warnings.push(`This line list has only org-unit/indicator columns, but it still lists ONE ROW PER ${rowNoun.toUpperCase()} (many rows per facility), not one row per org unit. If the user wanted org units with totals or percentages, that is a PIVOT TABLE (manage_dashboards create_visualization, vis_type PIVOT_TABLE, layout rows:["ou"] columns:["dx"]) — build that and tell them why.`);
+  }
 
   return {
     payload, outputType, programId, ctx, stageObj, columns, filters, probe, warnings,
@@ -912,6 +1047,7 @@ async function executeManageLineLists(args) {
       line_list_id: llId,
       name: summary.name,
       row_count: probeRes.row_count,
+      ...(probeRes.row_count_is_lower_bound ? { row_count_is_lower_bound: true, row_count_note: probeRes.row_count_note } : {}),
       headers: probeRes.headers,
       empty: probeRes.row_count === 0,
       _note: probeRes.row_count === 0 ? 'The query is VALID but returns 0 rows — check periods/org units/filters, and whether analytics tables have run since the data was entered.' : undefined,
@@ -936,6 +1072,16 @@ async function executeManageLineLists(args) {
         existing_id: ex.id,
         _hint: 'Use action="update" with line_list_id to change it, action="get" to inspect it, or pick a different name.',
       };
+    }
+
+    // One of several top org units, picked by the model, is not "the whole
+    // hierarchy" (see singleRootScopeRefusal).
+    {
+      const ouDims = [...built.columns, ...built.filters].filter(d => d && d.kind === 'ou');
+      if (ouDims.length === 1) {
+        const rootScope = await singleRootScopeRefusal(ouDims[0].items, `Line list "${built.payload.name}"`);
+        if (rootScope) return rootScope;
+      }
     }
 
     // Pre-flight probe: prove the layout runs BEFORE saving anything.
@@ -975,7 +1121,7 @@ async function executeManageLineLists(args) {
     const warnings = [...built.warnings];
     if (staleAnalyticsWarning) warnings.push(staleAnalyticsWarning);
     if (probeRes && probeRes.row_count === 0) {
-      warnings.push('The saved list currently shows 0 rows. If data was entered recently, analytics tables may need a run (Data Administration → Analytics tables).');
+      warnings.push(await lineListEmptyWarning(built.probe.path));
     }
     return {
       success: true,
@@ -990,6 +1136,7 @@ async function executeManageLineLists(args) {
       sorting: built.payload.sorting || [],
       legend: built.payload.legend || null,
       row_count: probeRes ? probeRes.row_count : null,
+      ...(probeRes?.row_count_is_lower_bound ? { row_count_is_lower_bound: true, row_count_note: probeRes.row_count_note } : {}),
       open_url: `${dhis2.baseUrl}/dhis-web-line-listing/index.html#/${newId}`,
       warnings: warnings.length ? warnings : undefined,
       _next_step: 'Place it on a dashboard with manage_dashboards(action="add_items", items:[{ type:"EVENT_VISUALIZATION", event_visualization_id:"' + newId + '" }]) or create_dashboard with the same item type.',

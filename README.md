@@ -20,7 +20,7 @@
 
 ---
 
-## The 32 tools
+## The 39 tools
 
 Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → panel.js iconMap + toolLabels → CSS`. The model is given only the subset relevant to the current page and request — usually 6–12 of them.
 
@@ -58,6 +58,13 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 | 30 | `manage_legend_sets` | Colour-coded legend sets; `auto_bands` generates equal-width red→green ramps. |
 | 31 | `manage_dashboards` | Dashboards + visualizations: list/get/create, safe `add_items`/`remove_item`/`update`/`delete` with pre-write snapshots. |
 | 32 | `manage_maps` | **Thematic map authoring** (choropleth / bubble): `list`/`get`/`create`/`delete`. Assembles a thematic mapView from a friendly spec — data item on `columns[dx]` (type auto-resolved, program auto-attached for a program indicator), org units on `rows[ou]` with `organisationUnitLevels`, period on `filters[pe]`, optional legend set — the exact `/api/maps` structure DHIS2 needs (there is no simple "create map" object). Returns `map_id` to embed on a dashboard via `manage_dashboards(add_items, { type:"MAP", map_id })`. Auto-backup on delete. |
+| 33 | `manage_line_lists` | Saved Line Listing tables (eventVisualizations LINE_LIST) — EVENT / ENROLLMENT / TRACKED_ENTITY, dimensions by name, layout proven against analytics before saving. |
+| 34 | `manage_users` | Users, user roles and user groups: create/update/disable/enable/delete accounts (password policy, org-unit scopes, names → UIDs), roles with authorities validated against `/api/authorities` (DHIS2 silently stores misspelled ones), group membership through the group endpoint. |
+| 35 | `manage_data_values` | Aggregate data entry for one dataset × period × org-unit form: get / set / delete / complete / incomplete / validate. Values by data-element and disaggregation NAME; refuses the wrong-period-type, unassigned-org-unit and missing-disaggregation values DHIS2 would silently store invisibly; returns previous values as an undo record. |
+| 36 | `manage_metadata_translations` | Translate names / short names / form names / descriptions of any metadata object into a database locale — merges (a raw PUT wipes other locales), validates locale + property keys, bulk up to 100 objects. |
+| 37 | `manage_memory` | The assistant's **learning memory**: `search` / `record` / `list` lessons about DHIS2 and API behaviour (what failed and the exact fix). Relevant lessons are also injected automatically — in the system prompt, with a tool's manual, and on a failed call. Stored only in this browser; never patient data (see below). |
+| 38 | `manage_custom_app` | **AI-built DHIS2 apps & dashboard plugins.** The model writes React JSX; the tool compiles it, safety-scans and lints it, verifies every hard-coded UID, packages it with a prebuilt runtime kit (React 18 + `@dhis2/ui` + `@dhis2/app-runtime`) and installs it (`POST /api/apps`). Actions: `list`, `get_source`, `preview`, `create`, `update`, `delete`, `rollback`. Only ever touches assistant-built `ai-*` apps; backs up before every change. See [Building apps & plugins](#building-apps--plugins). |
+| 39 | `manage_sql_views` | **DHIS2 SQL views** — data no Web API endpoint returns (tracker ownership-transfer history lives only in `programownershiphistory`) and the data source for plugins that need it. `list` / `get` / `describe` (the server's real columns via `information_schema`) / `create` (runs the view once — DHIS2 does not check SQL on save — and removes it if it fails) / `update` / `delete` (backed up) / `run` (column names + row count; rows only for metadata-only views on a cloud model). Pre-checks every server refusal (illegal words, protected tables, version-renamed tables, unset variables, sharing nobody can read) before a request. |
 
 ### Page-context auto-detection
 
@@ -79,12 +86,12 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 ```
 ┌──────────────────────┐    ┌────────────────────────────┐    ┌──────────────────────┐
 │   Content Script      │   │  Background Service Worker  │   │    Side Panel         │
-│   (content.js)        │──▶│  (background.js, 6 modules)│──▶│  (sidepanel/)         │
+│   (content.js)        │──▶│  (background.js, 9 modules)│──▶│  (sidepanel/)         │
 │                       │   │                             │   │                       │
 │ • URL change monitor  │   │ • DHIS2 detection & session │   │ • Chat interface      │
 │ • hashchange/popstate │   │ • Page-context extraction   │   │ • Streaming display   │
 │ • 2s polling fallback │   │ • Universal LLM streaming   │   │ • Tool progress UI    │
-│ • Sends ctx updates   │   │ • 31-tool agentic loop      │   │ • Chart rendering     │
+│ • Sends ctx updates   │   │ • 37-tool agentic loop      │   │ • Chart rendering     │
 │ • Self-heal on        │   │ • Tracker write pipeline    │   │ • Image attachments   │
 │   "context invalid"   │   │ • Atomic metadata bundles   │   │ • Settings modal      │
 │   after extension     │   │ • Auto-backup + restore     │   │ • Theme switching     │
@@ -98,7 +105,7 @@ Each tool is wired through `TOOLS array → executeTool → TOOL_ROUTER → pane
 1. **Context extraction** — read URL of active DHIS2 tab → app type, program, stage, dataset, OU, TEI, viz, map.
 2. **System prompt assembly** — base rules + only the conditional blocks the request needs.
 3. **Reliability prefetch** — TEI details / visualization data / map data / dataset metadata / save-error E-codes resolved BEFORE the LLM is consulted, so the model sees facts rather than asking for them.
-4. **Tool selection** — `getContextualTools()` filters the 32 tools down to the 6–12 relevant for the request.
+4. **Tool selection** — `getContextualTools()` filters the 39 tools down to the 6–12 relevant for the request.
 5. **Streaming agent loop** — model calls tools, results stream back, model decides whether to continue. Hard caps: 50 iterations per turn, 3 consecutive empty responses trigger bailout.
 6. **Persistence** — per-turn state (`knownIds`, `knownIcons`, `recentCreations`, `writeAuth`, …) survives service-worker restarts via stripped JSON snapshots.
 
@@ -129,9 +136,79 @@ These are the silent-failure traps that this codebase has hit and codified, so y
 - **Custom (HTML) data-entry forms can't be created inline.** A `dataEntryForm` embedded in a dataSet/programStage payload — via `/api/metadata` OR a direct object PUT — bounces with E5002 "Invalid reference (DataEntryForm)". It must be `POST`ed standalone to `/api/dataEntryForms` first, then referenced by id. Input ids bind by `<dataElementUID>-<categoryOptionComboUID>-val` (datasets) vs `<programStageUID>-<dataElementUID>-val` (stages). Linking to a program stage needs a full PUT that **re-attaches `program:{id}`** — a PATCH/naive PUT drops it ("Program stage must reference a program") because `?fields=:owner` omits `program`. All encoded in `manage_custom_forms`.
 - **The WHO Growth Chart plugin is driven by a dataStore key + an enrollment-dashboard widget.** Functioning needs (1) the app installed (`capture-growth-chart`), and (2) `dataStore/captureGrowthChart/config` mapping the program's DOB/gender attributes, female/male option codes, and weight/height/head-circumference data elements (all three required or the chart hides), plus `programStageForGrowthChart: { "<programId>": "<stageId>" }`. The plugin *widget* must additionally be placed on the enrollment dashboard via the Tracker Plugin Configurator / Capture's "Add plugin" — that layout lives in the Capture-owned `dataStore/capture`, which `manage_growth_chart_plugin` deliberately does **not** overwrite (cache-corruption risk). All the safe/documented parts are automated; the widget step is surfaced as instructions.
 - **Custom app translations live in a dataStore namespace (DHIS2 2.43+).** `custom-translations/controller` maps each app slug → registered locales (`{ "capture": ["ar"] }`); `custom-translations/<slug>__<locale>` (double underscore, slug lowercased) holds a `{ "<exact source string>": "<replacement>" }` map. An app/locale pair NOT listed in `controller` is never loaded — so `manage_custom_translations` always writes both keys together. The value can be another language (translation) or the same one (re-labelling). Confirmed on play 2.43.0.1: the Capture app fetches `controller` then `capture__ar` (both 200) at startup and renders the translated strings in the live app.
+- **Aggregate imports store invisible values without strict flags.** A weekly period on a monthly dataset, an org unit the dataset is not assigned to, or a disaggregated data element without its category option combo all return `SUCCESS` and land where no Data Entry form shows them. `manage_data_values` refuses them client-side and `dhis2_query` adds `strictPeriods/strictOrganisationUnits/strictCategoryOptionCombos/strictAttributeOptionCombos/strictDataElements` to raw `dataValueSets` imports. A partial import answers HTTP 409 while some values *were* saved; a DELETE row without its `value` crashes the importer for option-set data elements.
+- **`PUT {type}/{id}/translations` replaces the whole set.** One French write wipes every other locale; unknown locales/properties are stored and never render. `manage_metadata_translations` merges and validates.
+- **`POST /api/users` ignores `dryRun`** (the user is really created), rejects the legacy `userCredentials` shape, and a role saved with a misspelled authority is accepted (201) but grants nothing. Group membership can only be changed through `userGroups/{g}/users/{u}`.
 - **HIDEFIELD on a compulsory program-stage data element** doesn't visually hide it in New Tracker Capture. The chatbot now auto-PUTs `compulsory:false` on affected PSDEs and pairs the rule with a `SETMANDATORYFIELD` rule keyed to the inverse condition, so compulsion is restored when the field shows again.
 
 ---
+
+## Building apps & plugins
+
+Ask for an app, a dashboard widget or a Capture plugin in plain language — *"build a dashboard widget that shows ANC coverage by district for the selected period"*, *"add a widget to this enrollment dashboard that lists the medications ordered"*, *"add a plugin to this form that shows the BMI category"* — and the assistant writes it, packages it, installs it on your DHIS2 server and, if you ask, puts it where you work. **Zero setup:** no Node, no CLI, no build server. Everything runs inside the extension.
+
+**How it works.** The model writes React JSX against a fixed set of globals (`React`, `ReactDOMClient`, `D2UI` = all of `@dhis2/ui`, `D2Runtime` = `@dhis2/app-runtime`, `postRobot`, `echarts`, `D2_APP_CONFIG`). `manage_custom_app` compiles it with Sucrase (`libs/sucrase.min.js`), checks it, and zips it with fflate (`libs/fflate.min.js`) together with the prebuilt runtime kit (`libs/d2-kit/`: one 1.6 MB IIFE + Roboto + design tokens). The zip (~0.5 MB, ~0.9 MB with charts) is uploaded through your logged-in DHIS2 tab to `POST /api/apps`, then verified in `/api/apps`.
+
+**The workflow the assistant follows** (it is in the tool manual): look up the real metadata and run the exact queries the app will make → `preview` (compile + safety scan + lint + UID check, nothing installed) → a 3–5 line summary for you (what it shows, which data it reads, whether it writes, where it appears) → after your "yes", `create` with the preview token, so exactly the previewed build is installed → the app link, or the steps to add the plugin to a dashboard (Edit → search the app name, listed under *Apps*).
+
+**What it refuses, in code.** Keys must start with `ai-`, and apps without the assistant's marker (`developer.company` in the manifest plus `src/manifest.ai.json`) are never updated or deleted. The safety scan rejects `eval` / `new Function`, `document.cookie`, `localStorage`/`sessionStorage`/`indexedDB`, `<script>` injection, `dangerouslySetInnerHTML` / `innerHTML`, `import`/`require`/`export`, requests to other servers and WebSocket/EventSource/`sendBeacon`. Unless the app is declared `needs_write_access`, any mutation is rejected too. The lint catches the runtime errors that would otherwise only show a blank page:
+- undeclared components or hooks;
+- names the kit does not export;
+- inline query objects, which the runtime silently freezes;
+- a missing render root, `DataProvider` or plugin handshake;
+- a `HeaderBar` (the v42 Global Shell already draws one);
+- crossed or unclosed JSX tags, which Sucrase itself accepts.
+
+UID-shaped strings that do not exist on the server are refused. `create`/`update`/`delete`/`rollback`/`place`/`unplace` pass the normal write-authorization gate; `list`/`get_source`/`preview`/`placements` are read-only. A preview is installed in the same turn only when your own message asked to install; otherwise the assistant shows the summary and waits for your answer.
+
+**Placing plugins** (`place` / `unplace` / `placements`):
+- **Dashboards:** the plugin becomes an `APP` item on an existing dashboard (appended, dashboard backed up first) or on a new one. `manage_dashboards` accepts `{ type: "APP", app_key }` items too.
+- **Capture pages:** an enrollment widget goes on the enrollment dashboard, the add-event or the edit-event page of one tracker program, in the left or right column, at the top or bottom. The tool writes Capture's own layout (`dataStore/capture/enrollmentOverviewLayout` and the two event-page keys) exactly as the Tracker Plugin Configurator does. A program without a layout starts from Capture's default page, so nothing else on the page changes.
+- **Capture forms:** a form-field plugin goes into a tracker stage's event form or a program's registration form (`dataStore/capture/dataEntryForms`), with a **field map**: the aliases the plugin uses (`values.weight`, `setFieldValue({ fieldId: "bmi" })`) mapped to data elements or attributes. The form is written section by section the way the Configurator writes it. A mapped field either stays in the form or is replaced by the plugin (`replace_field`). A placement whose code writes an alias the field map does not cover is refused (Capture would reject that write).
+- **Safety:** every Capture write is backed up first (`manage_backups(restore)` puts the old value back) and read back to verify it. `unplace` puts any replaced fields back where the plugin was, and removes a program or form entry that is back to Capture's default, so it follows the metadata again. `delete` takes a plugin off every dashboard and Capture page before uninstalling it. Writing `dataStore/capture` through `dhis2_query` stays blocked. Capture reads its configuration when it loads, so one reload shows the change.
+
+**Maintenance.** Each app embeds its own JSX source, so `update` takes only the changed files, bumps the version and backs up the previous version first. App backups live in the usual `dhis2-ai-extension-backups` namespace, the last 5 per app, and `manage_backups(restore)` reinstalls them too. `rollback` reinstalls a previous version. `delete` backs up first; `delete_app_data:true` also drops the app's dataStore namespace.
+
+**How generated code is written.** The tool manual adapts the [DHIS2 app-development agent skill](https://github.com/devotta-labs/dhis2-app-skills) (the one [developers.dhis2.org recommends](https://developers.dhis2.org/docs/guides/ai-development)) to this no-build runtime:
+- React 18 only, and `@dhis2/ui` for everything;
+- show `displayName`, always pass `fields`, and take the API contract from the server, not from memory;
+- server-side paging, search and order;
+- `engine.mutate` with alerts and pending states, and a confirmation Modal before every delete;
+- the DHIS2 widget and dashboard layouts and design tokens;
+- server-version feature flags;
+- hash routes so the Global Shell URL stays in sync.
+
+The skill's App Platform tooling (scaffolding, TanStack, react-router, i18n, CSS modules) does not exist in the kit, so each rule is restated with the equivalent the kit has.
+
+**DHIS2 behaviour this relies on** (verified on 2.42.5.1 / Dashboard app 101.6.1 / Capture 106.2.2):
+- **Upload filename:** the app's storage folder is named after the uploaded *file* (two apps uploaded as `app.zip` overwrite and co-delete each other). Uploads are therefore always `<key>.zip`, and a taken folder is refused.
+- **Namespace conflicts:** a reserved namespace that is already in use is a 409, checked before upload.
+- **App files:** they are served only unversioned (`/api/apps/<key>/…`), and `index.html` redirects to the Global Shell unless `?redirect=false`.
+- **Plugin size:** the Dashboard app gives a plugin item a **fixed** size (`setPluginHeight` is `null`), so plugin pages fill the item instead.
+- **Filters:** `dashboardItemFilters` (`ou`/`pe`) arrive through post-robot's `updated` message without reloading the plugin.
+- **Settings without 404s:** `dataStore/<ns>?fields=.&filter=_:eq:<key>` answers 200 even when nothing is saved, which is how plugins read per-item settings.
+- **Capture plugins:**
+  - An enrollment plugin receives `programId`, `enrollmentId`, `teiId`, `orgUnitId` (plus `programStageId`/`eventId` on event pages) and `navigate`.
+  - A form-field plugin receives `values`, `fieldsMetadata`, `errors`, `warnings` (all keyed by its own aliases), `setFieldValue`, `setContextFieldValue`, `formSubmitted`, `viewMode` and `orgUnitId`.
+  - Both get `setPluginHeight`: Capture sizes the frame to what the plugin reports.
+  - Form configs list data elements as `type: "TrackedEntityAttribute"`, and fields a config leaves out still appear in a trailing section.
+
+  Read from Capture's bundle and the Configurator's saved configs.
+
+Requirements: the App Management authority; dashboard plugins need DHIS2 ≥ 40.5 and Dashboard app ≥ 101; Capture form-field plugins are placed on tracker program stages and registration forms. An approve/reject card in the panel is still planned.
+
+**Maintainers.**
+- `node scripts/build-runtime-kit.js` rebuilds `libs/d2-kit/`, `libs/sucrase.min.js` and `libs/fflate.min.js` from exact pinned versions. It is dev-only, and the output is committed and reproducible byte for byte.
+- `npm run apps` runs the live and visual acceptance suite (`scripts/scenario-custom-apps-visual.js`, Playwright plus a local Chrome) and writes `test-results/custom-apps/report.html`. `--keep` leaves the test apps and dashboards in place for inspection.
+- `npm run apps:llm` (`scripts/llm-apps-acceptance.js`, needs `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`) has the chatbot itself build five complex apps and plugins. Each is verified in the real Dashboard and Capture apps, every DHIS2 call the chatbot makes is audited, and the server is left as found. Report: `test-results/custom-apps-llm/report.html`.
+
+## Learning memory
+
+The assistant learns from its own mistakes so it does not repeat them. Settings → **Learning memory** (on by default) has an on/off switch and a **View memories** screen (search, filter by area, delete, export, add your own note, clear all).
+
+- **How lessons are made.** (1) *Automatically*: when a tool call fails and a later call in the same request succeeds, the loop records the error and the exact change that fixed it (tool, action, endpoint pattern, parameter names and configuration values only). A failure the tool explained but that was not fixed is kept as a "known issue". (2) *By the assistant*: right after it recovers from an error it is nudged to write a clean lesson with `manage_memory(action="record")`. (3) *By you*: "remember for the future …" or a note in the viewer.
+- **How lessons are used.** Every request is matched to task areas (programs, rules, indicators, dashboards, maps, data values, users, translations, …) through the tools selected for it plus its wording; the best-matching lessons (max 8) are put in the system prompt. A tool's own lessons arrive with its manual on first use, and a failed call gets the lessons for that tool/endpoint attached to its result. Near-duplicates merge (seen count), the store is capped at 400 with least-valuable eviction, and "instance" lessons only apply on their own server.
+- **Privacy, enforced in code.** Stored in `chrome.storage.local` only. No memory write at all in a request that read or wrote individual tracker records or ran on a patient's record page; all text is scrubbed (UIDs, e-mails, phone/ID numbers, dates, filter values) and anything that still reads like personal data is refused.
 
 ## Model providers
 
@@ -152,7 +229,7 @@ Universal OpenAI-compatible. Configure `apiBaseUrl`, `modelId`, optional `apiKey
 
 **Local-first by default.** First-run config points at Ollama on `localhost:11434` with `llama3.2` and no key. Pull the model once (`ollama pull llama3.2`) and the assistant works fully offline against your DHIS2 session.
 
-`isLocalProvider` / `isValidProviderUrl` helpers gate the no-key path and reject non-`http(s)` URLs. All LLM and Tavily fetches have `AbortSignal.timeout` (90s non-stream / 60s stream-connect / 30s Tavily). `SAVE_PROVIDER_CONFIG` validates URL scheme, providerType allowlist, `maxTokens` 256-200000, `temperature` 0-2, and caps every string field.
+`isLocalProvider` / `isValidProviderUrl` helpers gate the no-key path and reject non-`http(s)` URLs. The patient-data privacy gate uses the stricter `providerRequestsStayLocal`: only a provider whose requests actually go to `localhost` counts as local. An "Ollama" preset pointed at another machine is treated as remote. All LLM and Tavily fetches have `AbortSignal.timeout` (90s non-stream / 60s stream-connect / 30s Tavily). `SAVE_PROVIDER_CONFIG` validates URL scheme, providerType allowlist, `maxTokens` 256-200000, `temperature` 0-2, and caps every string field.
 
 ### Vision
 
@@ -207,17 +284,28 @@ Filenames: `DHIS2_Report_YYYY-MM-DD_<timestamp>.<ext>`.
 
 ```
 dhis2-AI/
-├── manifest.json              MV3 config (v2.8.13)
+├── manifest.json              MV3 config (v2.8.27)
 ├── background.js              Service worker entry — thin importScripts() loader
 ├── src/                       Background worker modules (loaded, in order, by background.js)
 │   ├── core.js                config · state · safety gates · DHIS2 transport · backups · context
+│   ├── memory.js              learning memory (lessons, privacy taint, manage_memory)
 │   ├── registry.js            tool schemas · KB · manuals · tool selection · system prompt
 │   ├── providers.js           LLM streaming · image · web search · patient-data privacy gate
 │   ├── tools-metadata.js      executeTool dispatcher + standard metadata tools
 │   ├── tools-programs.js      program-authoring tools · plugins · standalone
-│   └── agent.js               agentic loop · feedback · keepalive · message router
+│   ├── tools-linelists.js     manage_line_lists
+│   ├── tools-admin.js         manage_users · manage_data_values · manage_metadata_translations
+│   ├── tools-sqlviews.js      manage_sql_views (SQL views · real DB columns)
+│   ├── tools-apps.js          manage_custom_app (AI-built apps & dashboard plugins)
+│   ├── tools-apps-placement.js  manage_custom_app place / unplace / placements
+│   └── agent.js               agentic loop · feedback · keepalive · screenshot · message router
 ├── scripts/
-│   └── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
+│   ├── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
+│   ├── scenario-sql-views.js  live SQL-view / privacy-exception / endpoint-guard test (npm run sqlviews)
+│   ├── live-harness.js        real executeTool against a live DHIS2 (basic-auth fetch shim)
+│   ├── build-runtime-kit.js   DEV-ONLY: rebuilds libs/d2-kit + sucrase + fflate (pinned)
+│   ├── custom-app-scenarios/  JSX of the acceptance-test apps
+│   └── scenario-*.js          live regression scenarios (npm run admin / sticky / apps, …)
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
 │   ├── panel.html             Side panel UI
@@ -227,7 +315,10 @@ dhis2-AI/
 │   ├── dhis2_chrome_extension_system_prompt.md
 │   └── dhis2_linelisting_tool.json
 ├── libs/
-│   └── echarts.min.js
+│   ├── echarts.min.js
+│   ├── sucrase.min.js         JSX compiler for manage_custom_app (worker IIFE)
+│   ├── fflate.min.js          zip for manage_custom_app (UMD)
+│   └── d2-kit/                runtime kit packed into every AI-built app (JS, CSS, fonts, KIT_VERSION.json)
 ├── icons/
 │   ├── icon16.png  icon48.png  icon128.png
 └── README.md
@@ -254,6 +345,556 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 - **No `dhis2_query` writes for sharing, program rules, or category objects.** The dedicated tools encode the right endpoint + content-type + post-create maintenance triggers.
 - **Lint before POST.** Local validators reject malformed program-rule conditions, fabricated icon keys, malformed sharing access strings, etc., so the chatbot doesn't waste a turn on a server-side bounce.
 - **Verify before recommend.** Memory and prior-conversation references are checked against `git log` / current code state before being acted on; per-turn `knownIds` registry blocks UIDs the model can't justify.
+- **Document every change in the [Changelog](#changelog) below**: what changed, why, and how it was verified. There are no separate change files.
+
+---
+
+## Changelog
+
+Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
+
+### 2.8.30 — A dashboard request DHIS2 cannot build as worded (2026-10-29)
+
+**The report.** On the 2.43 playground, for "MNCH / PNC (Adult Woman)", the user asked for: a line-listing table of all org units with a column for the % of women who attended ANC 1 and one for ANC 2-4; a line of attended visits across all org units; and a bubble map sized by the % attending ANC 1-4. The thread hit 13 failed calls, ended its first turn at the 3-error limit, and after "continue" produced a one-row-per-woman list, a chart of one org unit, a map with no data, and an indicator switched to count a *Weight* field. Every cause below was reproduced live on 2.43.2 (play) and 2.42.5 (localhost) first.
+
+**Requests DHIS2 cannot build as worded.**
+- New system-prompt section for chart/table/map/dashboard builds. It maps each request to the DHIS2 object that delivers it:
+  - a table of org units with % columns → a pivot table, not a line list;
+  - a line "across org units" → a column chart, or a line over time;
+  - "all org units" in a chart → district level;
+  - a point per org unit sized by a value → a bubble map;
+  - "last N years" → add THIS_YEAR.
+- If another object gives the same information, the chatbot builds it and opens its answer with a "Changed from your request" note. If nothing can, it explains and offers options instead of substituting something else.
+- `manage_line_lists` refuses a percentage indicator column (it shows 0 or 100 per row) and a count-of-records column (1 on every row). It explains that a line list is one row per record and gives the exact pivot-table call. A list with only org-unit and indicator columns gets the same warning.
+
+**Program indicators that save but cannot be computed.** DHIS2's expression check and the metadata import accept these; analytics then fails with "SQL syntax error (SqlState 42xxx)" on every chart, map and line list. All verified on 2.42.5 and 2.43.2:
+- `V{tei_count}` / `V{enrollment_count}` with SUM or AVERAGE → healed to COUNT and reported. This was the thread's first failure.
+- `V{event_count}` in an ENROLLMENT indicator is refused.
+- `d2:countIfCondition` on a text/option data element is refused. `d2:countIfValue` on one is refused on 2.43+ (it still works on 2.42).
+- Aggregation NONE is refused (HTTP 500 / SQL 42601 everywhere).
+- An EVENT count named after one stage but counting every stage is refused, with the stage filter to add. The thread's two "visit count" indicators were identical for this reason.
+- After every create and update, ONE aggregate analytics query proves each indicator computes. A new one that cannot is deleted again and reported in `failed[]` with the cause. A missing analytics table is not blamed on the indicator.
+- `list` and `get` flag existing indicators with these problems, so a later build does not reuse them blindly.
+- `d2:hasValue` inside `d2:condition("…")` is accepted. The server parses it and it computes on both versions. It is the clean "% of women who attended stage X" pattern; only a bare top-level `d2:hasValue` is filter-only.
+- The manual says: fix an indicator's syntax or aggregation, never what it measures.
+
+**"continue" turns.** Tools were chosen from the user's message alone, so "continue" had no dashboard or map tools and the model hand-POSTed them. Short follow-ups are now routed with the last real request of the conversation. Write authorization and the save-failure mode still read only the current message.
+
+**Raw writes and other guards.**
+- `dhis2_query` refuses hand-built POST/PUT/PATCH of `visualizations`, `maps`, `mapViews`, `eventVisualizations` and legacy types, a new `dashboards`, and `/metadata` bundles carrying them. It names the tool to use. Rename-only PATCHes and bulk deletes still go through.
+- An event analytics query mixing two stages is refused before sending (409 E7244).
+- Sharing a dashboard, chart, map or line list is refused unless the user asked for it. In one replay the model gave every user metadata write access to a dashboard nobody asked to share; the multi-step playbook said "share last" unconditionally.
+- Charts, dashboards and maps whose periods all end before this year (LAST_5_YEARS = 2021–2025) and miss all their data get a warning. A replay chose LAST_5_YEARS "to catch more data", and every tile showed 0 because all the data is in 2026.
+
+**Smaller fixes.**
+- `manage_line_lists` accepts org units sent as `"LEVEL-4;<uid>"` or `org_unit_level`.
+- Its query-failure diagnosis names the known SQL causes and says not to probe row-level endpoints (blocked for cloud models).
+- `manage_metadata` deletes visualizations, maps and line lists with a plain DELETE. On 2.43.2 the metadata-import delete answers HTTP 500 ("no Session") although the object is removed.
+
+**Second test prompt — WHO RMNCH "Maternal Care and Follow-up" dashboard (2.43.2 play, deepseek).** Run 1 had 4 failed calls, stopped at the error limit with no dashboard, and reported 909 instead of 202. Fixed, all live-verified on 2.42.5 and 2.43.2:
+- Yes/No data elements compared with true/false (SQL 42883) or 'true'/'false' (E7132) are healed to 1/0 (523 / 503 near-miss Yes / No match the raw records).
+- `events_in_period:true` on ENROLLMENT indicators adds EVENT_DATE boundaries: "registrations this year with a low-Hb visit during the year" = 202 (true) instead of 909 (visits dated next year counted).
+- A multi-indicator analytics query answers 200 and silently drops a broken indicator; the post-save check now re-asks every "no value" indicator alone (max 40).
+- `bulk_fix_expressions` runs the same lint, traps and post-save check (it saved a breaking fix).
+- Analytics-only indicators no longer PATCH the program's version (the user asked to leave program settings unchanged).
+- Chart layout: `category` / `series` accepted; a chart with only data items on the x-axis (columns/rows swapped) is corrected with a note. DHIS2 charts draw rows on the x-axis.
+- `/analytics` with a period and start/end dates drops the dates (409 E7105); a stage UID as `dimension=` becomes `stage=` (events) or is refused (enrollments).
+- `count_records` finds the program from `stage_id`, `program_id` or this turn's `get_program_info`.
+- Dashboard results carry `dashboard_url`.
+- Run 3: all four numbers correct (2,002 / 1,156 / 23.6 % / 202), dashboard built, program unchanged, 1 failed exploratory call (stage as dimension), since fixed. Later replays also caught `dimension=stage:A;B;C` (now refused before sending).
+
+**Third test prompt — four tables added to that dashboard (district summary, registration register, low-Hb visits, near-miss births).** Its first run built all four, 0 failed calls, but with 4 line-list refusals, a pivot WITHOUT the overall row it described, and a wrong postpartum figure in the reply. Fixed:
+- **The same data element from several stages** ("Hb at first ANC", "Hb at birth", "Hb at postpartum") is allowed in one ENROLLMENT line list — DHIS2 stores one dataElementDimension per stage (verified 2.43.2). The old duplicate check refused it, so the model built program indicators as a workaround. Saved lists are read back per stage, repetitions included.
+- A status column with no statuses shows every status (only a status FILTER needs them).
+- **`overall_row:true`** on a pivot with `[<parent>, "LEVEL-n"]` makes the parent its own row, computed by analytics from all records. DHIS2 pivot totals only add up or average the cells, which is wrong for percentages. Verified: 23.6 % / 50.6 % national next to the 13 districts; averaging the districts gives 23.7 % / 50.2 %.
+- **Post-save indicator check:** `filter=pe:THIS_YEAR;LAST_5_YEARS` answered 200 / 0.0 for an indicator that 409s with any single period or as a dimension, so the check now uses periods as a dimension.
+- **"Missing" written as `#{de} == ''`** is healed to `!d2:hasValue(#{de})`. On number / Yes-No fields it is E7132, and on text it never matches, because DHIS2 stores no empty values.
+- **ENROLLMENT line-list row counts:** the probe reads one page of 100, because `totalPages=true` is an SQL error on 2.42 and 2.43. A full page is now reported as a lower bound ("at least 100") instead of the count (a 2,002-row register was reported as "100 rows").
+- **Stage visit dates in ENROLLMENT lists:** DHIS2 2.41+ supports them (analytics answers `<stage>.EVENT_DATE`), but this tool cannot save them yet. The refusal and the manual now say exactly that and point to the Line Listing app, instead of the model telling the user DHIS2 cannot do it.
+- **`count_records` filters:** `"<de>:eq:<value>"` was turned into `dimension=<de>:<value>` without the operator, so every filtered count 409'd. It is now `<de>:EQ:<value>`, Yes/No as 1/0 (live: 523 near-miss and 1,156 low-Hb visits). The error hint no longer blames analytics tables, and the counted stage is labelled.
+
+**Verified.**
+- `npm run verify`: 785 checks pass (41 new).
+- Final real-model run of the second and third prompts as two fresh turns of one conversation (deepseek-v4p1-flash-1017, play 2.43.2): 129 DHIS2 calls, 0 failed. Checked on the server: 2,002 / 1,156 / 23.6 % / 202; chart axes; the pivot's overall row (14 rows); the three line lists (per-stage Hb columns, the two latest follow-up visits, Hb < 11 lowest first, near-miss = Yes); no broken indicator; program version unchanged; dashboard not shared. Remaining model behaviour: it still probes patient-level endpoints a few times on a cloud model; the privacy gate refuses each one.
+- `scripts/scenario-mnch-dashboard.js` replays the build tool-by-tool on play 2.43.2: traps refused or healed, a pivot table, a column chart, a bubble map, a line list and a dashboard. 99 calls, 0 failed, nothing left behind.
+- `scripts/scenario-line-lists.js` on localhost 2.42: 123 calls, 0 failed.
+- `npm run apps`: 346/346.
+- The exact user prompt through the real chat loop with Fireworks `deepseek-v4p1-flash-1017`, on a clean 2.43.2 playground with the program as page context: 56 DHIS2 calls, 0 failed. It produced a pivot table (districts × % ANC 1 / % ANC 2-4), a visits chart, a bubble map, and a dashboard that was not shared. Its "Changed from your request" note explained the pivot table, the line across org units and the district-level map. Its 4 indicators were checked on the server, and the pivot returns 100 % / 100 % for Bo.
+- `scripts/llm-run.js` takes `LLM_PAGE_CONTEXT` to replay page-bound prompts.
+
+### 2.8.29 — A weak model builds a whole NCD programme end to end without mistakes (2026-10-28)
+
+**The test.** On localhost:8081 (2.42.5) the chatbot, driven by Fireworks `deepseek-v4p1-flash-1017`, was asked in plain language to build an "NCD Hypertension and Diabetes Care" tracker program (3 stages, 6 rules, 7 indicators), then charts, a pivot, a single value, a pie, two line lists and a dashboard, then an enrollment widget, a form-field plugin, a dashboard plugin and an app. 40 patients were seeded through the tracker API (test scaffolding, deterministic). Every result was checked independently: every analytics value recomputed from the raw records, the rules driven in real Capture, the plugins and the app exercised in the real Capture / Dashboard / Line Listing apps. Each mistake below was reproduced, fixed in the tools, and the stage re-run until it came back clean (0 failed API calls).
+
+**Program rules.**
+- **Stage scope.** A rule can now be evaluated in one stage only: a rule-level `program_stage_id` / `program_stage_name`, or automatically when every action of the rule names the same stage. Before, a per-action stage was silently dropped, so a "screening" and a "follow-up" copy of one warning both fired everywhere and Capture showed the message twice (verified). `update` keeps a rule's scope (it used to wipe it).
+- **The duplicate lint** compares variables by the data element they read (so `#{sys_screening}` and `#{sys_followup}` are the same), covers messages on a field (same text), and ignores rules scoped to different stages.
+- **In-form variables read the current event.** `create_program` and `add_program_rules` created every rule variable as `DATAELEMENT_NEWEST_EVENT_PROGRAM`. On a repeatable stage, or a data element two stages share, a rule then judged the newest visit of the enrollment: the 2.42 server rule engine computed "BP controlled" for an earlier visit from a later one and refused the import with E1307 (verified). They now pick `DATAELEMENT_CURRENT_EVENT` when the rule acts in the data element's stage, as `manage_program_rules` already did. `audit` flags such variables on existing programs, with the PATCH that fixes them.
+- **Yes/No is BOOLEAN.** A field built as TEXT + a two-option Yes/No set becomes the BOOLEAN type (`keep_option_set:true` opts out), and the rules of the same call compare / ASSIGN `true` / `false`. ASSIGN to a yes/no field turns `'YES'` / `'No'` into booleans.
+
+**Program creation.**
+- **Data entry for everyone.** Tracker capture also needs DATA access on the program's tracked entity type (E1001 / E1104 for a plain Capture user — verified). `create_program` and `update_sharing` now add the program's data access to the type (data bits only, backed up, reported with how many other programs share the type). The sharing manual no longer claims only Program and ProgramStage carry data sharing.
+- **`unique` on a reused attribute** (an existing "National ID") is applied when no other program uses the attribute, and otherwise reported — the model used to tell the user it was unique when it was not.
+- Inline option sets of reused attributes / data elements are no longer created as orphans; stage names are only made unique where the server's schema requires it (2.42 does not, so "Follow-up Visit" is kept).
+
+**Analytics and dashboards.**
+- **The whole hierarchy.** On an instance with several top org units the model took the first one ("MoHP Egypt") as "the root", built seven empty tiles and told the user analytics had never run. The system prompt now lists the user's top org units and says the whole hierarchy is `USER_ORGUNIT`; visualizations, line lists and maps scoped to ONE of several top units the user never named are refused with that fix; an empty line list re-checks across `USER_ORGUNIT` before mentioning analytics.
+- **Program indicators on event / enrollment aggregate endpoints** (`dx:` or bare, one or many) are routed to `/api/analytics`: they 409 (E7224) there, or group by the indicator's value and give wrong numbers (the chat reported 31% / 8.8% for 29.0% / 8.3%).
+- `dimension=pe:LAST_12_MONTHS` results say there is no total row (a 2026 row was read as the 12-month total: 34 instead of 40 patients).
+- "This year and last year" periods are saved chronologically (explicit axis items; the server's own order drew 2026 before 2025). The viz schema asks for relative period keywords when the request is relative.
+- `visualizations/<id>/data` (a PNG) is answered with `get_visualization_details` (without changing the turn's "open chart"); line lists accept `stage.de` columns and read a shared data element from the list's own stage; `search_metadata` has `page` and says when a list is cut off; `count_records` without any org unit counts across the user's own units.
+- Visualization-context enrichment no longer appends a dimension the query already has as a FILTER (three 409s "dimension and filter simultaneously" in one turn); `dimension=stage:<uid>` becomes the `stage` parameter; the program-indicator routing keeps `startDate` / `endDate`.
+- **Unrequested analytics runs are refused** when the tables are newer than every program (the model ran the job twice to "rebuild" new indicators — they are computed at query time; on a big server the job takes hours). A run the user asks for, or approves with "yes", goes ahead.
+- `update_sharing` handles line lists (`eventVisualizations`; legacy `eventReports` / `eventCharts` are mapped on 2.40+ — their APIs return nothing, so the backup failed and the model fell back to a raw PATCH).
+
+**Apps and plugins.**
+- `preview` refuses code that reads program indicators through `analytics/events|enrollments/aggregate` (a league-table plugin showed nothing while the chat presented "verified data").
+- Lint: a tracker timestamp (`occurredAt`, `enrolledAt`, …) with `'T00:00:00'` appended is an error (Invalid Date — a widget showed "—" for "days since last visit"). The manual states the timestamp format.
+- Lint (errors): `pager.pageCount` read from `tracker/*` without `totalPages: true` (2.42 sends no pageCount then — an overdue list silently lost the two most overdue patients); nested fields on tracker records (`orgUnit[id,displayName]` — orgUnit is a UID string, every facility showed "—"); `<SingleSelectField items={…}>` (no such prop — an empty facility filter). The manual states these tracker-list facts.
+- `dhis2_query` refuses web-app pages (`dhis-web-capture/index.html` → 404) and gives the Capture deep-link format; the research-streak guard never blocks `manage_custom_app preview` (its own hint sends the model there — an app was never built).
+- Manual: never present values as what a plugin "shows"; name only org units whose place you saw.
+- System prompt rule 14.3: after building, report what was built — no unasked data figures or data-quality claims (several were wrong: "34 patients", "one patient has no diagnosis").
+
+**Provider quirk.** This model HTML-escapes `&`, `<`, `>` inside tool-call strings ("NCD HTN &amp; DM Care" was saved as a short name). Entities are decoded in name / label / message / expression arguments (never in code, HTML or paths).
+
+**Verified.** `npm run verify` 744/744 (57 new checks); `npm run apps` 346/346; `npm run sqlviews` green. Final live run on a reset instance (program, data and dashboards deleted; shared objects restored), deepseek-v4p1-flash-1017, 0 failed API calls in every chat turn:
+| Stage | Chat turn | Independent checks |
+|---|---|---|
+| Program (3 stages, 7 rules, 7 indicators) | 107 calls, 0 failed | structure 107/107 · plain Capture user can register · all 7 indicators equal the values recomputed from 40 seeded patients · 17/17 rule checks in real Capture |
+| Charts, pivot, single value, pie, 2 line lists, dashboard | 89 calls, 0 failed | 59/59 — every cell (843) equals the raw records, chronological quarters, all 7 tiles draw in the Dashboard app, line lists show 40 / 83 rows |
+| Enrollment widget | 52 calls, 0 failed | 47/47 on 5 patients in real Capture (badge, days, red > 90 d, visits, sizing, no errors) |
+| Form-field plugin | 52 calls, 0 failed | 20/20 (every BP band, colours, HbA1c / glucose thresholds, nothing saved) |
+| Dashboard plugin | 27 calls, 0 failed | 11/11 (values, ranking, bars, follows the dashboard period filter) |
+| App | 22 calls, 0 failed | 8/8 (20 overdue patients, sort, rows, facility filter, opens the enrollment in Capture) |
+
+Within that final run, the analytics stage was re-run three times and the app twice, each time after fixing the cause listed above (analytics-run guard, filter-aware enrollment, routing dates, stage parameter; tracker-list and select-option lints, preview never blocked); the table shows the clean runs.
+
+
+### 2.8.28 — Plugins that work together, and Capture seeing metadata changes (2026-10-25)
+
+**The failing thread.** Asked for a form-field plugin with a red FLAG next to every data element of the MCH stages, plus an enrollment widget listing the flagged values, the chatbot needed five versions.
+- **v1.1: "I click FLAG and nothing happens."** The cause (reproduced in real Capture 106): the new storage data element had been added to the stages without raising `programs.version`. Capture caches each program and reloads it only on a version change, so it kept the old stages, even after a reload. It dropped the plugin's `flags` alias ("could not find programStageDataElement") and refused `setFieldValue` with a console-only error.
+- **v1.2:** the chatbot blamed `needs_write_access` (unrelated: `setFieldValue` is not a server write) and made the button flip locally, so it now *looked* flagged while nothing was stored.
+- **v2.0–2.1:** moved the state to one dataStore key holding every enrollment. The enrollment came from the parent URL, but with the wrong parameter name (`enrollment=`; Capture uses `enrollmentId=`, and only `eventId=` on the edit page).
+- **v2.2:** told the user the parent URL "cannot be read from an iframe" (false: same origin, verified) and shipped a global "active enrollment" pointer that the widget writes for the form plugin. Two users or tabs overwrite it; patient values sit in an unreserved namespace shared public read-write; the program's access control is bypassed.
+
+**Capture refresh, for every tool.** Any successful write that changes a program's stages, data elements, sections, custom forms, rules, rule variables / actions or indicators is noted in `safeDhis2Fetch`. When the outermost `executeTool` call finishes, each affected program's version is raised once, with a JSON patch on `/version`. The result reports `capture_refresh`.
+- Programs the same import creates or updates are left alone: a new program is uncached, and DHIS2 raises an updated program's version itself.
+- A deleted object's program is resolved before the delete.
+- Verified on 2.42.5.1: a stage PUT leaves the version unchanged; the patch raises it; Capture reloads.
+
+**Placement (`manage_custom_app`).**
+- `place` (form) also raises the version when Capture's copy is older than the last stage or rule change (`capture_cache`).
+- The plugin URL now carries `?programId=…&programStageId=…`: form-field plugins get no such prop, and the edit-event URL has no stage.
+- `place` warns when JSON state is written to a visible field (`replace_field:true`; never HIDEFIELD, which blanks the value).
+- `unplace` puts a plugin-owned field back in its own section, in metadata order, so the config returns to Capture's default. Before, every re-place added a section.
+- `placements` without a key lists every assistant-built plugin.
+- The alias checker resolves `fieldId: CONST` and accepts plugins that iterate `fieldsMetadata`.
+
+**Lint.**
+- Warns when `setFieldValue` is used without checking `fieldsMetadata`.
+- Warns when the code names a dataStore namespace (literal, `'dataStore/' + NS` or a template with `const NS`) that neither this app, an installed app, nor a preview in this conversation reserves. Unreserved entries are shared public read-write (verified). Replaying the thread's installed v2.2.0 code through `preview` now flags `ai-mch-flags` in both plugins.
+
+**Patient data never goes into the dataStore (user rule, 2026-10-25).** Enforced in code, not only in the manual.
+- `preview` REFUSES code that writes the dataStore or userDataStore when it can see patient data:
+  - every Capture plugin (its props are a patient's record);
+  - any file that reads `tracker/*`, `events`, `enrollments`, `relationships`, event / enrollment line-list analytics, or a SQL view.
+- A write is detected as:
+  - a mutation object (create / update / replace / json-patch) whose resource names the dataStore, directly, through a variable, or by shorthand;
+  - or a POST / PUT / PATCH request to it.
+- It has its own top-line error, so the model redesigns instead of debugging.
+- Still allowed:
+  - a Capture plugin READING its settings;
+  - `app.jsx` of an `app_and_plugin` writing them;
+  - dashboard per-item settings;
+  - plugins writing tracker data.
+- Replaying the thread's installed v2.2.0 code through `preview` now refuses both plugins.
+- `dhis2_query` refuses a dataStore / userDataStore write when its body carries tracker record fields (enrollment / event / tracked-entity ids, `dataValues` …). It also refuses any dataStore write after the turn has already read patient-level data. That tracking works whether or not learning memory is on.
+
+**Routing.** The custom-app section of the system prompt now also appears on follow-up turns in a thread that used `manage_custom_app`. Before, "I click FLAG and nothing happens" named no app, so the model got no guidance and diagnosed by guessing. The section adds two rules:
+- state the shared-data contract first;
+- diagnose a "does nothing" report with real reads (placements, source, stage fields) and claim only verified causes.
+
+**Manual (custom apps).**
+- Verified form-field facts:
+  - `fieldsMetadata` has no `id` or `displayName`; options are `{code, text}`;
+  - `values` holds only non-empty fields;
+  - Capture's address parameters for the new / edit / registration pages;
+  - view mode until "Edit event";
+  - Save happens in the background.
+- New section **"Plugins that work together"**:
+  - design the contract first;
+  - state about a record lives in tracker data;
+  - a namespace owned by one app;
+  - one dataStore key per record if dataStore is insisted on;
+  - never a shared "current record" pointer;
+  - widgets refetch after Capture's background save.
+- New section **"When a plugin does nothing"**: verify before naming a cause, the check order, and "placed" is not "working".
+
+**Verified.**
+- `npm run verify`: 687 checks, all green (37 new).
+- `npm run apps`: the full suite, 346 checks, all green against localhost 2.42.5.1 / Capture 106.2.2 (scenario 9 skipped: needs an LLM key). New scenario 14 drives the recommended design in real Capture:
+  - add the storage element with the real tool → version +1;
+  - install both plugins with no lint warnings;
+  - place them (storage field plugin-owned, URL context);
+  - flag → FLAGGED, then Save;
+  - the widget shows the card;
+  - the value is saved with the event;
+  - zero failed API calls;
+  - everything removed again.
+
+### 2.8.27 — SQL views, a metadata-only privacy exception, and the "transfer history" thread (2026-10-23)
+
+**The failing thread.** Asked for "a dashboard plugin that shows the transfer history of all org units, filterable by date and org unit" (2.43.2 playground), the chatbot:
+- did not know that a tracker "transfer" is an ownership transfer, recorded only in the `programownershiphistory` table;
+- probed guessed endpoints: `tracker/ownership/transfer` (405), `tracker/ownership` (404), `audits` (404), `audits/trackedEntity` (500);
+- built version 1 on a proxy signal (enrollment org unit ≠ owner org unit), with no transfer dates;
+- had placement refused twice, although the request said "install it on a dashbaord" and the user then said "go ahead install and setup";
+- once told to use a SQL view, sent `schemas/enrollment|programInstance|trackedEntityInstance` (3 × 404);
+- wrote SQL with 2.40 table and column names and the protected `userinfo` table, saved with sharing `rw------`, so every reader, admin included, gets 409 E4312;
+- told the user "DHIS2 validated the SQL on save". It does not: a view on a nonexistent table saves with 201.
+
+**New tool `manage_sql_views`** (new module `src/tools-sqlviews.js`).
+- `describe` returns the server's real columns from `information_schema`, through a temporary view that is removed again.
+- `create` / `update` run the view once and report its columns and row count. SQL that fails there is reported with the real PostgreSQL error, and the view is removed (create) or put back as it was (update).
+- Every refusal the server would give is caught before any request:
+  - the 15 illegal words, which DHIS2 matches anywhere, strings included (`'delete me'` → E4311);
+  - protected tables;
+  - tables removed in 2.41 / 2.43 (`event` became `trackerevent` + `singleevent` on 2.43);
+  - 2.40 column names;
+  - variables without a value, or with a value DHIS2 rejects;
+  - sharing nobody can read;
+  - a second view with an existing name.
+- Default sharing is `r-r-----`; every result states who can read the rows.
+
+**Privacy: metadata-only SQL views are now readable on a cloud model.** Patient data stays blocked.
+- The decision uses the view's **current** SQL, fetched at read time: a QUERY view whose every table is on a metadata allowlist (programs, data elements, org units, option sets, favourites, `information_schema` …).
+- Anything unknown fails closed: unlisted tables, functions not on a safe list (`query_to_xml`, `dblink` …), variables outside string literals or in comments, more than one statement, VIEW/MATERIALIZED_VIEW types, extra query parameters.
+- A patient-level view gives the model only its column names and row count; database errors that could quote row values are withheld.
+- Gate holes closed: `audits/trackedEntity*` / `audits/enrollment` (patient audit trails) and `analytics/trackedEntities/query`.
+
+**Other fixes from the thread.**
+- **Placement:** misspelled place nouns are recognised ("dashbaord"); "install / set up … on a dashboard" counts as asking; "go ahead" answers the assistant's own placement plan, not only a question. A refused `place` says not to retry that turn.
+- **`dhis2_query` answers guessed endpoints without sending them** (`tracker/ownership*`, bare `audits`, `schemas/<not a metadata type>`), and heals `schemas/dataElements` → `schemas/dataElement`. These refusals do not become memory "lessons".
+- **Plugin preview** refuses a plugin on a SQL view nobody can read, or one that never sends a variable the view needs. It warns on `paging:false` over a patient-level view.
+- **`<Pagination pageSize={25}>` is refused at preview.** The kit's `@dhis2/ui` page-size menu offers 5, 10, 20, 30, 40, 50, 75 and 100, so 25 logs "There is no option with the value: \"25\"" on every render. Both the failed thread's plugin and the first real-model rerun used 25. A listed size, `pageSizes` or `hidePageSizeSelect` passes; the manual says so.
+- **Knowledge.** The manuals now cover:
+  - the verified transfer-history SQL (from the user's dhis2-plugin-skill, run against 14 real transfers on 2.42.5.1);
+  - the 2.41+/2.43 tracker tables;
+  - how a plugin reads a view (variables, server-side paging, dashboard org-unit filter, the E4312 notice).
+- The routing prompt now tells the model that a "transfer" is an ownership transfer, read with a SQL view.
+
+**Verified.**
+- `npm run verify`: 650 checks, all passing, 50 of them new. They include 33 privacy-analyzer cases: CTE shadowing, `TABLE x`, commented / identifier variables, `pg_catalog`, `datavalue`.
+- `npm run sqlviews` (live, cloud provider configured): 30 of 30 checks on localhost 2.42.5.1 (14 transfers) and 30 of 30 on the 2.43.2 playground (0 transfers recorded — reported as such). Each run: 62 API calls, 0 unexpected failures (2 deliberate 409s), instance left as found.
+- Server rules were probed live on 2.42.5.1, and the tables and columns on both 2.42.5.1 and 2.43.2.
+- **Real model, the user's own message verbatim** (new case F in `npm run apps:llm`, Fireworks `deepseek-v4p1-flash-1017`, localhost):
+  - One turn, 64 s. The model described the tables, created the SQL view (14 transfers), previewed and installed the plugin, and placed it on a new dashboard.
+  - 22 DHIS2 calls, 0 failed. No guessed endpoint, no false claims.
+  - In the real Dashboard app the plugin shows the 14 transfers (from, to, by, when). The date filter works. No console errors.
+  - 20 of 20 checks pass, and the server is left as found. The first run failed only on the page-size console error, fixed above.
+
+### Also in 2.8.26 — placing plugins: dashboards, Capture pages, Capture forms (2026-10-22)
+
+**The assistant now puts the plugins it builds where people work**, and writes exactly what the Tracker Plugin Configurator writes (new module `src/tools-apps-placement.js`).
+- **`manage_custom_app` `place` / `unplace` / `placements`.**
+  - `target "dashboard"`: an existing dashboard (appended through `manage_dashboards`, backed up first) or a new one.
+  - `"enrollment_dashboard"` / `"enrollment_event_new"` / `"enrollment_event_edit"`: a widget on that Capture page of one tracker program, left or right column, top or bottom.
+  - `"form"`: a form-field plugin in a tracker stage's event form or a program's registration form, with a `field_map` from the plugin's aliases to data elements or attributes. A mapped field stays in the form, or the plugin replaces it (`replace_field`).
+  - `delete` takes a plugin off every page first. `placements` is read-only.
+- **The formats were verified, not assumed.** Sources: the Capture 106.2.2 bundle on 2.42.5.1, the configs the Configurator (3.0.2) had saved on that server, and developers.dhis2.org.
+  - A program without a layout starts from Capture's own default page, which differs from the docs' example.
+  - Data elements in stage forms are written as `type: "TrackedEntityAttribute"`, like the Configurator does. Fields left out of a config still appear in a trailing section.
+  - Plugin props: enrollment pages pass `programId` / `enrollmentId` / `teiId` / `orgUnitId` (+ `programStageId` / `eventId`). Forms pass `values` / `fieldsMetadata` / `errors` / `warnings` keyed by alias, `setFieldValue`, `setContextFieldValue`, `formSubmitted`, `viewMode`. Both pass `setPluginHeight`.
+  - `setFieldValue` only accepts mapped aliases, so `place` refuses a field map that misses an alias the code writes.
+- **Safety.**
+  - Every `dataStore/capture` write is backed up (`capture_config` backups; `manage_backups(restore)` writes the old value back) and read back. The comparison ignores key order, because DHIS2 stores dataStore values as jsonb.
+  - `unplace` puts replaced fields back and removes an entry that is back to Capture's default.
+  - Raw `dhis2_query` writes to `dataStore/capture` stay blocked, and its hint now points to `place`.
+- **Manual.**
+  - A form-field plugin template, `setFieldValue` value formats, field-map rules and placement steps.
+  - Capture's widget card style (white, 1 px grey400 border, 3 px radius, 44 px header), read from the bundle.
+- **Fixes found while testing.**
+  - Capture plugin pages no longer get `body.d2-plugin`. Its full-height `#root` is right for fixed-size dashboard items, but in Capture a wrapper of 100% height reports the frame's own height. A model-written widget was cut off that way (651 px frame, 697 px content).
+  - The lint no longer tells form-field plugins to read `enrollmentId`.
+- **Found by having the chatbot build real apps** (`npm run apps:llm`, Fireworks GLM-5.3-flash). Each defect was fixed at the root, checked against the model's own code, and has a check in `npm run verify`:
+  - **Notes-app read:** the notes app GET `dataStore/<ns>/notes` before the key existed, a 404 on every first visit. The lint now refuses direct key reads in code that never uses the `filter=_:eq:<key>` read (HTTP 200, `entries: []` when nothing is saved). Key paths inside mutations stay allowed. The manual teaches the read and create/update rules for any app, not only dashboard settings.
+  - **Notes-app delete:** the same app deleted the last note with `{ type: last ? 'delete' : 'update', data }`, which app-runtime refuses ("Mutation type 'delete' does not support property 'data'"). Nothing was sent, and the note could never be deleted. The lint now refuses `type: 'delete'` with `data` and `type: 'create'` with `id` in mutation objects.
+  - **Unrequested dashboard:** asked only to "build a dashboard widget … show me a preview first", then "yes, install it", the model also created a dashboard nobody asked for and put the widget on it. Installing is not placing: `place` now goes ahead only when a placement was asked for, either in the user's message or a recent one ("add it to …", "as a widget on the enrollment dashboard", "plugin here", "place it"), or as a yes to the assistant's own placement question. Otherwise it refuses and tells the model to ask where it should go. Refused once, the model created the dashboard through `manage_dashboards` instead, so `APP` items there obey the same rule. Scenario 9 checks that nothing was placed.
+  - **Height lost to a wrapper's margin:** a model-written form plugin reported the `offsetHeight` of a wrapper that had `margin: 4px 0`, and Capture cut off the margin (frame 88 px, content 92 px). Capture plugin pages now also load `capture-plugin.css` (`#root { display: flow-root }`, so every margin stays inside `#root`). The manual's templates report `#root`'s height, and the lint warns when a Capture plugin reports a wrapper's `offsetHeight`.
+  - **Always-open modal:** another notes app rendered its delete-confirmation `<Modal>` unconditionally. It was open on load, and its backdrop blocked every click in the app. The lint now refuses a `Modal` rendered as an unconditional child (behind `cond &&`, a ternary, `hide=` or a component's own `return` is fine), and the manual says so.
+  - **Search-query probe:** while testing its app's search, the model sent `dhis2_query` `filter=programType:eq:WITH_REGISTRATION;displayName:ilike:mch`, a 400. On metadata endpoints this is now split into one `filter` parameter per expression; analytics `ou:A;B` and tracker filters stay as they are.
+- **`manage_dashboards`** accepts `{ type: "APP", app_key }` items in `create_dashboard` and `add_items`, after checking the key is an installed dashboard plugin. The item shape was verified with a VALIDATE + COMMIT import.
+- **No Tavily key → no docs search offered.** `architect_metadata(browse_dhis2_docs)` failed on every call without a key (in the hands-on session). The action, its parameter and its mention in the description are now left out of the wire tools until a key is saved; a direct call gets "unavailable, do not retry".
+- **Verified.**
+  - `npm run verify`: 600 checks, all passing.
+  - `npm run apps` (the whole visual suite, with the real model for scenario 9): 330 of 330. The tool made 228 API calls; the only 5 failures were the deliberate negative tests.
+  - `npm run apps:llm`, real model, five complex requests in plain user language. Every case passed on its latest run, with zero failed DHIS2 calls from the chatbot (A 9, B 15, C 39, D 26, E 6 calls):
+    - A: a program explorer app with search and paging (correct stage and data-element counts);
+    - B: a malaria chart plugin placed on a new dashboard;
+    - C: the medication widget placed on the Pharmacy enrollment dashboard, listing the 11 ordered drugs in real Capture, sized exactly;
+    - D: a BMI / fever form-field plugin the model mapped to Weight, Height and Temperature itself, working in the real Capture form;
+    - E: a notes app that saves, confirms and deletes on the server.
+  - In every run the Capture configuration and the app list ended exactly as before.
+  - `npm run verify` also covers placement round trips against an in-memory server: place → unplace must leave every key identical.
+  - `npm run apps --only=10,11,12,13`: 49 live checks, 0 failed API calls.
+    - The KPI plugin was placed on a new dashboard and rendered.
+    - A medication widget was placed on the Pharmacy enrollment dashboard. In the **real Capture app** it lists the 11 drugs actually ordered, at 1440 px and 1024 px, sized to its content.
+    - A form-field plugin was placed in the W4W Initial Assessment form. In the real Capture event form, typed weight, height and temperature reach the plugin, and `setFieldValue` writes the mapped field. The form was left without saving.
+    - After every unplace and delete, `dataStore/capture` is identical to before.
+  - The test cleanups now delete only backups whose reason names a test object or app, so other activity on a shared server is never touched.
+
+### Also in 2.8.26 — fixes from the first hands-on test (2026-10-22)
+
+**The assistant forgot the conversation after a pause on large programs.** The test was on a Capture enrollment page of the Pharmacy program. The assistant previewed a plugin and asked "Shall I install it?". The answer "yes install it" got "I don't have a record of what 'it' refers to". This was reproduced in real Chrome with the real extension and side panel, using both a recording mock LLM and Fireworks GLM-5.3-flash.
+- **Cause.**
+  - `programMetadata` caches every option of every option set on every stage field. For the Pharmacy program (15 drug slots × the drug list) that is 6.1 MB.
+  - `saveState` wrote it in the same `chrome.storage.session.set()` as the chat history. Chrome rejected the whole write ("Session storage quota bytes exceeded") and the empty `catch {}` swallowed the error.
+  - Chrome evicts the idle MV3 worker after 30 s. The next message restored no history, and with it lost the sticky tool list, so `manage_custom_app` was not even offered.
+  - Any large program was affected: every follow-up turn after a pause, and the stage context that sticky context relies on.
+- **Fix (`src/core.js`, `src/agent.js`).**
+  - `chatHistory`, `dhis2Full` and `dhis2State` are written separately, and failures are logged.
+  - An over-budget state leaves out the re-fetchable `programMetadata`; the chat handler re-fetches it when it is missing after a restart.
+  - A history that is itself over quota keeps its newest turns.
+  - `CHAT_MESSAGE` awaits the state restore before building the turn.
+- **Capture enrollment plugins: the manual now states what is true.**
+  - The tool accepted `plugin_type: "CAPTURE"`, but the manual said nothing about it, so the model guessed props and told the user the widget would be "selectable" in Capture.
+  - The props `{ teiId, programId, enrollmentId, orgUnitId }` and `setPluginHeight` were verified against three enrollment plugins already installed on 2.42 / Capture 106. The manual now covers them, the tracker query, auto-height reporting, a narrow-column list layout, the rule against reading patient rows, and the fact that placement is manual (Tracker Plugin Configurator).
+  - The lint warns when a Capture plugin reads neither `enrollmentId` nor `teiId`, or never reports its height.
+  - `where_to_find` says plainly that the widget is not placed automatically.
+- **No more impossible offers.**
+  - The `dhis2_query` block on `dataStore/capture` is unconditional, but its hint said "ask them to confirm the exact JSON before writing". The model then offered "say yes and I'll write the layout", a write that would be blocked again. The hint now says no confirmation lifts it and points to the Tracker Plugin Configurator.
+  - A `manage_custom_app` call cut off by the output-token limit now gets "write shorter source" advice instead of advice about splitting a tracker program.
+- **No install before the user approves.**
+  - With the real model, "Build a dashboard widget … Show me a preview first." was previewed and installed in the same turn. The manual said to ask, but nothing enforced it, and the suite's check for it was broken: it counted the manual-gate notice as an install and searched for "create" in a summary that never contains it.
+  - Previews now remember their turn. `create` is refused (`_awaiting_approval`) unless one of these holds: the user's own message asked to install ("create and install …"; not "preview first" or "don't install"), it asked to put the plugin somewhere (placing implies installing), or a preview of that key was shown in an earlier turn. This applies whether the model passes the preview token or the files: in one run the model sent the files instead of the token, which skipped a token-only check.
+  - The refusal tells the model to end the turn and ask; it no longer retries the same install.
+  - Scenario 9 now judges by the server's app list and deletes whatever key the model chose. It also starts a fresh conversation every run: `llm-harness.js` persists session storage to `.llm-session.json`, so the scenario had been continuing the previous run's thread, and the model skipped discovery for the app it "remembered".
+- **A dropped LLM stream is retried.** If the provider's connection drops before any text has reached the panel ("terminated" / "network error"; Fireworks did this several times during the runs), the agent loop now retries the request up to twice, exactly as it already did for a stalled stream. The request is safely repeatable at that point because nothing in it has run yet. Once text has streamed, the error is still shown, so output is never duplicated.
+- **A dropped LLM stream left an unhandled rejection.** Fireworks closed a streaming connection mid-response. The stall handler's `reader.cancel()` returns a rejected promise on an already-errored stream, and nothing caught it. Chrome logged it as an uncaught error; under Node it killed the visual suite before its cleanup. The rejection is now caught, in both the OpenAI-compatible and the Anthropic paths. The suite also records an unhandled rejection as a failed check, so a run always reaches cleanup.
+
+### 2.8.26 — 2026-10-21
+
+**AI-built DHIS2 apps & dashboard plugins (`manage_custom_app`, new module `src/tools-apps.js`).** The assistant writes React JSX and installs it as a real DHIS2 app or dashboard plugin, with zero setup for the user. See [Building apps & plugins](#building-apps--plugins).
+- **Runtime kit.** A dev-only `scripts/build-runtime-kit.js` produces the committed kit from exact pins: React 18.3.1, @dhis2/ui 10.18.0, @dhis2/app-runtime 3.17.4, post-robot 10.0.46 (the version the host uses), Roboto 400/500/700 with an Arabic system-font fallback, `@dhis2/ui` design tokens as CSS variables, and the export lists the lint checks against. It also produces Sucrase and fflate for the worker. The extension itself stays build-free. A rebuild from a clean install matches the committed files byte for byte.
+- **Tool.**
+  - Actions: `list` / `get_source` / `preview` / `create` / `update` / `delete` / `rollback`.
+  - Safety scan, lint and UID verification. Crossed JSX tags are refused because Sucrase compiles them silently, and a missing `)` is reported on its own line rather than where Sucrase backtracked.
+  - A `preview_token` (memory + `chrome.storage.session`) so `create` installs exactly the previewed build.
+  - Version bumps, app backups (last 5) and `manage_backups(restore)` support.
+  - Client-side pre-checks for existing keys, namespace collisions and upload-folder collisions, so the server never answers with a 409.
+  - `D2_APP_CONFIG` gives the generated code the server's `baseUrl`, `apiVersion` and `serverVersion`.
+- **Wiring.**
+  - `uploadAppZip` in `core.js`: multipart upload through the DHIS2 tab, falling back to the worker; a 401 or login redirect becomes "Not signed in".
+  - `list` / `get_source` / `preview` are discovery actions.
+  - Registry schema, manual, routing stub and intent detection; dispatcher; memory area; panel card.
+  - `dhis2_query` can no longer `POST /api/apps` or `DELETE apps/<key>`; those go through the tool, which only touches assistant-built `ai-*` apps.
+- **Manual.** It incorporates the DHIS2 app-development agent skill (devotta-labs/dhis2-app-skills @0ad888fd35, recommended by developers.dhis2.org), restated as rules for this runtime, not copied code. It adds what this server showed:
+  - the fixed-size dashboard items (`setPluginHeight = null`) and the `print-layout` mode;
+  - the `useStaticInput` trap, where inline query objects are frozen at first render;
+  - the 404-free dataStore settings read;
+  - alerts forwarded to the dashboard via `parentAlertsAdd`.
+- **Transport fixes found by the real-browser run** (they help every tool, not only this one):
+  - `fetchViaTab` passed `undefined` as the body of every body-less write. Chrome rejects that in `executeScript` args ("Value is unserializable"), so **every DELETE silently fell back to a direct worker fetch**. DHIS2 answers a write from the extension's own origin with HTTP 200, an empty body, and does nothing (verified for DELETE and for the multipart upload). Metadata deletes only worked thanks to the POST `importStrategy=DELETE` retry; dataStore-key and app deletes did not. The body is now `null`, and DELETEs really go through the tab (204).
+  - `safeDhis2Fetch` re-sent a write answered **204 No Content** through its empty-body retry, turning a completed `DELETE /api/apps/<key>` into "404 App does not exist". 204 is never retried now.
+  - A direct DELETE's 409 carries its reasons in `response.errorReports` (ObjectReport); those are now surfaced like import errors, keeping the existing E4030 hints.
+  - `uploadAppZip` reports an empty 2xx as "NOT installed — open a DHIS2 tab" instead of passing it through.
+- **Verified.**
+  - `npm run verify`: 91 new offline checks, all green.
+  - The existing live suites (`npm run admin`, line lists, sticky context) still pass with 0 unexpected failed calls.
+  - The extension was loaded unpacked in real Chrome 155 over CDP. Inside the real service worker: libs and modules load under the MV3 CSP, preview reads the kit via `chrome.runtime.getURL`, the preview token survives in `chrome.storage.session`, the upload goes through the DHIS2 tab (201), the app renders, and the delete goes through the tab (204). 12 of 12 checks.
+  - `npm run apps` on DHIS2 2.42.5.1 / Dashboard 101.6.1 / Global Shell 1.12.3 (Chrome, 1440 px and 400 px): 7 generated apps/plugins across 8 scenarios plus an error-state app, **277 checks, 0 failed**, 40 screenshots. The tool made 88 API calls; the only 5 failures were the deliberate negative tests (one bypassed-pre-check 409, four logged-out 401s). The instance was left exactly as found.
+    - Coverage: standalone app (direct + Global Shell), KPI and echarts dashboard plugins following the ou/pe filters without reload, edit and print modes, per-item settings in two independent instances, a write-enabled notes app (refused when declared read-only), Arabic/RTL under `keyUiLocale=ar`, update → rollback, and the negative paths (syntax error, banned patterns, key prefix, real apps, namespace collision, existing key, logged out, read-only turn).
+    - Rendered numbers were compared with the same API queries.
+    - Every screenshot was reviewed by eye. The KPI tiles were redesigned to centred single-value style after review.
+- **Not done here.** The end-to-end LLM scenario was skipped because no LLM credentials were configured. Capture plugins and automatic dashboard placement are phase 2.
+
+### Also in 2.8.26 — security & performance review (2026-10-21)
+
+**Security & performance review.** Each issue was reproduced live on DHIS2 2.42.5.1 before being fixed.
+- **Privacy-gate bypass closed.** The patient-data gate checked the raw `dhis2_query` path, but `fetch()` resolves `..`, `%2e` and `\` and drops `#…`, and DHIS2 decodes `%74`. With a cloud model, `programs/../tracker/trackedEntities` and seven other spellings returned patient rows. `safeDhis2Fetch` and `apiUrl` now refuse such paths (`ambiguousApiPathReason`), and the gate matches the canonical path.
+- **"Local" means where requests go.** An "Ollama" preset pointed at `ollama.com` or another machine counted as local for the privacy gate. The new `providerRequestsStayLocal` decides by the request URL.
+- **Content-script messages are untrusted.** Code running in a DHIS2 page could read the stored API key, re-point the provider URL and read the learning memory through the message router. Content scripts may now send only their five message types; everything else must come from the extension's own pages.
+- **Only the focused tab drives context.** A background DHIS2 tab navigating, or expiring to the login page, re-pointed the session mid-turn. Only the active tab of the focused window counts now, and only its top frame.
+- **Markdown links** in replies are limited to `http(s)`/`mailto` with quotes encoded, which stops attribute injection.
+- **Performance:** one in-app navigation loaded the page context up to 4× concurrently (6–8 requests, now 2). `initializeFromUrl` shares and serializes runs, and the latest navigation wins. Hidden tabs no longer wake the service worker.
+
+**Screenshots work without `activeTab` / `<all_urls>`.** `captureVisibleTab` needs one of those, and the manifest deliberately has neither. The selection overlay now captures the tab itself with `getDisplayMedia({ preferCurrentTab })`: Chrome asks "Allow … to see this tab?", and the overlay grabs one native-resolution frame, crops it and stops the stream. A "Capture selection" button covers drags that outlive the ~5 s user activation. A cancelled prompt no longer cuts off a streaming reply. Requires HTTPS or localhost.
+
+### 2.8.25 — 2026-10-20
+- **Administration tools** (`src/tools-admin.js`):
+  - `manage_users`: users, roles and groups. Enforces the password policy and validates authorities, which DHIS2 otherwise stores even when misspelled.
+  - `manage_data_values`: aggregate data entry by names. Refuses wrong-period-type, unassigned-org-unit and missing-disaggregation values that DHIS2 silently stores invisibly.
+  - `manage_metadata_translations`: merges instead of wiping other locales.
+- **Learning memory** (`src/memory.js`, `manage_memory`, Settings → Learning memory). Lessons are recorded from failure→fix sequences and injected per task. Turns that touch patient data write nothing.
+- **Six silent-failure fixes:**
+  - rule-action key aliases;
+  - indicator type matched by factor;
+  - imperative data-entry/admin verbs now authorize writes;
+  - `dhis2_query` PATCH pre-checked against `/api/schemas`, and strict flags added to raw `dataValueSets` imports;
+  - post-commit 5xx on deletes verified;
+  - an aggregate-data delete block gets a data-pruning hint.
+
+### 2.8.24 — 2026-08-06
+- `manage_line_lists` was mislabelled in the panel, so it looked like the wrong tool was being used. Labels and routing fixed.
+- A stage the user called "repeatable" no longer ships one-event-only.
+- `GET optionSets/A,B,C` (HTTP 405) is healed.
+- The detected stage is persisted on every page-context write.
+
+### 2.8.23 — 2026-07-28
+- **Sticky stage context** (`carryStickyContext`): Capture's enrollment dashboard has no stage in its URL, so the context is no longer wiped by URL re-parses.
+  - content.js re-sends the stage every 30 s, and the DOM fallback needs a unique match.
+  - The panel shows a Stage chip.
+- **Blocked-delete recovery:** E4030 from soft-deleted events gets the exact `softDeletedEventRemoval` recovery.
+- An empty 2xx response counts as success.
+
+### 2.8.22 — 2026-07-27
+- **Unfinished-turn guard:** the loop no longer ends a task on a text-only "I'll now…" reply.
+- Program-rule actions are no longer shipped without their target. Loose target names are resolved.
+
+### 2.8.21 — 2026-07-26
+- **Growth chart:** the 80 KB tool-result truncation also hit internal reads, which reported `Program "undefined"`. Internal fetches now bypass it, and measurement data elements are chosen by numeric value type.
+
+### 2.8.20 — 2026-07-26
+- The tool router keeps a thread's tools on follow-up turns.
+- Bug reports no longer authorize writes.
+- "Add all OUs + fix sharing" can no longer drop the program from Capture.
+- About 600 lines of dead code removed.
+- Twelve classes of guaranteed-failed API call are healed before sending.
+
+### 2.8.19 — 2026-07-20
+- **Program-rule correctness:**
+  - Dead option literals are reported.
+  - Duplicate-rule lint covers every action type.
+  - "Person" is no longer substituted for a tracked entity type the user named.
+- **Section-safe stage edits:** adding or removing stage data elements backs up first and preserves `formType` and sections; `section_name` routing added.
+- **Not-signed-in switches:** switching to a DHIS2 instance you're not signed in to now gives a clean message instead of a CORS console error (`redirect: 'manual'`).
+
+### 2.8.18 — 2026-07-19
+- `manage_program_indicators` create accepts `indicators: […]` in a single import.
+- A coverage percentage is ONE program indicator: `AVERAGE` of `d2:condition(…, 100, 0)`. This fixed the 47-PI build that never finished.
+
+### 2.8.17 — 2026-07-19
+- **Named-program guard:** when a program the user named isn't found, program-bound writes on a different program are refused, and the assistant stops and asks instead of building on a lookalike.
+
+### 2.8.16 — 2026-07-19
+- **Weak-LLM reliability.** Fixes:
+  - wire-message sanitizing and tool-argument shape healing;
+  - recovery of leaked XML tool calls;
+  - reuse-compatibility gates for data elements, attributes and option sets.
+- The 3-prompt maternal-care acceptance completed with 0 failed API calls on MiniMax-M3 and Kimi-K2.6.
+
+### 2.8.15 — 2026-07-18
+- New `manage_line_lists` tool (`src/tools-linelists.js`): saved Line Listing tables (EVENT / ENROLLMENT / TRACKED_ENTITY). Layouts are proven against analytics before saving, and the tool refuses the traps that silently break line lists.
+- Dashboards accept `EVENT_VISUALIZATION` tiles.
+
+### 2.8.14 — 2026-07-14
+- **Complex-program robustness:**
+  - `create_program` pre-validation;
+  - malformed or truncated calls no longer disable the tool;
+  - a discovery-streak guard stops long runs of read-only calls;
+  - corrupted streamed tool-call JSON is repaired.
+
+### 2.8.13 — 2026-07-12
+- `create_program` skips one bad rule and continues, instead of dead-looping. A mechanical circuit breaker disables a tool after 3 blocks.
+- **Modular refactor:** `background.js` was split into `src/*.js` modules (byte-identical), with `npm run verify` and `ARCHITECTURE.md`.
+- **`create_program` correctness:** COMPLETEENROLLMENT and HIDEOPTION binding, stage sections, and "continue" now authorizes writes.
+- **Dashboard "replace a tile":** infinite loop fixed. Every tool call now gets a result, and there's a no-progress guard. Tracker data elements are refused in charts.
+
+### 2.8.12 — 2026-07-12
+- xAI Grok preset, plus custom-provider URL normalization and host-permission grant.
+
+### 2.8.11 — 2026-07-11
+- **Program rules:**
+  - cross-turn UID memory;
+  - the one-rule visibility doctrine (lint + audit);
+  - `A{Display Name}` token healing;
+  - in-place action updates.
+- Program deletes cascade (rules, program-rule variables, program indicators first).
+
+### 2.8.10 — 2026-07-10
+- A bare "yes" after a refused write authorizes only that tool.
+- Growth-chart dataStore guard and routing.
+- Refusals say the tool exists.
+
+### 2.8.9 — 2026-07-10
+- **Program indicators:**
+  - widget visibility (`display_in_form`);
+  - ENROLLMENT date boundaries;
+  - a whitelist of the 16 `d2:` functions the parser actually accepts.
+
+### 2.8.8 — 2026-07-10
+- **Existing metadata is never recreated:**
+  - loud dedup probes;
+  - name-conflict self-healing;
+  - case-insensitive reuse of attributes and data elements;
+  - verb-targeted write-auth negation.
+
+### 2.8.7 — 2026-07-09
+- `[` and `]` are percent-encoded in query strings, so self-hosted Tomcat DHIS2 no longer returns 400 on bracketed `fields`/`filter`.
+
+### 2.8.6 / 2.8.5 — 2026-07-08
+- `create_program` checks the tracked entity type exists (by UID or name) before import, and never sends the word "Person" as a UID. Matching is done in memory instead of with a brittle `name:eq` filter.
+
+### 2.8.4 — 2026-07-07
+- Creating on a fresh instance no longer hits the guard walls: field names are no longer mistaken for UIDs, a stop after consecutive HTTP errors, and the root org unit is resolved on an empty instance.
+
+### 2.8.3 — 2026-07-07
+- A new thread fully resets conversation memory and page context.
+
+### 2.8.2 — 2026-07-07
+- **MCH-scenario fixes:**
+  - stage-by-name rule actions;
+  - no phantom IDs after a failed create;
+  - option-code program-rule variables;
+  - empty-field numeric guards;
+  - program-indicator name disambiguation.
+
+### 2.8.1 — 2026-07-07
+- Repeated-failure guard, a budget-exhaustion summary, and a liveness heartbeat and stream-stall guard.
+
+### 2.8.0 — 2026-07-06
+- **Lazy tool manuals:** write tools send slim definitions, and the full manual is delivered on first use. That cut per-iteration context by 42%.
+- Inline program-rule variable resolution fixed.
+
+### 2.7.0 — 2026-07-04
+- **TB end-to-end audit fixes:** program-rule action and condition binding, a program-indicator OR-filter linter, and `create_program` ID chaining.
+- New `manage_maps` tool.
+- SQL-view execution is privacy-gated.
+
+### 2.6.0 – 2.6.8 — 2026-06-30 to 2026-07-02
+- New `manage_dashboards` tool, with safe `add_items`/`remove_item`/`update`/`delete`, pre-write snapshots and a destructive-write guard.
+- The privacy gate now also covers file-extension variants (`.csv`, `.json`).
+- **Orchestration of multi-step goals:**
+  - dashboards;
+  - org-unit provisioning;
+  - program indicator → dashboard;
+  - existing option set → data element → dataset;
+  - legend set → indicator.
+- **End-to-end audit fixes:**
+  - option theft;
+  - default data sharing;
+  - responsive custom forms;
+  - `A{}` resolution;
+  - ASSIGN option codes;
+  - search ranking.
+
+### 2.5.0 — 2026-07-01
+- **Hard-coded privacy gate:** patient-level tracker data can be read only when the model is local (Ollama).
+
+### 2.4.1 – 2.4.5 — 2026-06-30
+- New tools: `manage_validation_rules`, `manage_org_units`, `manage_indicators`, `manage_option_sets` and `manage_legend_sets`.
+
+### 2.2.0 – 2.4.0 — 2026-06-28/29
+- New tools: `manage_custom_forms` (custom HTML forms for datasets and program stages), `manage_custom_translations` (2.43 custom translations) and `manage_growth_chart_plugin` (WHO growth chart setup).
+- The agentic loop cap was raised to 50.
+- Option-set codes deduplicated (`A+`/`A-` no longer collide as `A_`).
+- Fixed cross-turn memory loss, a value-type default and a program-rule misdiagnosis.
+
+### 2.1.8 – 2.1.9 — 2026-06-04 to 2026-06-08
+- Agentic loop cap raised from 12 to 30.
+- An instance switch on the same host detects the login redirect instead of failing with a CORS error.
+- Permissions hardened for the Chrome Web Store: host access is now granted at runtime, per server.
 
 ---
 

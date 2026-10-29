@@ -186,6 +186,14 @@ function summarizeSaveErrorDiagnosis(diag) {
   };
 }
 
+// A provider stream that stalled or whose connection dropped. Before any text
+// reached the panel the request is safely repeatable (`messages` is not
+// mutated until a response arrives). Fireworks dropped streams mid-response
+// several times on 2026-10-22: "terminated" (Node) / "network error" (Chrome).
+function isRetryableStreamDrop(err) {
+  return /stream stalled|\bterminated\b|network ?error|failed to fetch|other side closed|socket hang up|ECONNRESET|connection (?:reset|closed)|BodyStreamBuffer/i.test(String((err && err.message) || err || ''));
+}
+
 // ── Agentic Loop ─────────────────────────────────────────────────────────────
 
 async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
@@ -193,6 +201,9 @@ async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
   try {
     return await _runAgenticLoopInner(userText, imageBase64, browseWeb);
   } finally {
+    // Learning memory: turn the turn's recovered failures into lessons (every
+    // exit path, including throws). Never allowed to break the turn.
+    try { await memoryEndTurn(); } catch (e) { console.warn('[Memory] end-of-turn failed:', e?.message || e); }
     releaseKeepalive();
   }
 }
@@ -230,8 +241,14 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   seedRecentCreations();
   console.log(`[AgenticLoop] knownIds seeded with ${dhis2.knownIds.size} UID(s); knownIcons + recentCreations reset`);
   // ── Dynamic tool selection — send only tools relevant to this request ──
-  const contextualTools = getContextualTools(ctx, userText, browseWeb);
+  await ensureMemoryLoaded(); // the memory on/off switch decides whether manage_memory is offered
+  // "continue" / "yes, do it" turns are routed with the request they continue.
+  const routingText = buildRoutingText(userText);
+  const contextualTools = getContextualTools(ctx, routingText, browseWeb, userText);
   const contextualToolNames = new Set(contextualTools.map(t => t.function.name));
+  // Learning memory: start observing this turn (privacy taint is decided here
+  // for patient-record pages and save-error diagnosis).
+  memoryBeginTurn(userText, ctx, contextualToolNames);
   // The ONE case where an unselected tool must stay unavailable: the user
   // reported a save failure and has not authorized a fix, so destructive tools
   // are withheld for the whole turn (see the late-admission branch below).
@@ -243,10 +260,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   // The provider receives SLIM definitions for MANUAL_TOOLS (routing info
   // only); each such tool's full manual is delivered by the gate below on its
   // first call this turn, BEFORE anything executes.
-  const wireTools = toWireTools(contextualTools);
+  const wireTools = toWireTools(stripUnavailableToolActions(contextualTools));
   const deliveredManuals = new Set();
 
-  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb);
+  const systemPrompt = await buildSystemPrompt(userText, !!imageBase64, !!browseWeb, routingText);
 
   // If image is attached, analyze with a vision model first, then include description
   let userContent;
@@ -288,6 +305,15 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     ...conversationHistory,
     { role: 'user', content: userContent },
   ];
+  // Learning memory: the stored lessons that match THIS request go right after
+  // the user's message (where models attend most — at the end of a long system
+  // prompt a binding lesson was read and then ignored in the live acceptance
+  // run). Transient: buildTurnHistory drops system messages, so lessons are
+  // re-selected fresh every turn and never pile up in history.
+  {
+    const memoryBlock = buildMemoryPromptBlock(userText, [...contextualToolNames]);
+    if (memoryBlock) messages.push({ role: 'system', content: memoryBlock.trim() });
+  }
 
   const charts = [];
   const apiCallsLog = [];
@@ -526,6 +552,11 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     manage_program_indicators: 'Processing program indicators',
     manage_metadata: 'Processing metadata changes',
     manage_line_lists: 'Working on line lists',
+    manage_users: 'Reviewing user administration',
+    manage_data_values: 'Reviewing data values',
+    manage_metadata_translations: 'Reviewing translations',
+    manage_memory: 'Reviewing learning memory',
+    manage_custom_app: 'Checking the app build',
   };
   const thinkingLabels = [
     'Analyzing your question',
@@ -613,7 +644,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
       // transparently — `messages` was not mutated for this iteration, so the
       // request is safely repeatable. If text already streamed, rethrow so the
       // user sees the error rather than duplicated output.
-      if (/stream stalled/i.test(provErr?.message || '') && !streamStartBroadcast && providerStallRetries < 2) {
+      if (isRetryableStreamDrop(provErr) && !streamStartBroadcast && providerStallRetries < 2) {
         providerStallRetries++;
         console.warn(`[AgenticLoop] provider stream stalled — retrying (${providerStallRetries}/2)`);
         broadcast({ type: 'AI_THINKING', iteration: i + 1, label: `Connection dropped — retrying (${providerStallRetries}/2)` });
@@ -683,6 +714,11 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           if (healedShape.healed) {
             console.warn(`[AgenticLoop] Healed provider-mangled argument shapes for ${toolName} ($text/stringified nesting)`);
             args = healedShape.value;
+          }
+          const healedEntities = healArgumentEntities(args);
+          if (healedEntities.healed) {
+            console.warn(`[AgenticLoop] Decoded HTML entities in ${toolName} label/expression arguments`);
+            args = healedEntities.value;
           }
         }
 
@@ -758,7 +794,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           // still get one "resend the same call" pass before split advice.
           const hitTokenLimit = argsCorrupted.finishReason === 'length';
           const persistent = hitTokenLimit || dhis2.corruptedCallCount >= 3;
-          const splitHint = `Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.`;
+          const splitHint = toolName === 'manage_custom_app'
+            // An app's source cannot be split across calls — the code must shrink.
+            ? `Write SHORTER source: drive repeated fields from one array of UIDs mapped over (never one block per field), drop comments and decorative markup, and put helpers used by both app and plugin in shared.jsx once. Write the code directly in the call — do not draft it in your reasoning first.`
+            : `Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.`;
           const feedback = {
             _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was ${hitTokenLimit ? `cut off by the response token limit after ${argsCorrupted.rawLength} characters` : `truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON)`}. NOTHING was executed.`,
             _hint: persistent
@@ -806,6 +845,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           deliveredManuals.add(tc.function.name);
           console.log(`[AgenticLoop] Manual gate: delivering ${tc.function.name} manual (call not executed)`);
           toolResult = buildManualGateResult(tc.function.name);
+          // The tool's own stored lessons travel with its manual.
+          const toolLessons = memoryLessonsFor({ tool: tc.function.name, args, userText });
+          if (toolLessons.length) { toolResult._memory_lessons = toolLessons; toolResult._memory_rule = MEMORY_TOOL_RULE; }
         } else {
           if (tc.function.name !== 'render_chart') {
             apiCallsLog.push({ tool: tc.function.name, args: JSON.parse(JSON.stringify(args)) });
@@ -885,7 +927,16 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             if (failNote && failNote.famCount >= 2) {
               toolResult._failure_streak = failNote.famCount;
               toolResult._hint = `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of ${tc.function.name} with the same error this turn. Identical retries are BLOCKED. Change the failing part based on the exact error above (e.g. simplify the expression to the supported grammar, or test with dry_run). If you cannot fix it now, STOP calling ${tc.function.name}: give the user a final answer listing what succeeded (names + IDs), what failed with this exact error, and your recommended next step.`;
-            } else if (!failNote) {
+            }
+            // Learning memory: a failure gets the stored fix for it attached; a
+            // success that resolves an earlier failure this turn gets a nudge
+            // to record the lesson (automatic lesson written at turn end anyway).
+            if (toolResult && typeof toolResult === 'object' && !Array.isArray(toolResult)) {
+              const mem = memoryObserveCall(tc.function.name, args, toolResult);
+              if (mem.lessons) { toolResult._memory_lessons = mem.lessons; toolResult._memory_rule = MEMORY_TOOL_RULE; }
+              if (mem.note) toolResult._memory_note = mem.note;
+            }
+            if (!failNote) {
               // Success — unlocks ONE identical retry for previously failed
               // calls (a prerequisite may have just been fixed).
               dhis2.toolSuccessCount = (dhis2.toolSuccessCount || 0) + 1;
@@ -1389,18 +1440,26 @@ function injectedScreenshotSelection() {
     const w = Math.abs(e.clientX - startX);
     const h = Math.abs(e.clientY - startY);
     overlay.remove();
+    document.removeEventListener('keydown', cancelHandler);
     if (w < 10 || h < 10) return;
-    setTimeout(() => {
-      chrome.runtime.sendMessage({
-        type: 'SCREENSHOT_AREA_SELECTED',
-        payload: {
-          x: Math.round(x),
-          y: Math.round(y),
-          width: Math.round(w),
-          height: Math.round(h),
-          devicePixelRatio: window.devicePixelRatio || 1,
-        },
-      });
+    const selection = {
+      x: Math.round(x),
+      y: Math.round(y),
+      width: Math.round(w),
+      height: Math.round(h),
+      devicePixelRatio: window.devicePixelRatio || 1,
+      viewportWidth: window.innerWidth,
+    };
+    setTimeout(async () => {
+      const res = await chrome.runtime
+        .sendMessage({ type: 'SCREENSHOT_AREA_SELECTED', payload: selection })
+        .catch(() => null);
+      if (!res?.captureInPage) return;
+      // getDisplayMedia needs transient user activation, which expires ~5 s
+      // after the mousedown. A slow drag outlives it, so ask for one more click
+      // instead of failing.
+      if (navigator.userActivation && !navigator.userActivation.isActive) confirmThenCapture(selection);
+      else captureThisTab(selection);
     }, 80);
   });
 
@@ -1413,6 +1472,93 @@ function injectedScreenshotSelection() {
   document.addEventListener('keydown', cancelHandler);
 
   document.body.appendChild(overlay);
+
+  // chrome.tabs.captureVisibleTab needs activeTab or <all_urls>, which the
+  // manifest deliberately doesn't declare, so the background refuses and we
+  // capture from inside the page: getDisplayMedia + preferCurrentTab needs no
+  // extension permission — Chrome asks the user to share this tab, we grab one
+  // frame and stop the stream immediately.
+  async function captureThisTab(sel) {
+    let stream = null;
+    try {
+      // Missing outside secure contexts (plain-http servers other than localhost).
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        throw Object.assign(new Error('getDisplayMedia is unavailable'), { name: 'InsecureContextError' });
+      }
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        // Without constraints Chrome downscales tab capture to ~800px wide; a
+        // max-only cap yields native-resolution frames (an `ideal` size is
+        // still resampled by a few pixels).
+        video: { displaySurface: 'browser', width: { max: 8192 }, height: { max: 8192 } },
+        audio: false,
+        preferCurrentTab: true,
+        selfBrowserSurface: 'include',
+        surfaceSwitching: 'exclude',
+        monitorTypeSurfaces: 'exclude',
+      });
+      const [track] = stream.getVideoTracks();
+      if (track.getSettings().displaySurface !== 'browser') {
+        throw Object.assign(new Error('a window or screen was shared'), { name: 'WrongSurfaceError' });
+      }
+      const video = document.createElement('video');
+      video.muted = true;
+      video.srcObject = stream;
+      await video.play();
+      // Chrome's "sharing this tab" bar shortens the viewport once capture
+      // starts but never narrows it, so scale by width and clamp the height.
+      const scale = video.videoWidth / sel.viewportWidth;
+      const sx = Math.round(sel.x * scale);
+      const sy = Math.round(sel.y * scale);
+      const sw = Math.min(Math.round(sel.width * scale), video.videoWidth - sx);
+      const sh = Math.min(Math.round(sel.height * scale), video.videoHeight - sy);
+      if (!(sw > 0 && sh > 0)) throw new Error('the captured frame does not cover the selected area');
+      const canvas = document.createElement('canvas');
+      canvas.width = sw;
+      canvas.height = sh;
+      canvas.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+      chrome.runtime.sendMessage({ type: 'SCREENSHOT_CAPTURED', dataUrl: canvas.toDataURL('image/png') });
+    } catch (err) {
+      chrome.runtime.sendMessage({ type: 'SCREENSHOT_FAILED', reason: err.name, error: err.message });
+    } finally {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    }
+  }
+
+  function confirmThenCapture(sel) {
+    const btn = document.createElement('button');
+    btn.id = '__dhis2_screenshot_confirm__';
+    btn.textContent = 'Capture selection';
+    Object.assign(btn.style, {
+      position: 'fixed',
+      left: (sel.x + sel.width / 2) + 'px',
+      top: (sel.y + sel.height / 2) + 'px',
+      transform: 'translate(-50%, -50%)',
+      zIndex: '2147483647',
+      background: '#4f46e5',
+      color: '#fff',
+      border: 'none',
+      padding: '8px 18px',
+      borderRadius: '8px',
+      fontSize: '14px',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      fontWeight: '500',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+      cursor: 'pointer',
+    });
+    const escHandler = (e) => {
+      if (e.key === 'Escape') {
+        btn.remove();
+        document.removeEventListener('keydown', escHandler);
+      }
+    };
+    btn.addEventListener('click', () => {
+      btn.remove();
+      document.removeEventListener('keydown', escHandler);
+      captureThisTab(sel);
+    });
+    document.addEventListener('keydown', escHandler);
+    document.body.appendChild(btn);
+  }
 }
 
 // ── Broadcasting ─────────────────────────────────────────────────────────────
@@ -1423,50 +1569,94 @@ function broadcast(data) {
 
 // ── Message Handler ──────────────────────────────────────────────────────────
 
+// Content scripts run inside DHIS2 pages, and Chrome's extension security model
+// treats their messages as untrusted (a compromised page renderer can send
+// whatever a content script can). They only ever send these types; everything
+// else — API keys, provider config, chat turns (which can authorize writes),
+// memory, feedback — is accepted only from the extension's own pages.
+const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
+  'DHIS2_CONTEXT_UPDATE', 'DHIS2_STAGE_DETECTED',
+  'SCREENSHOT_AREA_SELECTED', 'SCREENSHOT_CAPTURED', 'SCREENSHOT_FAILED',
+]);
+function isExtensionPageSender(sender) {
+  const prefix = chrome.runtime.getURL('');
+  return !!prefix && typeof sender.url === 'string' && sender.url.startsWith(prefix);
+}
+
+// Page context follows the tab the user is looking at. tabs.onUpdated,
+// webNavigation and content scripts report EVERY tab, so a background DHIS2 tab
+// reloading — or bouncing to the login page when its session expired — used to
+// re-point the connection (or reset `connected`) in the middle of a turn the
+// user was running in another tab.
+async function isFocusedActiveTab(tabId) {
+  try {
+    const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    return !!t && t.id === tabId;
+  } catch { return false; }
+}
+// Content-script context events: from a tab, only the focused active one counts.
+function fromFocusedTabOrPage(sender) {
+  return sender.tab ? isFocusedActiveTab(sender.tab.id) : Promise.resolve(true);
+}
+
+// Content script detected the active stage (from URL hash or DOM observation).
+// Use hasUidShape (loose) — the stage ID comes from a DHIS2-served URL and is
+// further cross-checked against knownStages below.
+function applyDetectedStage(payload) {
+  const detectedStageId = payload?.stageId;
+  if (detectedStageId && hasUidShape(detectedStageId)) {
+    // Only update if different from current and it's a valid stage in the program
+    const currentStageId = dhis2.pageContext?.stageId;
+    if (detectedStageId !== currentStageId) {
+      // Validate against known stages if program metadata is loaded
+      const knownStages = dhis2.programMetadata?.programStages;
+      if (!knownStages || knownStages.some(s => s.id === detectedStageId)) {
+        if (!dhis2.pageContext) dhis2.pageContext = {};
+        dhis2.pageContext.stageId = detectedStageId;
+        console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${payload?.source || 'unknown'})`);
+        // PERSIST. The detected stage exists ONLY here — no URL re-parse can
+        // recover it on the enrollment dashboard. Chrome kills the MV3
+        // worker after ~30 s idle and restores dhis2 from session storage,
+        // so an in-memory-only write meant the stage was reliably known for
+        // a short while and then gone ("the chatbot finds it for a bit then
+        // loses it", reported live 2026-08-06).
+        saveState();
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+      }
+    }
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Only accept messages from our own extension's content scripts and pages.
   // Reject anything with an external `sender.id` or an `externally_connectable` origin.
   if (sender.id !== chrome.runtime.id) return false;
   if (!msg || typeof msg.type !== 'string') return false;
+  if (!CONTENT_SCRIPT_MESSAGE_TYPES.has(msg.type) && !isExtensionPageSender(sender)) {
+    console.warn(`[security] Ignored "${msg.type}" from outside the extension's pages (${sender.url || 'unknown sender'})`);
+    return false;
+  }
   switch (msg.type) {
     case 'DHIS2_CONTEXT_UPDATE': {
       const url = msg.payload?.url || sender.tab?.url;
-      if (url) {
-        initializeFromUrl(url).then(r => {
-          broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-          sendResponse(r);
-        }).catch(e => sendResponse({ error: e.message }));
-      }
+      // A content script may only report its own page's origin.
+      let sameOrigin = false;
+      try { sameOrigin = !sender.tab || new URL(url).origin === new URL(sender.url || sender.tab.url).origin; } catch {}
+      if (!url || !sameOrigin) { sendResponse({ ignored: true }); return false; }
+      fromFocusedTabOrPage(sender).then(async (focused) => {
+        if (!focused) { sendResponse({ ignored: 'not the focused tab' }); return; }
+        const r = await initializeFromUrl(url);
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+        sendResponse(r);
+      }).catch(e => sendResponse({ error: e.message }));
       return true;
     }
 
     case 'DHIS2_STAGE_DETECTED': {
-      // Content script detected the active stage (from URL hash or DOM observation)
-      // Use hasUidShape (loose) — the stage ID comes from a DHIS2-served URL
-      // and is further cross-checked against knownStages below.
-      const detectedStageId = msg.payload?.stageId;
-      if (detectedStageId && hasUidShape(detectedStageId)) {
-        // Only update if different from current and it's a valid stage in the program
-        const currentStageId = dhis2.pageContext?.stageId;
-        if (detectedStageId !== currentStageId) {
-          // Validate against known stages if program metadata is loaded
-          const knownStages = dhis2.programMetadata?.programStages;
-          if (!knownStages || knownStages.some(s => s.id === detectedStageId)) {
-            if (!dhis2.pageContext) dhis2.pageContext = {};
-            dhis2.pageContext.stageId = detectedStageId;
-            console.log(`[StageDetect] Active stage updated: ${detectedStageId} (source: ${msg.payload?.source || 'unknown'})`);
-            // PERSIST. The detected stage exists ONLY here — no URL re-parse can
-            // recover it on the enrollment dashboard. Chrome kills the MV3
-            // worker after ~30 s idle and restores dhis2 from session storage,
-            // so an in-memory-only write meant the stage was reliably known for
-            // a short while and then gone ("the chatbot finds it for a bit then
-            // loses it", reported live 2026-08-06).
-            saveState();
-            broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
-          }
-        }
-      }
-      sendResponse({ success: true });
+      fromFocusedTabOrPage(sender).then((focused) => {
+        if (focused) applyDetectedStage(msg.payload);
+        sendResponse({ success: true });
+      }).catch(e => sendResponse({ error: e.message }));
       return true;
     }
 
@@ -1500,6 +1690,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'CHAT_MESSAGE': {
       sendResponse({ status: 'processing' });
       (async () => {
+        await stateRestored;
         await ensureConnected();
         // Re-extract context from current tab for SPA navigation
         try {
@@ -1530,7 +1721,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               freshCtx.programId !== oldProgramId ||
               freshCtx.visualizationId !== oldVisualizationId ||
               freshCtx.mapId !== oldMapId ||
-              (!freshCtx.programId && !!oldProgramId);
+              (!freshCtx.programId && !!oldProgramId) ||
+              // A large programMetadata is not persisted (see
+              // persistableDhis2Snapshot) — re-fetch it after a worker restart.
+              (!!freshCtx.programId && !dhis2.programMetadata);
 
             if (needsFullRefresh) {
               await initializeFromUrl(tab.url);
@@ -1706,7 +1900,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             func: injectedScreenshotSelection,
           });
         } catch (e) {
-          broadcast({ type: 'AI_ERROR', error: 'Cannot capture this page. Try on a regular web page.' });
+          broadcast({ type: 'SCREENSHOT_ERROR', error: 'Cannot capture this page. Try on a regular web page.' });
         }
       });
       sendResponse({ ok: true });
@@ -1714,23 +1908,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case 'SCREENSHOT_AREA_SELECTED': {
-      // Capture the visible tab, then crop to the selected area
+      // Prompt-free path: capture the visible tab, then crop to the selected area.
+      // Without activeTab / <all_urls> Chrome refuses captureVisibleTab, so the
+      // overlay is told to capture the tab itself (captureThisTab).
       const { x, y, width, height, devicePixelRatio } = msg.payload;
-      chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-        if (!tabs[0]?.id) { sendResponse({ error: 'No active tab' }); return; }
+      (async () => {
         try {
-          const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+          const dataUrl = await chrome.tabs.captureVisibleTab(sender.tab?.windowId ?? null, { format: 'png' });
           // Crop the captured image to the selected region
           const cropped = await cropImage(dataUrl, x, y, width, height, devicePixelRatio);
           // Send the cropped image back to the side panel
           broadcast({ type: 'SCREENSHOT_RESULT', dataUrl: cropped });
           sendResponse({ ok: true });
         } catch (e) {
-          broadcast({ type: 'AI_ERROR', error: 'Screenshot failed: ' + e.message });
-          sendResponse({ error: e.message });
+          sendResponse({ captureInPage: true });
         }
-      });
+      })();
       return true;
+    }
+
+    case 'SCREENSHOT_CAPTURED': {
+      // Already-cropped PNG from the overlay's in-page tab capture.
+      if (sender.tab && typeof msg.dataUrl === 'string' && msg.dataUrl.startsWith('data:image/png;base64,')) {
+        broadcast({ type: 'SCREENSHOT_RESULT', dataUrl: msg.dataUrl });
+      }
+      return false;
+    }
+
+    case 'SCREENSHOT_FAILED': {
+      const errors = {
+        NotAllowedError: 'Screenshot cancelled. To attach one, click **Allow** when Chrome asks "Allow … to see this tab?".',
+        WrongSurfaceError: 'Screenshot cancelled: a window or screen was shared. Choose **this tab** when Chrome asks.',
+        InsecureContextError: 'Screenshots need the DHIS2 page to be on HTTPS (or localhost). Use **Upload image** or paste a screenshot (Ctrl+V) instead.',
+      };
+      broadcast({ type: 'SCREENSHOT_ERROR', error: errors[msg.reason] || 'Screenshot failed: ' + (msg.error || 'unknown error') });
+      return false;
     }
 
     case 'GET_FEEDBACK_LOG': {
@@ -1742,6 +1954,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'GET_LAST_INTERACTION': {
       sendResponse(lastInteraction);
+      return true;
+    }
+
+    // Learning memory (settings → Learning memory): view / delete / clear /
+    // add a note / switch on-off. The worker is the single writer.
+    case 'MEMORY_GET':
+    case 'MEMORY_SET_ENABLED':
+    case 'MEMORY_DELETE':
+    case 'MEMORY_CLEAR':
+    case 'MEMORY_ADD_NOTE': {
+      memoryPanelRequest(msg)
+        .then(r => sendResponse(r))
+        .catch(e => sendResponse({ error: e.message }));
       return true;
     }
   }
@@ -1756,17 +1981,25 @@ chrome.action.onClicked.addListener(async (tab) => {
 // ── Tab URL Change ───────────────────────────────────────────────────────────
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.url && (tab.url.includes('/dhis-web-') || tab.url.includes('/apps/') || tab.url.includes('/api/'))) {
-    initializeFromUrl(tab.url).then(() => {
-      broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+  if (info.url && tab.active && (tab.url.includes('/dhis-web-') || tab.url.includes('/apps/') || tab.url.includes('/api/'))) {
+    isFocusedActiveTab(tabId).then((focused) => {
+      if (!focused) return;
+      return initializeFromUrl(tab.url).then(() => {
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+      });
     }).catch(() => {});
   }
 });
 
+// Top frame only: 2.42's global shell runs each app in an iframe whose own
+// fragment changes would otherwise re-initialize from the iframe's URL.
 chrome.webNavigation?.onReferenceFragmentUpdated?.addListener?.((details) => {
-  if (details.url && (details.url.includes('/dhis-web-') || details.url.includes('/apps/'))) {
-    initializeFromUrl(details.url).then(() => {
-      broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+  if (details.frameId === 0 && details.url && (details.url.includes('/dhis-web-') || details.url.includes('/apps/'))) {
+    isFocusedActiveTab(details.tabId).then((focused) => {
+      if (!focused) return;
+      return initializeFromUrl(details.url).then(() => {
+        broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+      });
     }).catch(() => {});
   }
 });

@@ -45,6 +45,15 @@ function isLocalProvider(cfg) {
   if (cfg.providerType === 'ollama') return true;
   return isLocalProviderUrl(cfg.apiBaseUrl);
 }
+// Stricter check for PRIVACY decisions: where chat requests actually go, not
+// the preset name. isLocalProvider() treats every "ollama" preset as local
+// (fine for "no API key needed"), but an Ollama preset pointed at
+// https://ollama.com or another machine sends tool results off the device.
+function providerRequestsStayLocal(cfg) {
+  if (!cfg) return false;
+  const fallback = cfg.providerType === 'anthropic' ? 'https://api.anthropic.com' : DEFAULT_PROVIDER_CONFIG.apiBaseUrl;
+  return isLocalProviderUrl(cfg.apiBaseUrl || fallback);
+}
 // Strict validator for user-supplied provider/vision URLs.
 // Rejects javascript:, data:, file: and anything that doesn't parse.
 function isValidProviderUrl(rawUrl) {
@@ -56,6 +65,9 @@ function isValidProviderUrl(rawUrl) {
 
 let _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };
 let _cachedApiKey = null;
+// Whether a Tavily key is saved — tools that need it are not offered without
+// one (see stripUnavailableToolActions in registry.js).
+let _hasTavilyKey = false;
 
 function getProviderConfig() {
   return _cachedProviderConfig;
@@ -100,11 +112,12 @@ function sanitizeHeaderValue(v) {
 }
 
 // Load cached settings at startup
-chrome.storage.local.get(['providerConfig', 'fireworksApiKey']).then(d => {
+chrome.storage.local.get(['providerConfig', 'fireworksApiKey', 'tavilyApiKey']).then(d => {
   if (d.providerConfig) {
     _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, ...d.providerConfig };
   }
   if (d.fireworksApiKey) _cachedApiKey = sanitizeHeaderValue(d.fireworksApiKey);
+  _hasTavilyKey = !!sanitizeHeaderValue(d.tavilyApiKey);
 });
 
 // Keep caches in sync whenever settings change
@@ -115,6 +128,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
   if (Object.prototype.hasOwnProperty.call(changes, 'fireworksApiKey')) {
     _cachedApiKey = sanitizeHeaderValue(changes.fireworksApiKey.newValue) || null;
+  }
+  if (Object.prototype.hasOwnProperty.call(changes, 'tavilyApiKey')) {
+    _hasTavilyKey = !!sanitizeHeaderValue(changes.tavilyApiKey.newValue);
   }
 });
 const TAVILY_SEARCH_URL = 'https://api.tavily.com/search';
@@ -206,6 +222,19 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   + '|yes(?:,?\\s*(?:please|do it|go ahead|fix(?: it)?|update|delete|remove))?'
   + '|let\'?s? (?:fix|update|delete|remove|do)'
   + ')\\b',
+  'i'
+);
+// Imperative-only write verbs. These are ordinary words in problem reports
+// ("the form I submitted", "reset happens", "after I enter data it fails"), so
+// they only count as an INSTRUCTION at the start of a sentence or after a
+// request marker (please / and / then / can you …), and never when the same
+// message is a problem report (see classifyWriteAuthorization). "Enter 12
+// malaria cases for January", "Reset Jane's password", "Mark the September
+// form complete", "Register three new clinics" were all classified read_only
+// and refused (verified 2026-10-20) although nothing in them is a complaint.
+const WRITE_AUTH_IMPERATIVE_RE = new RegExp(
+  '(?:^|[.!?;:\\n]\\s*|\\b(?:please|pls|kindly|and|then|also|now|next|can\\s+you|could\\s+you|would\\s+you|i\\s+want\\s+you\\s+to|i\\s+need\\s+you\\s+to)\\s+)'
+  + '(?:enter|record|submit|input|key\\s+in|fill\\s+in|type\\s+in|mark|reset|lock|unlock|deactivate|reactivate|onboard|invite|register|enrol+|import)\\b',
   'i'
 );
 const WRITE_AUTH_DIAG_RE = new RegExp(
@@ -308,9 +337,14 @@ function classifyWriteAuthorization(userText) {
     ),
     ' '
   );
-  const isBroad = WRITE_AUTH_BROAD_RE.test(inabilityStripped);
   const isDiag = WRITE_AUTH_DIAG_RE.test(text);
   const isProblem = WRITE_AUTH_PROBLEM_RE.test(text);
+  // Narrative clauses ("when I enter data and then submit it…") describe what
+  // the user DID, so their verbs are never instructions.
+  const isNarrative = /\b(?:when|whenever|if|after|before|while|once|every\s+time)\s+(?:i|we|they|he|she|users?|someone|the\s+user)\b/i.test(text)
+    || /\bfails?\b|\berrors?\b/i.test(text);
+  const isBroad = WRITE_AUTH_BROAD_RE.test(inabilityStripped)
+    || (!isProblem && !isNarrative && WRITE_AUTH_IMPERATIVE_RE.test(inabilityStripped.trim()));
   // Hard refusal: an explicit "no, …" decline always wins over any verb match.
   const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text);
   if (isBroad && !isRefusal) {
@@ -419,6 +453,51 @@ function destructive404StopOrNull(toolName, action) {
 
 function _namedTargetNorm(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// ── "The whole hierarchy" on a multi-root instance ─────────────────────────
+// A user can be assigned several top org units (localhost 2.42: Palestine,
+// Test, MoHP Egypt). Live 2026-10-28: asked for charts "across the whole
+// hierarchy", the model took the FIRST org unit of a program's assignment list
+// — the root "MoHP Egypt" — as THE root, scoped all seven items to it, found no
+// data (it lives under the other two roots) and told the user the analytics
+// tables had never run. USER_ORGUNIT covers every root the user has.
+let _userRootOuCache = null;
+async function userRootOrgUnits() {
+  const key = dhis2.baseUrl;
+  if (_userRootOuCache && _userRootOuCache.key === key) return _userRootOuCache.list;
+  const me = await safeDhis2Fetch('me?fields=organisationUnits[id,displayName,level]');
+  if (!me || me._error || !Array.isArray(me.organisationUnits)) return null;
+  const list = me.organisationUnits.map(o => ({ id: o.id, displayName: o.displayName, level: o.level }));
+  _userRootOuCache = { key, list };
+  return list;
+}
+// Everything the user typed in this thread (to tell "the user named this org
+// unit" from "the model picked it").
+function userWordsThisThread() {
+  const parts = [String(lastUserText || '')];
+  for (const m of (Array.isArray(conversationHistory) ? conversationHistory : [])) {
+    if (m && m.role === 'user') parts.push(typeof m.content === 'string' ? m.content : (Array.isArray(m.content) ? m.content.map(c => (c && c.text) || '').join(' ') : ''));
+  }
+  return parts.join('\n').toLowerCase();
+}
+// Refuse an analytics object scoped to exactly ONE of the user's several root
+// org units when the user never named it — the whole hierarchy is USER_ORGUNIT.
+// `orgUnits` is the ou item list (UIDs / keywords) the tool is about to save.
+async function singleRootScopeRefusal(orgUnits, what) {
+  const items = (Array.isArray(orgUnits) ? orgUnits : []).map(o => String(o).trim()).filter(Boolean);
+  if (items.length !== 1 || !/^[A-Za-z][A-Za-z0-9]{10}$/.test(items[0])) return null;
+  const roots = await userRootOrgUnits();
+  if (!roots || roots.length < 2) return null;
+  const root = roots.find(r => r.id === items[0]);
+  if (!root) return null;
+  const said = userWordsThisThread();
+  if (root.displayName && said.includes(String(root.displayName).toLowerCase())) return null;
+  return {
+    _error: `${what} is scoped to "${root.displayName}" (${root.id}) only — but this user has ${roots.length} top org units (${roots.map(r => r.displayName).join(', ')}) and never asked for "${root.displayName}". Nothing was saved.`,
+    _hint: `For "the whole hierarchy", "everywhere", "all org units" or "national", use org_units ["USER_ORGUNIT"] (it covers all ${roots.length}); for "facilities at level N" everywhere use ["USER_ORGUNIT", "LEVEL-N"]. Only scope to "${root.displayName}" if the user asked for it by name. Retry the same call with the corrected org units.`,
+    user_root_org_units: roots,
+  };
 }
 
 function noteMissingNamedTarget(objectType, nameFilter) {
@@ -788,6 +867,43 @@ function isIncompleteCallError(resultOrText) {
 // silently run a partial call (e.g. a create_program missing its last stages
 // and rules that then "succeeds"), so callers must treat it as corrupted and
 // ask the model to resend/split instead. Never throws. Pure — safe to unit test.
+// Some models (deepseek-v4p1-flash on Fireworks, 2026-10-28) HTML-escape
+// "&", "<" and ">" inside tool-call strings: a program short name was saved as
+// "NCD HTN &amp; DM Care" and an app was named "… &amp; Diabetes". Decode the
+// entities in label and expression arguments only — names, descriptions,
+// messages, rule / indicator expressions, where an entity is never meant
+// literally. Code, HTML and file contents are left alone (in JSX text "&lt;"
+// is legitimate).
+const ENTITY_ARG_KEY_RE = /^(?:name|short_?name|display_?name|form_?name|title|subtitle|description|label|content|message|condition|expression|filter|data|[a-z_]+_name|program_(?:short_name|description))$/i;
+function decodeHtmlEntities(s) {
+  return String(s)
+    .replace(/&#(\d+);/g, (m, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;|&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+function healArgumentEntities(value) {
+  let healed = false;
+  const walk = (v, key) => {
+    if (typeof v === 'string') {
+      if (key && ENTITY_ARG_KEY_RE.test(key) && /&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);/i.test(v) && !/<[a-z\/!]/i.test(v)) {
+        healed = true;
+        return decodeHtmlEntities(v);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) return v.map((x) => walk(x, key));
+    if (v && typeof v === 'object') {
+      const out = {};
+      for (const [k, x] of Object.entries(v)) out[k] = /^(?:files|source|code|html|htmlCode|html_code|body_html)$/i.test(k) ? x : walk(x, k);
+      return out;
+    }
+    return v;
+  };
+  const out = walk(value, null);
+  return { healed, value: healed ? out : value };
+}
+
 function repairToolCallArguments(raw) {
   const s0 = String(raw == null ? '' : raw);
   const tryParse = (t) => { try { JSON.parse(t); return true; } catch { return false; } };
@@ -1072,6 +1188,8 @@ const DISCOVERY_ACTIONS = {
   manage_program_indicators: new Set(['list', 'get']),
   manage_program_notifications: new Set(['list', 'get']),
   manage_backups: new Set(['list', 'get']),
+  manage_custom_app: new Set(['list', 'get_source', 'preview', 'placements']),
+  manage_sql_views: new Set(['list', 'get', 'describe', 'run']),
 };
 function isDiscoveryCall(toolName, args) {
   if (DISCOVERY_ONLY_TOOLS.has(toolName)) return true;
@@ -1081,6 +1199,11 @@ function isDiscoveryCall(toolName, args) {
 }
 function discoveryStreakStopOrNull(toolName, args) {
   if (!isDiscoveryCall(toolName, args)) return null;
+  // A preview is the first step of building an app — the very move this
+  // guard's hint asks for. It still does not reset the streak (no write yet),
+  // but it is never blocked (live 2026-10-28 both previews of an app were
+  // refused here and the turn ended with nothing built).
+  if (toolName === 'manage_custom_app' && args && args.action === 'preview') return null;
   // The guard exists to break "research forever, never act" — but on a turn
   // with NO write authorization there is nothing to act on: verifying,
   // explaining or diagnosing is legitimately all reads. Blocking discovery
@@ -1092,7 +1215,7 @@ function discoveryStreakStopOrNull(toolName, args) {
   if (streak < DISCOVERY_STREAK_LIMIT) return null;
   return {
     _error: `STOP researching: ${streak} read-only/discovery calls in a row this turn with NOTHING created or changed. You already have enough information to act.`,
-    _hint: `Issue the actual write the task needs NOW. To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
+    _hint: `Issue the actual write the task needs NOW (an app or plugin: manage_custom_app preview; data no endpoint has: manage_sql_views create). To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
     _scope: 'no_progress_repeat',   // feeds the circuit breaker: if the model ignores this and keeps spinning, the discovery tool is disabled and the loop ends
     _discovery_streak: streak,
   };
@@ -1458,7 +1581,10 @@ function userExplicitlyWantsDescendants(userText) {
 }
 
 // ── State Restoration (MV3 service worker can die and restart) ──────────────
-(async () => {
+// A chat message is what wakes an evicted worker, so its handler awaits this
+// before building the turn — otherwise it can read conversationHistory while
+// the get() below is still in flight and run the turn with no memory.
+const stateRestored = (async () => {
   try {
     const stored = await chrome.storage.session.get(['dhis2Full', 'chatHistory']);
     // Do NOT resurrect the previous thread if a new-thread reset (CLEAR_HISTORY)
@@ -1484,7 +1610,7 @@ async function ensureConnected() {
     if (activeTab?.url) {
       const activeBaseUrl = extractBaseUrl(activeTab.url);
       if (activeBaseUrl && dhis2.baseUrl && activeBaseUrl !== dhis2.baseUrl) {
-        const r = await initializeFromUrl(activeTab.url);
+        const r = await initializeFromUrlNow(activeTab.url);
         if (!r?.error) return dhis2.connected && !!dhis2.baseUrl;
         // Re-init failed — fall through and try the legacy paths so we still
         // return a usable answer (better than blocking the user entirely).
@@ -1503,7 +1629,7 @@ async function ensureConnected() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.url) {
-      const result = await initializeFromUrl(tab.url);
+      const result = await initializeFromUrlNow(tab.url);
       return result.success === true;
     }
   } catch {}
@@ -1515,6 +1641,7 @@ async function ensureConnected() {
 // truthy guard in recordKnownIdsFromResult and crashes the next .add() call
 // with "set.add is not a function". Counters/history reset every turn anyway.
 const PER_TURN_DHIS2_FIELDS = new Set([
+  'lastProgramLookup',
   'knownIds', 'knownIdsSeedSize', 'knownIcons',
   'recentCreations',
   'writeAuth',
@@ -1587,6 +1714,102 @@ function getThreadToolNames() {
   return out;
 }
 
+// An EVENT analytics query (aggregate or query) is about the events of ONE
+// stage: stage-qualified dimensions from two stages are a guaranteed 409
+// ("Multiple stages in stage-specific dimensions are not allowed", E7244 —
+// MNCH replay 2026-10-29). Refuse it before it is sent and say how to split
+// it; enrollment analytics, which does span stages, is untouched.
+function eventAnalyticsMultiStageRefusal(path) {
+  const p = String(path || '');
+  if (!/^analytics\/events\/(?:aggregate|query)\//.test(p)) return null;
+  const qs = p.split('?')[1] || '';
+  const stages = new Set();
+  for (const part of qs.split('&')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const key = part.slice(0, eq);
+    let val = part.slice(eq + 1);
+    try { val = decodeURIComponent(val); } catch { /* keep raw */ }
+    if (key === 'stage' && /^[A-Za-z][A-Za-z0-9]{10}$/.test(val)) stages.add(val);
+    if (key !== 'dimension' && key !== 'filter') continue;
+    // `dimension=stage:A;B;C` — several stages asked for at once (RMNCH run
+    // 2026-10-29: 409 "does not reference any … part of the program: stage").
+    const listed = val.match(/^(?:stage|programStage):(.+)$/i);
+    if (listed) { for (const id of listed[1].split(';')) if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(id.trim())) stages.add(id.trim()); continue; }
+    const m = val.match(/^([A-Za-z][A-Za-z0-9]{10})\.[A-Za-z][A-Za-z0-9]{10}(?::|$)/);
+    if (m) stages.add(m[1]);
+  }
+  if (stages.size < 2) return null;
+  return {
+    _error: `Not sent: an event analytics query covers ONE program stage, but this one mixes ${[...stages].join(', ')} (DHIS2 answers 409 "Multiple stages in stage-specific dimensions are not allowed").`,
+    _hint: 'Run one query per stage (stage=<stageUid> with only that stage\'s <stageUid>.<deUid> dimensions), or use analytics/enrollments/aggregate, which may combine stages. For indicator values use /analytics with dx:<programIndicatorUid>.',
+    _scope: 'event_analytics_multi_stage',
+  };
+}
+
+// /api/analytics refuses a period AND startDate/endDate together (409 E7105
+// "Periods and start and end dates cannot be specified simultaneously" — RMNCH
+// run 2026-10-29, after an events/aggregate query with both was routed here).
+// The period says the same thing more precisely, so the dates are dropped.
+function healAnalyticsPeriodAndDates(path) {
+  const p = String(path || '');
+  if (!/^analytics(?:\.json)?\?/.test(p)) return { path: p, healed: false };
+  const [base, qs] = [p.slice(0, p.indexOf('?')), p.slice(p.indexOf('?') + 1)];
+  const parts = qs.split('&');
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const hasPe = parts.some(x => /^(dimension|filter)=/i.test(x) && /^pe:/i.test(dec(x.replace(/^[^=]*=/, ''))));
+  const hasDates = parts.some(x => /^(startDate|endDate)=/i.test(x));
+  if (!hasPe || !hasDates) return { path: p, healed: false };
+  return { path: `${base}?${parts.filter(x => !/^(startDate|endDate)=/i.test(x)).join('&')}`, healed: true };
+}
+
+// count_records filters "<id>:<op>:<value>" → an analytics dimension
+// "<prefix><id>:<OP>:<value>". The operator is REQUIRED by analytics — the old
+// conversion dropped it ("de:true"), so every filtered count 409'd (RMNCH run
+// 2026-10-29). Yes/No values are 1/0 in analytics.
+function countRecordsFilterDimension(f, prefix = '') {
+  const m = String(f || '').match(/^([^:]+):(eq|ne|gt|ge|lt|le|like|ilike|in|!eq):(.+)$/i);
+  if (!m) return null;
+  const op = m[2].toLowerCase() === 'ilike' ? 'LIKE' : m[2].toUpperCase();
+  const val = m[3].replace(/^true$/i, '1').replace(/^false$/i, '0');
+  return `${prefix}${m[1]}:${op}:${val}`;
+}
+
+// ── Routing text for follow-up turns ────────────────────────────────────────
+// A follow-up turn ("continue", "yes go ahead", "do the rest") names no
+// feature, so the keyword router saw only that word and offered none of the
+// task's tools. Live 2026-10-29: after "Say continue and I will … create the
+// chart, the bubble map and the dashboard", the "continue" turn had no
+// manage_dashboards/manage_maps on the wire, so the model hand-POSTed a chart
+// of a single org unit and a map with no data item, and called both done.
+// Short messages are routed on themselves PLUS the last substantive request of
+// this conversation. Relevance only: write authorization and the save-failure
+// mode still read the current message alone.
+const FOLLOW_UP_ONLY_RE = /^\s*(?:(?:please|ok(?:ay)?|yes|yeah|sure|great|thanks|good)[,.!\s]+)*(?:continue|go\s+on|go\s+ahead|proceed|carry\s+on|keep\s+going|resume|yes|yeah|yep|ok(?:ay)?|sure|do\s+(?:it|that|this|the\s+rest)|finish(?:\s+(?:it|up|the\s+rest))?|next|try\s+again|retry|again)\b/i;
+
+function lastSubstantiveUserRequest(history = conversationHistory) {
+  const list = Array.isArray(history) ? history : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (!m || m.role !== 'user') continue;
+    const raw = typeof m.content === 'string'
+      ? m.content
+      : (Array.isArray(m.content) ? m.content.filter(p => p && p.type === 'text').map(p => p.text).join(' ') : '');
+    const t = String(raw || '').replace(/\[(?:Web Browsing Enabled|Attached Image Analysis)\][\s\S]*$/, '').trim();
+    if (!t) continue;
+    if (t.split(/\s+/).length <= 8 && FOLLOW_UP_ONLY_RE.test(t)) continue;
+    return t.slice(0, 3000);
+  }
+  return '';
+}
+
+function buildRoutingText(userText, history = conversationHistory) {
+  const cur = String(userText || '');
+  if (cur.trim().split(/\s+/).filter(Boolean).length > 25) return cur;
+  const prior = lastSubstantiveUserRequest(history);
+  return prior && prior !== cur.trim() ? `${cur}\n${prior}` : cur;
+}
+
 // The ONE case where the contextual set is a safety boundary rather than a
 // relevance filter: the user reported a save/load failure and has not
 // authorized a fix, so every destructive tool is withheld until they do. Shared
@@ -1604,6 +1827,27 @@ function snapshotDhis2ForPersistence() {
     out[k] = dhis2[k];
   }
   return out;
+}
+
+// chrome.storage.session holds 10 MB for the whole extension and rejects an
+// over-quota set() as a unit. programMetadata embeds every option of every
+// option set on every stage field, so it grows with the server's data: the
+// Pharmacy program (15 drug slots × the EDL/CDL drug list) is 6.1 MB, and every
+// save on its pages failed (verified live 2026-10-22). It is a cache that
+// initializeFromUrl re-fetches from the page URL, so above this size it is
+// left out of the persisted copy instead of sinking the write.
+const PERSIST_DHIS2_MAX_CHARS = 1_500_000;
+const REFETCHABLE_DHIS2_CACHES = ['programMetadata'];
+
+function persistableDhis2Snapshot() {
+  const snap = snapshotDhis2ForPersistence();
+  let json = JSON.stringify(snap);
+  if (json.length > PERSIST_DHIS2_MAX_CHARS) {
+    for (const k of REFETCHABLE_DHIS2_CACHES) delete snap[k];
+    console.warn(`[saveState] state is ${json.length} chars — not persisting ${REFETCHABLE_DHIS2_CACHES.join(', ')} (re-fetched after a restart)`);
+    json = JSON.stringify(snap);
+  }
+  return JSON.parse(json);
 }
 
 // ── Conversation-memory helpers ─────────────────────────────────────────────
@@ -1684,15 +1928,34 @@ function buildTurnHistory(messages, persistFromIdx, userContentOverride) {
   return out;
 }
 
+// Each key is written on its own: when all three shared one set() and the
+// state was over quota, the chat history was rejected with it, the error was
+// swallowed, and the first message after the idle worker was evicted ran with
+// no memory of the conversation ("yes install it" → "what is 'it'?").
 async function saveState() {
-  try {
-    await chrome.storage.session.set({
-      dhis2State: getSerializableState(),
-      dhis2Full: JSON.parse(JSON.stringify(snapshotDhis2ForPersistence())),
-      // Trim on a user boundary so a reload never restores an orphaned tool msg.
-      chatHistory: trimConversationHistory(conversationHistory),
-    });
-  } catch {}
+  const parts = [
+    ['dhis2State', () => getSerializableState()],
+    ['dhis2Full', () => persistableDhis2Snapshot()],
+    // Trim on a user boundary so a reload never restores an orphaned tool msg.
+    ['chatHistory', () => trimConversationHistory(conversationHistory)],
+  ];
+  await Promise.all(parts.map(async ([key, build]) => {
+    let value;
+    try {
+      value = build();
+      await chrome.storage.session.set({ [key]: value });
+    } catch (e) {
+      console.warn(`[saveState] ${key} not persisted: ${e?.message || e}`);
+      if (key !== 'chatHistory' || !Array.isArray(value)) return;
+      // Keep the most recent turns rather than nothing.
+      for (let keep = Math.floor(value.length / 2); keep >= 1; keep = Math.floor(keep / 2)) {
+        try {
+          await chrome.storage.session.set({ chatHistory: trimConversationHistory(value, keep) });
+          return;
+        } catch { /* halve again */ }
+      }
+    }
+  }));
 }
 
 // ── New-thread reset ────────────────────────────────────────────────────────
@@ -1777,6 +2040,8 @@ function apiUrl(path) {
   // encodeStrictQueryChars (hoisted). appendQueryParamsToPath already encodes
   // via URLSearchParams, so this only matters for raw bracketed path strings.
   const s = String(path);
+  const ambiguous = ambiguousApiPathReason(s);
+  if (ambiguous) throw new Error(`Refused API path "${s.split('?')[0]}": ${ambiguous}`);
   const qIdx = s.indexOf('?');
   if (qIdx === -1) return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${s}`;
   return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${s.substring(0, qIdx)}?${encodeStrictQueryChars(s.substring(qIdx + 1))}`;
@@ -1820,6 +2085,25 @@ function healMultiUidPath(path, method) {
   params.append('filter', `id:in:[${ids.join(',')}]`);
   if (!params.has('paging')) params.set('paging', 'false');
   return `${segs[0]}?${params.toString()}`;
+}
+
+// Two metadata filters joined in ONE filter parameter
+// (`filter=programType:eq:WITH_REGISTRATION;displayName:ilike:mch`) is a 400 —
+// DHIS2 wants one filter parameter per expression (verified 2026-10-22; a
+// model probing its app's search query sent exactly that). Split it. Metadata
+// endpoints only: in analytics `filter=ou:A;B` is ONE dimension filter and
+// must stay joined, and every part must itself read property:operator:value.
+const JOINED_FILTER_RE = /^[\w.]+:!?[A-Za-z$!]+:[^;]*(?:;[\w.]+:!?[A-Za-z$!]+:[^;]*)+$/;
+function healJoinedMetadataFilters(path) {
+  const s = String(path || '');
+  const [p, q] = s.split('?');
+  if (!q || /^\/?(?:analytics|tracker|events|dataValueSets|dataValues|dataStore|sqlViews|trackedEntityInstances|enrollments|relationships|query|dataEntry)\b/.test(p)) return s;
+  const params = new URLSearchParams(q);
+  const filters = params.getAll('filter');
+  if (!filters.some((f) => JOINED_FILTER_RE.test(f))) return s;
+  params.delete('filter');
+  for (const f of filters) for (const part of (JOINED_FILTER_RE.test(f) ? f.split(';') : [f])) params.append('filter', part);
+  return `${p}?${params.toString()}`;
 }
 
 function generateDhis2Uid() {
@@ -2148,6 +2432,16 @@ async function restoreFromBackup(backupKey) {
       _hint: 'Use manage_backups(action="list") to see available keys.',
     };
   }
+  // App backups (manage_custom_app) hold JSX source, not metadata: restoring
+  // one reinstalls that app version (src/tools-apps.js, loaded later).
+  if (entry?.custom_app && typeof restoreCustomAppFromBackup === 'function') {
+    return await restoreCustomAppFromBackup(backupKey, entry);
+  }
+  // Capture configuration backups (manage_custom_app place / unplace) hold a
+  // dataStore/capture value, not metadata (src/tools-apps-placement.js).
+  if (entry?.capture_config && typeof restoreCaptureConfigFromBackup === 'function') {
+    return await restoreCaptureConfigFromBackup(backupKey, entry);
+  }
   const objects = Array.isArray(entry?.objects) ? entry.objects : [];
   if (objects.length === 0) return { _error: `Backup ${backupKey} contains no objects.` };
 
@@ -2293,7 +2587,9 @@ async function fetchViaTab(fullUrl, method, headers, bodyStr) {
   if (!dhis2.baseUrl) return null;
   try {
     const tabs = await chrome.tabs.query({});
-    const dhis2Tab = tabs.find(t => t.url && t.url.startsWith(dhis2.baseUrl));
+    // Exact base match: a bare prefix test also matched another instance whose
+    // path merely starts the same way (…/stable-2-41 vs …/stable-2-41-1).
+    const dhis2Tab = tabs.find(t => t.url && (t.url === dhis2.baseUrl || t.url.startsWith(dhis2.baseUrl + '/')));
     if (!dhis2Tab) { console.warn('[fetchViaTab] No DHIS2 tab found'); return null; }
 
     const results = await chrome.scripting.executeScript({
@@ -2309,7 +2605,10 @@ async function fetchViaTab(fullUrl, method, headers, bodyStr) {
           return { error: e.message };
         }
       },
-      args: [fullUrl, method, headers, bodyStr],
+      // executeScript args must be structured-cloneable: `undefined` (every
+      // body-less write — i.e. every DELETE) made Chrome reject the injection
+      // ("Value is unserializable") and silently fall back to a direct fetch.
+      args: [fullUrl, method, headers, bodyStr ?? null],
     });
 
     const result = results?.[0]?.result;
@@ -2324,6 +2623,111 @@ async function fetchViaTab(fullUrl, method, headers, bodyStr) {
   }
 }
 
+// ── App upload (multipart POST /api/apps) ─────────────────────────────────────
+// fetchViaTab carries string bodies only, so the zip crosses into the DHIS2 tab
+// as base64, is rebuilt into a Blob there and POSTed same-origin with the user's
+// session (field name `file`, as DHIS2 requires). Falls back to a direct
+// service-worker FormData fetch when no DHIS2 tab is open.
+// The FILENAME is significant: DHIS2 stores an app's files under
+// apps/<filename-without-.zip>, so two apps uploaded under one filename
+// overwrite — and on delete remove — each other's files (verified 2.42.5.1).
+// Callers pass a name unique to the app (manage_custom_app uses <key>.zip).
+// The direct fallback is for non-browser callers (the Node harness): in Chrome,
+// DHIS2 answers a write from the extension's own origin with HTTP 200 and an
+// EMPTY body and does nothing (verified 2.42.5.1 — upload and DELETE alike), so
+// an empty 2xx is reported as "not installed", never as success.
+// Returns { app (the server's JSON), status } or { _error }.
+function bytesToBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+async function uploadAppZip(bytes, filename) {
+  if (!dhis2.baseUrl || !dhis2.apiVersion) {
+    const ok = await ensureConnected();
+    if (!ok) return { _error: 'Not connected to DHIS2. Navigate to a DHIS2 page.' };
+  }
+  const url = `${dhis2.baseUrl}/api/apps`;
+  const name = String(filename || 'app.zip');
+  let raw = null;
+  let viaTab = false;
+  try {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find(t => t.url && (t.url === dhis2.baseUrl || t.url.startsWith(dhis2.baseUrl + '/')));
+    if (tab) {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async (u, b64, fname) => {
+          try {
+            const bin = atob(b64);
+            const buf = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+            const fd = new FormData();
+            fd.append('file', new Blob([buf], { type: 'application/zip' }), fname);
+            const resp = await fetch(u, {
+              method: 'POST', body: fd, credentials: 'include', redirect: 'manual',
+              headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+            });
+            if (resp.type === 'opaqueredirect') return { ok: false, status: 0, redirected: true, text: '' };
+            return { ok: resp.ok, status: resp.status, text: await resp.text() };
+          } catch (e) {
+            return { error: e.message };
+          }
+        },
+        args: [url, bytesToBase64(bytes), name],
+      });
+      const r = results?.[0]?.result;
+      if (r && !r.error) { raw = r; viaTab = true; }
+      else console.warn('[uploadAppZip] in-tab upload failed:', r?.error || 'no result');
+    }
+  } catch (e) {
+    console.warn('[uploadAppZip] tab path unavailable:', e.message);
+  }
+  if (!raw) {
+    try {
+      const fd = new FormData();
+      fd.append('file', new Blob([bytes], { type: 'application/zip' }), name);
+      const resp = await fetch(url, {
+        method: 'POST', body: fd, credentials: 'include', redirect: 'manual',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+      });
+      raw = resp.type === 'opaqueredirect'
+        ? { ok: false, status: 0, redirected: true, text: '' }
+        : { ok: resp.ok, status: resp.status, text: await resp.text().catch(() => '') };
+    } catch (e) {
+      return { _error: `App upload failed: ${e.message}` };
+    }
+  }
+  console.log(`[uploadAppZip] POST /api/apps (${name}, ${bytes.length} bytes) → HTTP ${raw.status}`);
+  if (raw.redirected || raw.status === 0 || raw.status === 401 || (raw.status >= 300 && raw.status < 400)) {
+    return { _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true, _hint: 'Nothing was installed. Ask the user to log in to DHIS2 in the browser tab, then retry the same call.' };
+  }
+  let body = null;
+  try { body = raw.text ? JSON.parse(raw.text) : null; } catch { /* non-JSON */ }
+  if (!raw.ok) {
+    const msg = (body && body.message) || (raw.text && raw.text.length < 300 ? raw.text : '') || `HTTP ${raw.status}`;
+    return {
+      _error: `DHIS2 rejected the app (HTTP ${raw.status}): ${msg}`,
+      _status: raw.status,
+      ...(raw.status === 403 ? { _hint: 'This DHIS2 user may not install apps — it needs the App Management authority (M_dhis-web-app-management) or ALL.' } : {}),
+      ...(raw.status === 409 && /namespace/i.test(msg) ? { _hint: 'Another app already reserves this dataStore namespace. Choose a different key.' } : {}),
+    };
+  }
+  if (!body || typeof body !== 'object') {
+    return {
+      _error: `DHIS2 answered HTTP ${raw.status} with an empty body — the app was NOT installed.`,
+      _status: raw.status,
+      _hint: viaTab
+        ? 'Retry once; if it repeats, the server may be behind a proxy that strips upload responses.'
+        : 'App installs go through an open DHIS2 tab where the user is logged in (the browser does not let the extension post the upload itself). Ask the user to open or refresh a DHIS2 tab on this server, then retry the same call.',
+    };
+  }
+  return { app: body, status: raw.status };
+}
+
 // Percent-encode the characters that RFC 7230 / Tomcat reject in a raw request
 // target (`" < > [ \ ] ^ ` { | }` and whitespace). DHIS2's nested-`fields` and
 // `filter=...:in:[..]` syntaxes rely on `[`/`]`, so on a strict Tomcat-fronted
@@ -2336,6 +2740,31 @@ function encodeStrictQueryChars(query) {
   return String(query).replace(/[\s"<>\[\\\]^`{|}]/g, (c) =>
     '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')
   );
+}
+
+// Every gate (patient-data privacy, write authorization, dataStore guards)
+// inspects a tool's path as a literal string, but fetch() resolves dot
+// segments — also spelled %2e — and backslashes, drops a #fragment, and DHIS2
+// decodes %-escaped letters. So "programs/../tracker/trackedEntities",
+// "./tracker/events", "tracker/%74rackedEntities" or "tracker\trackedEntities"
+// read patient rows straight past the privacy gate (verified live on 2.42.5.1).
+// No DHIS2 API path needs any of these, so refuse them: what the gates check
+// is what gets sent. Only the part before "?" is checked.
+function ambiguousApiPathReason(path) {
+  const p = String(path).split('?')[0];
+  if (/[\\#;]/.test(p)) return 'it contains a backslash, "#" or ";"';
+  if (/(^|\/)(\.|%2e){1,2}(\/|$)/i.test(p)) return 'it contains a "." or ".." segment';
+  if (/%(3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9ae]|2d|2e)/i.test(p)) return 'it percent-encodes a letter, digit or "-._~"';
+  return null;
+}
+
+// E4030 on a data element / category option combo that holds AGGREGATE data.
+const AGGREGATE_DATA_BLOCK_RE = /associated with another object:?\s*`?(?:DataValue(?:Audit)?|DataValueAudit)\b/i;
+function aggregateDataBlockHint(pathOrId) {
+  const src = String(pathOrId || '');
+  const uid = (src.match(/"id"\s*:\s*"([A-Za-z][A-Za-z0-9]{10})"/) || [])[1]
+    || (src.match(/[A-Za-z][A-Za-z0-9]{10}(?=$|[/?\s])/) || [])[0] || '<data element UID>';
+  return `This data element holds (or once held) AGGREGATE data values — their audit history keeps blocking deletion even after the values are cleared. Recommended: keep it as unused metadata. ONLY if the user explicitly confirms that ALL of its data and audit history may be destroyed permanently: dhis2_query(method="POST", path="maintenance/dataPruning/dataElements/${uid}"), then retry this SAME delete once. Never prune without that explicit confirmation.`;
 }
 
 async function safeDhis2Fetch(path, options = {}) {
@@ -2356,6 +2785,14 @@ async function safeDhis2Fetch(path, options = {}) {
   }
 
   let cleanPath = path.replace(/^\//, '').replace(/^api\/\d+\//, '');
+  const ambiguous = ambiguousApiPathReason(cleanPath);
+  if (ambiguous) {
+    return {
+      _error: `Refused API path "${cleanPath.split('?')[0]}": ${ambiguous}. The browser or server would rewrite it into a different endpoint than the one requested.`,
+      _hint: 'Use the plain resource path, e.g. "programs/<uid>?fields=…": no ../ or ./ segments, backslashes, "#", ";" or %-escaped letters.',
+      _refused_path: true,
+    };
+  }
   const qIdx = cleanPath.indexOf('?');
   let fullUrl;
   if (qIdx !== -1) {
@@ -2405,6 +2842,10 @@ async function safeDhis2Fetch(path, options = {}) {
     // so the request is same-origin (avoiding empty-body issues in MV3 service workers).
     // Fall back to direct service-worker fetch if no tab is available.
     let rawResp = null; // { ok, status, statusText, text }
+    // A deleted stage / rule … can no longer be asked which program it was in.
+    const captureDeletedFrom = isWrite && !options._captureBump
+      ? await captureProgramsOfDeletedObjects(method, cleanPath, bodyStr)
+      : null;
 
     if (isWrite) {
       rawResp = await fetchViaTab(fullUrl, method, headers, bodyStr);
@@ -2434,13 +2875,53 @@ async function safeDhis2Fetch(path, options = {}) {
       const text = await resp.text().catch(() => '');
       rawResp = { ok: resp.ok, status: resp.status, statusText: resp.statusText, text };
 
-      // For writes: if direct fetch returned empty, retry once (session quirks in MV3)
-      if (isWrite && (!text || !text.trim())) {
+      // For writes: if direct fetch returned empty, retry once (session quirks in MV3).
+      // Never on 204: "No Content" IS the success response, and re-sending the
+      // write turned a completed DELETE /api/apps/<key> into "404 App does not
+      // exist" (verified 2.42.5.1, 2026-10-21).
+      if (isWrite && resp.status !== 204 && (!text || !text.trim())) {
         console.warn(`[safeDhis2Fetch] Empty from direct ${method}, retrying.`);
         const resp2 = await fetch(fullUrl, { ...fetchOpts, credentials: 'include' });
         const text2 = await resp2.text().catch(() => '');
         if (text2 && text2.trim()) {
           rawResp = { ok: resp2.ok, status: resp2.status, statusText: resp2.statusText, text: text2 };
+        }
+      }
+    }
+
+    // ── Post-commit 5xx on a DELETE ────────────────────────────────────────
+    // DHIS2 2.42 deletes a dataSet whose data elements use an option set, then
+    // fails in a post-commit Hibernate callback and answers HTTP 500 "Unable to
+    // perform afterTransactionCompletion callback: could not initialize proxy
+    // [OptionSet#…] - no Session" — the object IS gone (verified 2026-10-20,
+    // both DELETE dataSets/{id} and POST metadata?importStrategy=DELETE). Every
+    // delete site would report that success as a failure, so re-check the
+    // targets and report what actually happened.
+    if (!rawResp.ok && rawResp.status >= 500 && /afterTransactionCompletion/i.test(rawResp.text || '')) {
+      const targets = [];
+      const pOnly = cleanPath.split('?')[0];
+      const dm = method === 'DELETE' && pOnly.match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
+      if (dm) targets.push({ type: dm[1], id: dm[2] });
+      if (method === 'POST' && /^metadata\b/.test(pOnly) && /importStrategy=DELETE/i.test(cleanPath) && bodyStr) {
+        try {
+          for (const [type, arr] of Object.entries(JSON.parse(bodyStr))) {
+            if (Array.isArray(arr)) for (const o of arr) if (o && typeof o.id === 'string') targets.push({ type, id: o.id });
+          }
+        } catch { /* not JSON — leave as error */ }
+      }
+      if (targets.length && targets.length <= 50) {
+        let allGone = true;
+        for (const t of targets) {
+          const chk = await safeDhis2Fetch(`${t.type}/${t.id}?fields=id`);
+          if (chk?._status !== 404) { allGone = false; break; }
+        }
+        if (allGone) {
+          const stats = { created: 0, updated: 0, deleted: targets.length, ignored: 0, total: targets.length };
+          return {
+            httpStatus: 'OK', status: 'OK', stats, response: { status: 'OK', stats, typeReports: [] },
+            message: `Deleted ${targets.length} object(s).`,
+            _post_commit_server_error: `DHIS2 answered HTTP ${rawResp.status} (post-commit callback error) but the deletion WAS committed — verified each object now returns 404.`,
+          };
         }
       }
     }
@@ -2467,6 +2948,12 @@ async function safeDhis2Fetch(path, options = {}) {
           }
         }
       }
+      // A direct DELETE /{type}/{id} answers with an ObjectReport, whose
+      // reasons sit in response.errorReports (no typeReports) — the shape every
+      // DELETE has now that body-less writes really go through the tab.
+      for (const er of (errBody?.response?.errorReports || [])) {
+        if (er.message && importErrors.length < 8 && !importErrors.includes(er.message)) importErrors.push(er.message);
+      }
       if (importErrors.length) errMsg += ` — ${importErrors.join('; ')}`;
       // E4030 "associated with another object: Event" after the user already
       // deleted the events in Capture: events are only SOFT-deleted, and the
@@ -2474,15 +2961,24 @@ async function safeDhis2Fetch(path, options = {}) {
       // the model doesn't flail through analytics/tracker probes.
       const blockedByEvent = importErrors.some(m => /associated with another object.*Event/i.test(m))
         || /associated with another object.*Event/i.test(errMsg);
+      // Same family, aggregate side: a data element that ever held aggregate
+      // values keeps DataValueAudit rows (and soft-deleted DataValue rows) after
+      // its values are cleared, and they block deletion forever (verified
+      // 2.42.5.1, 2026-10-20). Only data pruning removes them — destructive, so
+      // the hint demands explicit confirmation.
+      const blockedByAggregate = !blockedByEvent && (importErrors.some(m => AGGREGATE_DATA_BLOCK_RE.test(m)) || AGGREGATE_DATA_BLOCK_RE.test(errMsg));
       return {
         _error: errMsg, _url: fullUrl, _status: rawResp.status,
         ...(errBody ? { _body: errBody } : {}),
         ...(importErrors.length ? { error_details: importErrors } : {}),
+        ...(blockedByAggregate ? { _hint: aggregateDataBlockHint(`${cleanPath} ${bodyStr || ''}`) } : {}),
         ...(blockedByEvent ? {
           _hint: 'This object still has event data values referencing it. If the user says the events were already deleted in the Capture UI, they are only SOFT-deleted and still block deletion: run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry this SAME delete once. If real (non-deleted) events still hold values, tell the user which events must be deleted first. Do NOT probe analytics, tracker reads, or count_records — they cannot remove the association.',
         } : {}),
       };
     }
+
+    if (isWrite && !options._captureBump) noteCaptureMetadataWrite(method, cleanPath, bodyStr, captureDeletedFrom);
 
     if (rawResp.status === 204) return { success: true, message: 'Deleted successfully.' };
 
@@ -2633,6 +3129,179 @@ async function safeDhis2Fetch(path, options = {}) {
   } catch (err) {
     return { _error: `Fetch failed: ${err.message}`, _url: fullUrl };
   }
+}
+
+// ── Capture metadata freshness ──────────────────────────────────────────────
+// Capture (106) caches each program's metadata — stages and their data
+// elements, sections, custom forms, program rules / variables / indicators,
+// program attributes — in IndexedDB and reloads a program ONLY when
+// programs.version differs from the cached one (its getStalePrograms). DHIS2
+// does not raise that version when a stage, rule … changes (verified 2.42.5.1,
+// 2026-10-25: PUT programStages leaves it; only a program update raises it).
+// So after the assistant added a storage data element to three stages, every
+// Capture that had opened the program kept the old stages for good — reloading
+// did not help — and the form-field plugin mapped to the new element had that
+// alias silently dropped (setFieldValue refused, console-only): "I click FLAG
+// and nothing happens" (live thread 2026-10-25). Every successful write that
+// touches such metadata is noted here; executeTool raises each affected
+// program's version once when the tool call finishes.
+const CAPTURE_PROGRAM_REF_FIELDS = Object.freeze({
+  programStages: 'program[id]',
+  programStageSections: 'programStage[program[id]]',
+  programSections: 'program[id]',
+  programRules: 'program[id]',
+  programRuleVariables: 'program[id]',
+  programRuleActions: 'programRule[program[id]]',
+  programIndicators: 'program[id]',
+});
+// Objects Capture caches inside the programs that use them.
+const CAPTURE_USED_BY_PROGRAM_TYPES = new Set(['dataElements', 'trackedEntityAttributes', 'dataEntryForms']);
+const CAPTURE_BUMP_MAX_PROGRAMS = 20;
+let _captureMetaPending = null;
+
+function captureMetaPending() {
+  if (!_captureMetaPending) _captureMetaPending = { programs: new Set(), lookups: new Map(), skip: new Set() };
+  return _captureMetaPending;
+}
+
+function captureProgramIdOf(type, o) {
+  if (!o || typeof o !== 'object') return null;
+  if (type === 'programStageSections') return (o.programStage && o.programStage.program && o.programStage.program.id) || null;
+  if (type === 'programRuleActions') return (o.programRule && o.programRule.program && o.programRule.program.id) || null;
+  return (o.program && o.program.id) || null;
+}
+
+// The objects a write carries: [type, [objects]] pairs for a metadata import,
+// one pair for a single-object POST / PUT.
+function captureWrittenObjects(pathOnly, bodyStr) {
+  if (!bodyStr) return [];
+  let body;
+  try { body = JSON.parse(bodyStr); } catch { return []; }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
+  if (pathOnly === 'metadata') return Object.entries(body).filter(([, v]) => Array.isArray(v));
+  const m = pathOnly.match(/^([a-zA-Z]+)(?:\/([A-Za-z][A-Za-z0-9]{10}))?$/);
+  if (!m) return [];
+  return [[m[1], [{ ...body, id: body.id || m[2] }]]];
+}
+
+// Before a DELETE: the programs the deleted objects belong to.
+async function captureProgramsOfDeletedObjects(method, cleanPath, bodyStr) {
+  const pathOnly = cleanPath.split('?')[0];
+  const want = new Map();
+  if (method === 'DELETE') {
+    const m = pathOnly.match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
+    if (m && CAPTURE_PROGRAM_REF_FIELDS[m[1]]) want.set(m[1], [m[2]]);
+  } else if (method === 'POST' && pathOnly === 'metadata' && /importStrategy=DELETE/i.test(cleanPath)) {
+    for (const [type, objs] of captureWrittenObjects(pathOnly, bodyStr)) {
+      if (!CAPTURE_PROGRAM_REF_FIELDS[type]) continue;
+      want.set(type, objs.map((o) => o && o.id).filter((id) => typeof id === 'string').slice(0, 50));
+    }
+  }
+  if (!want.size) return null;
+  const out = new Set();
+  for (const [type, ids] of want) for (const id of await captureResolvePrograms(type, ids)) out.add(id);
+  return [...out];
+}
+
+async function captureResolvePrograms(type, ids) {
+  const list = [...new Set(ids)].filter((id) => /^[A-Za-z][A-Za-z0-9]{10}$/.test(id)).slice(0, 100);
+  if (!list.length) return [];
+  const inList = `[${list.join(',')}]`;
+  const out = new Set();
+  const opts = { noTruncate: true, _captureBump: true };
+  if (CAPTURE_PROGRAM_REF_FIELDS[type]) {
+    const r = await safeDhis2Fetch(`${type}?filter=id:in:${inList}&fields=id,${CAPTURE_PROGRAM_REF_FIELDS[type]}&paging=false`, opts);
+    for (const o of (r && r[type]) || []) { const p = captureProgramIdOf(type, o); if (p) out.add(p); }
+  } else if (type === 'dataElements' || type === 'dataEntryForms') {
+    const f = type === 'dataElements' ? 'programStageDataElements.dataElement.id' : 'dataEntryForm.id';
+    const r = await safeDhis2Fetch(`programStages?filter=${f}:in:${inList}&fields=program[id]&paging=false`, opts);
+    for (const s of (r && r.programStages) || []) if (s.program && s.program.id) out.add(s.program.id);
+    if (type === 'dataEntryForms') {
+      const p = await safeDhis2Fetch(`programs?filter=dataEntryForm.id:in:${inList}&fields=id&paging=false`, opts);
+      for (const x of (p && p.programs) || []) out.add(x.id);
+    }
+  } else if (type === 'trackedEntityAttributes') {
+    const r = await safeDhis2Fetch(`programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:in:${inList}&fields=id&paging=false`, opts);
+    for (const x of (r && r.programs) || []) out.add(x.id);
+  }
+  return [...out];
+}
+
+// After a successful write: remember which programs Capture must reload.
+// Programs the payload itself creates or updates are left alone — a new one
+// is in nobody's cache, and DHIS2 raises an updated one's version itself.
+function noteCaptureMetadataWrite(method, cleanPath, bodyStr, deletedFrom) {
+  try {
+    const pend = captureMetaPending();
+    for (const id of deletedFrom || []) pend.programs.add(id);
+    const pathOnly = cleanPath.split('?')[0];
+    if (method === 'DELETE' || /importStrategy=DELETE/i.test(cleanPath)) return;
+    const pm = pathOnly.match(/^programs\/([A-Za-z][A-Za-z0-9]{10})$/);
+    if (pm && method === 'PATCH') { pend.programs.add(pm[1]); return; }
+    const addLookup = (type, id) => {
+      if (!pend.lookups.has(type)) pend.lookups.set(type, new Set());
+      pend.lookups.get(type).add(id);
+    };
+    const relevant = (type) => !!CAPTURE_PROGRAM_REF_FIELDS[type] || CAPTURE_USED_BY_PROGRAM_TYPES.has(type);
+    let found = false;
+    for (const [type, objs] of captureWrittenObjects(pathOnly, bodyStr)) {
+      if (type === 'programs') { for (const o of objs) if (o && o.id) pend.skip.add(o.id); continue; }
+      if (!relevant(type)) continue;
+      for (const o of objs.slice(0, 200)) {
+        // Capture shows only displayInForm program indicators. Analytics-only
+        // ones need no reload, and bumping would change the PROGRAM object
+        // when the user asked to leave program settings alone (live
+        // 2026-10-29: 14 dashboard indicators PATCHed programs/<id>.version).
+        if (type === 'programIndicators' && o && o.displayInForm !== true) continue;
+        const p = CAPTURE_PROGRAM_REF_FIELDS[type] ? captureProgramIdOf(type, o) : null;
+        if (p) { pend.programs.add(p); found = true; } else if (o && typeof o.id === 'string') { addLookup(type, o.id); found = true; }
+      }
+    }
+    // PATCH bodies (JSON Patch arrays) and sub-resource writes name no program:
+    // look the object up by the id in the path.
+    const one = pathOnly.match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})(?:\/|$)/);
+    if (!found && one && relevant(one[1])) addLookup(one[1], one[2]);
+  } catch (e) {
+    console.warn('[capture-refresh] could not note a write:', e && e.message);
+  }
+}
+
+// Mark a program for a version bump (a placement that found Capture's copy of
+// it out of date).
+function noteCaptureProgramChanged(programId) {
+  if (programId) captureMetaPending().programs.add(programId);
+}
+
+// Raise programs.version (+1) of every program noted since the last flush.
+// → null when nothing was noted, else { bumped:[…], failed:[…], note }.
+async function flushCaptureProgramVersionBumps() {
+  const pend = _captureMetaPending;
+  _captureMetaPending = null;
+  if (!pend || (!pend.programs.size && !pend.lookups.size)) return null;
+  const programs = new Set(pend.programs);
+  for (const [type, ids] of pend.lookups) {
+    for (const id of await captureResolvePrograms(type, [...ids])) programs.add(id);
+  }
+  for (const id of pend.skip) programs.delete(id);
+  if (!programs.size) return null;
+  const bumped = [];
+  const failed = [];
+  for (const id of [...programs].slice(0, CAPTURE_BUMP_MAX_PROGRAMS)) {
+    const p = await safeDhis2Fetch(`programs/${id}?fields=id,displayName,version`, { noTruncate: true, _captureBump: true });
+    if (!p || p._error) { if (p && p._status !== 404) failed.push({ program_id: id, error: p._error }); continue; }
+    const from = Number(p.version) || 0;
+    const r = await safeDhis2Fetch(`programs/${id}`, { method: 'PATCH', body: [{ op: 'add', path: '/version', value: from + 1 }], _captureBump: true });
+    if (r && r._error) failed.push({ program_id: id, program_name: p.displayName, error: r._error });
+    else bumped.push({ program_id: id, program_name: p.displayName, version: `${from} → ${from + 1}` });
+  }
+  if (!bumped.length && !failed.length) return null;
+  return {
+    bumped,
+    failed: failed.length ? failed : undefined,
+    note: bumped.length
+      ? 'Program version raised so every Capture user reloads this program\'s stages, forms, rules and indicators (Capture caches them and refreshes only when the version changes). A Capture tab that is already open needs one reload.'
+      : 'Could not raise the program version — Capture users who already opened this program keep seeing the old stages/rules until it changes: ask an admin to save the program once in the Maintenance app.',
+  };
 }
 
 const TRACKER_BUNDLE_KEYS = ['events', 'trackedEntities', 'enrollments', 'relationships'];
@@ -3636,13 +4305,95 @@ function healEventAnalyticsDxDimension(path) {
     const key = part.slice(0, eq);
     const val = part.slice(eq + 1);
     if (!/^dimension$/i.test(key)) return part;
+    // `dimension=stage:<uid>` is a 409 ("Query item or filter is invalid") —
+    // the stage is its own parameter on these endpoints (live 2026-10-28).
+    const st = val.match(/^(?:stage|programStage)(?::|%3A)([A-Za-z][A-Za-z0-9]{10})$/i);
+    if (st) { healed = true; return `stage=${st[1]}`; }
     // `dx:UID` or the URL-encoded `dx%3AUID`
     const m = val.match(/^dx(?::|%3A)(.+)$/i);
     if (!m) return part;
     healed = true;
-    return `${key}=${m[1]}`;
+    // Several items: each data element / attribute is its OWN dimension here.
+    return m[1].split(/;|%3B/i).filter(Boolean).map((it) => `${key}=${it}`).join('&');
   }).join('&');
   return { path: healed ? `${head}?${query}` : p, healed };
+}
+
+// A program-stage UID given as a bare `dimension=<stageUid>` on an event or
+// enrollment analytics endpoint is a 409 ("Item identifier does not reference
+// any data element, attribute or indicator part of the program" — RMNCH run
+// 2026-10-29). On the EVENT endpoints the stage is its own parameter, so it is
+// moved there; the ENROLLMENT endpoints have no stage parameter, so the query
+// is refused before it is sent, with the right shape.
+const _programStageIdsCache = new Map();
+async function healBareStageDimension(path) {
+  const p = String(path || '');
+  const m = p.match(/^(analytics\/(events|enrollments)\/(?:aggregate|query)\/([A-Za-z][A-Za-z0-9]{10})(?:\.json)?)\?(.*)$/);
+  if (!m) return { path: p };
+  const [, head, kind, pid, qs] = m;
+  const parts = qs.split('&');
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const bare = parts.filter(x => /^dimension=/i.test(x) && /^[A-Za-z][A-Za-z0-9]{10}$/.test(dec(x.slice(x.indexOf('=') + 1))));
+  if (!bare.length) return { path: p };
+  if (!_programStageIdsCache.has(pid)) {
+    const r = await safeDhis2Fetch(`programs/${pid}?fields=programStages[id]`);
+    _programStageIdsCache.set(pid, new Set(((r && !r._error && r.programStages) || []).map(s => s.id)));
+  }
+  const stageIds = _programStageIdsCache.get(pid);
+  const stageParts = bare.filter(x => stageIds.has(dec(x.slice(x.indexOf('=') + 1))));
+  if (!stageParts.length) return { path: p };
+  const stages = [...new Set(stageParts.map(x => dec(x.slice(x.indexOf('=') + 1))))];
+  const existing = parts.find(x => /^stage=/i.test(x));
+  if (existing) stages.push(dec(existing.slice(6)));
+  const distinct = [...new Set(stages)];
+  if (kind === 'enrollments' || distinct.length > 1) {
+    return {
+      path: p,
+      refusal: {
+        _error: `Not sent: ${distinct.join(', ')} ${distinct.length > 1 ? 'are program stages' : 'is a program stage'}, not a dimension — DHIS2 answers 409 for a stage UID in dimension=.`,
+        _hint: kind === 'enrollments'
+          ? 'Enrollment analytics has no stage parameter: qualify data elements as <stageUid>.<deUid> in dimension=, or count a stage\'s events with analytics/events/aggregate/<program>?stage=<stageUid>.'
+          : 'An event query covers ONE stage: pass it as stage=<stageUid> (one query per stage).',
+        _scope: 'stage_as_dimension',
+      },
+    };
+  }
+  const kept = parts.filter(x => !stageParts.includes(x) && !/^stage=/i.test(x));
+  return { path: `${head}?${[...kept, `stage=${distinct[0]}`].join('&')}`, healed: true };
+}
+
+// Program indicators asked for on an event/enrollment AGGREGATE endpoint
+// (`analytics/enrollments/aggregate/<program>?dimension=dx:PI1;PI2`, or the
+// bare `dimension=PI1;PI2` / `dimension=PI1`) bounce with 409 E7224 — and as
+// separate dimensions they "work" but GROUP BY the indicator's value, so the
+// numbers are wrong. Live 2026-10-28 (2.42.5): three 409s and a summary that
+// reported BP control 31% (really 29.0%) and HbA1c 8.8% (really 8.3%).
+// Program-indicator values by org unit / period come from /api/analytics with
+// dx. When every data item of the query is a program indicator, route it there.
+async function routeProgramIndicatorAnalytics(path) {
+  const p = String(path || '');
+  const m = p.match(/^analytics\/(?:events|enrollments)\/aggregate\/[A-Za-z][A-Za-z0-9]{10}(?:\.json)?\?(.*)$/);
+  if (!m) return { path: p, routed: false };
+  const parts = m[1].split('&');
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const items = [];
+  const itemParts = new Set();
+  for (const part of parts) {
+    const kv = part.match(/^dimension=(.*)$/i);
+    if (!kv) continue;
+    const val = dec(kv[1]);
+    if (/^(ou|pe|co|ao|longitude|latitude):/i.test(val)) continue;
+    const list = val.replace(/^dx:/i, '');
+    const ids = list.split(';').map(x => x.trim()).filter(Boolean);
+    if (!ids.length || !ids.every(x => /^[A-Za-z][A-Za-z0-9]{10}$/.test(x))) return { path: p, routed: false };
+    items.push(...ids);
+    itemParts.add(part);
+  }
+  if (!items.length) return { path: p, routed: false };
+  const r = await safeDhis2Fetch(`programIndicators?filter=id:in:[${[...new Set(items)].join(',')}]&fields=id&paging=false`);
+  if (!r || r._error || (r.programIndicators || []).length !== new Set(items).size) return { path: p, routed: false };
+  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x));
+  return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true };
 }
 
 async function validateAnalyticsProgramId(path) {
@@ -3743,9 +4494,13 @@ function hasDimensionParam(usp, dimKey) {
 async function enrichAnalyticsPathWithVisualizationContext(path, vizId) {
   if (!isAnalyticsPath(path) || !vizId) return path;
   const { base, usp } = splitPathAndQuery(path);
-  const needsDx = !hasDimensionParam(usp, 'dx');
-  const needsPe = !hasDimensionParam(usp, 'pe');
-  const needsOu = !hasDimensionParam(usp, 'ou');
+  // A dimension given as a FILTER is present too — appending it again as a
+  // dimension is a guaranteed 409 "Dimensions cannot be specified as dimension
+  // and filter simultaneously" (live 2026-10-28: three in one turn).
+  const asFilter = (k) => usp.getAll('filter').some((f) => String(f).split(/:|%3A/i)[0] === k);
+  const needsDx = !hasDimensionParam(usp, 'dx') && !asFilter('dx');
+  const needsPe = !hasDimensionParam(usp, 'pe') && !asFilter('pe');
+  const needsOu = !hasDimensionParam(usp, 'ou') && !asFilter('ou');
   if (!needsDx && !needsPe && !needsOu) return path;
 
   const fields = [
@@ -4032,7 +4787,41 @@ function carryStickyContext(freshCtx, prevCtx) {
   return ctx;
 }
 
-async function initializeFromUrl(url) {
+// One in-app navigation reaches initializeFromUrl up to four times (tabs.onUpdated,
+// the webNavigation fragment event, content.js's hashchange message and its 2 s
+// poll), and every copy re-fetched the program metadata — measured 4× per
+// navigation on 2.42. Calls for the same URL now share one run, and runs are
+// serialized so an older navigation finishing late can't overwrite a newer
+// page's context; a queued run whose URL is no longer the latest is skipped and
+// its caller gets the latest run's result. ensureConnected calls
+// initializeFromUrlNow directly: it runs inside tool calls, where joining an
+// in-flight run could mean waiting on itself.
+const INIT_QUEUE_TIMEOUT_MS = 20000; // a hung DHIS2 request must not block every later navigation
+const _initRuns = new Map();
+let _initQueue = Promise.resolve();
+let _initLatestUrl = null;
+function initializeFromUrl(url) {
+  _initLatestUrl = url;
+  let run = _initRuns.get(url);
+  if (!run) {
+    run = _initQueue.then(() => (url === _initLatestUrl ? initializeFromUrlNow(url) : { superseded: true }));
+    _initRuns.set(url, run);
+    let timer;
+    const settled = run.catch(() => {}).finally(() => {
+      clearTimeout(timer);
+      if (_initRuns.get(url) === run) _initRuns.delete(url);
+    });
+    _initQueue = Promise.race([settled, new Promise((r) => { timer = setTimeout(r, INIT_QUEUE_TIMEOUT_MS); })]);
+  }
+  return run.then(function followLatest(r) {
+    if (!r?.superseded) return r;
+    const latest = _initRuns.get(_initLatestUrl);
+    if (latest && latest !== run) return latest.then(followLatest);
+    return { success: !!dhis2.connected, state: getSerializableState() };
+  });
+}
+
+async function initializeFromUrlNow(url) {
   const baseUrl = extractBaseUrl(url);
   if (!baseUrl) return { error: 'Not a DHIS2 page' };
 

@@ -241,11 +241,24 @@ function show(r) { return JSON.stringify(r === undefined ? null : r).slice(0, 30
       check('duplicate name refused w/ existing id', r._error && r.existing_id === evList, show(r));
 
       // A NONE-aggregation PI generates invalid SQL per row — must be refused
-      // mechanically before any probe/POST.
-      const nonePi = await t('manage_program_indicators', {
+      // mechanically before any probe/POST. manage_program_indicators itself
+      // now refuses NONE (it breaks every analytics query, 2026-10-29), so the
+      // fixture for a PRE-EXISTING one is written with the bare transport.
+      const noneByTool = await t('manage_program_indicators', {
         action: 'create', program_id: TB,
         indicator: { name: 'XNEG none-agg PI', expression: `d2:count(#{${ST_FU}.a4VFTEz17gK})`, analytics_type: 'ENROLLMENT', aggregation_type: 'NONE' },
       });
+      check('NONE-aggregation PI refused by manage_program_indicators (nothing saved)', noneByTool._error && /NONE/.test(noneByTool._error), show(noneByTool));
+      const noneId = ctx.generateDhis2Uid();
+      const noneFixture = await ctx.safeDhis2Fetch('metadata?atomicMode=ALL', { method: 'POST', body: { programIndicators: [{
+        id: noneId, name: 'XNEG none-agg PI', shortName: 'XNEG none-agg PI', program: { id: TB },
+        expression: `d2:count(#{${ST_FU}.a4VFTEz17gK})`, analyticsType: 'ENROLLMENT', aggregationType: 'NONE',
+        analyticsPeriodBoundaries: [
+          { boundaryTarget: 'ENROLLMENT_DATE', analyticsPeriodBoundaryType: 'AFTER_START_OF_REPORTING_PERIOD' },
+          { boundaryTarget: 'ENROLLMENT_DATE', analyticsPeriodBoundaryType: 'BEFORE_END_OF_REPORTING_PERIOD' },
+        ],
+      }] } });
+      const nonePi = noneFixture && !noneFixture._error ? { program_indicator_id: noneId } : noneFixture;
       r = await t('manage_line_lists', {
         action: 'create', name: 'XNEG none agg', output_type: 'ENROLLMENT', program_id: TB,
         columns: [
