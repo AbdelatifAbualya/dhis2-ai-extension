@@ -108,10 +108,25 @@ function dataStorePatientDataReason(body) {
 // once, when the outermost call finishes — see noteCaptureMetadataWrite.
 let _executeToolDepth = 0;
 async function executeTool(name, args) {
+  // skip_backup:true is honoured ONLY with recorded user consent (see
+  // backupSkipConsent in core.js). The model setting the flag is not consent:
+  // it is dropped, the backup is taken, and the result says so. One check
+  // here covers every tool and every internal hand-off of the args.
+  let skipNote = null;
+  if (args && typeof args === 'object' && args.skip_backup === true && _executeToolDepth === 0) {
+    const consent = backupSkipConsent(name, args);
+    if (!consent.ok) {
+      args = { ...args, skip_backup: false };
+      skipNote = 'skip_backup was ignored: the user has not approved skipping the backup, so a backup was taken as usual. Only if a backup FAILS, tell the user and ask whether to proceed without one.';
+    } else {
+      dhis2.backupSkipApproval = consent.reason;
+    }
+  }
   _executeToolDepth++;
   let result;
   try {
     result = await executeToolCall(name, args);
+    if (skipNote && result && typeof result === 'object' && !Array.isArray(result)) result._skip_backup_ignored = skipNote;
   } finally {
     _executeToolDepth--;
   }

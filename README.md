@@ -353,6 +353,33 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.31 — Security review fixes: patient data, write scope, backups, generated apps, other languages (2026-10-29)
+
+Five reported issues, each reproduced first; all were real.
+
+1. **Patient data could reach a cloud model through the save-error prefetch.** When a user reported a save error with a person open, the prefetch read that person's enrollments (ids, status, dates, org unit) with no privacy check and put them in a system message, whatever the provider.
+   - The prefetch now reads them only when requests stay local. With a cloud model it says the check was skipped and what to look for.
+   - **Every request to a remote provider is now filtered at the single point all model-bound messages pass through** (`filterPatientDataForProvider` in `callProviderStreaming` / `callFireworks`). A system or tool message carrying a tracker record (a record identity next to record content) is replaced by a notice. The user's own messages are not touched, and the per-tool privacy gate is unchanged.
+2. **Write permission was broader than the request.**
+   - "Can you explain how to delete a program?", "How do I create a dashboard?", "What happens if I delete…" and "Do not make any changes; explain…" all granted full write permission. How-to questions and no-change requests are now read-only.
+   - Permission is bound to the kind of action asked for. A create or update request does not authorize deleting existing objects; the assistant may still remove objects it created itself in the conversation.
+   - A bare "yes" approves exactly the refused proposal: same tool, same kind of action, and for deletes the same targets. It is repeatable and **never widens** to another action or tool. It used to turn into full permission after the first matching call.
+3. **`skip_backup:true` needed no consent.** It is now honoured only with recorded consent: the user's own words this turn ("…without a backup", in any of the supported languages), or a "yes" to a backup failure of that tool reported last turn. Otherwise the flag is dropped, a backup is taken, and the result says so. The "user authorized this" text now states the recorded reason.
+4. **Generated-app restrictions relied on pattern matching.** `const u = 'https://…'; fetch(u)` and `{ method: m }` passed the scan, which stays as a lint. Every generated page now also enforces the rules at runtime:
+   - a Content-Security-Policy (`connect-src 'self'`, no form posts, no plugins);
+   - `app-guard.js`, loaded first, which refuses requests to other origins and, for read-only apps, anything but GET/HEAD (fetch, XMLHttpRequest, sendBeacon).
+   The viewer's own DHIS2 authorities remain the final limit.
+5. **Arabic (and other) instructions were refused.** "أنشئ لوحة معلومات…" and "احذف هذا المؤشر" were classified read-only. Arabic, French, Spanish and Portuguese imperative, negated and how-to verbs, bare "yes", and the main nouns (dashboard, indicator, program, map, chart, table, stage, rule) are now glossed into English. The same rules then decide permission and tool routing: one policy, not one per language.
+
+**Verified.**
+- `npm run verify`: all checks pass, 11 new.
+- `scripts/scenario-mnch-dashboard.js` (play 2.43.2): 97 calls, 0 failed.
+- `scripts/scenario-line-lists.js` (localhost 2.42.5): 117 calls, 0 failed.
+- `npm run apps`: 346/346. Every installed app and plugin, now with the CSP and app-guard.js, works in real Chrome (direct and global shell), with zero failed requests.
+- Real-model replay of the RMNCH dashboard + tables prompts (deepseek-v4p1-flash-1017, play 2.43.2): 104 DHIS2 calls, 0 failed, no refused writes; 2,002 / 1,156 / 23.6 % / 202 and the four tables as before.
+- An Arabic request ("أنشئ لوحة معلومات … لبرنامج WHO RMNCH Tracker …") built its dashboard end to end: 14 calls, 0 failed.
+- All test objects were deleted afterwards.
+
 ### 2.8.30 — A dashboard request DHIS2 cannot build as worded (2026-10-29)
 
 **The report.** On the 2.43 playground, for "MNCH / PNC (Adult Woman)", the user asked for: a line-listing table of all org units with a column for the % of women who attended ANC 1 and one for ANC 2-4; a line of attended visits across all org units; and a bubble map sized by the % attending ANC 1-4. The thread hit 13 failed calls, ended its first turn at the 3-error limit, and after "continue" produced a one-row-per-woman list, a chart of one org unit, a map with no data, and an indicator switched to count a *Weight* field. Every cause below was reproduced live on 2.43.2 (play) and 2.42.5 (localhost) first.

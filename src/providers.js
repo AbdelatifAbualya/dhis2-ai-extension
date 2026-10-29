@@ -37,7 +37,39 @@ function sanitizeWireMessages(messages, isGoogle) {
   });
 }
 
+// ── Outbound patient-data filter — the last line of the cloud privacy policy ──
+// Tool calls that read patient-level tracker data are refused for remote
+// providers (enforcePatientDataPrivacyGate), but internal helpers can still
+// put record data into a SYSTEM or TOOL message on their own: the save-error
+// prefetch injected a person's enrollments (ids, status, dates, org unit)
+// whatever the provider (security review, 2026-10-29). So every request to a
+// remote provider is checked HERE, the one place every model-bound byte
+// passes through: a system/tool message that carries a tracker record (a
+// record identity next to record content) is replaced by a notice. The user's
+// own messages are theirs to share and are not touched.
+const PATIENT_RECORD_ID_RE = /"(?:enrollment|trackedEntity|trackedEntityInstance|event)"\s*:\s*"[A-Za-z][A-Za-z0-9]{10}"/;
+const PATIENT_RECORD_CONTENT_RE = /"(?:enrolledAt|occurredAt|enrollmentDate|incidentDate|eventDate|scheduledAt|completedAt|dataValues|attributes|geometry|notes)"\s*:/;
+function messageCarriesPatientRecord(m) {
+  if (!m || (m.role !== 'tool' && m.role !== 'system')) return false;
+  const text = typeof m.content === 'string'
+    ? m.content
+    : (Array.isArray(m.content) ? m.content.map(p => (p && typeof p.text === 'string' ? p.text : '')).join('\n') : '');
+  return !!text && PATIENT_RECORD_ID_RE.test(text) && PATIENT_RECORD_CONTENT_RE.test(text);
+}
+function filterPatientDataForProvider(messages, cfg = getProviderConfig()) {
+  if (!Array.isArray(messages) || providerRequestsStayLocal(cfg)) return messages;
+  let removed = 0;
+  const out = messages.map(m => {
+    if (!messageCarriesPatientRecord(m)) return m;
+    removed++;
+    return { ...m, content: JSON.stringify({ _privacy_redacted: 'Patient-level tracker records were removed from this message before it was sent to the cloud model (they can only be read with a local model). Work from program-level information and aggregate counts; tell the user if a record-level check was needed.' }) };
+  });
+  if (removed) console.warn(`[privacy] removed patient-level records from ${removed} message(s) before sending to a remote provider`);
+  return out;
+}
+
 async function callFireworks(messages, useTools = true, tools = TOOLS) {
+  messages = filterPatientDataForProvider(messages);
   const stored = await chrome.storage.local.get(['fireworksApiKey', 'providerConfig']);
   const key = sanitizeHeaderValue(stored.fireworksApiKey);
   const cfg = { ...DEFAULT_PROVIDER_CONFIG, ...(stored.providerConfig || {}) };
@@ -809,6 +841,7 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
 
 async function callProviderStreaming(messages, useTools, onTextChunk, tools = TOOLS, iteration = 0) {
   const cfg = _cachedProviderConfig;
+  messages = filterPatientDataForProvider(messages, cfg || getProviderConfig());
   if (cfg.providerType === 'anthropic') {
     return callAnthropicStreaming(messages, useTools, onTextChunk, tools, iteration);
   }

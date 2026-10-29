@@ -94,8 +94,13 @@ async function prefetchSaveErrorContext(ctx) {
     safeDhis2Fetch(`programs/${programId}?fields=${programFields}`),
     safeDhis2Fetch(`me?fields=id,username,organisationUnits[id,displayName],dataViewOrganisationUnits[id,displayName],userCredentials[username,userRoles[id,displayName,authorities]],authorities`),
   ];
-  // If a TEI is in context, also fetch existing enrollments for this entity in this program
-  if (ctx.teiId) {
+  // If a TEI is in context, also fetch existing enrollments for this entity in
+  // this program — ONLY when requests stay local. These are patient records;
+  // the result goes into the model's messages, so on a cloud provider the
+  // same privacy gate as every tool applies (security review 2026-10-29: this
+  // prefetch read them for remote providers too).
+  const patientReadAllowed = providerRequestsStayLocal(getProviderConfig());
+  if (ctx.teiId && patientReadAllowed) {
     calls.push(safeDhis2Fetch(`tracker/enrollments?trackedEntity=${ctx.teiId}&program=${programId}&fields=enrollment,status,enrolledAt,occurredAt,orgUnit&pageSize=20`));
   }
 
@@ -150,6 +155,9 @@ async function prefetchSaveErrorContext(ctx) {
       });
     }
   }
+  if (ctx.teiId && !patientReadAllowed) {
+    findings.push({ code: 'E1015/E1016', risk: 'unknown', cause: 'This person\'s existing enrollments were NOT read — patient data is only read with a local model. If they already have an ACTIVE enrollment in this program (E1015), or the program allows one enrollment only and they were enrolled before (E1016), that is the cause; ask the user to check the person\'s enrollments in Capture.' });
+  }
   const teiActiveEnrollment = (enrollments?.enrollments || enrollments?.instances || []).find(e => e.status === 'ACTIVE');
   if (ctx.teiId && teiActiveEnrollment) {
     findings.push({ code: 'E1015', risk: 'high', cause: 'This tracked entity already has an ACTIVE enrollment in this program', evidence: { existing_enrollment: teiActiveEnrollment } });
@@ -162,7 +170,8 @@ async function prefetchSaveErrorContext(ctx) {
     program_id: programId,
     program: program._error ? { _error: program._error } : program,
     user: me._error ? { _error: me._error } : { id: me.id, username: me.username, organisationUnits: me.organisationUnits, authorities_count: (me.authorities || []).length },
-    existing_enrollments: enrollments,
+    existing_enrollments: patientReadAllowed ? enrollments : undefined,
+    ...(ctx.teiId && !patientReadAllowed ? { existing_enrollments_note: 'not read — patient data stays local with a cloud model' } : {}),
     findings,
     diagnostic_note: 'Use findings[] to identify the cause directly. Do NOT ask the user for the error code or DevTools output unless findings is empty AND no E-code can be inferred from the data above.',
   };
@@ -940,6 +949,18 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
               // Success — unlocks ONE identical retry for previously failed
               // calls (a prerequisite may have just been fixed).
               dhis2.toolSuccessCount = (dhis2.toolSuccessCount || 0) + 1;
+              // Remember what the assistant itself created, so it may clean up
+              // its own work without a separate "delete" from the user
+              // (requireWriteAuth → targetsCreatedByAssistant).
+              if (WRITE_CAPABLE_TOOL_NAMES.has(tc.function.name) && /create|add|place|install|import/i.test(String(args?.action || args?.method || ''))) {
+                const ids = [];
+                for (const [k, v] of Object.entries(toolResult)) {
+                  if (/(?:^|_)ids?$/.test(k) && k !== 'id' && !/backup/i.test(k)) (Array.isArray(v) ? v : [v]).forEach(x => typeof x === 'string' && ids.push(x));
+                  if (k === 'id' && typeof v === 'string') ids.push(v);
+                  if ((k === 'created' || k === 'new_visualizations') && Array.isArray(v)) v.forEach(o => o && typeof o.id === 'string' && ids.push(o.id));
+                }
+                noteAssistantCreatedIds(ids);
+              }
               // Reset the cumulative HTTP-error counter so it measures
               // CONSECUTIVE failures (its documented intent), not lifetime
               // ones. A long legitimate build — e.g. creating an OU hierarchy

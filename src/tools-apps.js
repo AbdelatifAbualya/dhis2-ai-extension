@@ -888,12 +888,61 @@ function escapeCustomAppHtml(s) {
 // had margin: 4px 0 and lost those pixels (frame 88 px, content 92 px).
 const CAPTURE_PLUGIN_CSS = '#root { display: flow-root; }\n';
 
+// Runtime enforcement of what the static scan (scanCustomAppCode) can only
+// lint: the scan matches literal strings, so `const u = 'https://x'; fetch(u)`
+// or `{ method: m }` passed it (security review 2026-10-29). Every generated
+// page therefore carries
+//   • a Content-Security-Policy: network requests only to the server the app
+//     is installed on (connect-src 'self'), no form posts, no plugins;
+//   • app-guard.js, loaded FIRST: for an app declared read-only it refuses
+//     any request but GET/HEAD (fetch, XMLHttpRequest, sendBeacon) and
+//     double-checks the origin. The viewer's own DHIS2 authorities remain the
+//     final limit on what any request can do.
+const CUSTOM_APP_CSP = "connect-src 'self'; form-action 'none'; object-src 'none'; base-uri 'self'";
+function buildCustomAppGuardJs(spec) {
+  const readOnly = !spec.needsWriteAccess;
+  return `/* generated: runtime request policy (see manage_custom_app) */
+(function () {
+  'use strict';
+  var READ_ONLY = ${readOnly ? 'true' : 'false'};
+  var ORIGIN = window.location.origin;
+  function sameOrigin(u) { try { return new URL(String(u), window.location.href).origin === ORIGIN; } catch (e) { return false; } }
+  function refuse(why) { var e = new Error('Blocked by app policy: ' + why); console.error(e.message); return e; }
+  var nativeFetch = window.fetch;
+  if (nativeFetch) {
+    var guardedFetch = function (input, init) {
+      var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+      var method = String((init && init.method) || (input && typeof input === 'object' && input.method) || 'GET').toUpperCase();
+      if (!sameOrigin(url)) return Promise.reject(refuse('requests may only go to this DHIS2 server'));
+      if (READ_ONLY && method !== 'GET' && method !== 'HEAD') return Promise.reject(refuse('this app is read-only (' + method + ')'));
+      return nativeFetch.apply(this, arguments);
+    };
+    try { Object.defineProperty(window, 'fetch', { value: guardedFetch, writable: false, configurable: false }); } catch (e) { window.fetch = guardedFetch; }
+  }
+  var XHR = window.XMLHttpRequest;
+  if (XHR && XHR.prototype && XHR.prototype.open) {
+    var nativeOpen = XHR.prototype.open;
+    var guardedOpen = function (method, url) {
+      if (!sameOrigin(url)) throw refuse('requests may only go to this DHIS2 server');
+      if (READ_ONLY && !/^(GET|HEAD)$/i.test(String(method))) throw refuse('this app is read-only (' + method + ')');
+      return nativeOpen.apply(this, arguments);
+    };
+    try { Object.defineProperty(XHR.prototype, 'open', { value: guardedOpen, writable: false, configurable: false }); } catch (e) { XHR.prototype.open = guardedOpen; }
+  }
+  if (navigator.sendBeacon) {
+    try { Object.defineProperty(navigator, 'sendBeacon', { value: function () { console.error('Blocked by app policy: sendBeacon'); return false; }, writable: false, configurable: false }); } catch (e) { /* CSP still limits it to this server */ }
+  }
+})();
+`;
+}
+
 function buildCustomAppHtml(spec, entryJs) {
-  const scripts = ['d2-kit.min.js', 'app-config.js'];
+  const scripts = ['app-guard.js', 'd2-kit.min.js', 'app-config.js'];
   if (spec.usesEcharts) scripts.push('echarts.min.js');
   if (spec.sources['shared.jsx']) scripts.push('shared.js');
   scripts.push(entryJs);
   return '<!doctype html>\n<html dir="auto">\n<head>\n<meta charset="utf-8">\n'
+    + `<meta http-equiv="Content-Security-Policy" content="${CUSTOM_APP_CSP}">\n`
     + '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
     + `<title>${escapeCustomAppHtml(spec.name)}</title>\n<link rel="stylesheet" href="d2-kit.css">\n`
     + (entryJs === 'plugin.js' && spec.pluginType === 'CAPTURE' ? '<link rel="stylesheet" href="capture-plugin.css">\n' : '')
@@ -953,6 +1002,7 @@ function packageCustomApp(spec, compiled, kit, echartsBytes) {
   const manifest = buildCustomAppManifest(spec);
   const aiManifest = buildCustomAppAiManifest(spec);
   add('manifest.webapp', enc.encode(JSON.stringify(manifest, null, 2)));
+  add('app-guard.js', enc.encode(buildCustomAppGuardJs(spec)));
   add('app-config.js', enc.encode(buildCustomAppConfigJs(spec)));
   if (compiled['shared.jsx'] != null) add('shared.js', enc.encode(compiled['shared.jsx']));
   // Entry files run in their own strict-mode IIFE (prefix on the SAME line, so
@@ -1182,6 +1232,7 @@ async function backupCustomAppVersion(key, source, action, reason) {
   };
   const put = await safeDhis2Fetch(`dataStore/${encodeURIComponent(BACKUP_NAMESPACE)}/${encodeURIComponent(backupKey)}`, { method: 'POST', body: entry });
   if (put && put._error) {
+    dhis2.lastBackupFailure = { tool: 'manage_custom_app', turn: dhis2.turnCounter || 0 };
     return {
       _error: `Could not back up ${key} v${source.aiManifest.version} before ${action}: ${put._error}`,
       _requires_user_confirmation: true,

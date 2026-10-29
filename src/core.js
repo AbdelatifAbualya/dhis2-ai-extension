@@ -278,8 +278,131 @@ const SAVE_FAILURE_RE = new RegExp(
   'i'
 );
 
+// ── Multilingual write intent (security review 2026-10-29) ──────────────────
+// The authorization patterns below are English. "أنشئ لوحة معلومات لبرنامج
+// رعاية الأمومة" (create a dashboard…) and "احذف هذا المؤشر" (delete this
+// indicator) were classified read_only, so a model that understood the
+// request could not do it. writeIntentGloss() turns imperative / negated /
+// how-to verbs and bare "yes" of Arabic, French, Spanish and Portuguese into
+// the equivalent English phrase, and the SAME English rules then decide —
+// one policy, not one per language. Only unambiguous verb forms are listed
+// (no Arabic غير/حدث/عدل without shadda: they also mean "not"/"event"/"justice").
+const WI_LANGS = [
+  { // Arabic — imperatives; negative forms ("لا تحذف") use other verb forms and never match
+    info: /(?:^|[\s،؛.!?:"'(])(?:كيف|كيفية|اشرح|إشرح|شرح|ماذا\s+يحدث|ما\s+الذي\s+يحدث|طريقة)/,
+    noChange: /(?:لا\s+تقم\s+بأي\s+(?:تغيير|تعديل)|بدون\s+(?:أي\s+)?(?:تغيير|تعديل)|دون\s+(?:أي\s+)?(?:تغيير|تعديل)|لا\s+(?:تغير|تعدل|تغيّر|تعدّل)\s+(?:أي\s+)?شي|فقط\s+اشرح)/,
+    yes: /^\s*(?:نعم|أجل|اجل|موافق|تفضل|حسنا|حسناً|نفذ|نفّذ|تابع|استمر)\s*[.!؟?]*\s*$/,
+    verbs: [
+      ['create', /(?:^|[\s،؛.!?:"'(])(?:و|ف)?(?:أنشئ|انشئ|أنشِئ|اصنع|إصنع|أضف|اضف|أضِف|ابنِ|قم\s+ب(?:إنشاء|انشاء|إضافة|اضافة|بناء))/],
+      ['update', /(?:^|[\s،؛.!?:"'(])(?:و|ف)?(?:عدّل|عدِّل|أصلح|اصلح|صحّح|صحح|حدّث|حدِّث|غيّر|غيِّر|قم\s+ب(?:تعديل|تحديث|تغيير|إصلاح|اصلاح))/],
+      ['delete', /(?:^|[\s،؛.!?:"'(])(?:و|ف)?(?:احذف|إحذف|أزل|ازل|أزِل|امسح|إمسح|قم\s+ب(?:حذف|إزالة|ازالة|مسح))/],
+    ],
+  },
+  { // French
+    info: /(?<!\p{L})(?:comment|explique|expliquez|qu'est-ce\s+qui\s+se\s+passe)(?!\p{L})/iu,
+    noChange: /(?<!\p{L})(?:ne\s+(?:modifie|modifiez|change|changez|touche|touchez)\s+(?:à\s+)?rien|sans\s+(?:rien\s+)?(?:modifier|changer)|aucune\s+modification)(?!\p{L})/iu,
+    yes: /^\s*(?:oui|d'accord|ok|vas-y|allez-y|c'est\s+bon|confirme|confirmé)\s*[.!]*\s*$/iu,
+    neg: (v) => new RegExp(`(?<!\\p{L})ne\\s+(?:\\S+\\s+){0,2}(?:${v})\\s+(?:pas|jamais|rien)(?!\\p{L})`, 'iu'),
+    verbs: [
+      ['create', 'crée|créez|créer|construis|construisez|ajoute|ajoutez|génère|générez|fais|faites'],
+      ['update', 'modifie|modifiez|corrige|corrigez|change|changez|renomme|renommez|mets\\s+à\\s+jour|mettez\\s+à\\s+jour'],
+      ['delete', 'supprime|supprimez|efface|effacez|retire|retirez|enlève|enlevez'],
+    ],
+  },
+  { // Spanish
+    info: /(?<!\p{L})(?:cómo|explica|explícame|explique|qué\s+pasa\s+si)(?!\p{L})/iu,
+    noChange: /(?<!\p{L})(?:sin\s+(?:hacer\s+)?(?:ningún\s+)?cambios?|no\s+(?:cambies|modifiques|hagas)\s+nada)(?!\p{L})/iu,
+    yes: /^\s*(?:sí|si|claro|adelante|vale|de\s+acuerdo|confirmo|hazlo)\s*[.!]*\s*$/iu,
+    neg: (v) => new RegExp(`(?<!\\p{L})no\\s+(?:lo\\s+|la\\s+|los\\s+|las\\s+)?(?:${v})(?!\\p{L})`, 'iu'),
+    verbs: [
+      ['create', 'crea|cree|crear|construye|construir|agrega|añade|genera|haz'],
+      ['update', 'modifica|actualiza|corrige|cambia|edita|renombra'],
+      ['delete', 'elimina|borra|quita|suprime'],
+    ],
+  },
+  { // Portuguese — the negative imperative ("não exclua") uses the SAME form, so negation is checked
+    info: /(?<!\p{L})(?:como\s+(?:eu\s+|posso\s+|faço\s+para\s+|se\s+)|explique|explica|o\s+que\s+acontece)(?!\p{L})/iu,
+    noChange: /(?<!\p{L})(?:sem\s+(?:fazer\s+)?(?:nenhuma\s+)?(?:alteraç(?:ão|ões)|mudanças?)|não\s+(?:altere|mude|modifique|faça)\s+nada)(?!\p{L})/iu,
+    yes: /^\s*(?:sim|pode|claro|vai\s+em\s+frente|confirmo|faça)\s*[.!]*\s*$/iu,
+    neg: (v) => new RegExp(`(?<!\\p{L})não\\s+(?:o\\s+|a\\s+|os\\s+|as\\s+)?(?:${v})(?!\\p{L})`, 'iu'),
+    verbs: [
+      ['create', 'crie|cria|criar|construa|adicione|adiciona|gere|faça'],
+      ['update', 'modifique|atualize|corrija|altere|mude|edite|renomeie'],
+      ['delete', 'exclua|apague|remova|elimine'],
+    ],
+  },
+];
+// English noun glosses so the TOOL ROUTER also understands the request
+// (an Arabic "dashboard" request otherwise got no dashboard tools).
+const WI_NOUNS = [
+  [/لوحة\s+(?:معلومات|تحكم|القيادة|المعلومات)|(?<!\p{L})(?:tableau\s+de\s+bord|tablero|panel\s+de\s+control|painel)(?!\p{L})/iu, 'dashboard'],
+  [/مؤشرات?\s+(?:ال)?برنامج|(?<!\p{L})(?:indicateurs?\s+de\s+programme|indicadores?\s+de\s+programa)(?!\p{L})/iu, 'program indicator'],
+  [/مؤشر|(?<!\p{L})(?:indicateurs?|indicador(?:es)?)(?!\p{L})/iu, 'indicator'],
+  [/برنامج|برامج|(?<!\p{L})(?:programmes?|programas?)(?!\p{L})/iu, 'program'],
+  [/خريطة|خرائط|(?<!\p{L})(?:cartes?|mapas?)(?!\p{L})/iu, 'map'],
+  [/رسم\s+بياني|مخطط|(?<!\p{L})(?:graphiques?|gráficos?)(?!\p{L})/iu, 'chart'],
+  [/جدول|(?<!\p{L})(?:tableau|tabla|tabela)(?!\p{L})/iu, 'table'],
+  [/قائمة\s+(?:السجلات|الحالات)|(?<!\p{L})(?:liste\s+de\s+lignes|listado)(?!\p{L})/iu, 'line list'],
+  [/مرحلة|(?<!\p{L})(?:étape|etapa)(?!\p{L})/iu, 'stage'],
+  [/قاعدة|قواعد|(?<!\p{L})(?:règles?|reglas?|regras?)(?!\p{L})/iu, 'program rule'],
+];
+const WI_EN_VERB = { create: 'create', update: 'update', delete: 'delete' };
+
+function writeIntentGloss(text) {
+  const t = String(text || '');
+  if (!/[^\x00-\x7F]/.test(t) && !/\b(?:crée|créez|supprime|elimina|borra|crea|exclua|apague|oui|sí|sim|comment|cómo)\b/i.test(t)) return '';
+  const out = [];
+  for (const L of WI_LANGS) {
+    if (L.yes.test(t)) { out.push('yes'); continue; }
+    if (L.noChange.test(t)) out.push('do not make any changes.');
+    const info = L.info.test(t);
+    for (const [cls, v] of L.verbs) {
+      const re = v instanceof RegExp ? v : new RegExp(`(?<!\\p{L})(?:${v})(?!\\p{L})`, 'iu');
+      if (!re.test(t)) continue;
+      const negated = L.neg && typeof v === 'string' && L.neg(v).test(t);
+      out.push(`${negated ? 'do not ' : ''}${info ? 'how to ' : ''}${WI_EN_VERB[cls]} it.`);
+    }
+  }
+  for (const [re, en] of WI_NOUNS) if (re.test(t)) out.push(en);
+  return [...new Set(out)].join(' ');
+}
+
+// "Do not make any changes; explain how to…" — an explicit no-change request
+// overrides every verb in the message.
+const WRITE_AUTH_NO_CHANGE_RE = /\b(?:(?:do\s+not|don'?t|never|please\s+don'?t)\s+(?:make|do|apply|perform|save|commit)\s+(?:any\s+)?(?:changes?|edits?|modifications?|writes?|updates?)|without\s+(?:making\s+|doing\s+)?(?:any\s+)?(?:changes?|changing\s+anything|modifying\s+anything|edits?)|no\s+changes?|(?:do\s+not|don'?t)\s+(?:change|modify|touch|edit)\s+anything|read[-\s]?only|just\s+(?:explain|tell|describe|answer|show)|only\s+(?:explain|tell|describe|answer))\b/i;
+// "How do I create…", "explain how to delete…", "what happens if I delete…" —
+// the verb is the SUBJECT of a question, not an instruction. Stripped (with
+// the verb) before looking for a write verb.
+const WRITE_AUTH_INFO_RE = new RegExp(
+  '\\b(?:how\\s+(?:do|can|could|should|would|might|does|did)\\s+(?:i|we|one|you|someone|users?|a\\s+user)\\s+(?:go\\s+about\\s+)?'
+  + '|how\\s+(?:is|are)\\s+\\w+\\s+'
+  + '|how\\s+to\\s+'
+  + '|(?:explain|describe|tell\\s+me|show\\s+me|teach\\s+me|walk\\s+me\\s+through|guide\\s+me(?:\\s+on)?)\\s+(?:to\\s+me\\s+)?(?:how|the\\s+(?:steps|way|process))(?:\\s+(?:to|for|of))?\\s+'
+  + '|what\\s+(?:happens|would\\s+happen|will\\s+happen)\\s+(?:if|when)\\s+(?:i|we|you|someone|a\\s+user)\\s+'
+  + '|is\\s+it\\s+(?:possible|safe|ok(?:ay)?)\\s+to\\s+'
+  + '|(?:steps|instructions|guide)\\s+(?:to|for|on(?:\\s+how\\s+to)?)\\s+'
+  + '|can\\s+(?:i|we|users?)\\s+'
+  + ')[\\w-]+',
+  'gi'
+);
+// Write classes a message's verbs ask for. Deletes are only allowed for
+// messages that ask for them (or for the assistant's own objects).
+const WRITE_DELETE_FAMILY_RE = /\b(?:delete|deleting|remove|removing|drop|destroy|wipe|prune|sweep|purge|clean\s*up|cleanup|clean|clear|erase|discard|get\s+rid\s+of|replace|swap|unassign|detach|unplace|uninstall|dedupe|de-?duplicate|merge|consolidate|fix|repair|correct|rebuild|redo|reorgani[sz]e|reset|restore|revert|undo|roll\s*back)\b/i;
+function writeVerbClasses(text) {
+  const t = String(text || '');
+  return {
+    delete: WRITE_DELETE_FAMILY_RE.test(t),
+    update: /\b(?:fix|repair|patch|correct|update|modify|change|edit|rewrite|overwrite|rename|set|apply|move|share|assign|enable|disable|grant|link|attach|configure)\b/i.test(t),
+    create: /\b(?:create|build|make|set\s*up|setup|add|insert|generate|design|install|place|import|enter|record|register|enrol+)\b/i.test(t),
+  };
+}
+
 function classifyWriteAuthorization(userText) {
-  const text = String(userText || '');
+  const original = String(userText || '');
+  // Non-English instructions are judged by the same English rules through
+  // their gloss (writeIntentGloss). The gloss carries negation and how-to.
+  const gloss = writeIntentGloss(original);
+  const text = gloss === 'yes' ? 'yes' : (gloss ? `${original}\n${gloss}` : original);
   // Turn bookkeeping lives here because this is the single per-turn entry
   // point shared by the agentic loop and the test harness. Guarded so the
   // function still works when `dhis2` isn't defined (unit tests).
@@ -337,17 +460,22 @@ function classifyWriteAuthorization(userText) {
     ),
     ' '
   );
+  // Questions about HOW to do something are not instructions to do it.
+  const infoStripped = inabilityStripped.replace(WRITE_AUTH_INFO_RE, ' ');
   const isDiag = WRITE_AUTH_DIAG_RE.test(text);
   const isProblem = WRITE_AUTH_PROBLEM_RE.test(text);
   // Narrative clauses ("when I enter data and then submit it…") describe what
   // the user DID, so their verbs are never instructions.
   const isNarrative = /\b(?:when|whenever|if|after|before|while|once|every\s+time)\s+(?:i|we|they|he|she|users?|someone|the\s+user)\b/i.test(text)
     || /\bfails?\b|\berrors?\b/i.test(text);
-  const isBroad = WRITE_AUTH_BROAD_RE.test(inabilityStripped)
-    || (!isProblem && !isNarrative && WRITE_AUTH_IMPERATIVE_RE.test(inabilityStripped.trim()));
-  // Hard refusal: an explicit "no, …" decline always wins over any verb match.
-  const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text);
-  if (isBroad && !isRefusal) {
+  const isBroad = WRITE_AUTH_BROAD_RE.test(infoStripped)
+    || (!isProblem && !isNarrative && WRITE_AUTH_IMPERATIVE_RE.test(infoStripped.trim()));
+  // Hard refusal: an explicit "no, …" decline, or "do not make any changes /
+  // just explain", always wins over any verb match.
+  const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text)
+    || WRITE_AUTH_NO_CHANGE_RE.test(text);
+  if (isRefusal) return { scope: 'read_only', reason: 'the user asked for no changes (explain / read-only)' };
+  if (isBroad) {
     // A BARE affirmation ("yes", "go ahead") directly after a refused write is
     // an answer to THAT proposal — scope the authorization to the proposed
     // tool so it cannot be spent on an unrelated write (observed live: "yes"
@@ -355,9 +483,19 @@ function classifyWriteAuthorization(userText) {
     const bareAffirm = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|confirm(?:ed)?|do\s+it|go\s+ahead(?:\s+and\s+(?:do|run)\s+it)?|proceed|continue|go\s+for\s+it|run\s+it|yes,?\s*please)[.!\s]*$/i.test(text);
     const lrw = D.lastRefusedWrite;
     if (bareAffirm && lrw && lrw.tool && lrw.turn === D.turnCounter - 1) {
-      return { scope: 'scoped', tool: lrw.tool, action: lrw.action, reason: `bare affirmation — authorization scoped to the write proposed last turn: ${lrw.tool}(${lrw.action})` };
+      // Approve EXACTLY what was refused last turn (every refused call of
+      // that turn): tool + action class, and for deletes the same targets.
+      const approved = (Array.isArray(D.lastRefusedWrites) ? D.lastRefusedWrites : [lrw]).filter(r => r && r.turn === D.turnCounter - 1);
+      return { scope: 'scoped', tool: lrw.tool, action: lrw.action, approved: approved.length ? approved : [lrw], reason: `bare affirmation — authorization scoped to the write(s) proposed last turn: ${(approved.length ? approved : [lrw]).map(r => `${r.tool}(${r.action})`).join(', ')}` };
     }
-    return { scope: 'broad', reason: 'user message contains explicit write/fix verb (or affirmative response)' };
+    // Which kinds of write the user asked for. A follow-up ("continue",
+    // "yes") carries the verbs of the request it continues.
+    let verbSource = infoStripped;
+    if (bareAffirm || (typeof FOLLOW_UP_ONLY_RE !== 'undefined' && FOLLOW_UP_ONLY_RE.test(original.trim()) && original.trim().split(/\s+/).length <= 8)) {
+      const prior = typeof lastSubstantiveUserRequest === 'function' ? lastSubstantiveUserRequest() : '';
+      if (prior) { const pg = writeIntentGloss(prior); verbSource = `${verbSource}\n${prior}\n${pg}`; }
+    }
+    return { scope: 'broad', verbs: writeVerbClasses(verbSource), reason: 'user message contains explicit write/fix verb (or affirmative response)' };
   }
   if (isDiag) return { scope: 'read_only', reason: 'user asked to diagnose/check/inspect — no fix authorization' };
   if (isProblem) return { scope: 'read_only', reason: 'user reported a problem — diagnose first, fix only after explicit "yes"' };
@@ -379,29 +517,87 @@ function classifyWriteAuthorization(userText) {
 //              live 2026-07-10 on the growth-chart transcript.
 //   'read_only' — refuse and RECORD the proposal so next turn's "yes" can be
 //              scoped to it.
+// The kind of write a call performs. dhis2_query passes its HTTP method.
+function writeActionClass(toolName, action, descriptor) {
+  const a = String(action || '').toLowerCase();
+  if (descriptor && typeof descriptor.path === 'string' && /importStrategy=DELETE/i.test(descriptor.path)) return 'delete';
+  if (/(?:^|_|\b)(?:delete|remove|purge|unplace|unassign|detach|clear|uninstall|drop)/.test(a)) return 'delete';
+  if (a === 'post' || /(?:^|_)(?:create|add|place|install|import|batch|insert)/.test(a)) return 'create';
+  return 'update';
+}
+function writeTargetsOf(descriptor) {
+  const out = new Set();
+  const walk = (v) => {
+    if (typeof v === 'string') { for (const m of v.match(/\b[A-Za-z][A-Za-z0-9]{10}\b/g) || []) out.add(m); }
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === 'object') Object.values(v).forEach(walk);
+  };
+  walk(descriptor);
+  return [...out];
+}
+// Objects the assistant created in this conversation — it may always remove
+// its own work (a broken chart it just built) without a separate "delete".
+function noteAssistantCreatedIds(ids) {
+  const list = Array.isArray(dhis2.assistantCreatedIds) ? dhis2.assistantCreatedIds : [];
+  for (const id of ids || []) if (typeof id === 'string' && /^[A-Za-z][A-Za-z0-9]{10}$/.test(id) && !list.includes(id)) list.push(id);
+  dhis2.assistantCreatedIds = list.slice(-500);
+}
+function targetsCreatedByAssistant(descriptor) {
+  const ids = writeTargetsOf(descriptor);
+  const mine = new Set(Array.isArray(dhis2.assistantCreatedIds) ? dhis2.assistantCreatedIds : []);
+  return ids.length > 0 && ids.every(id => mine.has(id));
+}
+function rememberRefusedWrite(toolName, action, descriptor) {
+  const entry = { tool: toolName, action, targets: writeTargetsOf(descriptor), turn: dhis2.turnCounter || 0 };
+  dhis2.lastRefusedWrite = entry;
+  const prev = Array.isArray(dhis2.lastRefusedWrites) ? dhis2.lastRefusedWrites.filter(r => r && r.turn === entry.turn) : [];
+  dhis2.lastRefusedWrites = [...prev, entry].slice(-20);
+}
+
 function requireWriteAuth(toolName, action, descriptor) {
   const wa = dhis2.writeAuth || {};
   const scope = wa.scope || 'read_only';
+  const cls = writeActionClass(toolName, action, descriptor);
   if (scope === 'broad') {
+    // Bound to the kind of change the user asked for: "create a dashboard"
+    // is not permission to delete anything (security review 2026-10-29).
+    // wa.verbs is set only by classifyWriteAuthorization (callers that set
+    // broad directly — tests — keep the old behaviour).
+    if (cls === 'delete' && wa.verbs && !wa.verbs.delete && !targetsCreatedByAssistant(descriptor)) {
+      rememberRefusedWrite(toolName, action, descriptor);
+      return {
+        _error: `Refused: ${toolName}(action=${action}) DELETES something, but the user asked only to ${['create', 'update'].filter(k => wa.verbs[k]).join('/') || 'change things'} — not to delete. Nothing was removed.`,
+        _hint: 'Tell the user exactly what you would delete (name + ID) and why, and ask. If they reply "yes" / "delete it", retry this same call. Objects you created yourself in this conversation can be removed without asking.',
+        _refused: { tool: toolName, action, target: descriptor || null },
+        _scope: 'delete_not_requested',
+      };
+    }
     if (dhis2.lastRefusedWrite && dhis2.lastRefusedWrite.tool === toolName) dhis2.lastRefusedWrite = null;
     return null;
   }
   if (scope === 'scoped') {
-    if (toolName === wa.tool) {
-      dhis2.writeAuth = { scope: 'broad', reason: `scoped approval fulfilled by ${toolName}(${action}) — follow-up writes this turn allowed` };
+    // A bare "yes" approves exactly what was proposed: the same tool and kind
+    // of action (and, for a delete, the same targets) — repeatable, but it
+    // never widens to other tools, other actions or other targets.
+    const approved = Array.isArray(wa.approved) && wa.approved.length ? wa.approved : [{ tool: wa.tool, action: wa.action, targets: [] }];
+    const targets = writeTargetsOf(descriptor);
+    const match = approved.some(p => p && p.tool === toolName
+      && writeActionClass(p.tool, p.action, null) === cls
+      && (cls !== 'delete' || !(p.targets || []).length || targets.every(t => p.targets.includes(t))));
+    if (match) {
       dhis2.lastRefusedWrite = null;
       return null;
     }
     return {
-      _error: `Refused: the user's bare "yes" authorizes ONLY the write you proposed last turn — ${wa.tool}(${wa.action || 'the proposed action'}) — not ${toolName}(action=${action}).`,
-      _hint: `Call ${wa.tool} NOW to do exactly what the user approved. Do NOT substitute a different tool, do NOT route the write through raw dhis2_query, and NEVER spend this approval on deletes/changes the user did not ask for. After the approved ${wa.tool} call succeeds, further writes this turn are allowed again.`,
+      _error: `Refused: the user's bare "yes" authorizes ONLY the write(s) you proposed last turn — ${(Array.isArray(wa.approved) && wa.approved.length ? wa.approved : [wa]).map(p => `${p.tool}(${p.action || 'the proposed action'})`).join(', ')} — not ${toolName}(action=${action}).`,
+      _hint: `Do exactly what the user approved, with the same tool. Do NOT substitute a different tool, do NOT route the write through raw dhis2_query, and NEVER spend this approval on deletes/changes the user did not ask for. Anything beyond the approved change needs its own confirmation: describe it and ask.`,
       _refused: { tool: toolName, action, target: descriptor || null, approved_tool: wa.tool, approved_action: wa.action || null },
       _scope: 'requires_matching_tool',
     };
   }
   // read_only: remember exactly what was proposed-and-refused so a bare "yes"
   // on the next turn authorizes THIS call and nothing else.
-  dhis2.lastRefusedWrite = { tool: toolName, action, turn: dhis2.turnCounter || 0 };
+  rememberRefusedWrite(toolName, action, descriptor);
   return {
     _error: `Refused: ${toolName}(action=${action}) is a destructive write, but this conversation turn does not authorize it. Reason: ${wa.reason || 'no authorization detected'}. NOTE: the tool itself IS available and working — this is a per-turn authorization gate, NOT a missing tool. Never tell the user the tool does not exist, and never fall back to a different tool for the same write.`,
     _hint: 'Tell the user EXACTLY what change you propose: object name + ID + before → after. Then ASK for confirmation. The user must reply with explicit authorization on the NEXT turn (e.g. "yes", "go ahead", "fix it", "update X", "delete it") — then retry THIS SAME tool call, not a substitute. A problem report ("I am getting error X", "this is broken") is NOT authorization — it is a request for diagnosis.',
@@ -1804,7 +2000,10 @@ function lastSubstantiveUserRequest(history = conversationHistory) {
 }
 
 function buildRoutingText(userText, history = conversationHistory) {
-  const cur = String(userText || '');
+  const raw = String(userText || '');
+  // Non-English requests also route through their English gloss.
+  const gl = writeIntentGloss(raw);
+  const cur = gl && gl !== 'yes' ? `${raw}\n${gl}` : raw;
   if (cur.trim().split(/\s+/).filter(Boolean).length > 25) return cur;
   const prior = lastSubstantiveUserRequest(history);
   return prior && prior !== cur.trim() ? `${cur}\n${prior}` : cur;
@@ -2374,7 +2573,7 @@ function buildBackupResultBlock(backupResult, skipBackup) {
     return {
       skipped: true,
       _warning:
-        'Backup was skipped (skip_backup:true). This operation is NOT recoverable via the extension. The user explicitly authorized this — say so in your summary.',
+        `Backup was skipped (skip_backup:true) with the user's recorded approval (${dhis2.backupSkipApproval || 'consent recorded'}). This operation is NOT recoverable via the extension — say so in your summary.`,
     };
   }
   if (!backupResult || backupResult._error) {
@@ -2394,6 +2593,26 @@ function buildBackupResultBlock(backupResult, skipBackup) {
 // Helper used at every write site: either returns a backup block (on success
 // or on intentional skip), or returns a tool-result-shaped error the caller
 // should bail with. Keeps the wiring at each site to two lines.
+// Recorded user consent to skip a backup (security review 2026-10-29: the
+// model could pass skip_backup:true on its own and the result then claimed
+// "the user explicitly authorized this"). Consent is EITHER the user's own
+// words this turn ("…without a backup", "skip the backup", any of the
+// supported languages) OR a bare "yes" right after a backup of THIS tool
+// failed and was reported. Test harnesses set dhis2.harnessSkipBackupConsent.
+const BACKUP_SKIP_WORDS_RE = /\b(?:skip(?:ping)?|without|no|bypass|don'?t\s+(?:take|make|create|need))\s+(?:the\s+|a\s+|any\s+)?backups?\b|\bbackups?\s+(?:is\s+)?not\s+needed\b|بدون\s+نسخ|دون\s+نسخ|sans\s+sauvegarde|sin\s+(?:copia|respaldo)|sem\s+(?:backup|cópia)/i;
+function backupSkipConsent(toolName, args) {
+  if (dhis2.harnessSkipBackupConsent === true) return { ok: true, reason: 'test harness' };
+  const said = String(typeof lastUserText === 'string' ? lastUserText : '');
+  if (BACKUP_SKIP_WORDS_RE.test(said)) return { ok: true, reason: `the user said so this turn ("${said.slice(0, 80)}")` };
+  const f = dhis2.lastBackupFailure;
+  const bareYes = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|go\s+ahead|proceed|do\s+it|confirm(?:ed)?)[.!\s]*$/i.test(said)
+    || (typeof writeIntentGloss === 'function' && writeIntentGloss(said) === 'yes');
+  if (bareYes && f && f.tool === toolName && f.turn === (dhis2.turnCounter || 0) - 1) {
+    return { ok: true, reason: `the user answered "yes" after the ${toolName} backup failed` };
+  }
+  return { ok: false };
+}
+
 async function ensureBackupOrBail(opMeta, targets, toolArgs) {
   if (toolArgs && toolArgs.skip_backup === true) {
     return { ok: true, block: buildBackupResultBlock(null, true), skipped: true };
@@ -2404,6 +2623,9 @@ async function ensureBackupOrBail(opMeta, targets, toolArgs) {
   }
   const snap = await snapshotBeforeWrite(opMeta, targets);
   if (snap && snap._error) {
+    // Recorded so that ONLY a "yes" to THIS failure (next turn, same tool)
+    // counts as consent to proceed without a backup.
+    dhis2.lastBackupFailure = { tool: (opMeta && opMeta.tool) || null, turn: dhis2.turnCounter || 0 };
     return {
       ok: false,
       error: {

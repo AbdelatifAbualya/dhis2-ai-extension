@@ -333,6 +333,7 @@ async function backupCaptureConfig(dsKey, existed, value, action, reason) {
   };
   const put = await safeDhis2Fetch(`dataStore/${encodeURIComponent(BACKUP_NAMESPACE)}/${encodeURIComponent(backupKey)}`, { method: 'POST', body: entry });
   if (put && put._error) {
+    dhis2.lastBackupFailure = { tool: 'manage_custom_app', turn: dhis2.turnCounter || 0 };
     return {
       _error: `Could not back up dataStore/${CAPTURE_NAMESPACE}/${dsKey} before changing it: ${put._error}`,
       _requires_user_confirmation: true,

