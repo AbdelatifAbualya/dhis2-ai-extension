@@ -1266,6 +1266,59 @@ async function postMetadataPayload(payload, dryRunOnly) {
 // The returned error carries `_scope:'incomplete_call'` + `_no_disable:true` so
 // the agent loop treats it as "your input was incomplete, resend it" — it never
 // counts toward disabling create_metadata (a well-formed retry must stay open).
+// ── "Yes/No" is DHIS2's BOOLEAN value type, not an option set ───────────────
+// Weak models build a yes/no field as TEXT + a home-made two-option "Yes/No"
+// set — live 2026-10-28: "BP controlled (yes/no)" became TEXT + "NCD Yes/No"
+// while "Current smoker (yes/no)" in the same program became BOOLEAN. The rule
+// lint treats 'Yes'/'No' comparisons as booleans (lintProgramRuleCondition), so
+// rules on such a field cannot even be written, and analytics lose the yes-rate.
+// A field whose inline option set is exactly Yes + No becomes BOOLEAN
+// (keep_option_set:true opts out); rules in the same call are rewritten to
+// match. Returns the names of the healed fields.
+function healYesNoOptionSets(args) {
+  const healed = [];
+  const heal = (def) => {
+    if (!def || typeof def !== 'object' || def.keep_option_set === true || !def.option_set || typeof def.option_set !== 'object') return;
+    if (def.value_type && !/^(TEXT|BOOLEAN)$/i.test(String(def.value_type))) return;
+    const opts = (def.option_set.options || []).map((o) => String(typeof o === 'string' ? o : (o && (o.name || o.code)) || '').trim().toLowerCase());
+    if (opts.length !== 2 || !opts.every((o) => /^(yes|no|y|n)$/.test(o)) || opts[0][0] === opts[1][0]) return;
+    delete def.option_set;
+    def.value_type = 'BOOLEAN';
+    if (def.name) healed.push(def.name);
+  };
+  for (const st of (Array.isArray(args.stages) ? args.stages : [])) for (const d of ((st && st.data_elements) || [])) heal(d);
+  if (args.stage && Array.isArray(args.stage.data_elements)) for (const d of args.stage.data_elements) heal(d);
+  for (const d of (Array.isArray(args.data_elements) ? args.data_elements : [])) heal(d);
+  for (const a of (Array.isArray(args.program_attributes) ? args.program_attributes : [])) heal(a);
+  if (healed.length && Array.isArray(args.program_rules)) {
+    const tokens = new Set(healed.map((n) => sanitizeVariableName(n)));
+    const names = new Set(healed);
+    for (const r of args.program_rules) {
+      if (!r) continue;
+      if (typeof r.condition === 'string') r.condition = rewriteYesNoComparisons(r.condition, tokens);
+      for (const a of (r.actions || [])) {
+        if (a && a.type === 'ASSIGN' && names.has(a.data_element_name || a.tracked_entity_attribute_name) && typeof a.data === 'string') a.data = booleanAssignLiterals(a.data);
+      }
+    }
+  }
+  return healed;
+}
+// `#{t} == 'Yes'` → `#{t} == true`; `#{t} == 'No'` → the empty-or-No form.
+function rewriteYesNoComparisons(cond, tokens) {
+  return String(cond).replace(/([#A])\{([^}]+)\}\s*(==|!=)\s*['"](yes|no|true|false|y|n)['"]/gi, (full, sig, tok, op, lit) => {
+    if (!tokens.has(String(tok).toLowerCase()) && !tokens.has(sanitizeVariableName(tok))) return full;
+    const ref = `${sig}{${tok}}`;
+    const yes = /^(yes|true|y)$/i.test(lit) === (op === '==');
+    return yes ? `${ref} == true` : `(!d2:hasValue(${ref}) || ${ref} != true)`;
+  });
+}
+// ASSIGN data for a yes/no (BOOLEAN / TRUE_ONLY) field: quoted 'YES' / 'No' /
+// 'true' literals become the bare booleans the field stores — also inside
+// d2:condition(…, 'YES', 'NO').
+function booleanAssignLiterals(data) {
+  return String(data).replace(/(['"])(yes|no|true|false)\1/gi, (full, q, lit) => (/^(yes|true)$/i.test(lit) ? 'true' : 'false'));
+}
+
 function validateAndHealProgramInput(args) {
   const nonEmpty = (s) => typeof s === 'string' && s.trim().length > 0;
   const issues = [];               // hard, un-inferable gaps → block (cheaply)
@@ -1770,6 +1823,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     }));
   }
   const filteredOptionSets = allOptionSets.filter(os => !os._skip);
+  const unusedOptionSets = []; // inline sets dropped because every user was reused (see payload assembly)
 
   // 2. Skip options belonging to skipped option sets (they already exist in DHIS2)
   const skippedOptionIds = new Set();
@@ -1950,7 +2004,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   ]);
 
   // ── Stage name collision resolution ─────────────────────────────────────────
-  // DHIS2 enforces GLOBAL uniqueness on ProgramStage.name at the DB level, so
+  // Older DHIS2 enforces GLOBAL uniqueness on ProgramStage.name at the DB level, so
   // generic names like "Test" or "Results" routinely collide with leftovers
   // from earlier attempts and the metadata import fails with a raw Postgres
   // "duplicate key value violates unique constraint" 409. Pre-probe each
@@ -1959,11 +2013,13 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // sees the original intent; we only disambiguate what DHIS2 requires to be
   // globally unique.
   const programShortForSuffix = (args.program_short_name || args.program_name || '').trim();
+  const stageNamesMustBeUnique = await programStageNamesMustBeUnique();
   // Per-stage probe chain (original → with program-short suffix → UID shard)
   // is preserved exactly — only the *across-stage* loop is parallelized so a
   // 5-stage program no longer pays 5×RTT for stage probes.
   const resolvedStageNames = await Promise.all(stages.map(async (stage) => {
     let candidate = stage.name;
+    if (!stageNamesMustBeUnique) return candidate;
     let probe = await safeDhis2Fetch(
       `programStages?filter=name:eq:${encodeURIComponent(candidate)}&fields=id&pageSize=1`
     );
@@ -2112,6 +2168,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   // forever, creating nothing — the TB program loop, 2026-07-12).
   const skippedRules = [];
   const ruleActionFixes = []; // invalid/aliased action types adjusted client-side so the import can't 409 on a bad enum
+  const ruleStageScopes = []; // { rule, stage, how } — rules evaluated in one stage only (inferRuleStageScope)
 
   // Rules that survive the per-rule condition lint. A rule with a known-broken
   // boolean pattern is SKIPPED (recorded) rather than aborting the whole import,
@@ -2183,7 +2240,27 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
 
     // PRV builders keyed by PRV NAME so a token-named variable (e.g. muac →
     // DE "MUAC in cm") and an exact-sanitized-name variable never collide.
-    const pushDePrv = (prvName, deName) => {
+    // Source type: DATAELEMENT_CURRENT_EVENT when the rule acts on a stage that
+    // holds the data element (the value being entered in THIS form), otherwise
+    // DATAELEMENT_NEWEST_EVENT_PROGRAM (a lookup from another stage) — the same
+    // choice manage_program_rules makes. Always-NEWEST made every rule on a
+    // repeatable stage, or on a data element two stages share, read the NEWEST
+    // visit of the enrollment: verified 2026-10-28 on 2.42.5, the server rule
+    // engine then computed "BP controlled" for an earlier follow-up from a later
+    // one and refused the import with E1307, and a screening form would warn
+    // about the latest follow-up's blood pressure.
+    const stagesOfDe = (deName) => stageUids.filter((_, si) => (stages[si].data_elements || []).some(d => d.name === deName));
+    const ruleActsOnStages = (rule) => {
+      const ids = new Set();
+      for (const act of ((rule && rule.actions) || [])) {
+        if (act.data_element_name) for (const id of stagesOfDe(act.data_element_name)) ids.add(id);
+        const ref = resolveStageRefForAction(act);
+        if (ref) ids.add(ref);
+      }
+      if (rule && (rule.program_stage_id || rule.program_stage_name)) { const ref = resolveStageRefForAction(rule); if (ref) ids.add(ref); }
+      return ids;
+    };
+    const pushDePrv = (prvName, deName, rule) => {
       if (prvCreated[prvName]) return;
       const prvUid = generateDhis2Uid();
       let sourceStageId = null;
@@ -2192,12 +2269,14 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           sourceStageId = stageUids[si]; break;
         }
       }
+      const acts = ruleActsOnStages(rule);
+      const inForm = stagesOfDe(deName).some(id => acts.has(id));
       allProgramRuleVariables.push({
         id: prvUid,
         name: prvName,
         program: { id: programUid },
         dataElement: { id: deUidMap[deName] },
-        programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+        programRuleVariableSourceType: inForm ? 'DATAELEMENT_CURRENT_EVENT' : 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
         // Option-set DEs MUST resolve the option CODE, matching the code
         // literals the conditions compare against. useCodeForOptionSet=false
         // makes #{var} yield the option NAME → every `== 'CODE'` comparison
@@ -2372,16 +2451,31 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         continue;
       }
 
+      // Stage the rule is evaluated in: an explicit rule-level stage, or the
+      // one stage every action names (see inferRuleStageScope).
+      let scopeStageId = null;
+      if (rule.program_stage_id || rule.program_stage_name) {
+        scopeStageId = resolveStageRefForAction(rule);
+        if (!scopeStageId) {
+          skippedRules.push({ rule: rule.name, reason: 'unresolved_stage', detail: `rule-level stage "${rule.program_stage_name || rule.program_stage_id}" is not a stage of this program; valid stage names: ${stages.map(st => st.name).join(', ')}` });
+          continue;
+        }
+        ruleStageScopes.push({ rule: rule.name, stage: rule.program_stage_name || rule.program_stage_id, how: 'requested' });
+      } else {
+        const stageDeIds = new Map(stages.map((st, si) => [stageUids[si], new Set((st.data_elements || []).map(d => deUidMap[d.name]).filter(Boolean))]));
+        scopeStageId = inferRuleStageScope(pendingActions, stageDeIds);
+        if (scopeStageId) ruleStageScopes.push({ rule: rule.name, stage: (stages[stageUids.indexOf(scopeStageId)] || {}).name || scopeStageId, how: 'every action names this stage' });
+      }
       // ── Commit: the whole rule is valid, so publish its PRVs, actions, rule ──
       if (rewrites.length) ruleTokenRewrites.push({ rule: rule.name, rewrites });
       for (const b of bindings) {
-        if (b.kind === 'de') pushDePrv(b.token, b.name); else pushTeaPrv(b.token, b.name);
+        if (b.kind === 'de') pushDePrv(b.token, b.name, rule); else pushTeaPrv(b.token, b.name);
       }
       // Action-target DEs/TEAs also get a PRV under their sanitized name
       // (pre-existing behavior — harmless and occasionally referenced later).
       for (const act of (rule.actions || [])) {
         if (act.data_element_name && deUidMap[act.data_element_name]) {
-          pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name);
+          pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name, rule);
         }
         if (act.tracked_entity_attribute_name && teaUidMap[act.tracked_entity_attribute_name]) {
           pushTeaPrv(sanitizeVariableName(act.tracked_entity_attribute_name), act.tracked_entity_attribute_name);
@@ -2395,6 +2489,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
         program: { id: programUid },
         condition: rule.condition,
         programRuleActions: pendingActions.map(a => ({ id: a.id })), // ID refs only
+        ...(scopeStageId ? { programStage: { id: scopeStageId } } : {}),
       });
     }
 
@@ -2451,6 +2546,23 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
       ruleDeadLiterals = mapped.deadLiterals || [];
     }
     ruleAutoGuards = autoGuardedConditions;
+  }
+
+  // An inline option set whose only users were REUSED (existing) attributes or
+  // data elements would be imported as an orphan — live 2026-10-28: the
+  // existing "Sex" attribute was reused and its inline "NCD Sex" set (+ its
+  // options) was still created. Ship only sets something new points at.
+  {
+    const usedOsIds = new Set([...filteredDataElements, ...filteredTEAs].map(o => o.optionSet && o.optionSet.id).filter(Boolean));
+    for (let i = filteredOptionSets.length - 1; i >= 0; i--) {
+      const os = filteredOptionSets[i];
+      if (usedOsIds.has(os.id)) continue;
+      const optIds = new Set((os.options || []).map(r => r.id));
+      finalOptions = finalOptions.filter(o => !optIds.has(o.id));
+      filteredOptionSets.splice(i, 1);
+      unusedOptionSets.push(os.name);
+      for (const [n, id] of Object.entries(optionSetUidMap)) if (id === os.id) delete optionSetUidMap[n];
+    }
   }
 
   // Build the atomic payload (Batch 1: options + optionSets + TEAs + DEs + program + stages)
@@ -2618,6 +2730,8 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     ...(ruleTokenRewrites.length ? { rule_token_rewrites: ruleTokenRewrites } : {}),
     ...(skippedRules.length ? { skipped_rules: skippedRules } : {}),
     ...(ruleActionFixes.length ? { rule_action_fixes: ruleActionFixes } : {}),
+    ...(ruleStageScopes.length ? { stage_scoped_rules: ruleStageScopes } : {}),
+    ...(unusedOptionSets.length ? { option_sets_not_created: unusedOptionSets.map(n => `${n} (the attribute/data element it was for already exists and keeps its own options)`) } : {}),
   };
 
   // Record successful program create in the per-turn registry so a duplicate
@@ -2680,10 +2794,37 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     _verify_repeatability: `CHECK NOW against what the user asked for. Any stage the user described as repeatable / recurring / "one per visit" / "multiple times" MUST show repeatable=true above. Every stage defaults to FALSE, so a forgotten flag looks exactly like a deliberate choice and DHIS2 reports no error — it just refuses the second event later. If one is wrong, fix it immediately with dhis2_query(path="programStages/<the stage id>", method="PATCH", body:{ repeatable:true }) — a PATCH is safe because it touches only that field (a PUT would wipe the stage's sections). Do NOT re-run create_program.`,
   };
 
+  // The program's data access must reach its tracked entity type too.
+  const tetSharing = programType === 'WITH_REGISTRATION' && result.phase === 'import'
+    ? await cascadeProgramDataSharingToTrackedEntityType(programUid, args) : null;
+  // "unique" asked for on attributes that were REUSED (not created here).
+  let uniqueness = null;
+  if (isTracker && result.phase === 'import') {
+    const createdTeaIds = new Set(allTrackedEntityAttributes.filter((t) => !t._skip).map((t) => t.id));
+    const reusedUnique = (args.program_attributes || [])
+      .filter((a) => a && a.unique === true)
+      .map((a) => ({ id: teaUidMap[a.name || a.id] }))
+      .filter((a) => a.id && !createdTeaIds.has(a.id));
+    if (reusedUnique.length) {
+      const u = await applyRequestedAttributeUniqueness(programUid, reusedUnique, args);
+      if (u.applied.length || u.not_applied.length) {
+        uniqueness = {
+          ...(u.applied.length ? { reused_attributes_made_unique: u.applied } : {}),
+          ...(u.not_applied.length ? {
+            reused_attributes_not_unique: u.not_applied,
+            _uniqueness_warning: `You asked for unique attribute(s) but reused existing one(s) that are NOT unique: ${u.not_applied.map((x) => `${x.attribute || x.id}${x.shared_with ? ` (also used by ${x.shared_with.join(', ')})` : ''}`).join('; ')}. They were left non-unique because making them unique changes every program that uses them. Do NOT tell the user these are unique — say so and ask whether to make them unique everywhere or to create a separate unique attribute for this program.`,
+          } : {}),
+        };
+      }
+    }
+  }
+
   return {
     ...result,
     ...skipInfo,
     ...repeatCheck,
+    ...(tetSharing ? { tracked_entity_type_sharing: tetSharing } : {}),
+    ...(uniqueness || {}),
     ...(args._input_heals && args._input_heals.length ? { _input_heals: args._input_heals } : {}),
     program_id: programUid,
     stage_ids,
@@ -2705,6 +2846,132 @@ function failedImportResult(result, what) {
     success: false,
     nothing_created: true,
     _hint: `${result?._hint ? result._hint + ' ' : ''}The import is ATOMIC and it failed — NOTHING was created by this ${what} call. Do NOT reuse any ids from this attempt. Fix the reported error and re-issue the call.`,
+  };
+}
+
+// Does this server enforce globally unique programStage names? Older versions
+// do (a DB constraint); 2.42 does not — its schema says name unique=false and a
+// second "Follow-up Visit" saves fine (verified 2026-10-28), so renaming the
+// stage there only made the model rename it back. Unknown → assume it does.
+let _stageNameUniqueCache = null;
+async function programStageNamesMustBeUnique() {
+  const key = dhis2.baseUrl;
+  if (_stageNameUniqueCache && _stageNameUniqueCache.key === key) return _stageNameUniqueCache.value;
+  const r = await safeDhis2Fetch('schemas/programStage?fields=properties[name,unique]');
+  if (!r || r._error || !Array.isArray(r.properties)) return true;
+  const value = (r.properties.find((x) => x.name === 'name') || { unique: true }).unique !== false;
+  _stageNameUniqueCache = { key, value };
+  return value;
+}
+
+// ── "unique" requested on a REUSED attribute ─────────────────────────────────
+// unique belongs to the attribute itself, not to the program link, so reusing
+// an existing non-unique "National ID" silently dropped the user's "unique" —
+// and the model then told the user it was unique (live 2026-10-28, 2.42.5).
+// After the program exists: an attribute that no other program or tracked
+// entity type uses is made unique (backed up first); one that others use is
+// left alone and reported, because uniqueness would change those programs too.
+async function applyRequestedAttributeUniqueness(programId, attrs, toolArgs) {
+  const out = { applied: [], not_applied: [] };
+  const ids = [...new Set((attrs || []).map((a) => a.id).filter(Boolean))];
+  if (!ids.length) return out;
+  const resp = await safeDhis2Fetch(`trackedEntityAttributes?filter=id:in:[${ids.join(',')}]&fields=id,displayName,unique&paging=false`);
+  if (resp?._error) {
+    for (const id of ids) out.not_applied.push({ id, reason: `could not read the attribute: ${resp._error}` });
+    return out;
+  }
+  for (const t of (resp.trackedEntityAttributes || [])) {
+    if (t.unique === true) continue;
+    const [progs, tets] = await Promise.all([
+      safeDhis2Fetch(`programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:eq:${t.id}&filter=id:ne:${programId}&fields=displayName&paging=false`),
+      safeDhis2Fetch(`trackedEntityTypes?filter=trackedEntityTypeAttributes.trackedEntityAttribute.id:eq:${t.id}&fields=displayName&paging=false`),
+    ]);
+    if (progs?._error || tets?._error) { out.not_applied.push({ attribute: t.displayName, id: t.id, reason: 'could not check which programs use it' }); continue; }
+    const users = [...(progs.programs || []).map((x) => `program "${x.displayName}"`), ...(tets.trackedEntityTypes || []).map((x) => `tracked entity type "${x.displayName}"`)];
+    if (users.length) { out.not_applied.push({ attribute: t.displayName, id: t.id, shared_with: users }); continue; }
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'create_metadata', action: 'create_program', reason: `Make attribute ${t.displayName} unique (requested for program ${programId})` },
+      [{ object_type: 'trackedEntityAttributes', object_id: t.id, role: 'primary' }],
+      toolArgs || {}
+    );
+    if (!backup.ok) { out.not_applied.push({ attribute: t.displayName, id: t.id, reason: 'backup failed' }); continue; }
+    const r = await safeDhis2Fetch(`trackedEntityAttributes/${t.id}`, { method: 'PATCH', body: { unique: true } });
+    if (r?._error) out.not_applied.push({ attribute: t.displayName, id: t.id, reason: r._error });
+    else out.applied.push({ attribute: t.displayName, id: t.id, backup: backup.block });
+  }
+  return out;
+}
+
+// ── A capturable program needs DATA access on its tracked entity type too ────
+// Tracker capture checks three data-shareable objects: the program, its stage
+// AND the program's tracked entity type. Verified 2026-10-28 on 2.42.5: a
+// program + stages shared "rwrw----" on the shared "person" type ("rw------")
+// refused every registration by a plain Capture user with E1001 "no data write
+// access to TrackedEntityType" and E1104 "no data read access to Program …,
+// TrackedEntityType". So whenever a program grants data access — publicly or to
+// a user group / user — the same audience gets the same DATA bits on its
+// tracked entity type. Only data bits are ever ADDED: metadata bits, other
+// users/groups and anything already broader stay exactly as they were, and the
+// type is backed up first (it may be shared by other programs).
+function addDataBits(have, want) {
+  const h = normalizeAccessString(have, 'rw------').split('');
+  const w = normalizeAccessString(want, '--------');
+  if (w[2] === 'r') h[2] = 'r';
+  if (w[3] === 'w') { h[2] = 'r'; h[3] = 'w'; }
+  if (h[2] === 'r') h[0] = 'r'; // data access is unusable without seeing the type
+  return h.join('');
+}
+async function cascadeProgramDataSharingToTrackedEntityType(programId, toolArgs) {
+  const p = await safeDhis2Fetch(`programs/${programId}?fields=programType,trackedEntityType[id,displayName]`);
+  if (!p || p._error || p.programType !== 'WITH_REGISTRATION' || !p.trackedEntityType?.id) return null;
+  const tet = p.trackedEntityType;
+  const [pr, tr] = await Promise.all([
+    safeDhis2Fetch(`sharing?type=program&id=${programId}`),
+    safeDhis2Fetch(`sharing?type=trackedEntityType&id=${tet.id}`),
+  ]);
+  if (!pr?.object || !tr?.object) return { id: tet.id, name: tet.displayName, updated: false, error: pr?._error || tr?._error || 'no sharing object' };
+  const prog = pr.object, obj = tr.object;
+  const before = obj.publicAccess;
+  let changed = false;
+  const nextPublic = addDataBits(obj.publicAccess, prog.publicAccess);
+  if (nextPublic !== obj.publicAccess) { obj.publicAccess = nextPublic; changed = true; }
+  const grantsAdded = [];
+  for (const [key, label] of [['userGroupAccesses', 'group'], ['userAccesses', 'user']]) {
+    const list = Array.isArray(obj[key]) ? obj[key] : (obj[key] = []);
+    for (const g of (prog[key] || [])) {
+      const acc = normalizeAccessString(g.access, '--------');
+      if (acc.slice(2, 4) === '--') continue;
+      const cur = list.find((x) => x.id === g.id);
+      if (cur) {
+        const merged = addDataBits(cur.access, acc);
+        if (merged !== cur.access) { cur.access = merged; changed = true; grantsAdded.push(`${label} ${g.displayName || g.id}`); }
+      } else {
+        list.push({ id: g.id, access: addDataBits('r-------', acc) });
+        changed = true;
+        grantsAdded.push(`${label} ${g.displayName || g.id}`);
+      }
+    }
+  }
+  if (!changed) return null;
+  const backup = await ensureBackupOrBail(
+    { operation: 'update_sharing', tool: 'manage_metadata', action: 'update_sharing', reason: `Data access on tracked entity type ${tet.displayName} for program ${programId}` },
+    [{ object_type: 'trackedEntityTypes', object_id: tet.id, role: 'cascade' }],
+    toolArgs || {}
+  );
+  if (!backup.ok) return { id: tet.id, name: tet.displayName, updated: false, error: backup.error?._error || 'backup failed' };
+  const put = await safeDhis2Fetch(`sharing?type=trackedEntityType&id=${tet.id}`, { method: 'PUT', body: { object: obj } });
+  if (put?._error) return { id: tet.id, name: tet.displayName, updated: false, error: put._error, backup: backup.block };
+  const others = await safeDhis2Fetch(`programs?filter=trackedEntityType.id:eq:${tet.id}&filter=id:ne:${programId}&fields=displayName&paging=false`);
+  return {
+    id: tet.id,
+    name: tet.displayName,
+    updated: true,
+    previous_public_access: before,
+    new_public_access: obj.publicAccess,
+    ...(grantsAdded.length ? { grants_extended: grantsAdded } : {}),
+    other_programs_using_it: (others?.programs || []).length,
+    _note: `Tracker data entry also needs DATA access on the tracked entity type "${tet.displayName}", so the program's data access was added to it (data bits only; nothing was removed). Tell the user, mentioning that this type is shared by ${(others?.programs || []).length} other program(s).`,
+    backup: backup.block,
   };
 }
 
@@ -2907,19 +3174,21 @@ async function addStageToProgram(args, defaultCatComboId) {
   // Pre-probe DHIS2 for shortName collisions on the genuinely NEW DEs only.
   await disambiguateShortNamesAgainstServer(finalDataElements, 'dataElements', 'dataElements');
 
-  // ── Stage name: DHIS2 enforces GLOBAL uniqueness on ProgramStage.name ──────
+  // ── Stage name: unique on older DHIS2 (see programStageNamesMustBeUnique) ──
   // Same probe chain as create_program: original → "<name> - <program short>"
-  // → UID-shard suffix.
+  // → UID-shard suffix. Where names need not be globally unique, only a clash
+  // inside THIS program is avoided.
   let finalStageName = stage.name;
   {
     const programShortForSuffix = (progResp.shortName || progResp.name || '').trim();
+    const scope = (await programStageNamesMustBeUnique()) ? '' : `&filter=program.id:eq:${args.program_id}`;
     let probe = await safeDhis2Fetch(
-      `programStages?filter=name:eq:${encodeURIComponent(finalStageName)}&fields=id&pageSize=1`
+      `programStages?filter=name:eq:${encodeURIComponent(finalStageName)}${scope}&fields=id&pageSize=1`
     );
     if (probe?.programStages?.length && programShortForSuffix) {
       finalStageName = `${stage.name} - ${programShortForSuffix}`.substring(0, 230);
       probe = await safeDhis2Fetch(
-        `programStages?filter=name:eq:${encodeURIComponent(finalStageName)}&fields=id&pageSize=1`
+        `programStages?filter=name:eq:${encodeURIComponent(finalStageName)}${scope}&fields=id&pageSize=1`
       );
     }
     if (probe?.programStages?.length) {
@@ -2976,9 +3245,17 @@ async function addStageToProgram(args, defaultCatComboId) {
     stageObj.publicAccess = normalizeAccessString(inheritedStageSharing.public);
   }
 
+  // Same as create_program: no orphan option set for a data element that was reused.
+  const usedOsIds = new Set(finalDataElements.map(d => d.optionSet && d.optionSet.id).filter(Boolean));
+  const unusedSets = finalOptionSets.filter(os => !usedOsIds.has(os.id));
+  const unusedOptIds = new Set(unusedSets.flatMap(os => (os.options || []).map(r => r.id)));
+  for (const os of unusedSets) for (const [n, id] of Object.entries(optionSetUidMap)) if (id === os.id) delete optionSetUidMap[n];
+  const shipOptionSets = finalOptionSets.filter(os => usedOsIds.has(os.id));
+  const shipOptions = finalOptions.filter(o => !unusedOptIds.has(o.id));
+
   const payload = {};
-  if (finalOptions.length) payload.options = finalOptions;
-  if (finalOptionSets.length) payload.optionSets = finalOptionSets;
+  if (shipOptions.length) payload.options = shipOptions;
+  if (shipOptionSets.length) payload.optionSets = shipOptionSets;
   if (finalDataElements.length) payload.dataElements = finalDataElements;
   payload.programStages = [stageObj];
   if (psSections.length) payload.programStageSections = psSections;
@@ -3691,9 +3968,17 @@ async function executeManageMetadata(args) {
     const _gate = requireWriteAuth('manage_metadata', 'update_sharing', { object_type: args.object_type, object_id: args.object_id });
     if (_gate) return _gate;
     if (!args.object_type || !args.object_id) return { _error: 'object_type and object_id required for update_sharing' };
+    // Since 2.40 line lists / event reports / event charts are all
+    // eventVisualizations; the legacy APIs answer an empty body for them, so
+    // the pre-write backup failed (live 2026-10-28, a line list shared as
+    // "eventReports") and the model fell back to a raw sharing PATCH.
+    if (/^event(?:Reports|Charts)$/.test(args.object_type) && Number(dhis2.apiVersion) >= 40) args.object_type = 'eventVisualizations';
 
     // Map plural API type names to singular form for the sharing endpoint
     const sharingTypeMap = {
+      eventVisualizations: 'eventVisualization', trackedEntityTypes: 'trackedEntityType',
+      programIndicators: 'programIndicator', sqlViews: 'sqlView', userGroups: 'userGroup',
+      legendSets: 'legendSet', validationRules: 'validationRule', organisationUnitGroups: 'organisationUnitGroup',
       programs: 'program', dataSets: 'dataSet', dataElements: 'dataElement',
       indicators: 'indicator', optionSets: 'optionSet',
       trackedEntityAttributes: 'trackedEntityAttribute',
@@ -3827,11 +4112,15 @@ async function executeManageMetadata(args) {
       stageResults.push({ id: st.id, name: st.name, updated: true, previous_public_access: stBefore, new_public_access: stObj.publicAccess });
     }
 
+    const tetSharing = args.object_type === 'programs' && args.cascade_to_tracked_entity_type !== false
+      ? await cascadeProgramDataSharingToTrackedEntityType(args.object_id, args) : null;
+
     return {
       success: true,
       action: 'update_sharing',
       object_type: args.object_type,
       object_id: args.object_id,
+      ...(tetSharing ? { tracked_entity_type_sharing: tetSharing } : {}),
       object_name: obj.displayName || obj.name || args.object_id,
       previous_public_access: previousPublicAccess,
       new_public_access: actualPublic,
@@ -4475,11 +4764,12 @@ async function addProgramRules(args) {
   // existing-rules read degrades to batch-only linting rather than blocking.
   {
     const existingRulesResp = await safeDhis2Fetch(
-      `programRules?filter=program.id:eq:${args.program_id}&fields=id,name,condition,programRuleActions%5BprogramRuleActionType,dataElement%5Bid,displayName%5D,trackedEntityAttribute%5Bid,displayName%5D,programStage%5Bid,displayName%5D,programStageSection%5Bid,displayName%5D%5D&pageSize=100`
+      `programRules?filter=program.id:eq:${args.program_id}&fields=id,name,condition,programStage%5Bid,displayName%5D,programRuleActions%5BprogramRuleActionType,dataElement%5Bid,displayName%5D,trackedEntityAttribute%5Bid,displayName%5D,programStage%5Bid,displayName%5D,programStageSection%5Bid,displayName%5D%5D&pageSize=100`
     );
     const semanticErrors = lintRuleVisibilitySemantics(
       args.program_rules,
-      existingRulesResp._error ? [] : (existingRulesResp.programRules || [])
+      existingRulesResp._error ? [] : (existingRulesResp.programRules || []),
+      { canonVar: buildPrvCanonicalizer([], args.program_rules) }
     );
     if (semanticErrors.length) {
       return {
@@ -4512,6 +4802,9 @@ async function addProgramRules(args) {
     }
   }
   const validStageIdSet = new Set((progResp.programStages || []).map(ps => ps.id));
+  const stageDeIds = new Map((progResp.programStages || []).map(ps => [ps.id, new Set((ps.programStageDataElements || []).map(p => p.dataElement?.id).filter(Boolean))]));
+  const stageNameById = new Map((progResp.programStages || []).map(ps => [ps.id, ps.displayName]));
+  const stageScoped = []; // { rule, stage, how } — rules evaluated in one stage only
   // Stage references in actions may arrive as a stage NAME (models often can't
   // know stage UIDs) — resolve name → id; a valid known UID passes through.
   const resolveStageRefForAction = (act) => {
@@ -4550,15 +4843,32 @@ async function addProgramRules(args) {
   const prvCreated = {};
   for (const n of existingVarNames) prvCreated[n] = 'existing';
 
-  const pushDePrv = (prvName, deName) => {
+  // Source type: CURRENT_EVENT when the rule acts on a stage holding the data
+  // element, NEWEST_EVENT_PROGRAM for a cross-stage lookup (see create_program).
+  const stagesOfDe = (deName) => (progResp.programStages || [])
+    .filter(ps => (ps.programStageDataElements || []).some(p => p.dataElement?.displayName === deName)).map(ps => ps.id);
+  const ruleActsOnStages = (rule) => {
+    const ids = new Set();
+    for (const act of ((rule && rule.actions) || [])) {
+      if (act.data_element_name) for (const id of stagesOfDe(act.data_element_name)) ids.add(id);
+      if (act.data_element_id) for (const ps of (progResp.programStages || [])) if ((ps.programStageDataElements || []).some(p => p.dataElement?.id === act.data_element_id)) ids.add(ps.id);
+      const ref = resolveStageRefForAction(act);
+      if (ref) ids.add(ref);
+    }
+    if (rule && (rule.program_stage_id || rule.program_stage_name)) { const ref = resolveStageRefForAction(rule); if (ref) ids.add(ref); }
+    return ids;
+  };
+  const pushDePrv = (prvName, deName, rule) => {
     if (prvCreated[prvName]) return;
     const prvUid = generateDhis2Uid();
+    const acts = ruleActsOnStages(rule);
+    const inForm = stagesOfDe(deName).some(id => acts.has(id));
     allPRVs.push({
       id: prvUid,
       name: prvName,
       program: { id: args.program_id },
       dataElement: { id: deNameToId[deName] },
-      programRuleVariableSourceType: 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
+      programRuleVariableSourceType: inForm ? 'DATAELEMENT_CURRENT_EVENT' : 'DATAELEMENT_NEWEST_EVENT_PROGRAM',
       // Option-set DEs must resolve option CODES so `== 'CODE'` conditions
       // fire (useCodeForOptionSet=false yields the option NAME — silent
       // never-matching rules; MCH bug, play 2.40.12, 2026-07-07).
@@ -4615,7 +4925,7 @@ async function addProgramRules(args) {
       };
     }
     for (const b of bindings) {
-      if (b.kind === 'de') pushDePrv(b.token, b.name); else pushTeaPrv(b.token, b.name);
+      if (b.kind === 'de') pushDePrv(b.token, b.name, rule); else pushTeaPrv(b.token, b.name);
     }
 
     // Action-target DEs/TEAs also get a PRV under their sanitized name
@@ -4626,7 +4936,7 @@ async function addProgramRules(args) {
       const targetFixes = canonicalizeActionTargetNames(act, Object.keys(deNameToId), Object.keys(teaNameToId));
       for (const f of targetFixes) actionTypeFixes.push({ rule: rule.name, action_type: act.type, outcome: 'target name resolved', detail: `${f.field} "${f.from}" → "${f.to}"` });
       if (act.data_element_name && deNameToId[act.data_element_name]) {
-        pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name);
+        pushDePrv(sanitizeVariableName(act.data_element_name), act.data_element_name, rule);
       }
       if (act.tracked_entity_attribute_name && teaNameToId[act.tracked_entity_attribute_name]) {
         pushTeaPrv(sanitizeVariableName(act.tracked_entity_attribute_name), act.tracked_entity_attribute_name);
@@ -4636,6 +4946,7 @@ async function addProgramRules(args) {
     // Build program rule + separate actions (top-level programRuleActions array)
     const prUid = generateDhis2Uid();
     const actionRefs = [];
+    const ruleActionsStart = allPRAs.length;
 
     for (const act of (rule.actions || [])) {
       // Invalid enum values 409/500 the WHOLE atomic import at deserialization
@@ -4716,14 +5027,33 @@ async function addProgramRules(args) {
       allPRAs.push(pra);
     }
 
-    allPRs.push({
+    const pr = {
       id: prUid,
       name: rule.name,
       description: rule.description || '',
       program: { id: args.program_id },
       condition: rule.condition,
       programRuleActions: actionRefs, // ID refs only, not full objects
-    });
+    };
+    // Stage the rule is evaluated in (see inferRuleStageScope).
+    if (rule.program_stage_id || rule.program_stage_name) {
+      const sid = resolveStageRefForAction(rule);
+      if (!sid) {
+        return {
+          success: false,
+          phase: 'lint',
+          _error: `Program rule "${rule.name}" asks to run only in stage "${rule.program_stage_name || rule.program_stage_id}", which is not a stage of this program. Nothing was imported.`,
+          valid_stages: (progResp.programStages || []).map(ps => ({ id: ps.id, name: ps.displayName })),
+          _hint: 'Pass the rule-level program_stage_id / program_stage_name of one of the valid stages, or leave it out so the rule runs in every stage. Fix the rule and retry.',
+        };
+      }
+      pr.programStage = { id: sid };
+      stageScoped.push({ rule: rule.name, stage: stageNameById.get(sid) || sid, how: 'requested' });
+    } else {
+      const sid = inferRuleStageScope(allPRAs.slice(ruleActionsStart), stageDeIds);
+      if (sid) { pr.programStage = { id: sid }; stageScoped.push({ rule: rule.name, stage: stageNameById.get(sid) || sid, how: 'every action names this stage' }); }
+    }
+    allPRs.push(pr);
   }
 
   // ── Option NAME → CODE mapping in conditions and ASSIGN data ──
@@ -4807,6 +5137,7 @@ async function addProgramRules(args) {
     summary: {
       program_id: args.program_id,
       programRules: allPRs.map(r => ({ id: r.id, name: r.name })),
+      ...(stageScoped.length ? { stage_scoped_rules: stageScoped } : {}),
       programRuleVariables: allPRVs.map(v => ({ id: v.id, name: v.name })),
       programRuleActions: allPRAs.map(a => ({ id: a.id, type: a.programRuleActionType })),
       ...(actionTypeFixes.length ? { action_type_fixes: actionTypeFixes } : {}),
@@ -5412,7 +5743,7 @@ async function executeManageProgramRules(args, ctxProgramId) {
 
     // Verify the rule exists BEFORE touching it. 404 → STOP, do not invent context.
     const _verify = await verifyTargetExists('programRules', args.rule_id, 'manage_program_rules', 'update',
-      'id,name,condition,priority,description,program[id],programRuleActions[id,programRuleActionType,content,data,evaluationTime,dataElement[id],trackedEntityAttribute[id],programStage[id]]');
+      'id,name,condition,priority,description,program[id],programStage[id],programRuleActions[id,programRuleActionType,content,data,evaluationTime,dataElement[id],trackedEntityAttribute[id],programStage[id]]');
     if (!_verify.exists) return _verify.refusal;
     const existing = _verify.data;
 
@@ -5608,6 +5939,16 @@ async function executeManageProgramRules(args, ctxProgramId) {
     };
     if (merged.description !== undefined) updatedRule.description = merged.description;
     if (merged.priority !== undefined) updatedRule.priority = merged.priority;
+    // Keep the rule's stage scope (the REPLACE import would otherwise drop it and
+    // the rule would start running in every stage); a rule-level
+    // program_stage_id changes it, and null / "" makes the rule program-wide.
+    if (Object.prototype.hasOwnProperty.call(args.rule, 'program_stage_id') && !args.rule.program_stage_id) {
+      // explicit clear
+    } else if (args.rule.program_stage_id) {
+      updatedRule.programStage = { id: args.rule.program_stage_id };
+    } else if (existing.programStage?.id) {
+      updatedRule.programStage = { id: existing.programStage.id };
+    }
 
     const payload = {};
     if (allPRVs.length) payload.programRuleVariables = allPRVs;
@@ -5758,9 +6099,18 @@ async function executeManageProgramRules(args, ctxProgramId) {
     // "5 unhidden" failure mode users hit when HIDEALLFIELDS is asked of stages
     // whose DEs are compulsory).
     const progResp = await safeDhis2Fetch(
-      `programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[id,compulsory,dataElement[id,displayName]],programStageSections[id,displayName]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName]]`,
+      `programs/${programId}?fields=id,programStages[id,displayName,repeatable,programStageDataElements[id,compulsory,dataElement[id,displayName]],programStageSections[id,displayName]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName]]`,
       { noTruncate: true }
     );
+    const deStageIds = new Map(); // DE id → ids of the stages that hold it
+    const repeatableStageIds = new Set();
+    for (const stage of (progResp.programStages || [])) {
+      if (stage.repeatable) repeatableStageIds.add(stage.id);
+      for (const psde of (stage.programStageDataElements || [])) {
+        const id = psde.dataElement?.id;
+        if (id) deStageIds.set(id, [...(deStageIds.get(id) || []), stage.id]);
+      }
+    }
     const validStageIds = new Set();
     const validDeIds = new Set();
     const validTeaIds = new Set();
@@ -5916,6 +6266,28 @@ async function executeManageProgramRules(args, ctxProgramId) {
         }
       }
 
+      // A NEWEST_EVENT_PROGRAM variable used by a rule that acts in the SAME
+      // form as its data element, on a repeatable stage or a data element
+      // several stages share, judges ANOTHER visit's value (the newest in the
+      // enrollment) — and an ASSIGN computed from it is refused on save with
+      // E1307 (verified 2026-10-28, 2.42.5). Older chatbot versions created
+      // such variables for every create_program rule.
+      if (structureAvailable) {
+        const actStages = new Set(rule.programStage?.id ? [rule.programStage.id] : []);
+        for (const a of actions) for (const sid of (deStageIds.get(a.dataElement?.id) || [])) actStages.add(sid);
+        const refs = new Set([...getProgramRuleExpressionRefs(cond).hash, ...actions.flatMap(a => getProgramRuleExpressionRefs(a.data || '').hash)]);
+        for (const name of refs) {
+          const v = varByName.get(name);
+          if (!v || v.programRuleVariableSourceType !== 'DATAELEMENT_NEWEST_EVENT_PROGRAM' || !v.dataElement?.id) continue;
+          const holders = deStageIds.get(v.dataElement.id) || [];
+          const sameForm = holders.filter(sid => actStages.has(sid));
+          if (!sameForm.length) continue;
+          const why = sameForm.some(sid => repeatableStageIds.has(sid)) ? 'its stage is repeatable' : (holders.length > 1 ? 'the data element is in several stages' : null);
+          if (!why) continue;
+          probs.push(`Variable #{${name}} (${v.id}) reads the NEWEST event of the whole enrollment (DATAELEMENT_NEWEST_EVENT_PROGRAM), but this rule acts in the same form and ${why} — so it judges another visit's value, and an ASSIGN computed from it is refused on save (E1307). Fix: dhis2_query(method="PATCH", path="programRuleVariables/${v.id}", body:{ programRuleVariableSourceType:"DATAELEMENT_CURRENT_EVENT" }).`);
+        }
+      }
+
       const hasConditionFinding = probs.some(p => p.startsWith('Condition ') || p.includes(' condition'));
       if (deep && cond.trim() && hasConditionFinding) {
         const serverRes = await validateProgramRuleCondition(cond, programId);
@@ -5979,7 +6351,7 @@ async function executeManageProgramRules(args, ctxProgramId) {
     // twin rules that hide the same target under complementary conditions
     // (target permanently hidden — the classic "field shows but can't be
     // used" / "field never appears" complaint), and duplicate hide rules.
-    const crossRuleIssues = lintRuleVisibilitySemantics(allRules);
+    const crossRuleIssues = lintRuleVisibilitySemantics(allRules, [], { canonVar: buildPrvCanonicalizer(allVars, []) });
 
     // Build fix hints for the conditions that only need a lint-driven rewrite.
     const conditionFixHints = [];
@@ -6017,7 +6389,7 @@ async function executeManageProgramRules(args, ctxProgramId) {
       } : {}),
       summary: (ruleIssues.length + varIssues.length + crossRuleIssues.length) === 0
         ? `All ${allRules.length} rules and ${allVars.length} variables are structurally sound.`
-        : `Found ${ruleIssues.length} rule(s), ${varIssues.length} variable(s)${crossRuleIssues.length ? `, and ${crossRuleIssues.length} cross-rule contradiction(s)` : ''} with issues. ${crossRuleIssues.length ? 'Cross-rule contradictions make fields permanently hidden or hidden-and-mandatory — fix by DELETING the redundant "Show …" twin rule (there is no SHOW action in DHIS2; fields re-appear when the hide condition is false). ' : ''}${conditionFixHints.length ? 'Use bulk_fix_conditions to apply the suggested condition rewrites.' : 'Fix action targets / variable references via update/create/delete.'} NEVER use dhis2_query PUT/PATCH for program rule metadata.`,
+        : `Found ${ruleIssues.length} rule(s), ${varIssues.length} variable(s)${crossRuleIssues.length ? `, and ${crossRuleIssues.length} cross-rule contradiction(s)` : ''} with issues. ${crossRuleIssues.length ? 'Cross-rule contradictions make fields permanently hidden or hidden-and-mandatory — fix by DELETING the redundant "Show …" twin rule (there is no SHOW action in DHIS2; fields re-appear when the hide condition is false). ' : ''}${conditionFixHints.length ? 'Use bulk_fix_conditions to apply the suggested condition rewrites.' : 'Fix action targets / variable references via update/create/delete.'} NEVER use dhis2_query PUT/PATCH for program rule metadata — the one exception is a variable's source type, patched exactly as its issue says.`,
     };
   }
 
@@ -6266,9 +6638,85 @@ function _prConditionsComplementary(a, b) {
   return `!(${ca})` === cb || `!(${cb})` === ca;
 }
 
-function _prConditionsEquivalent(a, b) {
-  const ca = _prCoreCondition(a), cb = _prCoreCondition(b);
+// `canonVar(name)` (optional) maps a #{variable} to the source it reads, so two
+// rules that name the SAME data element differently (#{systolic_bp_screening}
+// vs #{systolic_bp_followup}, both DATAELEMENT_CURRENT_EVENT of one DE) compare
+// as the same condition.
+function _prConditionsEquivalent(a, b, canonVar) {
+  const canon = (s) => (typeof canonVar === 'function'
+    ? s.replace(/#\{([^}]+)\}/g, (m, n) => { const k = canonVar(n); return k ? `#{${k}}` : m; })
+    : s);
+  const ca = canon(_prCoreCondition(a)), cb = canon(_prCoreCondition(b));
   return !!ca && ca === cb;
+}
+
+// Variable name (lowercased) → "<sourceType>|<DE or TEA id>|<stage for _STAGE>"
+// from the program's existing PRVs (server shape) and the variables:[] the
+// model supplied (tool shape). Names with no resolvable source are left out.
+function buildPrvCanonicalizer(existingPrvs = [], rules = []) {
+  const map = new Map();
+  const put = (name, st, src, stage) => {
+    const k = String(name || '').toLowerCase();
+    if (!k || !st || !src || map.has(k)) return;
+    map.set(k, `${st}|${src}|${st === 'DATAELEMENT_NEWEST_EVENT_PROGRAM_STAGE' ? (stage || '') : ''}`);
+  };
+  for (const v of existingPrvs || []) {
+    put(v.name, v.programRuleVariableSourceType, v.dataElement?.id || v.trackedEntityAttribute?.id, v.programStage?.id);
+  }
+  for (const r of rules || []) {
+    for (const v of (r && r.variables) || []) put(v.name, v.source_type, v.data_element_id || v.tei_attribute_id, v.program_stage_id);
+  }
+  return (name) => map.get(String(name || '').toLowerCase()) || null;
+}
+
+// ── Rule-level stage scope (programRule.programStage) ───────────────────────
+// A DHIS2 program rule with programStage set is evaluated ONLY in that stage's
+// events; without it the rule runs everywhere. Models express "this copy is for
+// the Follow-up stage" by putting program_stage_id on the rule's field actions,
+// but an action's programStage is only a TARGET for stage actions
+// (HIDEPROGRAMSTAGE / CREATEEVENT) — so the scope used to be dropped. Verified
+// 2026-10-28 in Capture (2.42): a screening copy and a follow-up copy of one
+// SHOWWARNING rule on a data element both stages share were saved unscoped, and
+// the warning rendered TWICE in each stage.
+// Order: an explicit rule-level program_stage_id / program_stage_name wins;
+// otherwise, when EVERY action is a field action on a data element (or an
+// untargeted message) and all of them name the same stage that holds their
+// data elements, the rule is scoped to it. Attribute targets, stage/event
+// actions, DISPLAY widgets, messages and mixed stages stay program-wide.
+const PR_STAGE_SCOPABLE_ACTION_TYPES = new Set([
+  'SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE',
+  'HIDEFIELD', 'SETMANDATORYFIELD', 'ASSIGN', 'HIDEOPTION', 'SHOWOPTIONGROUP', 'HIDEOPTIONGROUP',
+]);
+// `pras` are the BUILT actions (server shape); `stageDeIds` (optional) is
+// Map stageId → Set of data element ids. Returns the stage id or null.
+function inferRuleStageScope(pras, stageDeIds) {
+  if (!Array.isArray(pras) || !pras.length) return null;
+  let sid = null;
+  for (const a of pras) {
+    if (!PR_STAGE_SCOPABLE_ACTION_TYPES.has(a.programRuleActionType) || a.trackedEntityAttribute) return null;
+    const s = a.programStage && a.programStage.id;
+    if (!s || (sid && sid !== s)) return null;
+    sid = s;
+    const des = stageDeIds && stageDeIds.get(s);
+    if (a.dataElement && des && !des.has(a.dataElement.id)) return null;
+  }
+  return sid;
+}
+// Same decision on a rule in TOOL shape (before ids are resolved) — used by the
+// semantics lint so two rules for different stages are not called duplicates.
+function _prInputRuleScopeRef(rule) {
+  if (!rule) return null;
+  if (rule.program_stage_id || rule.program_stage_name) return rule.program_stage_id || rule.program_stage_name;
+  const acts = rule.actions || [];
+  if (!acts.length) return null;
+  let ref = null;
+  for (const a of acts) {
+    const r = a.program_stage_id || a.program_stage_name;
+    if (!PR_STAGE_SCOPABLE_ACTION_TYPES.has(a.type) || a.tei_attribute_id || a.tracked_entity_attribute_name || !r) return null;
+    if (ref && String(ref).trim().toLowerCase() !== String(r).trim().toLowerCase()) return null;
+    ref = r;
+  }
+  return ref;
 }
 
 // Normalize one rule (either shape) → { name, condition, actions:[{type, keys:Set,
@@ -6294,9 +6742,19 @@ function _prNormalizeRuleForLint(rule) {
     add('section', a.program_stage_section_id || a.programStageSection?.id, a.programStageSection?.displayName);
     if (!label) label = a.data_element_id || a.tei_attribute_id || a.program_stage_id || a.program_stage_section_id
       || a.dataElement?.id || a.trackedEntityAttribute?.id || a.programStage?.id || a.programStageSection?.id || null;
-    actions.push({ type, keys, label });
+    actions.push({ type, keys, label, msg: `${String(a.content || '').trim()}|${String(a.data || '').trim()}` });
   }
-  return { id: rule.id || null, name: rule.name || '', condition: rule.condition || '', actions, hasHideAllFields };
+  // Stage the rule is evaluated in: server rules carry programStage; tool-shape
+  // rules are scoped the way the builders scope them (inferRuleStageScope).
+  const scopeKeys = new Set();
+  if (rule.programRuleActions) {
+    if (rule.programStage?.id) scopeKeys.add(`stage:${rule.programStage.id}`);
+    if (rule.programStage?.displayName) scopeKeys.add(`stage:${sanitizeVariableName(rule.programStage.displayName)}`);
+  } else {
+    const ref = _prInputRuleScopeRef(rule);
+    if (ref) { scopeKeys.add(`stage:${ref}`); scopeKeys.add(`stage:${sanitizeVariableName(ref)}`); }
+  }
+  return { id: rule.id || null, name: rule.name || '', condition: rule.condition || '', actions, hasHideAllFields, scopeKeys };
 }
 
 const _prKeysIntersect = (a, b) => { for (const k of a) if (b.has(k)) return true; return false; };
@@ -6306,8 +6764,11 @@ const PR_ONE_RULE_DOCTRINE = 'DHIS2 has NO SHOW action — fields/sections/stage
 // Lint new rules (tool-input or server shape) against each other AND against
 // the program's existing rules. Returns an array of error strings — callers
 // refuse the import when any are present.
-function lintRuleVisibilitySemantics(newRules, existingRules = []) {
+// `opts.canonVar` (see buildPrvCanonicalizer) lets the duplicate check see
+// through differently-named variables that read the same data element.
+function lintRuleVisibilitySemantics(newRules, existingRules = [], opts = {}) {
   const errors = [];
+  const canonVar = opts && opts.canonVar;
   const news = (newRules || []).map(_prNormalizeRuleForLint);
   const olds = (existingRules || []).map(_prNormalizeRuleForLint);
 
@@ -6344,8 +6805,11 @@ function lintRuleVisibilitySemantics(newRules, existingRules = []) {
   //     "two identical BP warnings" / "referral set mandatory twice"). ASSIGN and
   //     DISPLAY* are deliberately excluded: ASSIGN-same-target-different-value is
   //     a CONFLICT not a duplicate, and DISPLAY feedback may legitimately repeat.
+  // A message ON a field (targeted SHOWWARNING / SHOWERROR …) is a duplicate
+  // only when the text is the same too — two different messages on one field
+  // under one condition can be deliberate.
   const UNTARGETED_DUP_TYPES = new Set(['SHOWWARNING', 'SHOWERROR', 'WARNINGONCOMPLETE', 'ERRORONCOMPLETE']);
-  const TARGETED_DUP_TYPES = new Set([...PR_HIDE_ACTION_TYPES, 'SETMANDATORYFIELD']);
+  const TARGETED_DUP_TYPES = new Set([...PR_HIDE_ACTION_TYPES, 'SETMANDATORYFIELD', ...UNTARGETED_DUP_TYPES]);
   const dupEntries = (list, isNew) => {
     const out = [];
     for (const r of list) {
@@ -6370,6 +6834,10 @@ function lintRuleVisibilitySemantics(newRules, existingRules = []) {
         ? _prKeysIntersect(a.act.keys, b.act.keys)
         : (!a.targeted && !b.targeted);
       if (!sameTarget) continue;
+      if (a.targeted && UNTARGETED_DUP_TYPES.has(a.act.type) && a.act.msg !== b.act.msg) continue;
+      // Rules evaluated in different stages never fire together.
+      const sa = a.rule.scopeKeys, sb = b.rule.scopeKeys;
+      if (sa && sb && sa.size && sb.size && !_prKeysIntersect(sa, sb)) continue;
       const label = a.act.label || a.act.type;
       const pairKey = [a.rule.name, b.rule.name, String(label)].sort().join('|');
       if (flagged.has(pairKey)) continue;
@@ -6377,12 +6845,12 @@ function lintRuleVisibilitySemantics(newRules, existingRules = []) {
       if (PR_HIDE_ACTION_TYPES.has(a.act.type) && _prConditionsComplementary(a.rule.condition, b.rule.condition)) {
         flagged.add(pairKey);
         errors.push(`Rule "${a.rule.name}" and ${bDesc} BOTH hide "${a.act.label}" under COMPLEMENTARY conditions ("${a.rule.condition}" vs "${b.rule.condition}") — together they hide it in every case, so the field/stage never appears. Keep ONLY the rule whose condition expresses when to HIDE and drop the other. ${PR_ONE_RULE_DOCTRINE}`);
-      } else if (_prConditionsEquivalent(a.rule.condition, b.rule.condition)) {
+      } else if (_prConditionsEquivalent(a.rule.condition, b.rule.condition, canonVar)) {
         flagged.add(pairKey);
         const tgtDesc = a.targeted
           ? `same ${a.act.type} target "${a.act.label}"`
           : `an equivalent ${a.act.type} (same effect) `;
-        errors.push(`Rule "${a.rule.name}" duplicates ${bDesc}: ${tgtDesc} under an equivalent condition — it fires redundantly (the user sees the effect twice). Do not create duplicate rules — keep ONE (merge the messages/targets if both were intended, or stage-scope them).`);
+        errors.push(`Rule "${a.rule.name}" duplicates ${bDesc}: ${tgtDesc} under an equivalent condition — it fires redundantly (the user sees the effect twice). Do not create duplicate rules — keep ONE rule without a stage (it already runs in every stage that has the field), or, if each copy is meant for one stage only, give each rule its own program_stage_id (rule level).`);
       }
     }
   }
@@ -7194,11 +7662,12 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   // rules). A failed existing-rules read degrades to batch-only linting.
   {
     const existingRulesResp = await safeDhis2Fetch(
-      `programRules?filter=program.id:eq:${programId}&fields=id,name,condition,programRuleActions%5BprogramRuleActionType,dataElement%5Bid,displayName%5D,trackedEntityAttribute%5Bid,displayName%5D,programStage%5Bid,displayName%5D,programStageSection%5Bid,displayName%5D%5D&pageSize=100`
+      `programRules?filter=program.id:eq:${programId}&fields=id,name,condition,programStage%5Bid,displayName%5D,programRuleActions%5BprogramRuleActionType,dataElement%5Bid,displayName%5D,trackedEntityAttribute%5Bid,displayName%5D,programStage%5Bid,displayName%5D,programStageSection%5Bid,displayName%5D%5D&pageSize=100`
     );
     const semanticErrors = lintRuleVisibilitySemantics(
       rules,
-      existingRulesResp._error ? [] : (existingRulesResp.programRules || [])
+      existingRulesResp._error ? [] : (existingRulesResp.programRules || []),
+      { canonVar: buildPrvCanonicalizer(progResp.programRuleVariables || [], rules) }
     );
     if (semanticErrors.length) {
       return {
@@ -7332,6 +7801,9 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   const allPRVs = [];
   const allPRAs = [];
   const allPRs  = [];
+  const stageScoped = []; // { rule, stage, how } — rules evaluated in one stage only
+  const stageDeIds = new Map((progResp.programStages || []).map(ps => [ps.id, new Set((ps.programStageDataElements || []).map(p => p.dataElement?.id).filter(Boolean))]));
+  const stageNameById = new Map((progResp.programStages || []).map(ps => [ps.id, ps.displayName]));
   const newPRVsByName = new Map();  // lowercased name → PRV (tracks PRVs we're creating in this batch)
   const unresolved = []; // { rule, ref, suggestions }
   const autoCreated = []; // for summary
@@ -7505,6 +7977,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
 
     // Build this rule's actions (regardless of unresolved refs — we'll abort below if any).
     const actionRefs = [];
+    const ruleActionsStart = allPRAs.length;
     for (const act of (rule.actions || [])) {
       const norm = normalizeRuleActionType(act.type, act.content);
       if (norm.skip) { actionTypeFixes.push({ rule: rule.name, action_type: act.type, outcome: 'dropped', detail: norm.note }); continue; }
@@ -7530,6 +8003,13 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       const teaTgt = deTgt ? null : resolveActionTeaEntry(act);
       if (deTgt && deTgt.id) pra.dataElement = { id: deTgt.id };
       else if (teaTgt && teaTgt.id) pra.trackedEntityAttribute = { id: teaTgt.id };
+      // A yes/no field stores true / false: 'YES' / 'No' assigned to it is an
+      // invalid value (see booleanAssignLiterals).
+      const tgtType = (deTgt || teaTgt || {}).valueType;
+      if (pra.programRuleActionType === 'ASSIGN' && pra.data && /^(BOOLEAN|TRUE_ONLY)$/.test(tgtType || '')) {
+        const fixed = booleanAssignLiterals(pra.data);
+        if (fixed !== pra.data) { actionTypeFixes.push({ rule: rule.name, action_type: 'ASSIGN', outcome: 'boolean literals', detail: `${pra.data} → ${fixed} (the target is a yes/no field)` }); pra.data = fixed; }
+      }
       // A name was supplied but did not resolve → surface it (fail loudly with
       // suggestions) rather than posting a target-less action that bounces server-side.
       if (!pra.dataElement && !pra.trackedEntityAttribute) {
@@ -7563,6 +8043,15 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     };
     if (rule.description) pr.description = rule.description;
     if (rule.priority !== undefined) pr.priority = rule.priority;
+    // Stage the rule is evaluated in (see inferRuleStageScope).
+    if (rule.program_stage_id || rule.program_stage_name) {
+      const sid = resolveStageRefForAction(rule);
+      if (sid) { pr.programStage = { id: sid }; stageScoped.push({ rule: rule.name, stage: stageNameById.get(sid) || sid, how: 'requested' }); }
+      else unresolved.push({ rule: rule.name, reference: `rule stage "${rule.program_stage_name || rule.program_stage_id}"`, suggestions: (progResp.programStages || []).map(ps => ({ kind: 'programStage', id: ps.id, displayName: ps.displayName })) });
+    } else {
+      const sid = inferRuleStageScope(allPRAs.slice(ruleActionsStart), stageDeIds);
+      if (sid) { pr.programStage = { id: sid }; stageScoped.push({ rule: rule.name, stage: stageNameById.get(sid) || sid, how: 'every action names this stage' }); }
+    }
     allPRs.push(pr);
   }
 
@@ -7721,6 +8210,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     ...result,
     summary: {
       programRules: allPRs.map(r => ({ id: r.id, name: r.name })),
+      ...(stageScoped.length ? { stage_scoped_rules: stageScoped } : {}),
       ...(actionTypeFixes.length ? { action_type_fixes: actionTypeFixes } : {}),
       programRuleVariables: allPRVs.map(v => ({ id: v.id, name: v.name, sourceType: v.programRuleVariableSourceType, dataElement: v.dataElement?.id, trackedEntityAttribute: v.trackedEntityAttribute?.id })),
       programRuleActions: allPRAs.map(a => ({ id: a.id, type: a.programRuleActionType })),

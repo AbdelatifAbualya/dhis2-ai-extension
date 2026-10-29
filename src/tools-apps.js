@@ -667,6 +667,39 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
       }
     }
   }
+  // @dhis2/ui SingleSelect(Field) / MultiSelect(Field) take <…Option> CHILDREN;
+  // an items / options prop is ignored and the dropdown says "No data found"
+  // (live 2026-10-28: an app's facility filter never offered a facility).
+  for (const [file, v] of Object.entries(views)) {
+    for (const m of v.code.matchAll(/createElement\(\s*(SingleSelectField|SingleSelect|MultiSelectField|MultiSelect)\s*,\s*\{([^{}]|\{[^{}]*\})*?\b(items|options)\s*:/g)) {
+      errors.push({ file, line: lineAt(v.code, m.index), message: `<${m[1]}> has no "${m[3]}" prop — it is ignored and the dropdown shows "No data found". Render the choices as children: {list.map((x) => <${m[1].startsWith('Multi') ? 'MultiSelectOption' : 'SingleSelectOption'} key={x.id} value={x.id} label={x.name} />)} (values are non-empty strings — use 'ALL' for an "All" choice, not '').` });
+    }
+  }
+  // Tracker lists (2.42): no pager.pageCount without totalPages=true, and
+  // orgUnit / trackedEntity / enrollment are UID strings (nested fields are
+  // ignored). Live 2026-10-28 an app read pageCount without totalPages (only
+  // the first 100 events → two patients missing) and showed "—" for every
+  // facility from orgUnit[id,displayName].
+  if (/['"`]tracker\//.test(allCode)) {
+    if (/\bpageCount\b/.test(allCode) && !/\btotalPages\b/.test(allCode)) {
+      errors.push({ message: 'tracker/* lists return no pager.pageCount (or total) unless the request sends totalPages: true — this loop stops after the first page and silently drops records. Add totalPages: true to the tracker params (and loop to pager.pageCount).' });
+    }
+    const nested = allCode.match(/fields\s*:\s*['"`][^'"`]*\b(orgUnit|trackedEntity|enrollment|program|programStage)\[/);
+    if (nested) {
+      errors.push({ message: `Tracker records carry ${nested[1]} as a plain UID string — "${nested[1]}[…]" in fields is ignored, so any name read from it is undefined. Request ${nested[1]} and look the names up (organisationUnits with filter id:in:[…], fields id,displayName).` });
+    }
+  }
+  // Tracker timestamps already carry a time part ("2026-01-23T00:00:00.000"):
+  // appending 'T00:00:00' to one is Invalid Date — live 2026-10-28 an
+  // enrollment widget showed "—" for "days since last visit" and raw
+  // timestamps in its table. A DATE data value ("YYYY-MM-DD") may take the
+  // suffix, so this fires only when the code reads a timestamp field, appends
+  // the suffix, and never trims anything to its first 10 characters.
+  if (/\b(?:occurredAt|enrolledAt|scheduledAt|completedAt|createdAt|updatedAt)\b/.test(allCode)
+      && /\+\s*['"`]T00:00(?::00)?(?:\.000)?Z?['"`]|\$\{[^}]+\}T00:00/.test(allCode)
+      && !/\.(?:slice|substring|substr)\(\s*0\s*,\s*10\s*\)|split\(\s*['"`]T['"`]\s*\)/.test(allCode)) {
+    errors.push({ message: 'Tracker timestamps (occurredAt, enrolledAt, scheduledAt, completedAt, createdAt, updatedAt) come back as "2026-01-23T00:00:00.000" — date AND time. Appending \'T00:00:00\' to one gives Invalid Date (a "days since" shows nothing, dates print raw). Take the day first: const day = String(ev.occurredAt).slice(0, 10); then new Date(day + \'T00:00:00\') and display day.' });
+  }
   if (/\btype\s*:\s*['"`]delete['"`]/.test(allCode) && !/\bModal\b/.test(allBare)) {
     warnings.push({ message: 'The app deletes data without a confirmation step — ask in a Modal (ModalTitle / ModalContent / ModalActions + ButtonStrip) before every delete.' });
   }
@@ -1259,6 +1292,22 @@ async function prepareCustomAppBuild(spec, opts = {}) {
       found_uids: uidCheck.found,
       _hint: 'Never invent UIDs. Look the real ones up (search_metadata, get_program_info, dhis2_query) and resend. If an object exists but is not shared with this user it also shows as unknown.',
     };
+  }
+
+  // Program-indicator VALUES come from /api/analytics with dx: — the event /
+  // enrollment aggregate endpoints refuse them (409 E7224) or, as separate
+  // dimensions, group by the indicator's value. Live 2026-10-28 a dashboard
+  // league-table plugin queried analytics/events/aggregate with three program
+  // indicators and showed nothing.
+  {
+    const pis = Object.entries(uidCheck.found || {}).filter(([, t]) => t === 'programIndicators').map(([id]) => id);
+    const code = Object.values(compiled).map((js) => customAppSourceViews(js).code).join('\n');
+    if (pis.length && /analytics\/(?:events|enrollments)\/aggregate/.test(code) && !/resource\s*:\s*['"`]analytics(?:\.json)?['"`]/.test(code)) {
+      return {
+        _error: `The code reads program indicator(s) ${pis.join(', ')} through analytics/events|enrollments/aggregate — DHIS2 refuses program indicators there (409 E7224), so the plugin would show nothing.`,
+        _hint: "Read program-indicator values from the plain analytics resource: { resource: 'analytics', params: ({ ou, pe }) => ({ dimension: [`dx:${PI_IDS.join(';')}`, `ou:${ou}`], filter: `pe:${pe}`, displayProperty: 'NAME' }) } — rows are [dx, ou, value]. Keep events/enrollments aggregate for data elements only. Fix the query and preview again.",
+      };
+    }
   }
 
   const sqlCheck = await checkCustomAppSqlViews(compiled, uidCheck.found);

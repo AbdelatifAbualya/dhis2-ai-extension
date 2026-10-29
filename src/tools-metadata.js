@@ -177,6 +177,15 @@ async function executeToolCall(name, args) {
       };
     }
     const method = (args.method || 'GET').toString().toUpperCase();
+    // App PAGES are not Web API resources: dhis2_query prefixes /api/<v>/, so
+    // "dhis-web-capture/index.html" is a guaranteed 404 (live 2026-10-28, a
+    // model checking how to link into Capture).
+    if (/^\/?dhis-web-[\w-]+(?:\/|$|#|\?)/i.test(String(args.path).trim()) || (/\.html?(?:$|[?#])/i.test(String(args.path).trim()) && !/^\/?(?:api\/)?apps\//i.test(String(args.path).trim()))) {
+      return {
+        _error: `"${args.path}" is a web-app page, not a Web API resource — dhis2_query only reads /api/… endpoints, so this would be a 404.`,
+        _hint: 'App pages are opened by the user, not queried. Deep links: Capture enrollment dashboard = <server>/dhis-web-capture/index.html#/enrollment?enrollmentId=…&programId=…&orgUnitId=…&teiId=… (2.42+ redirects it to /apps/capture#/…); Dashboard = <server>/dhis-web-dashboard/index.html#/<dashboardId>. Installed apps: manage_custom_app(action="list") or dhis2_query path "apps".',
+      };
+    }
     // A literal undefined / null / NaN path segment is a value the model failed
     // to fill in (an unset variable or a missing id) — guaranteed 404, never a
     // real object. Refuse it before it costs a failed call.
@@ -431,6 +440,31 @@ async function executeToolCall(name, args) {
       || /^maintenance\/analytic/i.test(safePath)
       || (/analytic/i.test(safePath.split('?')[0]) && !/^analytics(\/|\?|$)/i.test(safePath));
     if (method === 'POST' && analyticsRunMatch) {
+      // Unrequested runs. Live 2026-10-28 the model started the analytics job
+      // TWICE in one dashboard turn, telling the user new program indicators
+      // "need a rebuild" — false: indicators and charts are computed at query
+      // time from the existing tables, and on a large server the job can run
+      // for hours. A run the user did not ask for (or approve) is refused when
+      // the tables are already newer than every program on the server.
+      const wa0 = dhis2.writeAuth || {};
+      const asked = /\banalytic|resource\s*tables?|regenerat|rebuild|refresh (?:the )?(?:data|tables)/i.test(userWordsThisThread())
+        || (wa0.scope === 'scoped' && wa0.tool === 'dhis2_query');
+      if (!asked) {
+        const [info, newest] = await Promise.all([
+          safeDhis2Fetch('system/info'),
+          safeDhis2Fetch('programs?order=created:desc&fields=id,displayName,created&pageSize=1'),
+        ]);
+        const last = info && !info._error && (info.lastAnalyticsTableSuccess || info.lastAnalyticsTableGeneration);
+        const newestProg = newest && !newest._error && (newest.programs || [])[0];
+        if (last && newestProg && Date.parse(newestProg.created) < Date.parse(last)) {
+          dhis2.lastRefusedWrite = { tool: 'dhis2_query', action: 'analytics_run', turn: dhis2.turnCounter || 0 };
+          return {
+            _error: `Not started: the user did not ask for an analytics run, and the analytics tables (last generated ${last}) are newer than every program on this server (newest: "${newestProg.displayName}", created ${newestProg.created}).`,
+            _hint: 'Program indicators — new or changed — and visualizations are computed at query time from the existing tables: NO run is needed for them to show values. Only data entered after that time is missing from analytics. If a query is empty, check the indicator / filters / org units instead. If the user expects data entered since the last run, ASK them before starting one (on a large server it can take hours); a "yes" then allows exactly this call.',
+            _scope: 'analytics_run_not_requested',
+          };
+        }
+      }
       // Keep only the parameters the real endpoint understands (lastYears,
       // skipResourceTables, skipOutliers); everything else was invented for a
       // fictional endpoint and would be ignored or rejected.
@@ -811,6 +845,24 @@ async function executeToolCall(name, args) {
         console.log(`[dhis2_query] Split packed analytics dimensions → ${packHeal.path}`);
         safePath = packHeal.path;
       }
+      // visualizations/<id>/data is the chart IMAGE (PNG), not its values
+      // (live 2026-10-28: two "non-JSON response" errors) — read the values
+      // the way get_visualization_details does.
+      const vizData = safePath.match(/^visualizations\/([A-Za-z][A-Za-z0-9]{10})\/data(?:\.png)?(?:\?|$)/);
+      if (vizData) {
+        // Reading one chart's values must not make it "the open chart" for the
+        // rest of the turn (later analytics queries would inherit its dimensions).
+        const savedVizCtx = dhis2.visualizationContext;
+        const details = await executeTool('get_visualization_details', { visualization_id: vizData[1] });
+        dhis2.visualizationContext = savedVizCtx;
+        if (details && typeof details === 'object' && !Array.isArray(details)) details._routed_from = `${safePath} returns a PNG image, so the visualization's definition and values were read with get_visualization_details instead.`;
+        return details;
+      }
+      const piRoute = await routeProgramIndicatorAnalytics(safePath);
+      if (piRoute.routed) {
+        console.log(`[dhis2_query] Program indicators → /analytics: ${piRoute.path}`);
+        safePath = piRoute.path;
+      }
       const dxHeal = healEventAnalyticsDxDimension(safePath);
       if (dxHeal.healed) {
         console.log(`[dhis2_query] Healed dx: dimension for an event/enrollment analytics query → ${dxHeal.path}`);
@@ -895,32 +947,40 @@ async function executeToolCall(name, args) {
         }
       }
     }
+    // A multi-period keyword used as a DIMENSION returns one row per
+    // sub-period and no total (see analyticsPeriodRowsNote).
+    if (method === 'GET' && isAnalyticsPath(safePath) && writeResult && typeof writeResult === 'object' && Array.isArray(writeResult.rows)) {
+      const note = analyticsPeriodRowsNote(safePath);
+      if (note) writeResult._period_rows_note = note;
+    }
     return writeResult;
   }
 
   // ── count_records ──
   if (name === 'count_records') {
     const pid = args.program_override || programId;
-    const originalOuid = args.ou_override || orgUnitId;
+    // No org unit anywhere → count across all of the user's own org units
+    // (USER_ORGUNIT: one subtree-wide row per top unit, summed below) instead
+    // of an error the model can only answer by guessing a UID — live
+    // 2026-10-28 two such errors in a row while sizing an app.
+    const userRootsDefault = !(args.ou_override || orgUnitId);
+    const originalOuid = args.ou_override || orgUnitId || 'USER_ORGUNIT';
     if (!pid) return {
       _error: 'No program in context and no program_override given.',
       _hint: 'Do NOT guess a program UID. Pick a tool that does not need one: manage_program_indicators(action="discover") for cross-program indicator questions, search_metadata(object_type="programs", name_filter="<keyword>") to find a specific program, or ask the user to open a program first.',
     };
-    if (!originalOuid) return {
-      _error: 'No org unit in context and no ou_override given.',
-      _hint: 'Pass ou_override to a specific org unit, or ask the user to select one. Do NOT guess an org unit UID.',
-    };
 
     const progName = dhis2.programMetadata?.displayName || pid;
-    const hasOuOverride = typeof args.ou_override === 'string' && args.ou_override.trim().length > 0;
+    const hasOuOverride = userRootsDefault || (typeof args.ou_override === 'string' && args.ou_override.trim().length > 0);
     const userWantsDescendants = userExplicitlyWantsDescendants(lastUserText);
     // Unless user explicitly asks broader scope, keep counts at selected OU only.
     let includeChildren = args.include_children === true;
     if (!hasOuOverride && !userWantsDescendants) includeChildren = false;
     if (!hasOuOverride && userWantsDescendants) includeChildren = true;
+    if (userRootsDefault) includeChildren = false; // USER_ORGUNIT already covers each whole subtree
 
     let ouid = originalOuid;
-    let ouName = dhis2.ouContext?.displayName || originalOuid;
+    let ouName = userRootsDefault ? "all of the user's org units (USER_ORGUNIT)" : (dhis2.ouContext?.displayName || originalOuid);
     let scopeResolution = null;
     if (!hasOuOverride && !includeChildren) {
       const resolved = await resolveFacilityScopedOu(originalOuid);
@@ -1453,12 +1513,29 @@ async function executeToolCall(name, args) {
     // delete toward the wrong program (2026-07-01).
     const nameFilter = args.name_filter || args.query || args.name || args.search || null;
 
-    let path = `${type}?fields=${fields}&pageSize=${args.page_size || 50}`;
-    if (nameFilter) path += `&filter=displayName:ilike:${encodeURIComponent(nameFilter)}`;
-    if (args.filters?.length) {
-      for (const f of args.filters) path += `&filter=${f}`;
+    // Paging belongs in page/pageSize, never in a filter: models page by
+    // writing filters:["page:eq:2"], which DHIS2 rejects with 400 "Unknown path
+    // property: page" (live 2026-10-28). Lift such terms into the real params.
+    let page = Number(args.page) > 1 ? Math.floor(Number(args.page)) : 1;
+    let pageSize = Number(args.page_size) > 0 ? Math.floor(Number(args.page_size)) : 50;
+    const realFilters = [];
+    for (const f of (Array.isArray(args.filters) ? args.filters : [])) {
+      const m = String(f).trim().match(/^(page|pageSize|page_size|paging)\s*(?::eq:|=|:)\s*(\w+)$/i);
+      if (!m) { realFilters.push(f); continue; }
+      const key = m[1].toLowerCase();
+      if (key === 'page' && Number(m[2]) > 0) page = Math.floor(Number(m[2]));
+      else if ((key === 'pagesize' || key === 'page_size') && Number(m[2]) > 0) pageSize = Math.floor(Number(m[2]));
     }
+    pageSize = Math.min(pageSize, 500);
+    let path = `${type}?fields=${fields}&pageSize=${pageSize}${page > 1 ? `&page=${page}` : ''}`;
+    if (nameFilter) path += `&filter=displayName:ilike:${encodeURIComponent(nameFilter)}`;
+    for (const f of realFilters) path += `&filter=${f}`;
     const resp = await safeDhis2Fetch(path);
+    // Say when the list is cut off, and how to get the rest.
+    if (resp && !resp._error && Array.isArray(resp[type]) && resp.pager && resp.pager.total > resp[type].length) {
+      const pc = resp.pager.pageCount || Math.ceil(resp.pager.total / pageSize);
+      resp._more = `Showing ${resp[type].length} of ${resp.pager.total} (page ${resp.pager.page || page} of ${pc}).${(resp.pager.page || page) < pc ? ` Next: the same call with page: ${(resp.pager.page || page) + 1}` : ''} — or narrow it with name_filter.`;
+    }
     // Rank exact displayName matches first, then prefix matches, so "the
     // first result" is the least-surprising object when the model follows up
     // with a destructive action on it.
@@ -4751,6 +4828,31 @@ function buildVisualizationObject(spec, typeMap) {
     relativePeriods,
     periods: fixedPeriods,
   };
+  // Chronological period order. With relative-period flags alone the server
+  // orders them its own way — "each quarter of this year and last year" drew
+  // 2026 Q1–Q4 BEFORE 2025 Q1–Q4 (live 2026-10-28). Explicit axis items keep
+  // the order we give (verified 2.42), so send them when last-year periods
+  // must come first.
+  const yearRank = (p) => (/LAST_YEAR$/.test(p) ? 0 : /THIS_YEAR$/.test(p) ? 1 : null);
+  const relKeys = periods.map(p => p.toUpperCase()).filter(p => VIZ_REL_PERIOD_FLAG[p]);
+  if (relKeys.some(p => yearRank(p) === 0) && relKeys.some(p => yearRank(p) === 1)) {
+    const ordered = periods.map((p, i) => ({ id: VIZ_REL_PERIOD_FLAG[p.toUpperCase()] ? p.toUpperCase() : p, i }))
+      .sort((a, b) => ((yearRank(a.id) ?? 0.5) - (yearRank(b.id) ?? 0.5)) || (a.i - b.i)).map(x => ({ id: x.id }));
+    const items = {
+      dx: dataDimensionItems.map(d => ({ id: (Object.values(d).find(v => v && typeof v === 'object' && v.id) || {}).id })),
+      pe: ordered,
+      ou: [
+        ...(userOrganisationUnit ? [{ id: 'USER_ORGUNIT' }] : []),
+        ...(userOrganisationUnitChildren ? [{ id: 'USER_ORGUNIT_CHILDREN' }] : []),
+        ...(userOrganisationUnitGrandChildren ? [{ id: 'USER_ORGUNIT_GRANDCHILDREN' }] : []),
+        ...organisationUnitLevels.map(l => ({ id: `LEVEL-${l}` })),
+        ...organisationUnits.map(o => ({ id: o.id })),
+      ],
+    };
+    viz.columns = columnDimensions.map(d => ({ dimension: d, items: items[d] }));
+    viz.rows = rowDimensions.map(d => ({ dimension: d, items: items[d] }));
+    viz.filters = filterDimensions.map(d => ({ dimension: d, items: items[d] }));
+  }
   if (spec.short_name) viz.shortName = String(spec.short_name).slice(0, 50);
   if (spec.description) viz.description = String(spec.description);
   return { ok: true, id, viz };
@@ -4888,6 +4990,8 @@ async function executeManageMaps(args) {
     }
     const built = buildMapObject(spec, typeMap);
     if (built._error) return built;
+    const rootScope = await singleRootScopeRefusal(spec.org_units, `Map "${built.map.name}"`);
+    if (rootScope) return rootScope;
     const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
     if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
     const newId = resp?.response?.uid || built.map.id;
@@ -5011,6 +5115,8 @@ async function executeManageDashboards(args) {
     }
     const built = buildVisualizationObject(spec, typeMap);
     if (built._error) return built;
+    const rootScope = await singleRootScopeRefusal(spec.org_units, `Visualization "${built.viz.name}"`);
+    if (rootScope) return rootScope;
     const result = await postMetadataPayload({ visualizations: [built.viz] }, !!args.dry_run_only);
     if (!result.success) return { _error: result._error || 'Visualization create failed.', phase: result.phase, errors: result.errors };
     if (args.dry_run_only) {
@@ -5067,6 +5173,8 @@ async function executeManageDashboards(args) {
     for (const { index, spec } of inlineSpecs) {
       const built = buildVisualizationObject(spec, typeMap);
       if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
+      const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
+      if (rootScope) return rootScope;
       newVisualizations.push(built.viz);
       inlineVizIdByIndex[index] = built.id;
     }
@@ -5213,6 +5321,8 @@ async function executeManageDashboards(args) {
     for (const { index, spec } of inlineSpecs) {
       const built = buildVisualizationObject(spec, typeMap);
       if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
+      const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
+      if (rootScope) return rootScope;
       newVisualizations.push(built.viz);
       inlineVizIdByIndex[index] = built.id;
     }
@@ -6275,25 +6385,55 @@ async function executeCreateMetadata(args, contextOrgUnitId) {
     const defaultCatComboId = catComboResp?.categoryCombos?.[0]?.id;
     if (!defaultCatComboId) return { _error: 'Could not resolve default categoryCombo. Check DHIS2 connection.' };
 
-    if (action === 'create_program') {
-      return await createFullProgram(args, defaultCatComboId, contextOrgUnitId);
-    } else if (action === 'add_stage') {
-      return await addStageToProgram(args, defaultCatComboId);
-    } else if (action === 'add_data_elements_to_stage') {
-      return await addDataElementsToExistingStage(args, defaultCatComboId);
-    } else if (action === 'add_program_rules') {
-      return await addProgramRules(args);
-    } else if (action === 'create_option_set') {
-      return await createStandaloneOptionSet(args);
-    } else if (action === 'create_data_elements') {
-      return await createStandaloneDataElements(args, defaultCatComboId);
-    } else if (action === 'create_category_combo') {
-      return await createStandaloneCategoryCombo(args);
-    } else {
-      return { _error: `Unknown action: ${action}. Use one of: create_program, add_stage, add_data_elements_to_stage, add_program_rules, create_option_set, create_data_elements, create_category_combo` };
+    // A two-option Yes/No set is DHIS2's BOOLEAN type (see healYesNoOptionSets).
+    const yesNo = ['create_program', 'add_stage', 'add_data_elements_to_stage', 'create_data_elements'].includes(action) ? healYesNoOptionSets(args) : [];
+    if (yesNo.length) {
+      const res = await executeCreateMetadataAction(action, args, defaultCatComboId, contextOrgUnitId);
+      return res && typeof res === 'object' && !Array.isArray(res)
+        ? { ...res, yes_no_fields_made_boolean: yesNo, _yes_no_note: `${yesNo.join(', ')}: a Yes/No list is DHIS2's yes/no (BOOLEAN) type, so ${yesNo.length > 1 ? 'they were' : 'it was'} created as BOOLEAN without an option set. In rules compare with true (\`#{x} == true\`; "No or empty" = \`!d2:hasValue(#{x}) || #{x} != true\`) and ASSIGN true / false — never 'YES' / 'NO'.` }
+        : res;
     }
+    return await executeCreateMetadataAction(action, args, defaultCatComboId, contextOrgUnitId);
   } catch (err) {
     return { _error: `Metadata creation failed: ${err.message}` };
+  }
+}
+
+// Analytics rows per period: `dimension=pe:LAST_12_MONTHS` expands into twelve
+// monthly rows — there is no total row. Live 2026-10-28: the model queried
+// `pe:THIS_YEAR;LAST_12_MONTHS`, read the 2026 (THIS_YEAR) row as the
+// "last 12 months" total and told the user 34 patients instead of 40.
+const ANALYTICS_SINGLE_PERIOD_RE = /^(TODAY|YESTERDAY|THIS_(?:DAY|WEEK|BIWEEK|MONTH|BIMONTH|QUARTER|SIX_MONTH|YEAR|FINANCIAL_YEAR)|LAST_(?:WEEK|BIWEEK|MONTH|BIMONTH|QUARTER|SIX_MONTH|YEAR|FINANCIAL_YEAR))$/;
+function analyticsPeriodRowsNote(path) {
+  let p = String(path || '');
+  try { p = decodeURIComponent(p); } catch { /* keep raw */ }
+  const m = p.match(/[?&]dimension=pe:([^&]+)/);
+  if (!m) return null;
+  const items = m[1].split(';').map(x => x.trim()).filter(Boolean);
+  const multi = items.filter(x => /^[A-Z_0-9]+$/.test(x) && !ANALYTICS_SINGLE_PERIOD_RE.test(x));
+  if (!multi.length) return null;
+  const singles = items.filter(x => ANALYTICS_SINGLE_PERIOD_RE.test(x) || /^\d{4}(?:Q[1-4]|\d{2})?$/.test(x));
+  return `pe:${multi.join(';')} is a DIMENSION here, so the rows are one per sub-period (e.g. LAST_12_MONTHS → 12 monthly rows) — there is NO total row for ${multi.join('/')}.${singles.length ? ` The ${singles.join('/')} row(s) cover a different range and are NOT that total.` : ''} For one figure over the whole range re-query with filter=pe:${multi[0]} (never add up rates/averages from the rows; counts can be summed only over the sub-period rows).`;
+}
+
+// create_metadata action routing (after the write gate and default-catcombo lookup).
+async function executeCreateMetadataAction(action, args, defaultCatComboId, contextOrgUnitId) {
+  if (action === 'create_program') {
+    return await createFullProgram(args, defaultCatComboId, contextOrgUnitId);
+  } else if (action === 'add_stage') {
+    return await addStageToProgram(args, defaultCatComboId);
+  } else if (action === 'add_data_elements_to_stage') {
+    return await addDataElementsToExistingStage(args, defaultCatComboId);
+  } else if (action === 'add_program_rules') {
+    return await addProgramRules(args);
+  } else if (action === 'create_option_set') {
+    return await createStandaloneOptionSet(args);
+  } else if (action === 'create_data_elements') {
+    return await createStandaloneDataElements(args, defaultCatComboId);
+  } else if (action === 'create_category_combo') {
+    return await createStandaloneCategoryCombo(args);
+  } else {
+    return { _error: `Unknown action: ${action}. Use one of: create_program, add_stage, add_data_elements_to_stage, add_program_rules, create_option_set, create_data_elements, create_category_combo` };
   }
 }
 

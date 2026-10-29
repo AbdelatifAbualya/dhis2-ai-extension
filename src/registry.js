@@ -338,7 +338,11 @@ For cross-program comparisons such as "which program has the most program indica
           },
           page_size: {
             type: 'number',
-            description: 'Max results. Default: 50.'
+            description: 'Max results per page. Default: 50 (max 500).'
+          },
+          page: {
+            type: 'number',
+            description: 'Page number for long lists (1 = first). The result says "_more" when there are more pages. Never put paging into filters.'
           }
         },
         required: ['object_type']
@@ -860,6 +864,8 @@ If user enabled web browsing from UI, this tool should usually be called before 
                 name: { type: 'string' },
                 description: { type: 'string' },
                 condition: { type: 'string', description: 'Rule condition using #{variable_name} syntax' },
+                program_stage_name: { type: 'string', description: 'OPTIONAL: evaluate this rule ONLY in this stage (stage NAME; program_stage_id on an existing program). Leave out for a rule that applies wherever its fields appear — one unscoped rule already covers a data element shared by several stages; never make one copy per stage without it.' },
+                program_stage_id: { type: 'string', description: 'OPTIONAL rule-level stage ID (existing program, add_program_rules) — same meaning as program_stage_name.' },
                 actions: {
                   type: 'array',
                   items: {
@@ -1131,6 +1137,8 @@ Actions:
               condition: { type: 'string', description: 'd2 expression. Use #{varName} for DE variables, A{attrName} for TEA attributes. Examples: numeric: "d2:hasValue(#{queue_number}) && #{queue_number} > 0". Boolean/TRUE_ONLY yes: "#{flag} == true". Boolean empty-or-no: "!d2:hasValue(#{flag}) || #{flag} != true". Option set (with use_code_for_option_set=true): "#{status} == \'APPROVED\'". Never quote true/false and never compare booleans with == false.' },
               description: { type: 'string' },
               priority: { type: 'integer', description: 'Lower number = higher priority. Optional.' },
+              program_stage_id: { type: 'string', description: 'OPTIONAL rule-level stage: the rule is evaluated ONLY in this stage\'s events. Leave it out for a rule that should run in every stage that has its fields — ONE unscoped rule already covers a data element shared by several stages (never create one copy per stage without this field, or each copy fires in every stage and the user sees the message twice). When every action names the same stage via its own program_stage_id, the tool scopes the rule to that stage automatically. On update, pass "" to make a scoped rule program-wide.' },
+              program_stage_name: { type: 'string', description: 'Rule-level stage by NAME (alternative to program_stage_id).' },
               variables: {
                 type: 'array',
                 description: 'OPTIONAL. Program rule variables to create alongside this rule. Usually unnecessary — the tool auto-creates a PRV for any #{name} in the condition/actions whose sanitized name matches a program data element\'s displayName, picking DATAELEMENT_CURRENT_EVENT when the rule acts on the same stage and DATAELEMENT_NEWEST_EVENT_PROGRAM otherwise, inheriting valueType + option-set from the DE. Supply this array only to (a) override the auto-chosen source_type, (b) reference a DE whose displayName does not match your #{name} token, or (c) create a TEI_ATTRIBUTE variable with a custom name.',
@@ -1160,7 +1168,7 @@ Actions:
                     exclude_data_element_ids: { type: 'array', items: { type: 'string' }, description: 'For HIDEALLFIELDS: DE ids to keep visible (typically the trigger DE referenced in the condition).' },
                     data_element_id: { type: 'string', description: 'Target data element ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD' },
                     tei_attribute_id: { type: 'string', description: 'Target TEA ID for HIDEFIELD/ASSIGN/SETMANDATORYFIELD on attributes' },
-                    program_stage_id: { type: 'string', description: 'Target stage ID (for HIDEPROGRAMSTAGE and stage-scoped actions)' },
+                    program_stage_id: { type: 'string', description: 'Target stage ID for HIDEPROGRAMSTAGE / CREATEEVENT. On a field action it means "this rule is for that stage": when every action of the rule names the same stage, the rule is scoped to it (see the rule-level program_stage_id).' },
                     program_stage_name: { type: 'string', description: 'Target stage NAME (alternative to program_stage_id — resolved to the stage id automatically)' },
                     program_stage_section_id: { type: 'string', description: 'Target section ID (for HIDESECTION)' },
                     evaluation_time: { type: 'string', enum: ['ON_DATA_ENTRY', 'ON_COMPLETE', 'ALWAYS'], description: 'When action fires. Default: ON_DATA_ENTRY' }
@@ -1302,8 +1310,8 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
           },
           object_type: {
             type: 'string',
-            enum: ['dataElements', 'optionSets', 'options', 'trackedEntityAttributes', 'programStages', 'categoryOptions', 'categories', 'categoryCombos', 'indicators', 'dataElementGroups', 'indicatorGroups', 'programs', 'dataSets', 'dashboards', 'visualizations', 'maps', 'eventReports', 'eventCharts'],
-            description: 'The DHIS2 metadata type (plural form). Required for delete, check_references, and update_sharing.'
+            enum: ['dataElements', 'optionSets', 'options', 'trackedEntityAttributes', 'programStages', 'categoryOptions', 'categories', 'categoryCombos', 'indicators', 'dataElementGroups', 'indicatorGroups', 'programs', 'dataSets', 'dashboards', 'visualizations', 'maps', 'eventVisualizations', 'eventReports', 'eventCharts'],
+            description: 'The DHIS2 metadata type (plural form). Required for delete, check_references, and update_sharing. Line lists (and, since 2.40, event reports / event charts) are eventVisualizations.'
           },
           object_id: {
             type: 'string',
@@ -1375,6 +1383,10 @@ Access string format (8 chars): positions 1-2 = metadata (rw), positions 3-4 = d
           cascade_to_stages: {
             type: 'boolean',
             description: 'For update_sharing on object_type="programs": also apply the same access to every PROGRAM STAGE of that program. Default TRUE — sharing a program always implies sharing its stages, and stage DATA access is what actually allows event capture. Set false only for metadata-visibility-only changes.'
+          },
+          cascade_to_tracked_entity_type: {
+            type: 'boolean',
+            description: 'For update_sharing on a tracker program: also ADD the program\'s data access (public, groups, users) to its tracked entity type — registration needs it. Default TRUE; only data bits are added, nothing is removed.'
           },
           user_group_accesses: {
             type: 'array',
@@ -2088,8 +2100,8 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
               name: { type: 'string', description: 'Visualization display name (required).' },
               vis_type: { type: 'string', description: 'Chart type: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, STACKED_AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, YEAR_OVER_YEAR_COLUMN, SCATTER, BUBBLE. Default COLUMN.' },
               data_items: { type: 'array', items: { type: 'string' }, description: 'Indicator / dataElement / programIndicator UIDs to plot (the dx dimension). Types are auto-resolved and existence-verified.' },
-              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) and/or fixed ISO periods (202401, 2025Q1, 2025).' },
-              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2).' },
+              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords and/or fixed ISO periods (202401, 2025Q1, 2025). A request phrased relative to today MUST use relative keywords so the saved chart rolls forward: "each quarter of this year and last year" = ["QUARTERS_THIS_YEAR","QUARTERS_LAST_YEAR"], "by month this year" = ["MONTHS_THIS_YEAR"], "last 12 months" = ["LAST_12_MONTHS"], "this year" = ["THIS_YEAR"], "last 4 quarters" = ["LAST_4_QUARTERS"]. Fixed periods only when the user names them.' },
+              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2). "The whole hierarchy" = ["USER_ORGUNIT"]; "facilities at level N" everywhere = ["USER_ORGUNIT","LEVEL-N"].' },
               short_name: { type: 'string', description: 'Optional short name (max 50 chars).' },
               description: { type: 'string', description: 'Optional description.' },
               layout: {
@@ -2754,11 +2766,12 @@ const KB_PROGRAM_RULE_SYNTAX = `**Program Rule syntax:**
 - Action types: SHOWWARNING, SHOWERROR, HIDEFIELD, HIDEPROGRAMSTAGE, HIDESECTION, HIDEALLFIELDS, ASSIGN, SETMANDATORYFIELD, DISPLAYTEXT, DISPLAYKEYVALUEPAIR, WARNINGONCOMPLETE, ERRORONCOMPLETE (⚠ SHOWWARNINGINFORMATION is NOT accepted by the server enum — it is auto-aliased to SHOWWARNING)
 - Actions fire when the condition is TRUE. "Hide X unless Y=Yes" → write the HIDE condition as "Y is not Yes", not "Y is Yes".
 - ⛔ **There is NO "show field" action — visibility is ONE hide rule, never a show/hide pair.** Fields, sections and stages are visible by default; a HIDE action hides while its condition is TRUE and the engine re-shows AUTOMATICALLY the moment it turns false. Therefore "show X only when Y is Yes" = EXACTLY ONE rule: \`{ name: "Hide X when Y is not Yes", condition: "!d2:hasValue(#{y}) || #{y} != true", actions: [{ type: "HIDEFIELD", data_element_name: "X" }] }\`. NEVER ALSO create a second "Show X when Y is Yes" rule — a complementary twin hides the target in EVERY case (permanently hidden). NEVER put a HIDE action under the positive/"show" condition. NEVER combine HIDEFIELD and SETMANDATORYFIELD on the same field in one rule (hidden-AND-mandatory renders the field broken/un-selectable in Capture — this is exactly what breaks multi-select option sets). If X must be required when visible, that is a SEPARATE rule: \`{ name: "Require X when Y is Yes", condition: "#{y} == true", actions: [{ type: "SETMANDATORYFIELD", data_element_name: "X" }] }\`. The tool hard-refuses all three broken shapes (phase "lint") — emit the one-rule pattern from the start.
+- **One rule covers every stage.** A rule without a stage runs in EVERY stage (and an action on a data element applies wherever that data element appears), so "warn in both the screening and the follow-up visit" on a data element both stages share = ONE rule with no stage. Never create one copy per stage unless each copy gets its own rule-level \`program_stage_id\` (create_program: \`program_stage_name\`) — unscoped copies all fire in every stage and the user sees each message twice. Use the rule-level stage only when the rule must NOT run elsewhere (e.g. a check that only makes sense at the follow-up visit). The tool scopes a rule automatically when every action names the same stage (\`stage_scoped_rules\` in the result) and refuses duplicates whose variables read the same data element.
 - 🔎 **"Field shows but can't be used / options not selectable / field never appears" → run \`action=audit\` FIRST.** Its \`cross_rule_issues\` detects hide+mandate contradictions and complementary show/hide twins on existing programs. NEVER blame "a DHIS2 rendering issue" without audit evidence — these symptoms are almost always contradictory program rules.
 - **SHOWWARNING / SHOWERROR / WARNINGONCOMPLETE / ERRORONCOMPLETE** display \`content\` (static prefix) **plus** the *evaluated* \`data\` expression. Variables like \`#{var}\` or \`A{attr}\` placed in \`content\` are shown LITERALLY (the user sees the brace token, not the value). To echo a field value, set \`content: "Selected risks:"\` and \`data: "#{maternal_risk_factors}"\`. For multiple variables use \`d2:concatenate("prefix ", #{a}, ", ", #{b}, " suffix")\` in \`data\`. The tool auto-rewrites trailing variables out of content into data, but emit the right shape from the start.
 - **DISPLAYTEXT** (instructions banner) takes \`content\` only — keep it static.
 - **DISPLAYKEYVALUEPAIR** shows a live value in the Feedback (default) or Indicators widget: \`content\` = the static label/key, \`data\` = the evaluated expression (e.g. \`{ type: "DISPLAYKEYVALUEPAIR", content: "BMI", data: "#{weight_kg} / ((#{height_cm}/100) * (#{height_cm}/100))" }\`). This is THE action for "display X in the Feedback widget" requests; add \`location: "indicators"\` to target the Indicators widget instead.
-- **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored.
+- **ASSIGN** uses \`data\` exclusively (a d2 expression assigned to the target DE/TEA); content is ignored. Capture shows the assigned field READ-ONLY while the rule assigns it (verified 2.42 / Capture 106) — never tell the user it stays editable. For a yes/no (BOOLEAN) target assign \`true\` / \`false\`, never 'YES' / 'NO'.
 - **HIDEALLFIELDS** (chatbot sugar — not a raw DHIS2 type): pass it as \`{ type: "HIDEALLFIELDS", exclude_data_element_ids: [<trigger DE id>] }\` and the tool auto-expands it into one HIDEFIELD per DE in the trigger's stage (excluding excluded IDs) plus one HIDEPROGRAMSTAGE for every other stage in the program. Use this whenever the user says "hide all data elements", "hide everything except X", "gate the form on X" — single-stage HIDEFIELD enumeration silently misses other stages.
 - **DHIS2 capture compulsion gotcha** (auto-handled by HIDEALLFIELDS): a HIDEFIELD action targeting a *compulsory* PSDE leaves the field VISIBLE in New Tracker Capture — compulsion outranks visibility. HIDEALLFIELDS automatically (a) PUTs the affected program stage(s) with \`compulsory: false\` on every hidden PSDE, AND (b) auto-creates a paired SETMANDATORYFIELD rule with the inverse condition so the original "required when visible" semantic is preserved. Pass \`restore_mandate_when_visible: false\` on the HIDEALLFIELDS action to skip the paired rule. The summary lists \`compulsory_flags_cleared\` and \`auto_paired_mandate_rules\` so you can report what changed. NEVER manually emit HIDEFIELD per-DE for "hide all" requests — you'll silently leave the compulsory ones visible.
 - **HIDEPROGRAMSTAGE** (better than N HIDEFIELDs when no DE in that stage is the trigger); HIDESECTION hides a section. Two things you MUST know (verified live on Capture 2.40):
@@ -2819,7 +2832,7 @@ This is the pattern to use whenever the user asks for "the percentage/rate/cover
 - Every \`manage_program_indicators(action=create|update)\` call validates expression+filter via DHIS2's \`/programIndicators/expression/description\` and \`/filter/description\` endpoints BEFORE saving. If either returns \`status: ERROR\`, the create/update is refused and the parser's exact error string is returned to you in \`_error\` along with a hint in \`_hint\`. Read both, fix the expression, and retry — do NOT loop with the same broken filter.`;
 
 const KB_VALUE_TYPE_MAPPING = `**Value-type mapping** (use these exact DHIS2 valueTypes):
-- "Yes/No" / "boolean" → \`BOOLEAN\`
+- "Yes/No" / "yes/no" / "boolean" → \`BOOLEAN\` — NEVER TEXT + a two-option Yes/No option set (the tool converts one to BOOLEAN and rewrites the rules in the same call; a set with a third option such as "Unknown" stays an option set)
 - "Yes only" / "checkbox" → \`TRUE_ONLY\`
 - "date" → \`DATE\`
 - "date and time" → \`DATETIME\`
@@ -2949,7 +2962,7 @@ When a program/object doesn't appear in an app (Capture, Data Entry, etc.) or a 
 
 **A program's stages are shared WITH it.** A programStage carries its OWN sharing, and its DATA bits are what actually gate event capture — so a program shared \`"rwrw----"\` whose stages are still \`"rw------"\` looks correctly shared and still blocks enrollment/event entry. \`update_sharing\` on a program therefore cascades the same access to every stage automatically (\`cascade_to_stages\`, default true), and \`create_program\`/\`add_stage\` give new stages the program's sharing. Never share a program and leave its stages behind, and when data entry is blocked ALWAYS check the stages before looking anywhere else.
 
-**Only Program and ProgramStage are DATA-shareable.** DataElement, TrackedEntityAttribute, OptionSet, ProgramIndicator, Dashboard and Visualization have \`dataShareable:false\` in the DHIS2 schema: the server accepts a \`"rwrw----"\` PUT with HTTP 200 and silently stores \`"rw------"\`. \`update_sharing\` compares what you asked for against what was stored: the METADATA half still applies (so sharing a dashboard publicly works exactly as intended), and the reply carries \`_data_sharing_not_applicable\` explaining that the data bits were dropped because that class has no data sharing. Treat that note as DONE, not as a failure — do NOT retry it and do NOT repeat it across sibling objects. If you are chasing a DATA-access problem, it lives in the program, its stages, the tracked entity type, or the user's org units — never in these classes.
+**Only Program, ProgramStage and TrackedEntityType are DATA-shareable** (plus DataSet for aggregate). Tracker data entry needs data access on ALL THREE: the program, the stage, and the program's tracked entity type (E1001 / E1104 otherwise). \`create_program\` and \`update_sharing\` on a program add the program's data access to its tracked entity type automatically (data bits only — reported as \`tracked_entity_type_sharing\`; tell the user, since the type may be shared with other programs). DataElement, TrackedEntityAttribute, OptionSet, ProgramIndicator, Dashboard and Visualization have \`dataShareable:false\` in the DHIS2 schema: the server accepts a \`"rwrw----"\` PUT with HTTP 200 and silently stores \`"rw------"\`. \`update_sharing\` compares what you asked for against what was stored: the METADATA half still applies (so sharing a dashboard publicly works exactly as intended), and the reply carries \`_data_sharing_not_applicable\` explaining that the data bits were dropped because that class has no data sharing. Treat that note as DONE, not as a failure — do NOT retry it and do NOT repeat it across sibling objects. If you are chasing a DATA-access problem, it lives in the program, its stages, the tracked entity type, or the user's org units — never in these classes.
 
 ⚠️ **NEVER** use dhis2_query PUT/PATCH to modify sharing — it fails with 405/500. The DHIS2 sharing API is \`PUT /api/sharing?type={singularType}&id={id}\` — update_sharing handles this correctly.`;
 
@@ -3137,12 +3150,17 @@ To an aggregate **indicator**: pass the set's UID as \`legend_set_id\` to manage
 - "Create a stockout legend: 0 red, 1–10 amber, 11+ green": create legend_set:{ name:"Stock status", legends:[{name:"Out",startValue:0,endValue:1,color:"#D32F2F"},{name:"Low",startValue:1,endValue:11,color:"#FBC02D"},{name:"OK",startValue:11,endValue:1000000,color:"#388E3C"}] }.
 - "Add a 'Very high' 100–150 band": add_legends legend_set_id:"<id>", legends:[{name:"Very high",startValue:100,endValue:150,color:"#1B5E20"}].`;
 
-const KB_DASHBOARDS_DETAILS = `### Why a raw POST silently fails (and this tool does not)
+const KB_DASHBOARDS_DETAILS = `### Reporting what you built
+- After building charts / tables / dashboards, describe WHAT was built (items, data, periods, org units, sharing) and how to open it. Do NOT add a "what the data shows" analysis unless the user asked — every such figure has been wrong at least once (live 2026-10-28: a 2026 row read as the 12-month total; a partial query read as all facilities).
+- If the user does ask for figures: take each from ONE successful /analytics query of exactly that item's dx and org units, with the period as a FILTER (filter=pe:LAST_12_MONTHS gives the total; as a dimension it gives one row per month and no total). Never mix dimension= and filter= for the same dimension (409).
+- New or changed program indicators need NO analytics run — they are computed at query time from the existing tables. Never start one unless the user asks.
+
+### Why a raw POST silently fails (and this tool does not)
 DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/\`filterDimensions\` (lists of dimension ids) and its DATA as \`dataDimensionItems\` (typed dx items) + \`relativePeriods\`/\`periods\` (pe) + \`organisationUnits\`/\`organisationUnitLevels\`/\`userOrganisationUnit\` (ou). The \`columns\`/\`rows\`/\`filters\` arrays are DERIVED read-only views — a raw POST that only sets them imports an EMPTY, un-renderable chart. This tool assembles the correct structure (verified VALIDATE+COMMIT on the live server).
 
 ### Fields
 - **vis_type**: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, … (default COLUMN).
-- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025).
+- **periods**: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, MONTHS_THIS_YEAR, QUARTERS_THIS_YEAR, QUARTERS_LAST_YEAR, …) and/or fixed ISO periods (202401, 2025Q1, 2025). A request relative to today ("each quarter of this year and last year", "monthly this year") MUST use the relative keywords — a fixed list stops updating.
 - **org_units**: UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2 = all level-2 OUs).
 - **layout** (optional): which of dx/pe/ou sit on columns/rows/filters. Sensible per-type defaults apply (pivot → cols[pe]/rows[dx]; single-value/gauge/pie → cols[dx], pe+ou in filter; charts → cols[dx]/rows[pe]).
 
@@ -3295,7 +3313,7 @@ ReactDOMClient.createRoot(document.getElementById('root')).render(<Provider conf
 - Writes: const engine = useDataEngine(); await engine.mutate({ resource, id, type: 'create' | 'update' | 'delete', data }). Keep a pending flag (Button loading / disabled while it runs), refetch the affected query afterwards, and report the outcome with useAlert:
   const { show } = useAlert(({ msg }) => msg, ({ ok }) => (ok ? { success: true } : { critical: true })); … show({ msg: 'Note saved', ok: true }).
 - ALWAYS confirm before deleting: <Modal small> with ModalTitle, ModalContent naming the item, ModalActions > <ButtonStrip end> "Cancel" + <Button destructive>Delete</Button>.
-- Forms: @dhis2/ui inputs call onChange({ value }) — not an event; SingleSelectField uses selected + onChange({ selected }). Validate before saving and show it on the field (error + validationText). Group buttons in ButtonStrip; a short form can live in a Modal.
+- Forms: @dhis2/ui inputs call onChange({ value }) — not an event; SingleSelectField uses selected + onChange({ selected }), and its choices are <SingleSelectOption value label /> CHILDREN — there is no items / options prop (it is ignored: an empty dropdown); option values are non-empty strings ('ALL' for an "All" choice, not ''). Validate before saving and show it on the field (error + validationText). Group buttons in ButtonStrip; a short form can live in a Modal.
 - Layout: a section ("widget") = white box, border 1px solid #d5dde5, radius 3px, header 16px / weight 500 / colour #404b5a with 16px padding, content padding 16px. Dashboard-style app pages: two columns flex 3 (main) : 1 (summaries), gap 16px — one column below ~800px.
 - Styling: DHIS2 design tokens — var(--colors-grey900), var(--spacers-dp16), var(--elevations-e100) — not hand-picked colours or spacing.
 - Version differences: gate version-specific params in ONE feature map on the server version: const FEATURES = { multiText: 41 }; const supports = (f) => !!D2_APP_CONFIG.serverVersion && D2_APP_CONFIG.serverVersion.minor >= FEATURES[f]; (inside Provider, useConfig().serverVersion is the same).
@@ -3311,7 +3329,7 @@ ReactDOMClient.createRoot(document.getElementById('root')).render(<Provider conf
 - A Modal is open whenever it is rendered: render it only when needed ({target && <Modal onClose={…}>…</Modal>}) or pass hide={!open}. An always-rendered Modal's backdrop blocks every click in the app (the tool refuses it).
 - Mutation shapes the runtime REFUSES ("Invalid query", nothing is sent): type 'delete' WITH data, type 'create' WITH id, json-patch without an array. Deleting the last item of a list kept in one key: update the key with [] (or a separate { resource, type: 'delete' } with no data) — never one object whose type switches to 'delete' while it still carries data.
 - Saved data lives in the app's own namespace (D2_APP_CONFIG.namespace, needs_write_access:true) — settings and app data only, NEVER patient data (refused: see "Plugins that work together"). ONE key that may not exist yet: read \`{ s: { resource: \`dataStore/\${D2_APP_CONFIG.namespace}\`, params: { fields: '.', filter: '_:eq:notes' } } }\` → data.s.entries[0]?.value (HTTP 200 with entries [] when nothing is saved). All keys: params { fields: '.', pageSize: 200 } → entries [{ key, value }]. NEVER GET dataStore/<ns>/<key> (query or engine.fetch) — it is a 404 until the first save, a failed request on every first visit; the tool refuses it. Save with engine.mutate({ resource: \`dataStore/\${ns}/<key>\`, type: saved ? 'update' : 'create', data }) — 'create' on an existing key is a 409, 'update' on a missing one a 404, so track which applies.
-- Analytics: resource 'analytics', params { dimension: ['dx:ID1;ID2', 'pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'] } → { headers:[{ name }], rows, metaData:{ items:{ <id>:{ name } } } }. Find columns by header name; values are STRINGS → Number(v). A dx with no data has NO row — show "No data" for it, never 0.
+- Analytics: resource 'analytics', params { dimension: ['dx:ID1;ID2', 'pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'] } → { headers:[{ name }], rows, metaData:{ items:{ <id>:{ name } } } }. Find columns by header name; values are STRINGS → Number(v). A dx with no data has NO row — show "No data" for it, never 0. PROGRAM INDICATORS go here too (dx:PI1;PI2) — never through analytics/events|enrollments/aggregate, which refuse them (409 E7224; the preview refuses such code).
 - Event counts: resource \`analytics/events/aggregate/\${programId}\`, params { dimension: ['pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT'], outputType: 'EVENT' } — a count with no events is the row ['0'], not an empty result.
 - Variables are read once per mount: render the data part in a child component with key={ou + '|' + pe} so a filter change remounts it and refetches (or call refetch(newVariables)).
 - States: loading → a centred <CircularLoader small />; error → <NoticeBox error title="Could not load …">{error.message}</NoticeBox>; empty → <NoticeBox title="No data">…</NoticeBox> or a muted message. Never a blank screen.
@@ -3368,6 +3386,8 @@ postRobot.on('updated', ({ data }) => { render(data); });   // filter / mode cha
 
 ### Capture enrollment plugins (plugin.jsx, plugin_type "CAPTURE")
 Verified on Capture 106 against the enrollment plugins already in use: same handshake as above (getPropsFromParent, then 'updated'); the props are { teiId, programId, enrollmentId, orgUnitId } plus setPluginHeight. Read exactly those — never guess other names or parse the page URL.
+Tracker LISTS (verified 2.42): tracker/events | enrollments | trackedEntities return a pager with NO pageCount / total unless you send totalPages: true (without it there is only pager.nextPage while more pages exist). Page with params { page, pageSize: 100, totalPages: true } and loop to pager.pageCount — reading pageCount without totalPages stops after the first page and silently drops records (live 2026-10-28: an "overdue patients" app lost the two most overdue). orgUnit, trackedEntity, enrollment, program and programStage are plain UID STRINGS there — nested fields such as orgUnit[id,displayName] are ignored; get org unit names with { resource: 'organisationUnits', params: { filter: \`id:in:[\${ids.join(',')}]\`, fields: 'id,displayName', paging: false } }.
+Tracker DATES (verified 2.42): event / enrollment timestamps — occurredAt, enrolledAt, scheduledAt, completedAt, createdAt, updatedAt — come back as "2026-01-23T00:00:00.000" (date AND time, no zone), while a DATE data value is "2026-01-23". Take the day with String(x).slice(0, 10) before any date math or display; never append 'T00:00:00' to a timestamp (that is "…000T00:00:00" = Invalid Date, so a "days since" shows "—" and the table prints the raw timestamp).
 \`\`\`
 const EVENTS = { ev: { resource: 'tracker/events', params: ({ enrollment, stage }) => ({
   enrollments: enrollment, programStage: stage, order: 'occurredAt:desc', pageSize: 100,
@@ -3450,7 +3470,7 @@ Where the state lives:
 - Check, in this order, with real reads: (1) placements(key) — is the plugin in that form / page, with the field map you expect; (2) get_program_info / the stage — is every mapped field a data element of that stage; (3) capture_refresh in earlier results, or place again — Capture's copy of the program may predate a new field; (4) get_source — does the code check fieldsMetadata, show errors, skip writes in viewMode; (5) the user's exact steps: Edit event clicked? event saved? Capture reloaded after an update?
 - Ask the user for what only they can see: the plugin's own status line, a screenshot, the browser console line that starts with "setFieldValue:".
 - Fix the cause you verified — one change at a time — and state what it changes.
-- "Placed and configured" is not "working": after build or fix, say exactly what you verified (installed, placed, field map, version) and give the user a 3–5 step test with the expected result at each step.
+- "Placed and configured" is not "working": after build or fix, say exactly what you verified (installed, placed, field map, version) and give the user a 3–5 step test with the expected result at each step. You never see the plugin run, so never present data values as what it "shows" or as "verified data" — a number you queried yourself is not proof the plugin's own query works (live 2026-10-28: a "verified" league table whose plugin query was refused by DHIS2 and showed nothing). Only quote values if the user asked, and then from ONE query that covers exactly what the plugin shows (all its org units). In test steps, name only org units whose place you saw in a result this turn (their path / parent): a facility is under the root in its path — on a multi-root instance never guess which root holds it.
 
 ### Charts (echarts)
 \`\`\`
@@ -4573,6 +4593,7 @@ Do NOT treat OU assignment as sharing, and do NOT treat sharing as OU assignment
 14. For any data element value that looks like a code (hyphens, letters+numbers) — resolve it using resolve_option_codes before displaying.
 14.1. For tracker write tasks, never invent TEI, enrollment, stage, or event IDs. Use the current context IDs exactly, or fetch them first.
 14.2. Never claim a tracker create/update/delete succeeded unless the tool result shows no validation errors and stats.created/stats.updated/stats.deleted is greater than 0.
+14.3. When you BUILD something (program, charts, dashboard, line list, plugin, app), report what you built — not your own reading of the data. Add NO data figures, "what the data shows" or data-quality findings ("one patient has no diagnosis", "facility X has no data") unless the user asked for them; each such claim has been wrong in practice. If the user asked, every figure must come from ONE successful query that directly proves it (totals with the period as a filter).
 15. For sharing/access issues (program not appearing, "can't see", no data access): check the access field first, then use manage_metadata(action=update_sharing) to fix. NEVER use dhis2_query PUT/PATCH for sharing — it will fail.
 16. Two-tier tool docs: authoring/write tools carry a short routing description; their FULL usage manual is delivered automatically as the result of your FIRST call to them each turn (that first call does not execute — it is not an error). When you receive a manual, read it, then immediately re-issue the corrected tool call. Never tell the user about manuals or this mechanism.
 19. VERIFY SAVED OUTPUTS WITH THEIR OWN TOOLS, NOT HAND-WRITTEN ANALYTICS URLS. To check that a saved line list returns rows use manage_line_lists(action="validate", …); for a saved visualization use get_visualization_details(include_analytics_preview=true); for a program indicator use manage_program_indicators(action="get"/"audit") or read the values through an existing visualization. Hand-assembling /api/analytics URLs is the single biggest source of 409s: \`;\` separates ITEMS INSIDE one dimension while separate dimensions each need their own \`dimension=\` parameter, \`dx:\` exists only on the aggregate /analytics endpoint (the event/enrollment endpoints take a bare UID), and every query needs a data dimension, a period and an org unit. If you must query analytics directly, send ONE \`dimension=\` per dimension and always include dx, pe and ou.
@@ -4665,11 +4686,18 @@ Use importStrategy=CREATE_AND_UPDATE to create new records AND update existing o
 `;
   }
 
+  // The user's top org units: on a multi-root instance "the whole hierarchy" is
+  // USER_ORGUNIT, never the first org unit the model happens to read
+  // (see singleRootScopeRefusal).
+  const userRoots = dhis2.baseUrl ? await userRootOrgUnits().catch(() => null) : null;
+  const rootsLine = Array.isArray(userRoots) && userRoots.length
+    ? `\n- Your top org units: ${userRoots.slice(0, 8).map(r => `${r.displayName} (${r.id})`).join(', ')}${userRoots.length > 8 ? ` +${userRoots.length - 8} more` : ''}${userRoots.length > 1 ? ` — ${userRoots.length} separate hierarchies. "The whole hierarchy" / "everywhere" / "all org units" = USER_ORGUNIT, which covers all of them; never treat one of them (or the first org unit of a program's list) as "the root". Facilities at level N everywhere = ["USER_ORGUNIT", "LEVEL-N"]. An empty analytics result for one of them says nothing about the others.` : ''}`
+    : '';
   p += `
 ## DHIS2 Instance
 - URL: ${dhis2.baseUrl}
 - Version: ${dhis2.systemInfo?.version || '?'}
-- API: ${dhis2.apiVersion}
+- API: ${dhis2.apiVersion}${rootsLine}
 `;
 
   // ── Contextual rules — only added when the relevant app/context is present ──

@@ -455,6 +455,51 @@ function _namedTargetNorm(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+// ── "The whole hierarchy" on a multi-root instance ─────────────────────────
+// A user can be assigned several top org units (localhost 2.42: Palestine,
+// Test, MoHP Egypt). Live 2026-10-28: asked for charts "across the whole
+// hierarchy", the model took the FIRST org unit of a program's assignment list
+// — the root "MoHP Egypt" — as THE root, scoped all seven items to it, found no
+// data (it lives under the other two roots) and told the user the analytics
+// tables had never run. USER_ORGUNIT covers every root the user has.
+let _userRootOuCache = null;
+async function userRootOrgUnits() {
+  const key = dhis2.baseUrl;
+  if (_userRootOuCache && _userRootOuCache.key === key) return _userRootOuCache.list;
+  const me = await safeDhis2Fetch('me?fields=organisationUnits[id,displayName,level]');
+  if (!me || me._error || !Array.isArray(me.organisationUnits)) return null;
+  const list = me.organisationUnits.map(o => ({ id: o.id, displayName: o.displayName, level: o.level }));
+  _userRootOuCache = { key, list };
+  return list;
+}
+// Everything the user typed in this thread (to tell "the user named this org
+// unit" from "the model picked it").
+function userWordsThisThread() {
+  const parts = [String(lastUserText || '')];
+  for (const m of (Array.isArray(conversationHistory) ? conversationHistory : [])) {
+    if (m && m.role === 'user') parts.push(typeof m.content === 'string' ? m.content : (Array.isArray(m.content) ? m.content.map(c => (c && c.text) || '').join(' ') : ''));
+  }
+  return parts.join('\n').toLowerCase();
+}
+// Refuse an analytics object scoped to exactly ONE of the user's several root
+// org units when the user never named it — the whole hierarchy is USER_ORGUNIT.
+// `orgUnits` is the ou item list (UIDs / keywords) the tool is about to save.
+async function singleRootScopeRefusal(orgUnits, what) {
+  const items = (Array.isArray(orgUnits) ? orgUnits : []).map(o => String(o).trim()).filter(Boolean);
+  if (items.length !== 1 || !/^[A-Za-z][A-Za-z0-9]{10}$/.test(items[0])) return null;
+  const roots = await userRootOrgUnits();
+  if (!roots || roots.length < 2) return null;
+  const root = roots.find(r => r.id === items[0]);
+  if (!root) return null;
+  const said = userWordsThisThread();
+  if (root.displayName && said.includes(String(root.displayName).toLowerCase())) return null;
+  return {
+    _error: `${what} is scoped to "${root.displayName}" (${root.id}) only — but this user has ${roots.length} top org units (${roots.map(r => r.displayName).join(', ')}) and never asked for "${root.displayName}". Nothing was saved.`,
+    _hint: `For "the whole hierarchy", "everywhere", "all org units" or "national", use org_units ["USER_ORGUNIT"] (it covers all ${roots.length}); for "facilities at level N" everywhere use ["USER_ORGUNIT", "LEVEL-N"]. Only scope to "${root.displayName}" if the user asked for it by name. Retry the same call with the corrected org units.`,
+    user_root_org_units: roots,
+  };
+}
+
 function noteMissingNamedTarget(objectType, nameFilter) {
   if (String(objectType) !== 'programs') return;
   const norm = _namedTargetNorm(nameFilter);
@@ -822,6 +867,43 @@ function isIncompleteCallError(resultOrText) {
 // silently run a partial call (e.g. a create_program missing its last stages
 // and rules that then "succeeds"), so callers must treat it as corrupted and
 // ask the model to resend/split instead. Never throws. Pure — safe to unit test.
+// Some models (deepseek-v4p1-flash on Fireworks, 2026-10-28) HTML-escape
+// "&", "<" and ">" inside tool-call strings: a program short name was saved as
+// "NCD HTN &amp; DM Care" and an app was named "… &amp; Diabetes". Decode the
+// entities in label and expression arguments only — names, descriptions,
+// messages, rule / indicator expressions, where an entity is never meant
+// literally. Code, HTML and file contents are left alone (in JSX text "&lt;"
+// is legitimate).
+const ENTITY_ARG_KEY_RE = /^(?:name|short_?name|display_?name|form_?name|title|subtitle|description|label|content|message|condition|expression|filter|data|[a-z_]+_name|program_(?:short_name|description))$/i;
+function decodeHtmlEntities(s) {
+  return String(s)
+    .replace(/&#(\d+);/g, (m, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;|&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+function healArgumentEntities(value) {
+  let healed = false;
+  const walk = (v, key) => {
+    if (typeof v === 'string') {
+      if (key && ENTITY_ARG_KEY_RE.test(key) && /&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);/i.test(v) && !/<[a-z\/!]/i.test(v)) {
+        healed = true;
+        return decodeHtmlEntities(v);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) return v.map((x) => walk(x, key));
+    if (v && typeof v === 'object') {
+      const out = {};
+      for (const [k, x] of Object.entries(v)) out[k] = /^(?:files|source|code|html|htmlCode|html_code|body_html)$/i.test(k) ? x : walk(x, k);
+      return out;
+    }
+    return v;
+  };
+  const out = walk(value, null);
+  return { healed, value: healed ? out : value };
+}
+
 function repairToolCallArguments(raw) {
   const s0 = String(raw == null ? '' : raw);
   const tryParse = (t) => { try { JSON.parse(t); return true; } catch { return false; } };
@@ -1117,6 +1199,11 @@ function isDiscoveryCall(toolName, args) {
 }
 function discoveryStreakStopOrNull(toolName, args) {
   if (!isDiscoveryCall(toolName, args)) return null;
+  // A preview is the first step of building an app — the very move this
+  // guard's hint asks for. It still does not reset the streak (no write yet),
+  // but it is never blocked (live 2026-10-28 both previews of an app were
+  // refused here and the turn ended with nothing built).
+  if (toolName === 'manage_custom_app' && args && args.action === 'preview') return null;
   // The guard exists to break "research forever, never act" — but on a turn
   // with NO write authorization there is nothing to act on: verifying,
   // explaining or diagnosing is legitimately all reads. Blocking discovery
@@ -4116,13 +4203,52 @@ function healEventAnalyticsDxDimension(path) {
     const key = part.slice(0, eq);
     const val = part.slice(eq + 1);
     if (!/^dimension$/i.test(key)) return part;
+    // `dimension=stage:<uid>` is a 409 ("Query item or filter is invalid") —
+    // the stage is its own parameter on these endpoints (live 2026-10-28).
+    const st = val.match(/^(?:stage|programStage)(?::|%3A)([A-Za-z][A-Za-z0-9]{10})$/i);
+    if (st) { healed = true; return `stage=${st[1]}`; }
     // `dx:UID` or the URL-encoded `dx%3AUID`
     const m = val.match(/^dx(?::|%3A)(.+)$/i);
     if (!m) return part;
     healed = true;
-    return `${key}=${m[1]}`;
+    // Several items: each data element / attribute is its OWN dimension here.
+    return m[1].split(/;|%3B/i).filter(Boolean).map((it) => `${key}=${it}`).join('&');
   }).join('&');
   return { path: healed ? `${head}?${query}` : p, healed };
+}
+
+// Program indicators asked for on an event/enrollment AGGREGATE endpoint
+// (`analytics/enrollments/aggregate/<program>?dimension=dx:PI1;PI2`, or the
+// bare `dimension=PI1;PI2` / `dimension=PI1`) bounce with 409 E7224 — and as
+// separate dimensions they "work" but GROUP BY the indicator's value, so the
+// numbers are wrong. Live 2026-10-28 (2.42.5): three 409s and a summary that
+// reported BP control 31% (really 29.0%) and HbA1c 8.8% (really 8.3%).
+// Program-indicator values by org unit / period come from /api/analytics with
+// dx. When every data item of the query is a program indicator, route it there.
+async function routeProgramIndicatorAnalytics(path) {
+  const p = String(path || '');
+  const m = p.match(/^analytics\/(?:events|enrollments)\/aggregate\/[A-Za-z][A-Za-z0-9]{10}(?:\.json)?\?(.*)$/);
+  if (!m) return { path: p, routed: false };
+  const parts = m[1].split('&');
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const items = [];
+  const itemParts = new Set();
+  for (const part of parts) {
+    const kv = part.match(/^dimension=(.*)$/i);
+    if (!kv) continue;
+    const val = dec(kv[1]);
+    if (/^(ou|pe|co|ao|longitude|latitude):/i.test(val)) continue;
+    const list = val.replace(/^dx:/i, '');
+    const ids = list.split(';').map(x => x.trim()).filter(Boolean);
+    if (!ids.length || !ids.every(x => /^[A-Za-z][A-Za-z0-9]{10}$/.test(x))) return { path: p, routed: false };
+    items.push(...ids);
+    itemParts.add(part);
+  }
+  if (!items.length) return { path: p, routed: false };
+  const r = await safeDhis2Fetch(`programIndicators?filter=id:in:[${[...new Set(items)].join(',')}]&fields=id&paging=false`);
+  if (!r || r._error || (r.programIndicators || []).length !== new Set(items).size) return { path: p, routed: false };
+  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x));
+  return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true };
 }
 
 async function validateAnalyticsProgramId(path) {
@@ -4223,9 +4349,13 @@ function hasDimensionParam(usp, dimKey) {
 async function enrichAnalyticsPathWithVisualizationContext(path, vizId) {
   if (!isAnalyticsPath(path) || !vizId) return path;
   const { base, usp } = splitPathAndQuery(path);
-  const needsDx = !hasDimensionParam(usp, 'dx');
-  const needsPe = !hasDimensionParam(usp, 'pe');
-  const needsOu = !hasDimensionParam(usp, 'ou');
+  // A dimension given as a FILTER is present too — appending it again as a
+  // dimension is a guaranteed 409 "Dimensions cannot be specified as dimension
+  // and filter simultaneously" (live 2026-10-28: three in one turn).
+  const asFilter = (k) => usp.getAll('filter').some((f) => String(f).split(/:|%3A/i)[0] === k);
+  const needsDx = !hasDimensionParam(usp, 'dx') && !asFilter('dx');
+  const needsPe = !hasDimensionParam(usp, 'pe') && !asFilter('pe');
+  const needsOu = !hasDimensionParam(usp, 'ou') && !asFilter('ou');
   if (!needsDx && !needsPe && !needsOu) return path;
 
   const fields = [

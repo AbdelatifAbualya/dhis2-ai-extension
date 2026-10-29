@@ -713,6 +713,11 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             console.warn(`[AgenticLoop] Healed provider-mangled argument shapes for ${toolName} ($text/stringified nesting)`);
             args = healedShape.value;
           }
+          const healedEntities = healArgumentEntities(args);
+          if (healedEntities.healed) {
+            console.warn(`[AgenticLoop] Decoded HTML entities in ${toolName} label/expression arguments`);
+            args = healedEntities.value;
+          }
         }
 
         // ── Unknown tool (hallucinated name) — answer, do not execute ──

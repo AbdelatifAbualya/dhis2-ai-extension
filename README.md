@@ -353,6 +353,54 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.29 — A weak model builds a whole NCD programme end to end without mistakes (2026-10-28)
+
+**The test.** On localhost:8081 (2.42.5) the chatbot, driven by Fireworks `deepseek-v4p1-flash-1017`, was asked in plain language to build an "NCD Hypertension and Diabetes Care" tracker program (3 stages, 6 rules, 7 indicators), then charts, a pivot, a single value, a pie, two line lists and a dashboard, then an enrollment widget, a form-field plugin, a dashboard plugin and an app. 40 patients were seeded through the tracker API (test scaffolding, deterministic). Every result was checked independently: every analytics value recomputed from the raw records, the rules driven in real Capture, the plugins and the app exercised in the real Capture / Dashboard / Line Listing apps. Each mistake below was reproduced, fixed in the tools, and the stage re-run until it came back clean (0 failed API calls).
+
+**Program rules.**
+- **Stage scope.** A rule can now be evaluated in one stage only: a rule-level `program_stage_id` / `program_stage_name`, or automatically when every action of the rule names the same stage. Before, a per-action stage was silently dropped, so a "screening" and a "follow-up" copy of one warning both fired everywhere and Capture showed the message twice (verified). `update` keeps a rule's scope (it used to wipe it).
+- **The duplicate lint** compares variables by the data element they read (so `#{sys_screening}` and `#{sys_followup}` are the same), covers messages on a field (same text), and ignores rules scoped to different stages.
+- **In-form variables read the current event.** `create_program` and `add_program_rules` created every rule variable as `DATAELEMENT_NEWEST_EVENT_PROGRAM`. On a repeatable stage, or a data element two stages share, a rule then judged the newest visit of the enrollment: the 2.42 server rule engine computed "BP controlled" for an earlier visit from a later one and refused the import with E1307 (verified). They now pick `DATAELEMENT_CURRENT_EVENT` when the rule acts in the data element's stage, as `manage_program_rules` already did. `audit` flags such variables on existing programs, with the PATCH that fixes them.
+- **Yes/No is BOOLEAN.** A field built as TEXT + a two-option Yes/No set becomes the BOOLEAN type (`keep_option_set:true` opts out), and the rules of the same call compare / ASSIGN `true` / `false`. ASSIGN to a yes/no field turns `'YES'` / `'No'` into booleans.
+
+**Program creation.**
+- **Data entry for everyone.** Tracker capture also needs DATA access on the program's tracked entity type (E1001 / E1104 for a plain Capture user — verified). `create_program` and `update_sharing` now add the program's data access to the type (data bits only, backed up, reported with how many other programs share the type). The sharing manual no longer claims only Program and ProgramStage carry data sharing.
+- **`unique` on a reused attribute** (an existing "National ID") is applied when no other program uses the attribute, and otherwise reported — the model used to tell the user it was unique when it was not.
+- Inline option sets of reused attributes / data elements are no longer created as orphans; stage names are only made unique where the server's schema requires it (2.42 does not, so "Follow-up Visit" is kept).
+
+**Analytics and dashboards.**
+- **The whole hierarchy.** On an instance with several top org units the model took the first one ("MoHP Egypt") as "the root", built seven empty tiles and told the user analytics had never run. The system prompt now lists the user's top org units and says the whole hierarchy is `USER_ORGUNIT`; visualizations, line lists and maps scoped to ONE of several top units the user never named are refused with that fix; an empty line list re-checks across `USER_ORGUNIT` before mentioning analytics.
+- **Program indicators on event / enrollment aggregate endpoints** (`dx:` or bare, one or many) are routed to `/api/analytics`: they 409 (E7224) there, or group by the indicator's value and give wrong numbers (the chat reported 31% / 8.8% for 29.0% / 8.3%).
+- `dimension=pe:LAST_12_MONTHS` results say there is no total row (a 2026 row was read as the 12-month total: 34 instead of 40 patients).
+- "This year and last year" periods are saved chronologically (explicit axis items; the server's own order drew 2026 before 2025). The viz schema asks for relative period keywords when the request is relative.
+- `visualizations/<id>/data` (a PNG) is answered with `get_visualization_details` (without changing the turn's "open chart"); line lists accept `stage.de` columns and read a shared data element from the list's own stage; `search_metadata` has `page` and says when a list is cut off; `count_records` without any org unit counts across the user's own units.
+- Visualization-context enrichment no longer appends a dimension the query already has as a FILTER (three 409s "dimension and filter simultaneously" in one turn); `dimension=stage:<uid>` becomes the `stage` parameter; the program-indicator routing keeps `startDate` / `endDate`.
+- **Unrequested analytics runs are refused** when the tables are newer than every program (the model ran the job twice to "rebuild" new indicators — they are computed at query time; on a big server the job takes hours). A run the user asks for, or approves with "yes", goes ahead.
+- `update_sharing` handles line lists (`eventVisualizations`; legacy `eventReports` / `eventCharts` are mapped on 2.40+ — their APIs return nothing, so the backup failed and the model fell back to a raw PATCH).
+
+**Apps and plugins.**
+- `preview` refuses code that reads program indicators through `analytics/events|enrollments/aggregate` (a league-table plugin showed nothing while the chat presented "verified data").
+- Lint: a tracker timestamp (`occurredAt`, `enrolledAt`, …) with `'T00:00:00'` appended is an error (Invalid Date — a widget showed "—" for "days since last visit"). The manual states the timestamp format.
+- Lint (errors): `pager.pageCount` read from `tracker/*` without `totalPages: true` (2.42 sends no pageCount then — an overdue list silently lost the two most overdue patients); nested fields on tracker records (`orgUnit[id,displayName]` — orgUnit is a UID string, every facility showed "—"); `<SingleSelectField items={…}>` (no such prop — an empty facility filter). The manual states these tracker-list facts.
+- `dhis2_query` refuses web-app pages (`dhis-web-capture/index.html` → 404) and gives the Capture deep-link format; the research-streak guard never blocks `manage_custom_app preview` (its own hint sends the model there — an app was never built).
+- Manual: never present values as what a plugin "shows"; name only org units whose place you saw.
+- System prompt rule 14.3: after building, report what was built — no unasked data figures or data-quality claims (several were wrong: "34 patients", "one patient has no diagnosis").
+
+**Provider quirk.** This model HTML-escapes `&`, `<`, `>` inside tool-call strings ("NCD HTN &amp; DM Care" was saved as a short name). Entities are decoded in name / label / message / expression arguments (never in code, HTML or paths).
+
+**Verified.** `npm run verify` 744/744 (57 new checks); `npm run apps` 346/346; `npm run sqlviews` green. Final live run on a reset instance (program, data and dashboards deleted; shared objects restored), deepseek-v4p1-flash-1017, 0 failed API calls in every chat turn:
+| Stage | Chat turn | Independent checks |
+|---|---|---|
+| Program (3 stages, 7 rules, 7 indicators) | 107 calls, 0 failed | structure 107/107 · plain Capture user can register · all 7 indicators equal the values recomputed from 40 seeded patients · 17/17 rule checks in real Capture |
+| Charts, pivot, single value, pie, 2 line lists, dashboard | 89 calls, 0 failed | 59/59 — every cell (843) equals the raw records, chronological quarters, all 7 tiles draw in the Dashboard app, line lists show 40 / 83 rows |
+| Enrollment widget | 52 calls, 0 failed | 47/47 on 5 patients in real Capture (badge, days, red > 90 d, visits, sizing, no errors) |
+| Form-field plugin | 52 calls, 0 failed | 20/20 (every BP band, colours, HbA1c / glucose thresholds, nothing saved) |
+| Dashboard plugin | 27 calls, 0 failed | 11/11 (values, ranking, bars, follows the dashboard period filter) |
+| App | 22 calls, 0 failed | 8/8 (20 overdue patients, sort, rows, facility filter, opens the enrollment in Capture) |
+
+Within that final run, the analytics stage was re-run three times and the app twice, each time after fixing the cause listed above (analytics-run guard, filter-aware enrollment, routing dates, stage parameter; tracker-list and select-option lints, preview never blocked); the table shows the clean runs.
+
+
 ### 2.8.28 — Plugins that work together, and Capture seeing metadata changes (2026-10-25)
 
 **The failing thread.** Asked for a form-field plugin with a red FLAG next to every data element of the MCH stages, plus an enrollment widget listing the flagged values, the chatbot needed five versions.

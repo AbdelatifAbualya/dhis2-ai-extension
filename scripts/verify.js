@@ -1867,6 +1867,17 @@ async function runCustomAppChecks() {
     !pc._error && unzip(pc.pkg.zip)['echarts.min.js'] && /echarts\.min\.js[\s\S]*app\.js/.test(td.decode(unzip(pc.pkg.zip)['index.html'])));
   const unk = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': clean.replace("resource: 'me'", "resource: 'programs/AbCdEfGh123'") }));
   truthy('a hard-coded UID that does not exist on the server is refused', unk.unknown_uids && unk.unknown_uids[0] === 'AbCdEfGh123');
+  {
+    const savedSdf = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p, o) => (/^metadata\?fields=id&filter=id:in:/.test(p) ? { programIndicators: [{ id: 'YTg1u5yjZKQ' }], programs: [{ id: 'fbfJHSPpUQD' }] } : savedSdf(p, o));
+    try {
+      const evAgg = clean.replace("resource: 'me'", "resource: 'analytics/events/aggregate/fbfJHSPpUQD', params: { dimension: ['ou:USER_ORGUNIT', 'YTg1u5yjZKQ'] }");
+      const piBad = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': evAgg }));
+      truthy('program indicators read through analytics/events/aggregate are refused at preview (409 E7224 in the browser)', /refuses program indicators there/.test(piBad._error || ''));
+      const piOk = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': clean.replace("resource: 'me'", "resource: 'analytics', params: { dimension: ['dx:YTg1u5yjZKQ', 'ou:USER_ORGUNIT'] }") }));
+      truthy('…the plain analytics resource with dx: passes', !/refuses program indicators/.test(piOk._error || ''));
+    } finally { ctx.safeDhis2Fetch = savedSdf; }
+  }
 
   // Never touch apps the assistant did not build.
   calls = [];
@@ -2553,6 +2564,279 @@ async function runCaptureRefreshChecks() {
   truthy('manual: diagnose before changing code, and "placed" is not "working"', /### When a plugin "does nothing"/.test(manual) && /"Placed and configured" is not "working"/.test(manual));
 }
 
+async function runRuleScopeAndTetSharingChecks() {
+  console.log('\nRule stage scope, duplicate rules across stages & tracked-entity-type data sharing:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const stageDes = new Map([['stageScreen1', new Set(['deSystolic1', 'deDiastol01', 'deSmoker001', 'deCigs00001'])], ['stageFollow1', new Set(['deSystolic1', 'deDiastol01', 'deHbA1c0001'])]]);
+  const act = (type, de, stage, extra = {}) => ({ programRuleActionType: type, ...(de ? { dataElement: { id: de } } : {}), ...(stage ? { programStage: { id: stage } } : {}), ...extra });
+  eq('every field action naming one stage scopes the rule to it', ctx.inferRuleStageScope([act('SHOWWARNING', 'deSystolic1', 'stageFollow1'), act('ASSIGN', 'deHbA1c0001', 'stageFollow1')], stageDes), 'stageFollow1');
+  eq('…two different stages stay program-wide', ctx.inferRuleStageScope([act('SHOWWARNING', 'deSystolic1', 'stageFollow1'), act('HIDEFIELD', 'deCigs00001', 'stageScreen1')], stageDes), null);
+  eq('…an action without a stage keeps the rule program-wide', ctx.inferRuleStageScope([act('SHOWWARNING', 'deSystolic1', 'stageFollow1'), act('SHOWERROR', 'deDiastol01')], stageDes), null);
+  eq('…an attribute target keeps it program-wide', ctx.inferRuleStageScope([act('HIDEFIELD', null, 'stageFollow1', { trackedEntityAttribute: { id: 'teaNatId0001' } })], stageDes), null);
+  eq('…HIDEPROGRAMSTAGE (the stage is the TARGET) is never a scope', ctx.inferRuleStageScope([act('HIDEPROGRAMSTAGE', null, 'stageFollow1')], stageDes), null);
+  eq('…a data element that is not in the named stage is not scoped', ctx.inferRuleStageScope([act('HIDEFIELD', 'deCigs00001', 'stageFollow1')], stageDes), null);
+  // The NCD case (2026-10-28): a screening and a follow-up copy of one warning on
+  // a data element both stages share, each with its own CURRENT_EVENT variables.
+  const v = (name, de) => ({ name, source_type: 'DATAELEMENT_CURRENT_EVENT', data_element_id: de, value_type: 'INTEGER_POSITIVE' });
+  const copy = (suffix, stage) => ({
+    name: `Crisis warning ${suffix}`,
+    condition: `d2:hasValue(#{sys_${suffix}}) && #{sys_${suffix}} >= 180`,
+    variables: [v(`sys_${suffix}`, 'deSystolic1')],
+    actions: [{ type: 'SHOWWARNING', data_element_id: 'deSystolic1', content: 'Hypertensive crisis', ...(stage ? { program_stage_id: stage } : {}) }],
+  });
+  const scoped = [copy('screening', 'stageScreen1'), copy('followup', 'stageFollow1')];
+  eq('per-stage copies that each name their stage are not duplicates', ctx.lintRuleVisibilitySemantics(scoped, [], { canonVar: ctx.buildPrvCanonicalizer([], scoped) }), []);
+  const unscoped = [copy('screening'), copy('followup')];
+  truthy('unscoped copies whose variables read the same data element ARE duplicates', /"Crisis warning screening" duplicates rule "Crisis warning followup"/.test(ctx.lintRuleVisibilitySemantics(unscoped, [], { canonVar: ctx.buildPrvCanonicalizer([], unscoped) }).join(' ')));
+  const existing = [{ id: 'ruleOld0001', name: 'Old crisis', condition: 'd2:hasValue(#{bp_sys}) && #{bp_sys} >= 180', programRuleActions: [{ programRuleActionType: 'SHOWWARNING', content: 'Hypertensive crisis', dataElement: { id: 'deSystolic1' } }] }];
+  const prvs = [{ name: 'bp_sys', programRuleVariableSourceType: 'DATAELEMENT_CURRENT_EVENT', dataElement: { id: 'deSystolic1' } }];
+  truthy('…also against an existing rule on the program (server shape)', ctx.lintRuleVisibilitySemantics([copy('screening')], existing, { canonVar: ctx.buildPrvCanonicalizer(prvs, [copy('screening')]) }).length === 1);
+  eq('…but not against an existing rule scoped to another stage', ctx.lintRuleVisibilitySemantics([copy('screening', 'stageScreen1')], [{ ...existing[0], programStage: { id: 'stageFollow1' } }], { canonVar: ctx.buildPrvCanonicalizer(prvs, [copy('screening')]) }), []);
+  eq('…a different message on the same field is not a duplicate', ctx.lintRuleVisibilitySemantics([copy('screening'), { ...copy('followup'), actions: [{ type: 'SHOWWARNING', data_element_id: 'deSystolic1', content: 'Recheck in 5 minutes' }] }], [], { canonVar: ctx.buildPrvCanonicalizer([], unscoped) }), []);
+  eq('a NEWEST_EVENT_PROGRAM variable is not the same source as a CURRENT_EVENT one', ctx.lintRuleVisibilitySemantics(unscoped, [], { canonVar: ctx.buildPrvCanonicalizer([], [copy('screening'), { ...copy('followup'), variables: [{ ...v('sys_followup', 'deSystolic1'), source_type: 'DATAELEMENT_NEWEST_EVENT_PROGRAM' }] }]) }), []);
+  // Tracked entity type data sharing.
+  eq('addDataBits adds data bits only', [ctx.addDataBits('rw------', 'rwrw----'), ctx.addDataBits('r-r-----', 'r-rw----'), ctx.addDataBits('rwrw----', 'r-r-----'), ctx.addDataBits('--------', 'r-rw----')], ['rwrw----', 'r-rw----', 'rwrw----', 'r-rw----']);
+  const saved = { sdf: ctx.safeDhis2Fetch, bk: ctx.ensureBackupOrBail };
+  const puts = [];
+  let tetPublic = 'rw------';
+  ctx.ensureBackupOrBail = async () => ({ ok: true, block: { backup_key: 'bk' } });
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    if (o.method === 'PUT') { puts.push({ p, body: o.body }); return { status: 'OK' }; }
+    if (/^programs\/progNcd0001\?fields=programType/.test(p)) return { programType: 'WITH_REGISTRATION', trackedEntityType: { id: 'tetPerson01', displayName: 'person' } };
+    if (p === 'sharing?type=program&id=progNcd0001') return { object: { publicAccess: 'rwrw----', userGroupAccesses: [{ id: 'grpNurses01', access: 'r-rw----' }], userAccesses: [] } };
+    if (p === 'sharing?type=trackedEntityType&id=tetPerson01') return { object: { publicAccess: tetPublic, userGroupAccesses: [{ id: 'grpViewer01', access: 'r-r-----' }], userAccesses: [] } };
+    if (/^programs\?filter=trackedEntityType/.test(p)) return { programs: [{ displayName: 'A' }, { displayName: 'B' }] };
+    return { _error: `unexpected ${p}` };
+  };
+  try {
+    const r = await ctx.cascadeProgramDataSharingToTrackedEntityType('progNcd0001', {});
+    const body = puts[0] && puts[0].body.object;
+    truthy('a program shared for data capture gives its tracked entity type the same data access', r && r.updated && body && body.publicAccess === 'rwrw----');
+    eq('…groups with data access on the program are added; existing grants are kept', body && body.userGroupAccesses.map((g) => `${g.id}:${g.access}`).sort(), ['grpNurses01:r-rw----', 'grpViewer01:r-r-----']);
+    truthy('…and the result says how many other programs share the type', r && r.other_programs_using_it === 2 && /shared by 2 other program/.test(r._note));
+    puts.length = 0; tetPublic = 'rwrw----';
+    ctx.safeDhis2Fetch = ((inner) => async (p, o = {}) => (p === 'sharing?type=trackedEntityType&id=tetPerson01'
+      ? { object: { publicAccess: 'rwrw----', userGroupAccesses: [{ id: 'grpNurses01', access: 'rwrw----' }], userAccesses: [] } } : inner(p, o)))(ctx.safeDhis2Fetch);
+    const r2 = await ctx.cascadeProgramDataSharingToTrackedEntityType('progNcd0001', {});
+    truthy('…a type that already grants it is left alone (no write, no backup)', r2 === null && puts.length === 0);
+  } finally { ctx.safeDhis2Fetch = saved.sdf; ctx.ensureBackupOrBail = saved.bk; }
+  // "unique" on a reused attribute; stage names only unique where the server says so.
+  {
+    const saved2 = { sdf: ctx.safeDhis2Fetch, bk: ctx.ensureBackupOrBail };
+    const writes = [];
+    ctx.ensureBackupOrBail = async () => ({ ok: true, block: { backup_key: 'bk' } });
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (o.method) { writes.push(`${o.method} ${p} ${JSON.stringify(o.body)}`); return {}; }
+      if (/^trackedEntityAttributes\?filter=id:in:/.test(p)) return { trackedEntityAttributes: [{ id: 'teaNatId0001', displayName: 'National ID', unique: false }, { id: 'teaShared001', displayName: 'Passport', unique: false }, { id: 'teaAlready01', displayName: 'Epid', unique: true }] };
+      if (/trackedEntityAttribute\.id:eq:teaShared001/.test(p) && p.startsWith('programs')) return { programs: [{ displayName: 'Other program' }] };
+      if (p.startsWith('programs?') || p.startsWith('trackedEntityTypes?')) return { programs: [], trackedEntityTypes: [] };
+      if (p.startsWith('schemas/programStage')) return { properties: [{ name: 'name', unique: false }] };
+      return { _error: `unexpected ${p}` };
+    };
+    try {
+      const u = await ctx.applyRequestedAttributeUniqueness('progNcd0001', [{ id: 'teaNatId0001' }, { id: 'teaShared001' }, { id: 'teaAlready01' }], {});
+      eq('a reused attribute nobody else uses is made unique; one shared with another program is reported, not changed', [u.applied.map((x) => x.attribute), u.not_applied.map((x) => `${x.attribute}: ${x.shared_with}`), writes], [['National ID'], ['Passport: program "Other program"'], ['PATCH trackedEntityAttributes/teaNatId0001 {"unique":true}']]);
+      vm.runInContext('_stageNameUniqueCache = null', ctx);
+      eq('programStage names are not renamed where the server schema says name is not unique', await ctx.programStageNamesMustBeUnique(), false);
+      vm.runInContext('_stageNameUniqueCache = null', ctx);
+      ctx.safeDhis2Fetch = async () => ({ _error: 'HTTP 500' });
+      eq('…and are still de-duplicated when the schema cannot be read', await ctx.programStageNamesMustBeUnique(), true);
+    } finally { ctx.safeDhis2Fetch = saved2.sdf; ctx.ensureBackupOrBail = saved2.bk; vm.runInContext('_stageNameUniqueCache = null', ctx); }
+  }
+  // create_program's embedded rules: in-form variables read the CURRENT event.
+  {
+    const saved3 = { sdf: ctx.safeDhis2Fetch, pmp: ctx.postMetadataPayload };
+    let posted = null;
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (o.method) return { status: 'OK' };
+      if (/^schemas\/programStage/.test(p)) return { properties: [{ name: 'name', unique: false }] };
+      if (/^trackedEntityTypes/.test(p)) return { trackedEntityTypes: [{ id: 'tetPerson01', name: 'person', displayName: 'person' }], id: 'tetPerson01', name: 'person' };
+      if (/^trackedEntityAttributes\?filter=name:in:/.test(p) && /Verify%20sex/.test(p)) return { trackedEntityAttributes: [{ id: 'teaSexExist', name: 'Verify sex', valueType: 'TEXT', optionSet: { options: [{ name: 'Male' }, { name: 'Female' }] } }] };
+      const m = p.match(/^(\w+)/);
+      return { [m ? m[1] : 'x']: [], pager: { total: 0 } };
+    };
+    ctx.postMetadataPayload = async (payload) => { posted = payload; return { success: false, phase: 'validate', _error: 'mock: stop after building' }; };
+    try {
+      vm.runInContext('_stageNameUniqueCache = null', ctx);
+      await ctx.createFullProgram({
+        program_name: 'Verify BP', org_unit_ids: ['ouRoot00001'], program_type: 'WITH_REGISTRATION', tracked_entity_type_id: 'tetPerson01',
+        program_attributes: [{ name: 'Verify name', value_type: 'TEXT' }, { name: 'Verify sex', value_type: 'TEXT', option_set: { name: 'Verify sex set', options: ['Male', 'Female'] } }],
+        stages: [
+          { name: 'Screening', data_elements: [{ name: 'Verify systolic', value_type: 'INTEGER_POSITIVE' }, { name: 'Verify diagnosis', value_type: 'TEXT', option_set: { name: 'Verify dx', options: ['HTN', 'DM'] } }] },
+          { name: 'Follow-up', repeatable: true, data_elements: [{ name: 'Verify systolic', value_type: 'INTEGER_POSITIVE' }, { name: 'Verify hba1c', value_type: 'NUMBER' }] },
+        ],
+        program_rules: [
+          { name: 'Crisis', condition: '#{verify_systolic} >= 180', actions: [{ type: 'SHOWWARNING', data_element_name: 'Verify systolic', content: 'Crisis' }] },
+          { name: 'Hide hba1c', condition: "#{verify_diagnosis} == 'HTN'", actions: [{ type: 'HIDEFIELD', data_element_name: 'Verify hba1c' }] },
+          { name: 'Low at follow-up', condition: '#{verify_systolic} < 90', actions: [{ type: 'SHOWWARNING', data_element_name: 'Verify systolic', content: 'Low', program_stage_name: 'Follow-up' }] },
+        ],
+      }, 'bjDvmb4bfuf', null);
+      const src = Object.fromEntries(((posted && posted.programRuleVariables) || []).map((x) => [x.name, x.programRuleVariableSourceType]));
+      eq('create_program: a variable the rule acts on in the same stage reads the CURRENT event; a cross-stage lookup reads the newest event', [src.verify_systolic, src.verify_diagnosis], ['DATAELEMENT_CURRENT_EVENT', 'DATAELEMENT_NEWEST_EVENT_PROGRAM']);
+      eq('create_program: the inline option set of a REUSED attribute is not created (no orphan); the new data element\'s set is', [((posted && posted.optionSets) || []).map((o) => o.name), ((posted && posted.trackedEntityAttributes) || []).map((t) => t.name), ((posted && posted.options) || []).length], [['Verify dx'], ['Verify name'], 2]);
+      const fu = ((posted && posted.programStages) || []).find((x) => x.name === 'Follow-up');
+      eq('create_program: a rule whose actions all name one stage is scoped to it; the others run everywhere; stage names are kept', [((posted && posted.programRules) || []).map((r) => (r.programStage ? r.programStage.id === (fu && fu.id) : null)), ((posted && posted.programStages) || []).map((x) => x.name)], [[null, null, true], ['Screening', 'Follow-up']]);
+    } finally { ctx.safeDhis2Fetch = saved3.sdf; ctx.postMetadataPayload = saved3.pmp; vm.runInContext('_stageNameUniqueCache = null', ctx); }
+  }
+  // audit: a NEWEST_EVENT_PROGRAM variable used in the same (repeatable) form.
+  {
+    const saved4 = ctx.safeDhis2Fetch;
+    const prv = (src) => ({ id: 'prvSys00001', name: 'sys', programRuleVariableSourceType: src, dataElement: { id: 'deSystolic1' } });
+    let vars = [prv('DATAELEMENT_NEWEST_EVENT_PROGRAM')];
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p.startsWith('programRules?')) return { programRules: [{ id: 'ruleCrisis1', name: 'Crisis', condition: 'd2:hasValue(#{sys}) && #{sys} >= 180', programRuleActions: [{ id: 'actCrisis01', programRuleActionType: 'SHOWWARNING', content: 'Crisis', dataElement: { id: 'deSystolic1' } }] }], pager: { pageCount: 1 } };
+      if (p.startsWith('programRuleVariables?')) return { programRuleVariables: vars, pager: { pageCount: 1 } };
+      if (p.startsWith('programs/progNcd0001')) return { id: 'progNcd0001', programStages: [{ id: 'stageScreen1', repeatable: false, programStageDataElements: [{ dataElement: { id: 'deSystolic1' } }] }, { id: 'stageFollow1', repeatable: true, programStageDataElements: [{ dataElement: { id: 'deSystolic1' } }] }], programTrackedEntityAttributes: [] };
+      return { _error: `unexpected ${p}` };
+    };
+    try {
+      const a = await ctx.executeTool('manage_program_rules', { action: 'audit', program_id: 'progNcd0001', deep: false });
+      truthy('audit flags a NEWEST_EVENT_PROGRAM variable read in the same repeatable form, with the PATCH that fixes it', JSON.stringify(a).includes('reads the NEWEST event of the whole enrollment') && JSON.stringify(a).includes('programRuleVariables/prvSys00001'));
+      vars = [prv('DATAELEMENT_CURRENT_EVENT')];
+      const b = await ctx.executeTool('manage_program_rules', { action: 'audit', program_id: 'progNcd0001', deep: false });
+      truthy('…and not a CURRENT_EVENT one', !JSON.stringify(b).includes('reads the NEWEST event'));
+    } finally { ctx.safeDhis2Fetch = saved4; }
+  }
+  // search_metadata paging: never a "page" filter; say when the list is cut off.
+  {
+    const saved5 = ctx.safeDhis2Fetch;
+    const seen = [];
+    ctx.safeDhis2Fetch = async (p) => { seen.push(p); return { trackedEntityAttributes: [{ id: 'a' }, { id: 'b' }], pager: { page: /page=2/.test(p) ? 2 : 1, pageCount: 3, total: 6 } }; };
+    try {
+      const r = await ctx.executeTool('search_metadata', { object_type: 'trackedEntityAttributes', page_size: 2, filters: ['page:eq:2', 'valueType:eq:TEXT'] });
+      eq('search_metadata: a "page:eq:N" filter becomes the page parameter (no 400 "Unknown path property")', seen[0], 'trackedEntityAttributes?fields=id,displayName,code,description&pageSize=2&page=2&filter=valueType:eq:TEXT');
+      truthy('…and a cut-off list says how to get the next page', /Showing 2 of 6 \(page 2 of 3\)\. Next: the same call with page: 3/.test(r._more || ''));
+    } finally { ctx.safeDhis2Fetch = saved5; }
+  }
+  // A two-option Yes/No set is the BOOLEAN type; rules in the same call follow.
+  {
+    const args = {
+      stages: [{ name: 'Follow-up', data_elements: [
+        { name: 'BP controlled', value_type: 'TEXT', option_set: { name: 'NCD Yes/No', options: ['Yes', 'No'] } },
+        { name: 'Referred', value_type: 'TEXT', option_set: { name: 'YNU', options: ['Yes', 'No', 'Unknown'] } },
+        { name: 'Kept', value_type: 'TEXT', keep_option_set: true, option_set: { name: 'YN', options: ['Yes', 'No'] } },
+      ] }],
+      program_rules: [
+        { name: 'a', condition: "#{bp_controlled} == 'YES' && #{referred} == 'YES'", actions: [{ type: 'ASSIGN', data_element_name: 'BP controlled', data: 'd2:condition("#{sys} < 140", \'YES\', \'NO\')' }] },
+        { name: 'b', condition: "#{bp_controlled} == 'No'", actions: [{ type: 'SHOWWARNING', data_element_name: 'BP controlled', content: 'Uncontrolled' }] },
+      ],
+    };
+    eq('a Yes/No option set becomes BOOLEAN (a Yes/No/Unknown set and keep_option_set stay)', [ctx.healYesNoOptionSets(args), args.stages[0].data_elements.map((d) => `${d.value_type}${d.option_set ? '+OS' : ''}`)], [['BP controlled'], ['BOOLEAN', 'TEXT+OS', 'TEXT+OS']]);
+    eq('…and the rules of the same call compare / assign booleans', [args.program_rules[0].condition, args.program_rules[0].actions[0].data, args.program_rules[1].condition], ["#{bp_controlled} == true && #{referred} == 'YES'", 'd2:condition("#{sys} < 140", true, false)', '(!d2:hasValue(#{bp_controlled}) || #{bp_controlled} != true)']);
+  }
+  // Multi-root instances: one root picked by the model is not "the whole hierarchy".
+  {
+    const saved6 = { sdf: ctx.safeDhis2Fetch, base: ctx.__dhis2().baseUrl };
+    const probes = [];
+    ctx.__dhis2().baseUrl = 'http://verify.local';
+    vm.runInContext('_userRootOuCache = null; lastUserText = "Build charts across the whole hierarchy"; conversationHistory = [];', ctx);
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p.startsWith('me?fields=organisationUnits')) return { organisationUnits: [{ id: 'rootPalest1', displayName: 'Palestine', level: 1 }, { id: 'rootEgypt01', displayName: 'MoHP Egypt', level: 1 }] };
+      if (p.startsWith('analytics/')) { probes.push(p); return /ou:USER_ORGUNIT/.test(p) ? { headers: [], rows: [[1], [2]], metaData: { pager: { total: 40 } } } : { headers: [], rows: [], metaData: { pager: { total: 0 } } }; }
+      return { _error: `unexpected ${p}` };
+    };
+    try {
+      const r = await ctx.singleRootScopeRefusal(['rootEgypt01'], 'Visualization "x"');
+      truthy('one of several top org units, never named by the user, is refused with USER_ORGUNIT as the fix', r && /never asked for "MoHP Egypt"/.test(r._error) && /USER_ORGUNIT/.test(r._hint));
+      eq('…USER_ORGUNIT, a level, several units, or a root the user named pass', [await ctx.singleRootScopeRefusal(['USER_ORGUNIT'], 'x'), await ctx.singleRootScopeRefusal(['rootEgypt01', 'LEVEL-4'], 'x'), await ctx.singleRootScopeRefusal(['rootEgypt01', 'rootPalest1'], 'x')], [null, null, null]);
+      vm.runInContext('lastUserText = "a chart for MoHP Egypt only"', ctx);
+      eq('…and so does a root the user asked for by name', await ctx.singleRootScopeRefusal(['rootEgypt01'], 'x'), null);
+      const w = await ctx.lineListEmptyWarning('analytics/enrollments/query/progNcd0001?dimension=ou:rootEgypt01&dimension=pe:LAST_12_MONTHS');
+      truthy('an empty line list re-checks across USER_ORGUNIT and says the data lives elsewhere (not "run analytics")', /returns 40 row\(s\)/.test(w) && /Analytics tables are fine/.test(w) && probes.some((p) => /dimension=ou:USER_ORGUNIT&/.test(p)));
+      const prompt = await ctx.buildSystemPrompt('make a chart');
+      truthy('the system prompt names every top org unit and says the whole hierarchy is USER_ORGUNIT', /Your top org units: Palestine \(rootPalest1\), MoHP Egypt \(rootEgypt01\) — 2 separate hierarchies/.test(prompt));
+    } finally {
+      ctx.safeDhis2Fetch = saved6.sdf; ctx.__dhis2().baseUrl = saved6.base;
+      vm.runInContext('_userRootOuCache = null; lastUserText = ""; conversationHistory = [];', ctx);
+    }
+  }
+  truthy('analytics: a multi-period keyword as a dimension is labelled "no total row", and a mixed yearly row is not that total', /NO total row for LAST_12_MONTHS\. The THIS_YEAR row\(s\) cover a different range/.test(ctx.analyticsPeriodRowsNote('analytics?dimension=dx:abc&dimension=pe:THIS_YEAR;LAST_12_MONTHS&dimension=ou:USER_ORGUNIT') || ''));
+  eq('…a filter=pe or a single period gets no note', [ctx.analyticsPeriodRowsNote('analytics?dimension=dx:abc&filter=pe:LAST_12_MONTHS'), ctx.analyticsPeriodRowsNote('analytics?dimension=pe:THIS_YEAR&dimension=dx:abc')], [null, null]);
+  {
+    const saved7 = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('programIndicators?filter=id:in:') ? { programIndicators: (p.match(/in:\[([^\]]+)\]/)[1].split(',')).filter((x) => x.startsWith('pi')).map((id) => ({ id })) } : { _error: 'unexpected' });
+    try {
+      eq('program indicators asked for on an enrollment AGGREGATE endpoint are routed to /analytics (no 409 E7224)', await ctx.routeProgramIndicatorAnalytics('analytics/enrollments/aggregate/progNcd0001?dimension=ou%3AUSER_ORGUNIT&dimension=pe%3ALAST_12_MONTHS&dimension=dx%3Api000000001%3Bpi000000002&pageSize=50&stage=stageFollow1'), { path: 'analytics?dimension=dx%3Api000000001%3Bpi000000002&dimension=ou%3AUSER_ORGUNIT&dimension=pe%3ALAST_12_MONTHS', routed: true });
+      eq('…also bare / single program-indicator dimensions (no dx:), which otherwise group by the indicator value', (await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&dimension=pe:THIS_YEAR&dimension=pi000000001&dimension=pi000000002;pi000000003&stage=stageFollow1')).path, 'analytics?dimension=dx%3Api000000001%3Bpi000000002%3Bpi000000003&dimension=ou:USER_ORGUNIT&dimension=pe:THIS_YEAR');
+      eq('…keeping startDate / endDate when the query has no pe dimension', (await ctx.routeProgramIndicatorAnalytics('analytics/enrollments/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT;LEVEL-4&dimension=pi000000001&startDate=2025-11-01&endDate=2026-10-31')).path, 'analytics?dimension=dx%3Api000000001&dimension=ou:USER_ORGUNIT;LEVEL-4&startDate=2025-11-01&endDate=2026-10-31');
+      eq('…data elements are not routed (they stay event/enrollment dimensions)', (await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=dx:deSystolic1&dimension=pe:LAST_12_MONTHS')).routed, false);
+    } finally { ctx.safeDhis2Fetch = saved7; }
+    eq('…dimension=stage:<uid> becomes the stage parameter', ctx.healEventAnalyticsDxDimension('analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&dimension=stage:stageFoll01&startDate=2025-01-01').path, 'analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&stage=stageFoll01&startDate=2025-01-01');
+    eq('several items under one dx: on an event endpoint become one dimension each', ctx.healEventAnalyticsDxDimension('analytics/events/query/progNcd0001?dimension=dx:deSystolic1;deDiastol01&dimension=pe:LAST_12_MONTHS').path, 'analytics/events/query/progNcd0001?dimension=deSystolic1&dimension=deDiastol01&dimension=pe:LAST_12_MONTHS');
+  }
+  {
+    const b = ctx.buildVisualizationObject({ name: 'q', vis_type: 'COLUMN', data_items: ['piVisits001'], periods: ['QUARTERS_THIS_YEAR', 'QUARTERS_LAST_YEAR'], org_units: ['USER_ORGUNIT'] }, { piVisits001: 'PROGRAM_INDICATOR' });
+    eq('"this year and last year" periods are saved chronologically (last year first) with explicit axis items', b.viz.rows && b.viz.rows[0].items.map((i) => i.id), ['QUARTERS_LAST_YEAR', 'QUARTERS_THIS_YEAR']);
+    const c = ctx.buildVisualizationObject({ name: 'q', vis_type: 'LINE', data_items: ['piVisits001'], periods: ['LAST_12_MONTHS'], org_units: ['USER_ORGUNIT'] }, { piVisits001: 'PROGRAM_INDICATOR' });
+    eq('…other period sets keep the flag-only payload', c.viz.rows, undefined);
+  }
+  {
+    const lintDates = (code) => ctx.lintCustomAppCode({ 'plugin.jsx': code }, 'plugin', null, 'CAPTURE').errors.some((e) => /Tracker timestamps/.test(e.message));
+    const bug = "const Q = { ev: { resource: 'tracker/events', params: { fields: 'event,occurredAt' } } };\nfunction daysSince(dateStr) { const d = new Date(dateStr + 'T00:00:00'); return d; }\nconst n = daysSince(latest.occurredAt);";
+    const trackerLint = (code) => ctx.lintCustomAppCode({ 'app.jsx': code }, 'app', null).errors.map((e) => e.message).join(' | ');
+    const pagedBad = "const Q = { r: { resource: 'tracker/events', params: { page: 1, pageSize: 100, fields: 'event,orgUnit[id,displayName]' } } };\nconst n = res.r.pager.pageCount;";
+    truthy('custom-app lint: tracker paging on pager.pageCount without totalPages, and orgUnit[…] on tracker records, are refused', /no pager\.pageCount/.test(trackerLint(pagedBad)) && /orgUnit as a plain UID string/.test(trackerLint(pagedBad)));
+    truthy('…with totalPages and a plain orgUnit they pass', !/pageCount|plain UID/.test(trackerLint(pagedBad.replace('page: 1,', 'page: 1, totalPages: true,').replace('orgUnit[id,displayName]', 'orgUnit'))));
+    const selLint = (src) => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, 'app', null).errors.some((e) => /has no "items" prop/.test(e.message));
+    eq('custom-app lint: <SingleSelectField items={…}> (an empty dropdown) is refused; options as children pass', [selLint('const A = () => <SingleSelectField label="F" items={xs} selected={v} onChange={f} />;'), selLint('const A = () => <SingleSelectField label="F" selected={v} onChange={f}>{xs.map((x) => <SingleSelectOption key={x} value={x} label={x} />)}</SingleSelectField>;')], [true, false]);
+    eq('custom-app lint: a tracker timestamp with T00:00:00 appended (Invalid Date) is refused; a trimmed one or a DATE data value is not', [lintDates(bug), lintDates(bug.replace("latest.occurredAt", "String(latest.occurredAt).slice(0, 10)")), lintDates("const next = new Date(dv.value + 'T00:00:00');")], [true, false, false]);
+  }
+  {
+    const h = ctx.healArgumentEntities({ program_short_name: 'NCD HTN &amp; DM Care', name: 'Visits (A &amp; B)', rules: [{ condition: '#{a} &lt; 140 &amp;&amp; #{b} &gt;= 90' }], files: { 'plugin.jsx': '<span>BP &lt; 140</span>' }, html: '<p>Q&amp;A</p>', path: 'a?x=1&amp;y=2' });
+    eq('HTML entities a model put in names / expressions are decoded; code, HTML and paths are left alone', [h.value.program_short_name, h.value.name, h.value.rules[0].condition, h.value.files['plugin.jsx'], h.value.html, h.value.path], ['NCD HTN & DM Care', 'Visits (A & B)', '#{a} < 140 && #{b} >= 90', '<span>BP &lt; 140</span>', '<p>Q&amp;A</p>', 'a?x=1&amp;y=2']);
+  }
+  {
+    const saved8 = ctx.safeDhis2Fetch; const seen = [];
+    const d8 = ctx.__dhis2(); const savedOu = d8.ouContext; const savedPc = d8.pageContext;
+    d8.ouContext = null; d8.pageContext = { appType: 'Dashboard' };
+    ctx.safeDhis2Fetch = async (p) => { seen.push(p); return { headers: [{ name: 'ou' }, { name: 'value' }], rows: [['rootA', '30'], ['rootB', '10']] }; };
+    try {
+      const r = await ctx.executeTool('count_records', { record_type: 'enrollments', program_override: 'progNcd0001' });
+      eq('count_records with no org unit anywhere counts across USER_ORGUNIT (sum of the top units) instead of failing', [r._error || r.count, /dimension=ou:USER_ORGUNIT&/.test(seen[0] || '')], [40, true]);
+    } finally { ctx.safeDhis2Fetch = saved8; d8.ouContext = savedOu; d8.pageContext = savedPc; }
+  }
+  {
+    const saved9 = ctx.safeDhis2Fetch; const d9 = ctx.__dhis2(); const savedWa = d9.writeAuth; const posts = [];
+    d9.writeAuth = { scope: 'broad', reason: 'verify' };
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (o.method === 'POST') { posts.push(p); return { response: { id: 'job1' } }; }
+      if (p === 'system/info') return { lastAnalyticsTableSuccess: '2026-10-28T21:00:08.103' };
+      if (p.startsWith('programs?order=created:desc')) return { programs: [{ id: 'progNcd0001', displayName: 'NCD', created: '2026-10-28T20:50:00.000' }] };
+      return { _error: 'unexpected ' + p };
+    };
+    try {
+      vm.runInContext('lastUserText = "add the pie chart to the dashboard"; conversationHistory = [];', ctx);
+      const r = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'resourceTables/analytics' });
+      truthy('an analytics run the user did not ask for is refused when the tables are newer than every program (nothing started)', r._scope === 'analytics_run_not_requested' && posts.length === 0);
+    } finally { ctx.safeDhis2Fetch = saved9; d9.writeAuth = savedWa; vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx); }
+  }
+  {
+    const saved10 = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('visualizations/vizCtx00001') ? { dataDimensionItems: [{ programIndicator: { id: 'piRate00001' } }], relativePeriods: { last12Months: true }, userOrganisationUnit: true, columns: [{ dimension: 'dx', items: [{ id: 'piRate00001' }] }], rows: [{ dimension: 'pe', items: [{ id: 'LAST_12_MONTHS' }] }], filters: [{ dimension: 'ou', items: [{ id: 'USER_ORGUNIT' }] }] } : { _error: 'x' });
+    try {
+      const out = await ctx.enrichAnalyticsPathWithVisualizationContext('analytics?dimension=dx:piRate00001&dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT', 'vizCtx00001');
+      truthy('visualization-context enrichment never re-adds a dimension the query already has as a FILTER (409)', !/dimension=ou/.test(decodeURIComponent(out)));
+    } finally { ctx.safeDhis2Fetch = saved10; }
+  }
+  {
+    const saved11 = ctx.safeDhis2Fetch; let called = 0;
+    ctx.safeDhis2Fetch = async () => { called++; return {}; };
+    try {
+      const r = await ctx.executeTool('dhis2_query', { path: 'dhis-web-capture/index.html' });
+      truthy('dhis2_query refuses a web-app page (no 404 call) and explains the Capture deep link', /web-app page/.test(r._error || '') && /enrollment\?enrollmentId=/.test(r._hint || '') && called === 0);
+    } finally { ctx.safeDhis2Fetch = saved11; }
+    {
+      const dS = ctx.__dhis2(); const savedS = { wa: dS.writeAuth, n: dS.consecutiveDiscoveryCalls };
+      dS.writeAuth = { scope: 'broad' }; dS.consecutiveDiscoveryCalls = 20;
+      truthy('the discovery-streak guard never blocks manage_custom_app preview (its own hint sends the model there), but still blocks a list', ctx.discoveryStreakStopOrNull('manage_custom_app', { action: 'preview' }) === null && !!ctx.discoveryStreakStopOrNull('manage_custom_app', { action: 'list' }));
+      dS.writeAuth = savedS.wa; dS.consecutiveDiscoveryCalls = savedS.n;
+    }
+  }
+  const kb = vm.runInContext('KB_PROGRAM_RULE_SYNTAX + KB_METADATA_SHARING', ctx);
+  truthy('manuals: one unscoped rule covers every stage; TrackedEntityType is data-shareable', /One rule covers every stage/.test(kb) && /Only Program, ProgramStage and TrackedEntityType are DATA-shareable/.test(kb));
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -2563,6 +2847,7 @@ setImmediate(async () => {
   if (loaded) await runSqlViewChecks().catch((e) => bad(`SQL view checks threw: ${e && e.stack || e}`));
   if (loaded) await runCustomAppChecks().catch((e) => bad(`custom-app checks threw: ${e && e.stack || e}`));
   if (loaded) await runCaptureRefreshChecks().catch((e) => bad(`Capture refresh checks threw: ${e && e.stack || e}`));
+  if (loaded) await runRuleScopeAndTetSharingChecks().catch((e) => bad(`rule scope / TET sharing checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

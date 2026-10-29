@@ -269,8 +269,15 @@ function lineListNearestDimensions(dimToken, ctx) {
 }
 
 async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis) {
-  const raw = typeof spec === 'string' ? { dimension: spec } : (spec || {});
-  const dimToken = String(raw.dimension || raw.id || raw.name || '').trim();
+  const raw = typeof spec === 'string' ? { dimension: spec } : { ...(spec || {}) };
+  let dimToken = String(raw.dimension || raw.id || raw.name || '').trim();
+  // DHIS2's own stage-qualified form "<stageUid>.<deUid>" (what a saved line
+  // list stores) — live 2026-10-28 it was refused as "not a dimension".
+  const qualified = dimToken.match(/^([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})$/);
+  if (qualified && ctx.stagesById.has(qualified[1])) {
+    if (!raw.program_stage_id && !raw.stage_id && !raw.program_stage && !raw.stage) raw.program_stage_id = qualified[1];
+    dimToken = qualified[2];
+  }
   if (!dimToken) return { _error: `A ${axis} entry is missing its "dimension" (pass a keyword like "ou"/"event_date", a UID, or an exact DE/attribute/program-indicator name).` };
   const lower = lowercaseText(dimToken);
 
@@ -401,6 +408,11 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
       if (!target.stageIds.includes(stage.id)) return { _error: `Data element "${target.name}" is not in stage "${stage.name}". It belongs to: ${target.stageIds.map(id => ctx.stagesById.get(id)?.name || id).join(', ')}.` };
     } else if (target.stageIds.length === 1) {
       stage = ctx.stagesById.get(target.stageIds[0]);
+    } else if (ctx.listStageId && target.stageIds.includes(ctx.listStageId)) {
+      // An EVENT list is ONE stage: a data element several stages share is read
+      // from the list's own stage (live 2026-10-28: "Systolic" in Screening and
+      // Follow-up refused although the list was on Follow-up).
+      stage = ctx.stagesById.get(ctx.listStageId);
     } else {
       return { _error: `Data element "${target.name}" appears in ${target.stageIds.length} stages (${target.stageIds.map(id => ctx.stagesById.get(id)?.name || id).join(', ')}) — pass program_stage_id to disambiguate.` };
     }
@@ -560,6 +572,25 @@ async function lineListAnalyticsFresh(programId) {
   return out;
 }
 
+// A 0-row list is not proof of stale analytics: the data may simply live
+// under other org units (live 2026-10-28: a list scoped to one of three roots
+// was empty while the other two held 40 enrollments, and the model told the
+// user to run analytics). Re-probe the same query across all of the user's org
+// units before saying anything about analytics.
+async function lineListEmptyWarning(probePath) {
+  const base = 'The saved list currently shows 0 rows.';
+  if (!probePath || /[?&](?:dimension|filter)=ou:USER_ORGUNIT(?:&|$)/.test(probePath)) {
+    return `${base} The query itself is valid; there is no matching data for these periods and filters across the user's org units (or analytics tables predate the data). Do not guess a cause — check system/info lastAnalyticsTableSuccess before mentioning analytics.`;
+  }
+  const wide = probePath.replace(/([?&](?:dimension|filter)=ou:)[^&]*/, '$1USER_ORGUNIT');
+  if (wide === probePath) return base;
+  const r = await lineListRunProbe(wide);
+  if (r.ok && r.row_count > 0) {
+    return `${base} The SAME query across all of the user's org units (USER_ORGUNIT) returns ${r.row_count} row(s) — the data lives under OTHER org units than the ones this list is scoped to. Analytics tables are fine. If the user asked for the whole hierarchy, update the list's org units to ["USER_ORGUNIT"].`;
+  }
+  return `${base} Across all of the user's org units it is empty too, so this is not an org-unit problem: either no data matches these periods/filters, or analytics tables predate the data — check system/info lastAnalyticsTableSuccess before saying which.`;
+}
+
 async function lineListRunProbe(probePath) {
   const resp = await safeDhis2Fetch(probePath);
   if (resp?._error) {
@@ -711,6 +742,7 @@ async function lineListBuildFromSpec(args, { requireName }) {
   }
 
   // Resolve every column / filter spec.
+  ctx.listStageId = outputType === 'EVENT' && stageObj ? stageObj.id : null;
   const optionCache = new Map();
   const resolveAxis = async (specs, axis) => {
     const out = [];
@@ -938,6 +970,16 @@ async function executeManageLineLists(args) {
       };
     }
 
+    // One of several top org units, picked by the model, is not "the whole
+    // hierarchy" (see singleRootScopeRefusal).
+    {
+      const ouDims = [...built.columns, ...built.filters].filter(d => d && d.kind === 'ou');
+      if (ouDims.length === 1) {
+        const rootScope = await singleRootScopeRefusal(ouDims[0].items, `Line list "${built.payload.name}"`);
+        if (rootScope) return rootScope;
+      }
+    }
+
     // Pre-flight probe: prove the layout runs BEFORE saving anything.
     const dataCheck = String(args.data_check || 'warn_empty');
     let probeRes = null;
@@ -975,7 +1017,7 @@ async function executeManageLineLists(args) {
     const warnings = [...built.warnings];
     if (staleAnalyticsWarning) warnings.push(staleAnalyticsWarning);
     if (probeRes && probeRes.row_count === 0) {
-      warnings.push('The saved list currently shows 0 rows. If data was entered recently, analytics tables may need a run (Data Administration → Analytics tables).');
+      warnings.push(await lineListEmptyWarning(built.probe.path));
     }
     return {
       success: true,
