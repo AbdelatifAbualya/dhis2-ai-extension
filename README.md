@@ -353,6 +353,108 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.34 — A failed check no longer stops the build; tiles can be inserted and reordered; maps draw correctly; apps read every location; app requests are not mistaken for bug reports (2026-11-01)
+
+The RMNCH "Maternal Care and Follow-up" thread (play 2.42.7) built the dashboard, its charts and its tables correctly in the first two prompts. The third prompt asked for two maps, an explanation, a new tile order and some checks. It ended with the maps built but never placed on the dashboard.
+
+**What went wrong, in order:**
+1. To re-check two summary tiles, the model put the tiles' own **visualization ids** (`YMQkujLUT3e`, `XJruzyOnBWS`) into an analytics query as data items. DHIS2 answered 409 ("no valid dimension options: dx"). The model then sent the same ids to the enrollment endpoint: two more 409s. It blamed "enrollment-type indicators", which was wrong.
+2. Three HTTP errors in a row tripped the turn's error stop, which **blocked every tool**. The optional verification query had failed, but the stop also refused the dashboard write the task still needed.
+3. Before that, the model believed `add_items` could only append below the other tiles. To put the maps between the district table and the detailed tables, it planned to **rebuild the dashboard with `create_dashboard`**. That would have made a second dashboard with the same name.
+4. Checked on screen: every bubble on the facility map was **black**, and that map had **no district boundaries**, although the user asked for them.
+
+**Fixes (no task-specific code):**
+- **Chart, map, line-list or dashboard ids used as analytics data items** (`healSavedObjectAsDataItem`, core.js). Before an analytics query is sent, one metadata read finds any id that is a saved object. The result is cached, and a failed read never blocks the query.
+  - A chart or map id is replaced by the data items it plots. The query runs, and the result says what was changed (`_query_corrected`, `_sent_path`).
+  - A line-list or dashboard id is refused with the tool that reads it (`manage_line_lists validate` / `manage_dashboards get`).
+  - The thread's three failing queries now return 1156 and 202 with no failed call.
+- **The HTTP-error stop is limited to the failing lane** (`httpErrorStopOrNull`). After 3 errors in a row, only the tool and action that failed are blocked (for `dhis2_query`, the method). The refusal says every other tool still works and tells the model to finish the remaining steps. 6 errors in a row, in any mix, still block everything. A 404 on `GET <type>/<uid>` now names the type the id really has.
+- **Dashboard tiles can be placed and reordered** (tools-metadata.js):
+  - `add_items` takes `insert_after_item_id` or `insert_before_item_id` (a tile id). The new tiles go there and the dashboard is re-flowed. Existing tiles keep their small / half / full.
+  - `arrange` takes `order: [tile ids]`. Tiles left out follow in their current order and are reported.
+  - A chart id passed where a tile id belongs is refused, and the refusal lists the tile ids.
+  - `get` lists tiles in reading order, with `position` and the `data_items` each chart or map plots.
+- **`create_dashboard` refuses a name that already exists** (case and spaces ignored). The refusal points to `add_items`, `arrange`, `remove_item` and `update`.
+- **Maps** (`buildMapObject`):
+  - The colour scale is saved as hex colours, one per class. A bare `YlOrRd` drew every class black. Verified 2.42.7: Maps-app layers store `#eff3ff,#bdd7e7,…`, and the assistant's were the only maps with a scale name. `color_scale` takes a ColorBrewer name or a hex list; an unknown name is refused.
+  - New `boundary_level` adds an outline layer of that level beneath the data, the same shape as the Maps app's boundary layers.
+  - New `no_data_color` gives places without data their own colour.
+- **Smaller fixes:**
+  - A query sent again with its parameters reordered counts as the same call for the loop guards.
+  - Text tiles are sized by their line breaks, so a bulleted explanation fits.
+- **Docs:** the dashboard manual covers inserting, reordering and checking a tile's numbers. It also gives the dashboard-filter behaviour, verified on 2.42.7: a period or org-unit filter re-queries single values, charts, pivots and maps. Line lists show "Filters are not applied to line list dashboard items" with a "Show without filters" button.
+
+**Checks:**
+- `npm run verify` → all pass, with a new block of 19 checks (`runDashboardMapsTurnChecks`).
+- Live scenarios, all with 0 failed calls:
+  - `npm run mnch` on stable-2-43-2-1: 103 calls.
+  - The line-list scenario on localhost:8081: 119 calls.
+  - `npm run apps`: 346/346.
+- Replay of the third prompt's tool sequence on a copy of the user's dashboard (play 2.42.7):
+  - the duplicate `create_dashboard` is refused;
+  - the three failing queries return data;
+  - the dashboard write passes while the read lane is stopped;
+  - both maps go between the district table and the tables;
+  - the final order is right.
+- Viewed in the Dashboard app: the maps follow a period filter, bubbles are coloured, and the district outlines are drawn.
+
+**Also in 2.8.34 — the "Malaria Case Explorer" app showed 0 records** (play 2.42.7). The app installed and opened, but every count was 0.
+
+- **Cause.** The app asked `tracker/events` for `orgUnit=<country>` with no `orgUnitMode`. DHIS2 then defaults to SELECTED: only events entered at that exact unit. Malaria cases are entered at facilities, so "All locations" and every district showed 0.
+  - Verified: the app's own query returns 0, and the same query with `orgUnitMode=DESCENDANTS` returns 100,332 for 2026 (Bo district 10,361).
+  - The model's own `dhis2_query` examples showed `tracker/…?orgUnit={id}` with no mode.
+- **Fixes:**
+  - The `manage_custom_app` preview refuses a `tracker/events | enrollments | trackedEntities` query that sends `orgUnit` without `orgUnitMode` (or `ouMode`). The refusal explains the 0-records symptom and the fix.
+  - The `dhis2_query` examples and the custom-app manual now use `orgUnitMode=DESCENDANTS`. The manual also gives the tracker filter syntax (option codes, repeated `filter`, `:ge:5:le:10`).
+- **The same thread's first preview called the program's real ids "not on this server".** The same check against the playground finds all six; none exist on localhost:8081. The connection follows the focused tab, so a tab on another DHIS2 server focused mid-turn moved the rest of the turn there: checks, installs and writes.
+  - A running request now stays on the server it started on. A switch to another server is held, and applied when the turn ends (`beginServerPinnedTurn` / `endServerPinnedTurn`, core.js). Same-server navigation is unaffected.
+  - The id check's refusal names the server it asked.
+- **Checks:**
+  - verify: a new block of 10 checks (`runAppOrgUnitAndServerPinChecks`).
+  - `npm run apps`: 346/346.
+  - The installed app's code is refused by the new rule. With `orgUnitMode: 'DESCENDANTS'` added it passes, installs as `ai-test-malaria-explorer`, and in the browser shows 100,332 matching records, 50 a page, and 10,361 for Bo.
+
+**Also in 2.8.34 — "Inpatient Outcomes Explorer": the chatbot said it had no app tool.** It mapped the program, then said `manage_custom_app` "is not available in this session".
+
+- **Cause.** Two loose phrase rules misread the request. Reproduced: the real turn got 8 read-only tools, exactly the set the model described.
+  1. "Keep the app read-only" matched the no-changes rule, which took the bare words "read-only" anywhere as "make no changes". The turn was classified read-only.
+  2. "Include helpful loading, error, invalid-filter, and empty-result messages" matched the save-failure rule ("load … error" within 50 characters).
+  - Together they switched on save-failure diagnosis. That mode withholds every write tool for the turn, and adds a system-prompt section saying "the user has reported a save error".
+- **Fixes** (core.js):
+  - `reportsSaveFailure()` removes a requested list of UI states (or one state after a feature verb, "show an error message") before testing. The tool strip, the system prompt, the save-error prefetch and memory all use it.
+  - "read-only" counts as no-changes only about the request ("read-only please", "stay read-only", "in read-only mode", or at the start).
+  - "no changes" followed by "to / in / on / for / of <object>" is a constraint inside the request, not a refusal.
+- **Unchanged:** "error saving the enrollment", "an error message when saving", "fails to load", "do not make any changes" and "no changes." classify exactly as before.
+- **Checks:** a new verify block of 5 checks (`runAppRequestRoutingChecks`). For the thread's request, the router now offers `manage_custom_app` (17 tools instead of 8).
+
+**Also in 2.8.34 — "Inpatient Outcomes Explorer", second attempt: four previews refused, no app.** The checker refused the app with "Nothing is rendered" and "<App> is used but never declared". The model moved the render call around four times, and the loop guard then blocked previews as "the same class of error".
+
+- **The prompt was not the cause; the checker was.** Every lint rule reads a copy of the code with string contents blanked, made by `customAppSourceViews`. It did not know regex literals. A quote inside a regex (the CSV-download escape `.replace(/"/g, '""')`, or `/'/g`, or a backtick) opened a "string" that ran to the next quote, and everything after it was blanked. So a render call at the end disappeared, and so did components declared after that point.
+  - Reproduced: the same correct app is refused with "Nothing is rendered" by the committed checker and passes the fixed one.
+  - The safety scan used the same copy, so code after such a regex was hidden from the safety rules as well.
+- **Fixes** (tools-apps.js):
+  - The scanner reads regex literals, and nested template literals with their `${…}` code (which stays visible to the checks). When unsure, it reads "/" as division: a misread regex can only cause a false warning, never hide code.
+  - Character positions are unchanged, so reported line numbers stay right.
+  - The loop guard counts a refusal that lists its problems as a repeat only when the problems repeat (core.js).
+- **The same turn counted 1,021 records for a program with 54,022.** This is a DHIS2 analytics-cache defect, verified on play 2.42.7 and 2.43.2. `analytics/events/aggregate` answers are cached without their program or stage:
+  - the same dimensions and period for program B return program A's rows **and** A's metaData;
+  - a second stage of one program gets the first stage's count (the follow-up stage got 62, live 291);
+  - a `stage` or `program` parameter, parameter order, or `pe` instead of dates do not help.
+  - 1,021 was the RMNCH first-ANC figure. The wrong count also set the app's design ("load 1,021 events in one pass").
+- **Fixes:**
+  - `safeDhis2Fetch` refuses an event or enrollment analytics answer whose metaData names another program, or another stage of the same program (`analyticsCacheMismatch`). The refusal names the program or stage the numbers belong to.
+  - `count_records` then counts live records with the tracker API and says why: 54,022 for the thread's query.
+  - Tracker requests on 2.41+ send `orgUnitMode`. 2.42 and 2.43 ignore the old `ouMode` without an error (verified: `ouMode=DESCENDANTS` answers 0). Every internal count that sent it is fixed in one place.
+  - The tracker count fallback uses CAPTURE scope instead of `orgUnit=USER_ORGUNIT`.
+- **Checks:**
+  - verify: a new block of 8 checks (`runAppScannerAndAnalyticsCacheChecks`).
+  - `npm run apps`: 346/346.
+  - `npm run mnch` on stable-2-43-2-1: 103 calls, 0 failed.
+  - The line-list scenario on localhost:8081 now stops at one tracked-entity analytics query, a server SQL error ("column t_1.usazQ2ALv62 does not exist"). That column is an org-unit group set "ALL " created there today; the tracked-entity analytics tables were not regenerated after it. It is fixed by an analytics table run that includes tracked entities, and is not caused by these changes (the same scenario passed 119/0 earlier the same day).
+  - A test inpatient app with CSV download, review flags and stay calculation previews, installs (`ai-test-inpatient-explorer` on play 2.42.7) and loads all 54,022 records through orgUnitMode=DESCENDANTS.
+
+**Not changed:** a stage's visit date in an ENROLLMENT line list still cannot be saved. The tool says so, and the bot reported it correctly in the second prompt.
+
 ### 2.8.33 — Dashboards are laid out so every tile can be read (2026-11-01)
 
 The RMNCH "Maternal Care and Follow-up" dashboard was built with correct numbers but could not be read. The four KPI tiles were about 70 px wide, every title was cut, and each chart was a sliver in the left third of the page with the rest of the row empty.

@@ -207,12 +207,18 @@ function isRetryableStreamDrop(err) {
 
 async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
   acquireKeepalive();
+  beginServerPinnedTurn();
   try {
     return await _runAgenticLoopInner(userText, imageBase64, browseWeb);
   } finally {
     // Learning memory: turn the turn's recovered failures into lessons (every
     // exit path, including throws). Never allowed to break the turn.
     try { await memoryEndTurn(); } catch (e) { console.warn('[Memory] end-of-turn failed:', e?.message || e); }
+    // A tab switch to another DHIS2 server during the turn applies now.
+    try {
+      const switched = await endServerPinnedTurn();
+      if (switched) broadcast({ type: 'CONTEXT_UPDATED', state: getSerializableState() });
+    } catch (e) { console.warn('[DHIS2] held server switch failed:', e?.message || e); }
     releaseKeepalive();
   }
 }
@@ -497,7 +503,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   // any existing enrollments for the TEI in context. Inject the bundle as a
   // system message so the model can identify the likely cause WITHOUT asking
   // the user for the error code — the chatbot has tools, it should use them.
-  const saveDiagDetected = SAVE_FAILURE_RE.test((userText || '').toLowerCase());
+  const saveDiagDetected = reportsSaveFailure(userText);
   if (saveDiagDetected && ctx.programId) {
     broadcast({ type: 'AI_THINKING', iteration: 0, label: 'Diagnosing save error' });
     try {
@@ -927,7 +933,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             // ── Post-flight: harvest UIDs from the result so subsequent calls
             //    can reference them, and bump the HTTP-error counter on 4xx/5xx. ──
             recordKnownIdsFromResult(toolResult);
-            noteHttpErrorFromResult(tc.function.name, toolResult);
+            noteHttpErrorFromResult(tc.function.name, toolResult, args);
             // Track EVERY failure (including HTTP-200 error payloads like
             // rejected PI expressions) so preflight can refuse doomed retries.
             // From the 2nd same-family failure, escalate the hint the model

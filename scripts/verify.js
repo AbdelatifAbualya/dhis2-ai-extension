@@ -3267,6 +3267,373 @@ async function runDashboardLayoutChecks() {
     (() => { const t = vm.runInContext('TOOLS', ctx).find(x => x.function.name === 'manage_dashboards'); const p = t.function.parameters.properties; const ip = p.items.items.properties; return p.action.enum.includes('arrange') && ip.size && !ip.x && !ip.width && !/58-column/.test(t.function.description); })());
 }
 
+// RMNCH thread 2026-11-01 (play 2.42.7), third prompt ("add two maps, arrange
+// the dashboard"): KPI-tile visualization ids sent as analytics data items
+// (three 409s), the HTTP-error stop then refused the dashboard write, and the
+// model tried to rebuild the dashboard with create_dashboard to reorder it.
+async function runDashboardMapsTurnChecks() {
+  console.log('\nRMNCH maps turn (lane-scoped HTTP stop, chart ids as data items, insert/reorder tiles, no duplicate dashboard):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const run = (code) => vm.runInContext(code, ctx);
+
+  // 1. The HTTP-error stop blocks the failing lane, not every tool.
+  {
+    const saved = { n: d.httpErrorCount, h: d.httpErrorHistory };
+    d.httpErrorCount = 0; d.httpErrorHistory = [];
+    try {
+      const e409 = { _error: 'DHIS2 API 409: Dimension is present in query without any valid dimension options: `dx`', _status: 409 };
+      for (let i = 0; i < 3; i++) ctx.noteHttpErrorFromResult('dhis2_query', e409, { method: 'GET', path: 'analytics?x=' + i });
+      const read = ctx.httpErrorStopOrNull('dhis2_query', { method: 'GET', path: 'programIndicators/XJruzyOnBWS' });
+      const write = ctx.httpErrorStopOrNull('manage_dashboards', { action: 'add_items', dashboard_id: 'xEtKQVG44h0' });
+      const getDash = ctx.httpErrorStopOrNull('manage_dashboards', { action: 'get', dashboard_id: 'xEtKQVG44h0' });
+      truthy('3 failed dhis2_query GETs block more dhis2_query GETs (saying every other tool still works) but not manage_dashboards add_items / get',
+        read && read._scope === 'http_error_limit_reached' && /every other tool still works/.test(read._hint) && write === null && getDash === null);
+      for (let i = 0; i < 3; i++) ctx.noteHttpErrorFromResult('manage_maps', e409, { action: 'create' });
+      const all = ctx.httpErrorStopOrNull('manage_dashboards', { action: 'add_items' });
+      truthy('6 errors in a row (any mix) still block every tool', all && all._blocked_lanes === 'all' && /Every tool is blocked/.test(all._hint));
+      const pre = (d.httpErrorCount = 3, d.httpErrorHistory = d.httpErrorHistory.slice(0, 3), ctx.preflightCheckCall('manage_dashboards', { action: 'arrange', dashboard_id: 'xEtKQVG44h0', order: [] }));
+      truthy('preflight lets the unrelated dashboard write through after the read lane is stopped', pre === null || pre._scope !== 'http_error_limit_reached');
+    } finally { d.httpErrorCount = saved.n; d.httpErrorHistory = saved.h; }
+  }
+
+  // 2. Saved chart / map / line-list / dashboard ids as analytics data items.
+  const savedFetch = ctx.safeDhis2Fetch;
+  const lookups = [];
+  const meta = {
+    visualizations: [
+      { id: 'YMQkujLUT3e', displayName: 'Follow-up ANC visits with Hb below 11 (2026)', type: 'SINGLE_VALUE', dataDimensionItems: [{ dataDimensionItemType: 'PROGRAM_INDICATOR', programIndicator: { id: 'HtpydimkL0Y', displayName: 'RMNCH Follow-up ANC visits Hb<11' } }] },
+      { id: 'XJruzyOnBWS', displayName: 'Registrations with a follow-up ANC visit with Hb below 11 (2026)', type: 'SINGLE_VALUE', dataDimensionItems: [{ dataDimensionItemType: 'PROGRAM_INDICATOR', programIndicator: { id: 'oVYCRemY0xE', displayName: 'RMNCH Registrations Hb<11' } }] },
+    ],
+    maps: [{ id: 'cL9y1QRKRRt', displayName: '% first ANC Hb<11 by district', mapViews: [{ dataDimensionItems: [{ dataDimensionItemType: 'PROGRAM_INDICATOR', programIndicator: { id: 'pfhawHn1Nss', displayName: '% first ANC Hb<11' } }] }] }],
+    eventVisualizations: [{ id: 'tbzYTKkr8dJ', displayName: 'Follow-up ANC visits Hb<11', type: 'LINE_LIST' }],
+    dashboards: [{ id: 'xEtKQVG44h0', displayName: 'Maternal Care and Follow-up' }],
+  };
+  const sent = [];
+  ctx.safeDhis2Fetch = async (p) => {
+    if (/^metadata\?visualizations=true/.test(p)) {
+      lookups.push(p);
+      const ids = (decodeURIComponent(p).match(/id:in:\[([^\]]*)\]/) || [, ''])[1].split(',');
+      const pick = (arr) => arr.filter(o => ids.includes(o.id));
+      return { visualizations: pick(meta.visualizations), maps: pick(meta.maps), eventVisualizations: pick(meta.eventVisualizations), dashboards: pick(meta.dashboards) };
+    }
+    if (/^programIndicators\?filter=id:in/.test(p)) { const ids = (decodeURIComponent(p).match(/\[([^\]]*)\]/) || [, ''])[1].split(','); return { programIndicators: ids.filter(id => ['HtpydimkL0Y', 'oVYCRemY0xE', 'pfhawHn1Nss'].includes(id)).map(id => ({ id })) }; }
+    if (/^programs\?fields=id,displayName/.test(p)) return { programs: [{ id: 'WSGAb5XwJ3Y', displayName: 'WHO RMNCH Tracker' }] };
+    if (/^programs\/WSGAb5XwJ3Y\?fields=programStages/.test(p)) return { programStages: [{ id: 'edqlbukwRfQ' }] };
+    if (/^analytics/.test(p)) { sent.push(p); return { headers: [], rows: [['HtpydimkL0Y', '2026', '1156'], ['oVYCRemY0xE', '2026', '202']] }; }
+    return {};
+  };
+  try {
+    run('_savedObjectByUid.clear()');
+    const h = await ctx.healSavedObjectAsDataItem('analytics?dimension=dx%3AYMQkujLUT3e%3BXJruzyOnBWS&dimension=pe%3A2026&filter=ou%3AImspTQPwCqd');
+    truthy('/analytics with two KPI-tile visualization ids in dx: swapped for the program indicators they plot, with a note naming both tiles',
+      h.healed && /dimension=dx:HtpydimkL0Y;oVYCRemY0xE&/.test(h.path) && /YMQkujLUT3e/.test(h.note) && /XJruzyOnBWS/.test(h.note) && /oVYCRemY0xE/.test(h.note));
+    const e = await ctx.healSavedObjectAsDataItem('analytics/enrollments/aggregate/WSGAb5XwJ3Y?dimension=dx:YMQkujLUT3e;XJruzyOnBWS&dimension=ou:ImspTQPwCqd');
+    const one = await ctx.healSavedObjectAsDataItem('analytics/enrollments/aggregate/WSGAb5XwJ3Y?dimension=XJruzyOnBWS&dimension=ou:ImspTQPwCqd');
+    truthy('enrollment analytics: the same ids (dx: list and a bare dimension=) are swapped the same way, from the cache (one lookup so far)',
+      e.healed && /dimension=dx:HtpydimkL0Y;oVYCRemY0xE/.test(e.path) && one.healed && /dimension=oVYCRemY0xE&/.test(one.path) && lookups.length === 1);
+    const ll = await ctx.healSavedObjectAsDataItem('analytics?dimension=dx:tbzYTKkr8dJ&dimension=pe:2026');
+    const db = await ctx.healSavedObjectAsDataItem('analytics?dimension=dx:xEtKQVG44h0&dimension=pe:2026');
+    truthy('a line-list id is refused with manage_line_lists validate, a dashboard id with manage_dashboards get — neither is sent',
+      ll.refusal?._scope === 'saved_object_as_data_item' && /validate/.test(ll.refusal._hint) && /manage_dashboards\(action="get"/.test(db.refusal?._hint || ''));
+    const before = lookups.length;
+    const plain = await ctx.healSavedObjectAsDataItem('analytics?dimension=dx:pfhawHn1Nss&dimension=pe:2026');
+    const plain2 = await ctx.healSavedObjectAsDataItem('analytics?dimension=dx:pfhawHn1Nss&dimension=pe:2026&filter=ou:ImspTQPwCqd');
+    const noDx = await ctx.healSavedObjectAsDataItem('analytics?dimension=ou:ImspTQPwCqd;LEVEL-2&dimension=pe:2026');
+    truthy('a real data item is left alone (and looked up only once); a query with no data items makes no lookup',
+      !plain.healed && !plain.refusal && !plain2.healed && lookups.length === before + 1 && !noDx.healed);
+    ctx.safeDhis2Fetch = async (p) => (/^metadata/.test(p) ? { _error: 'DHIS2 API 500', _status: 500 } : {});
+    run('_savedObjectByUid.clear()');
+    const down = await ctx.healSavedObjectAsDataItem('analytics?dimension=dx:YMQkujLUT3e&dimension=pe:2026');
+    truthy('a failed lookup never blocks the query', !down.healed && !down.refusal);
+    // End to end through dhis2_query with the thread's exact first failing call.
+    ctx.safeDhis2Fetch = savedFetch;
+    run('_savedObjectByUid.clear()');
+    const sf2 = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p, o) => {
+      if (/^metadata\?visualizations=true|^analytics|^programIndicators|^programs/.test(p)) {
+        if (/^metadata\?visualizations=true/.test(p)) return { visualizations: meta.visualizations.slice(), maps: [], eventVisualizations: [], dashboards: [] };
+        if (/^analytics/.test(p)) { sent.push(p); return { headers: [], rows: [['HtpydimkL0Y', '2026', '1156'], ['oVYCRemY0xE', '2026', '202']] }; }
+        return {};
+      }
+      return sf2(p, o);
+    };
+    const q = await ctx.executeTool('dhis2_query', { method: 'GET', path: 'analytics?dimension=dx%3AYMQkujLUT3e%3BXJruzyOnBWS&dimension=pe%3A2026&filter=ou%3AImspTQPwCqd' });
+    truthy('dhis2_query: the thread\'s first 409 query now returns the two tiles\' values and says what was corrected (_query_corrected, _sent_path)',
+      q && Array.isArray(q.rows) && q.rows.length === 2 && /HtpydimkL0Y;oVYCRemY0xE/.test(q._sent_path || '') && /dashboard tile, not a data item/.test(q._query_corrected || '') && /dx:HtpydimkL0Y;oVYCRemY0xE/.test(sent[sent.length - 1]));
+  } finally { ctx.safeDhis2Fetch = savedFetch; run('_savedObjectByUid.clear()'); }
+
+  // 3. Same query, parameters reordered = the same call for the loop guards.
+  truthy('a query with reordered parameters has the same call signature',
+    ctx.failedCallSignature('dhis2_query', { method: 'GET', path: 'analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou:ImspTQPwCqd&stage=WZbXY0S00lP&startDate=2026-01-01' })
+      === ctx.failedCallSignature('dhis2_query', { method: 'GET', path: 'analytics/events/aggregate/WSGAb5XwJ3Y?stage=WZbXY0S00lP&startDate=2026-01-01&dimension=ou:ImspTQPwCqd' }));
+
+  // 4. Dashboard: insert at a place, reorder, no same-name duplicate.
+  const savedD = { sdf: ctx.safeDhis2Fetch, wa: d.writeAuth, consent: d.harnessSkipBackupConsent, base: d.baseUrl };
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  d.harnessSkipBackupConsent = true;
+  d.baseUrl = d.baseUrl || 'https://verify.example/dhis';
+  const viz = (id, name, type, rows, columns) => ({ id, displayName: name, type, rows, columns });
+  const vizList = [
+    ...['KpiA', 'KpiB', 'KpiC', 'KpiD'].map((k) => viz(`Viz${k}0000`.slice(0, 11), `KPI ${k}`, 'SINGLE_VALUE', [], [{ dimension: 'dx', items: [{ id: 'a' }] }])),
+    viz('VizChart000', 'Monthly records', 'COLUMN', [{ dimension: 'pe', items: Array.from({ length: 12 }, (_, i) => ({ id: `2026${String(i + 1).padStart(2, '0')}` })) }], [{ dimension: 'dx', items: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }, { id: 'e' }] }]),
+    viz('VizPivot000', 'District summary', 'PIVOT_TABLE', [{ dimension: 'ou', items: [{ id: 'ImspTQPwCqd' }, { id: 'LEVEL-2' }] }], [{ dimension: 'dx', items: [{ id: 'a' }, { id: 'b' }] }]),
+  ];
+  const tiles0 = [
+    ...[0, 15, 30, 45].map((x, i) => ({ id: `ItemKpi000${i}`, type: 'VISUALIZATION', x, y: 0, width: 15, height: 9, visualization: { id: vizList[i].id } })),
+    { id: 'ItemChart00', type: 'VISUALIZATION', x: 0, y: 9, width: 60, height: 20, visualization: { id: 'VizChart000' } },
+    { id: 'ItemPivot00', type: 'VISUALIZATION', x: 0, y: 29, width: 60, height: 25, visualization: { id: 'VizPivot000' } },
+    { id: 'ItemList000', type: 'EVENT_VISUALIZATION', x: 0, y: 54, width: 60, height: 24, eventVisualization: { id: 'EvList00001' } },
+    { id: 'ItemList001', type: 'EVENT_VISUALIZATION', x: 0, y: 78, width: 60, height: 24, eventVisualization: { id: 'EvList00002' } },
+  ];
+  let stored = JSON.parse(JSON.stringify(tiles0));
+  const posts = [];
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    if (o.method === 'POST' || o.method === 'PUT') {
+      const body = typeof o.body === 'string' ? JSON.parse(o.body) : o.body;
+      posts.push({ p, body });
+      const dash = body?.dashboards?.[0];
+      if (dash && !/importMode=VALIDATE/.test(p)) stored = dash.dashboardItems;
+      return { status: 'OK', httpStatus: 'OK', response: { status: 'OK', stats: { created: 0, updated: 1, deleted: 0, ignored: 0, total: 1 }, typeReports: [] } };
+    }
+    if (/^dashboards\/DashMaps001\?fields=:owner/.test(p)) return { id: 'DashMaps001', name: 'Maternal Care and Follow-up', dashboardItems: JSON.parse(JSON.stringify(stored)) };
+    if (/^dashboards\/DashMaps001\?fields=dashboardItems/.test(p)) return { dashboardItems: stored };
+    if (/^dashboards\/DashMaps001\?fields=id,displayName/.test(p)) return { id: 'DashMaps001', displayName: 'Maternal Care and Follow-up', dashboardItems: stored.map(it => ({ ...it, ...(it.visualization ? { visualization: { ...it.visualization, displayName: 'V', type: 'SINGLE_VALUE', dataDimensionItems: [{ dataDimensionItemType: 'PROGRAM_INDICATOR', programIndicator: { id: 'HtpydimkL0Y', displayName: 'PI' } }] } } : {}) })) };
+    if (/^dashboards\?filter=name:ilike/.test(p)) return { dashboards: [{ id: 'DashMaps001', name: 'Maternal Care and Follow-up' }] };
+    if (/^visualizations\?filter=id:in/.test(p)) return { visualizations: vizList };
+    if (/^eventVisualizations\?filter=id:in/.test(p)) return { eventVisualizations: [{ id: 'EvList00001', displayName: 'Registrations', type: 'LINE_LIST' }, { id: 'EvList00002', displayName: 'Low Hb visits', type: 'LINE_LIST' }] };
+    if (/^maps\/(MapChoro001|MapBubble01)\?fields=id,displayName/.test(p)) return { id: p.slice(5, 16), displayName: 'Map' };
+    if (/^organisationUnits\?filter=level:eq:2/.test(p)) return { pager: { total: 13 }, organisationUnits: [] };
+    if (/^dataStore/.test(p)) return { status: 'OK' };
+    return {};
+  };
+  const readingOrder = () => ctx.dashboardReadingOrder(stored).map(it => it.id || it.map?.id);
+  const wellFormed = (items) => items.every((a, i) => items.every((b, j) => i === j || a.y + a.height <= b.y || b.y + b.height <= a.y || a.x + a.width <= b.x || b.x + b.width <= a.x));
+  try {
+    const badAnchor = await ctx.executeTool('manage_dashboards', { action: 'add_items', dashboard_id: 'DashMaps001', insert_after_item_id: 'VizPivot000', items: [{ type: 'MAP', map_id: 'MapChoro001' }] });
+    truthy('add_items with a chart id instead of a tile id as the anchor is refused, listing the tile ids, and nothing is written',
+      /No tile with item_id "VizPivot000"/.test(badAnchor._error || '') && /ItemPivot00/.test(badAnchor._hint || '') && posts.length === 0);
+    const ins = await ctx.executeTool('manage_dashboards', { action: 'add_items', dashboard_id: 'DashMaps001', insert_after_item_id: 'ItemPivot00', items: [{ type: 'MAP', map_id: 'MapChoro001' }, { type: 'MAP', map_id: 'MapBubble01' }, { type: 'TEXT', text: 'About this dashboard' }] });
+    const order = ctx.dashboardReadingOrder(stored);
+    const at = (id) => order.findIndex(it => it.id === id);
+    const maps = order.filter(it => it.type === 'MAP');
+    truthy('add_items insert_after_item_id puts the two maps and the note between the district table and the line lists; the maps share a row, KPIs keep 15 columns, nothing overlaps',
+      ins && ins.success && at('ItemPivot00') === 5 && order[6].type === 'MAP' && order[7].type === 'MAP' && order[8].type === 'TEXT' && at('ItemList000') === 9
+      && maps.length === 2 && maps[0].y === maps[1].y && maps[0].width === 30 && order.slice(0, 4).every(it => it.width === 15 && it.y === 0) && wellFormed(stored) && Array.isArray(ins.tile_rows) && /after tile ItemPivot00/.test(ins.inserted || ''));
+    const textId = order[8].id;
+    const ar = await ctx.executeTool('manage_dashboards', { action: 'arrange', dashboard_id: 'DashMaps001', order: [textId, 'ItemKpi0000', 'ItemKpi0001', 'ItemKpi0002', 'ItemKpi0003', 'ItemChart00', 'ItemPivot00'] });
+    const o2 = ctx.dashboardReadingOrder(stored).map(it => it.id);
+    truthy('arrange order puts the tiles in the given reading order; the tiles it leaves out follow in their current order and are reported',
+      ar && ar.success && o2[0] === textId && o2[1] === 'ItemKpi0000' && o2[6] === 'ItemPivot00' && stored.find(it => it.id === o2[7]).type === 'MAP' && o2[9] === 'ItemList000' && o2[10] === 'ItemList001' && /4 tile\(s\) were not in order/.test(ar._unlisted_tiles || '') && wellFormed(stored));
+    const badOrder = await ctx.executeTool('manage_dashboards', { action: 'arrange', dashboard_id: 'DashMaps001', order: ['VizChart000'] });
+    truthy('arrange refuses an order with a chart id instead of a tile id', /No tile with item_id VizChart000/.test(badOrder._error || ''));
+    const nPosts = posts.length;
+    const dup = await ctx.executeTool('manage_dashboards', { action: 'create_dashboard', dashboard: { name: 'maternal care and follow-up ' }, items: [{ visualization_id: 'VizChart000' }] });
+    truthy('create_dashboard with the name of an existing dashboard is refused (case and spaces ignored), pointing to add_items / arrange — nothing is written',
+      dup._scope === 'dashboard_name_exists' && dup._existing_dashboard?.id === 'DashMaps001' && /insert_after_item_id/.test(dup._hint) && /arrange/.test(dup._hint) && posts.length === nPosts);
+    const g = await ctx.executeTool('manage_dashboards', { action: 'get', dashboard_id: 'DashMaps001' });
+    truthy('get lists tiles in reading order with position, and each chart\'s data_items',
+      g && g.success && g.items[0].position === 1 && g.items[0].id === textId && g.items.find(it => it.visualization)?.visualization?.data_items?.[0]?.id === 'HtpydimkL0Y' && /TILE id/.test(g._items_note || ''));
+  } finally { ctx.safeDhis2Fetch = savedD.sdf; d.writeAuth = savedD.wa; d.harnessSkipBackupConsent = savedD.consent; d.baseUrl = savedD.base; }
+  // 5. Maps: colour scale saved as hex colours, boundary layer, no-data colour.
+  {
+    const typeMap = { pfhawHn1Nss: 'PROGRAM_INDICATOR', ekz3G3R5noc: 'PROGRAM_INDICATOR' };
+    const bub = ctx.buildMapObject({ name: 'Facilities', data_item: 'ekz3G3R5noc', org_unit_level: 4, org_units: ['ImspTQPwCqd'], period: '2026', thematic_map_type: 'BUBBLE', boundary_level: 2, program_id: 'WSGAb5XwJ3Y' }, typeMap);
+    const th = bub.map.mapViews.find(v => v.layer === 'thematic'), bd = bub.map.mapViews[0];
+    truthy('maps: the default colour scale is saved as 5 hex colours (a bare "YlOrRd" draws every bubble black); boundary_level adds a level-2 outline layer beneath the data under the same parent',
+      th.colorScale.split(',').length === 5 && th.colorScale.split(',').every(c => /^#[0-9a-f]{6}$/i.test(c)) && th.classes === 5
+      && bd.layer === 'boundary' && bd.organisationUnitLevels[0] === 2 && bd.organisationUnits[0].id === 'ImspTQPwCqd' && /LEVEL-2/.test(JSON.stringify(bd.rows)) && bub.map.mapViews[1] === th);
+    const ch = ctx.buildMapObject({ name: 'Districts', data_item: 'pfhawHn1Nss', org_unit_level: 2, period: '2026', color_scale: 'blues', classes: 3, no_data_color: '#D9D9D9' }, typeMap);
+    const own = ctx.buildMapObject({ name: 'D', data_item: 'pfhawHn1Nss', org_unit_level: 2, color_scale: '#fee5d9,#fcae91,#fb6a4a,#cb181d' }, typeMap);
+    const badScale = ctx.buildMapObject({ name: 'D', data_item: 'pfhawHn1Nss', org_unit_level: 2, color_scale: 'Rainbow' }, typeMap);
+    const badNoData = ctx.buildMapObject({ name: 'D', data_item: 'pfhawHn1Nss', org_unit_level: 2, no_data_color: 'grey' }, typeMap);
+    truthy('maps: a named scale in any case gives that many classes, a hex list is kept (4 classes), no_data_color is saved; an unknown scale or a non-hex no-data colour is refused',
+      ch.map.mapViews.length === 1 && ch.map.mapViews[0].colorScale === '#f7fbff,#6baed6,#08306b' && ch.map.mapViews[0].noDataColor === '#D9D9D9'
+      && own.map.mapViews[0].colorScale === '#fee5d9,#fcae91,#fb6a4a,#cb181d' && own.map.mapViews[0].classes === 4 && /Rainbow/.test(badScale._error || '') && /no_data_color/.test(badNoData._error || ''));
+  }
+  truthy('the manage_dashboards schema offers insert_after_item_id / insert_before_item_id and arrange order',
+    (() => { const t = vm.runInContext('TOOLS', ctx).find(x => x.function.name === 'manage_dashboards'); const p = t.function.parameters.properties; return p.insert_after_item_id && p.insert_before_item_id && p.order && /insert_after_item_id/.test(t.function.description); })());
+}
+
+// Malaria Case Explorer (2026-11-01, play 2.42.7): the app showed 0 of
+// 100,332 events — tracker/events with orgUnit=<country> and no orgUnitMode
+// (DHIS2 defaults to SELECTED). And its first preview called the program's
+// real ids "not on this server": the connection follows the focused tab, and
+// a tab on another server mid-turn moved the rest of the turn there.
+async function runAppOrgUnitAndServerPinChecks() {
+  console.log('\nCustom-app tracker org-unit mode + a running request stays on its server:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+  const lint = (src) => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, 'app', kitMeta).errors.filter((e) => /orgUnitMode/.test(e.message));
+  const root = "\nReactDOMClient.createRoot(document.getElementById('root')).render(<A />);";
+  const Q = (extra) => `const { useDataQuery } = D2Runtime;\nconst EVENTS = { list: { resource: 'tracker/events', params: (v) => ({ program: v.p, orgUnit: v.ou${extra}, page: v.page, pageSize: 50, totalPages: true, fields: 'event,orgUnit,occurredAt' }) } };\nconst A = () => { const { data } = useDataQuery(EVENTS, { variables: { p: 'x', ou: 'y', page: 1 } }); return null; };` + root;
+  truthy('the thread\'s query (tracker/events with orgUnit, no orgUnitMode) is refused, naming DESCENDANTS and the 0-records symptom',
+    lint(Q('')).some((e) => /DESCENDANTS/.test(e.message) && /shows 0 records/.test(e.message)));
+  truthy('…passes with orgUnitMode DESCENDANTS or an explicit SELECTED; an orgUnit read only in fields or from a record is not flagged',
+    !lint(Q(", orgUnitMode: 'DESCENDANTS'")).length && !lint(Q(", orgUnitMode: 'SELECTED'")).length
+    && !lint("const { useDataQuery } = D2Runtime;\nconst E = { l: { resource: 'tracker/events', params: { program: 'x', orgUnitMode: 'ACCESSIBLE', fields: 'event,orgUnit' } } };\nconst A = () => { const { data } = useDataQuery(E); const ou = data && data.l.events[0].orgUnit; return null; };" + root).length);
+  truthy('a URL-string query (tracker/enrollments?orgUnit=…) without orgUnitMode is refused too',
+    lint("const { useDataQuery } = D2Runtime;\nconst E = { l: { resource: 'tracker/enrollments?orgUnit=abc&program=x' } };\nconst A = () => { useDataQuery(E); return null; };" + root).length === 1);
+  const cheat = vm.runInContext('TOOLS', ctx).find((t) => t.function.name === 'dhis2_query').function.description;
+  truthy('the dhis2_query tracker examples carry orgUnitMode=DESCENDANTS', /tracker\/events\?[^\n]*orgUnitMode=DESCENDANTS/.test(cheat) && !/tracker\/events\?program=\{id\}&programStage=\{id\}&orgUnit=\{id\}&fields/.test(cheat));
+
+  // The UID refusal names the server it checked.
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async () => ({ system: { version: '2.42.5' } });
+    try {
+      const r = await ctx.checkCustomAppUids(['VBqh0ynB2wv']);
+      truthy('the app id check reports which server it asked', r.unknown.length === 1 && r.server === d.baseUrl);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  // A running request stays on its server.
+  const saved = { base: d.baseUrl, connected: d.connected, init: ctx.initializeFromUrl };
+  const switched = [];
+  d.baseUrl = 'https://play.im.dhis2.org/stable-2-42-7-1'; d.connected = true;
+  try {
+    ctx.beginServerPinnedTurn();
+    const held = await ctx.initializeFromUrlNow('http://localhost:8081/dhis-web-capture/index.html#/');
+    truthy('during a turn, a focused tab on another DHIS2 server does not move the connection (held, base URL unchanged)',
+      held && held.deferred && /localhost:8081/.test(held.deferred) && d.baseUrl === 'https://play.im.dhis2.org/stable-2-42-7-1');
+    const same = ctx.heldServerSwitch('https://play.im.dhis2.org/stable-2-42-7-1', 'https://play.im.dhis2.org/stable-2-42-7-1/apps/capture');
+    truthy('…same-server navigation during the turn is not held', same === null);
+    vm.runInContext('initializeFromUrl = (u) => { globalThis.__switchedTo = u; return Promise.resolve({ success: true }); };', ctx);
+    await ctx.endServerPinnedTurn();
+    truthy('when the turn ends, the held switch to the focused tab\'s server is applied', vm.runInContext('globalThis.__switchedTo', ctx) === 'http://localhost:8081/dhis-web-capture/index.html#/');
+    vm.runInContext('globalThis.__switchedTo = null;', ctx);
+    const free = ctx.heldServerSwitch('http://localhost:8081', 'http://localhost:8081/dhis-web-capture/');
+    truthy('…and with no turn running, switching servers works as before', free === null);
+  } finally {
+    vm.runInContext('initializeFromUrl = __savedInit;', Object.assign(ctx, { __savedInit: saved.init }));
+    d.baseUrl = saved.base; d.connected = saved.connected;
+  }
+  truthy('runAgenticLoop pins the server for the turn and applies a held switch at the end',
+    (() => { const src = vm.runInContext('runAgenticLoop.toString()', ctx); return /beginServerPinnedTurn\(\)/.test(src) && /endServerPinnedTurn\(\)/.test(src); })());
+}
+
+// Inpatient Outcomes Explorer (2026-11-01, play 2.42.7): "Create an app …
+// Keep the app read-only. Include helpful loading, error, invalid-filter, and
+// empty-result messages." was classified read-only ("read-only" anywhere) AND
+// a save-failure report ("loading, error"), so the save-diagnosis strip
+// withheld every write tool and the model said manage_custom_app was missing.
+async function runAppRequestRoutingChecks() {
+  console.log('\nApp requests that describe a read-only app and its error messages are still build requests:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const ask = 'Create an app called “Inpatient Outcomes Explorer” for the Inpatient morbidity and mortality program. Use only program metadata to identify the fields. Do not fetch, sample, open, or inspect patient records while building or checking the app. Include a “Needs review” view. Keep the app read-only. Include helpful loading, error, invalid-filter, and empty-result messages. Keep missing answers separate from zero or No. Do not create test patient records in DHIS2 or validate against existing records. When finished, give me the app URL.';
+  const savedWa = d.writeAuth;
+  try {
+    d.writeAuth = ctx.classifyWriteAuthorization(ask);
+    const tools = ctx.getContextualTools({ appType: 'Dashboard' }, ask, false, ask).map((t) => t.function.name);
+    truthy('the thread\'s request is a write request, not a save-failure report, and manage_custom_app is offered (the strip left 8 read tools before)',
+      d.writeAuth.scope !== 'read_only' && !ctx.reportsSaveFailure(ask) && !ctx.isSaveDiagnosisReadOnly(ask) && tools.includes('manage_custom_app') && tools.length > 8);
+    const sp = await ctx.buildSystemPrompt(ask, false, false, ask);
+    truthy('…and its system prompt has the custom-app section, not "Save / Load failure diagnosis"', /manage_custom_app/.test(sp) && !/Save \/ Load failure diagnosis/.test(sp));
+  } finally { d.writeAuth = savedWa; }
+  const scope = (t) => ctx.classifyWriteAuthorization(t).scope;
+  truthy('"read-only" about the request still means no changes ("read-only please", "stay read-only", "work in read-only mode"); about the app being built it does not',
+    scope('Check the rules on this program, read-only please.') === 'read_only' && scope('Fix nothing — stay read-only and tell me what is wrong.') === 'read_only'
+    && scope('Work in read-only mode and list the stages.') === 'read_only' && scope('Create an app that lists events. Keep the app read-only.') !== 'read_only');
+  truthy('"no changes" alone still refuses; "no changes to <object>" inside a build request is a constraint, not a refusal',
+    scope('Explain the program indicators, no changes.') === 'read_only' && scope('Build a dashboard for the ANC program with no changes to the program itself.') !== 'read_only');
+  truthy('real failure reports still switch to save diagnosis ("error saving the enrollment", "an error message when saving", "fails to load")',
+    ctx.reportsSaveFailure('I get an error saving the enrollment in Capture') && ctx.reportsSaveFailure('I get an error message when saving the event')
+    && ctx.reportsSaveFailure('The enrollment page fails to load') && !ctx.reportsSaveFailure('Build an app with clear loading, error, and no-results messages'));
+}
+
+// Inpatient app, second attempt (2026-11-01): four previews refused for
+// correct code — a quote inside a regex (the CSV escape /"/g) made the source
+// scanner blank the rest of the file ("Nothing is rendered", "<App> is used
+// but never declared"). The same turn counted 1,021 events for a program with
+// 54,022: DHIS2's event-analytics cache answered with another program's entry.
+async function runAppScannerAndAnalyticsCacheChecks() {
+  console.log('\nApp source scanner (regex literals, template expressions) + analytics cache mismatches + tracker orgUnitMode:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+  const lintErrors = (src) => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, 'app', kitMeta).errors.map((e) => e.message);
+  const tail = "\nfunction Alerts() { return null; }\nfunction App() { return <div>Hi</div>; }\nconst CONFIG = { baseUrl: D2_APP_CONFIG.baseUrl, apiVersion: D2_APP_CONFIG.apiVersion };\nReactDOMClient.createRoot(document.getElementById('root')).render(<Provider config={CONFIG}><App /><Alerts /></Provider>);";
+  const head = 'const { Provider } = D2Runtime;\n';
+  const tricky = [
+    "const csvCell = (v) => '\"' + String(v == null ? '' : v).replace(/\"/g, '\"\"') + '\"';\n",
+    "const clean = (s) => String(s).replace(/'/g, '');\n",
+    "const needsQuote = (s) => /[\",\\n]/.test(s);\n",
+    "const noTicks = (s) => s.replace(/`/g, '');\n",
+    "const label = (a, b) => `${a} (${b ? `code ${b}` : 'none'})`;\n",
+  ];
+  truthy('the thread\'s CSV escape (and quotes / backticks inside regexes, nested templates) no longer hide the render call or the components after them',
+    tricky.every((mid) => lintErrors(head + mid + tail).length === 0));
+  truthy('…while a file that really has no render call is still refused', lintErrors(head + tricky[0] + 'function App() { return null; }').some((m) => /Nothing is rendered/.test(m)));
+  const v = ctx.customAppSourceViews('const z = {} / 1; eval("x") / 1; const t = `a ${ eval(`b ${y}`) } c`; const r = /["]/g;');
+  truthy('the safety scan still sees code after a division and inside template ${…} (eval stays visible); positions are preserved',
+    (v.bare.match(/eval\(/g) || []).length === 2 && v.bare.length === v.code.length && /const r = \/ {3}\/g;/.test(v.bare));
+  const safety = ctx.scanCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', head + tricky[0] + 'const s = localStorage.getItem("k");' + tail).code });
+  truthy('…and a rule violation after the CSV escape is reported (it was blanked out before)', safety.some((x) => /localStorage/.test(x.match)));
+
+  // Loop guard: a listed-problems refusal repeats only when the problems repeat.
+  {
+    const saved = { f: d.failedCallSigs, fam: d.toolErrorFamilies };
+    d.failedCallSigs = new Map(); d.toolErrorFamilies = new Map();
+    try {
+      const refusal = (msgs) => ({ _error: `The code would fail at runtime: ${msgs.length} problem(s).`, problems: msgs.map((message) => ({ message })) });
+      const a = ctx.noteToolFailure('manage_custom_app', { action: 'preview', n: 1 }, refusal(['Nothing is rendered: call …']));
+      const b = ctx.noteToolFailure('manage_custom_app', { action: 'preview', n: 2 }, refusal(['<App> is used but never declared', '<Alerts> is used but never declared']));
+      const c = ctx.noteToolFailure('manage_custom_app', { action: 'preview', n: 3 }, refusal(['Nothing is rendered: call …']));
+      truthy('different lint problems are different failures for the loop guard; the same problem again counts as a repeat', a.famCount === 1 && b.famCount === 1 && c.famCount === 2);
+    } finally { d.failedCallSigs = saved.f; d.toolErrorFamilies = saved.fam; }
+  }
+
+  // Analytics answered from another program's / stage's cache entry.
+  const savedFetch = ctx.safeDhis2Fetch;
+  const progs = vm.runInContext('typeof _knownProgramsCache !== "undefined" ? _knownProgramsCache : null', ctx);
+  vm.runInContext('_knownProgramsCache = new Map([["eBAyeGv0exc","Inpatient morbidity and mortality"],["WSGAb5XwJ3Y","WHO RMNCH Tracker"]]); _knownProgramsCacheTs = Date.now(); _programStageIdsCache.set("WSGAb5XwJ3Y", new Set(["WZbXY0S00lP","edqlbukwRfQ"]));', ctx);
+  try {
+    const rmnchAnswer = { rows: [['ImspTQPwCqd', '1021']], metaData: { items: { WSGAb5XwJ3Y: { name: 'WHO RMNCH Tracker' }, WZbXY0S00lP: { name: 'First antenatal care visit' }, ImspTQPwCqd: { name: 'Sierra Leone' } } } };
+    const prog = await ctx.analyticsCacheMismatch('analytics/events/aggregate/eBAyeGv0exc?dimension=ou:USER_ORGUNIT&stage=Zj7UnCAulEk&startDate=2026-01-01&endDate=2026-12-31', rmnchAnswer);
+    const stage = await ctx.analyticsCacheMismatch('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou:ImspTQPwCqd&stage=edqlbukwRfQ&startDate=2026-07-03&endDate=2026-07-21', rmnchAnswer);
+    const same = await ctx.analyticsCacheMismatch('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou:ImspTQPwCqd&stage=WZbXY0S00lP&startDate=2026-07-03&endDate=2026-07-21', rmnchAnswer);
+    const noMeta = await ctx.analyticsCacheMismatch('analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd&skipMeta=true', { rows: [['x', '1']] });
+    truthy('an event-analytics answer that names another program (the thread: RMNCH\'s 1,021 for Inpatient) or another stage of the same program is refused; a matching or meta-less answer passes',
+      prog?._analytics_cache_mismatch?.answered === 'WSGAb5XwJ3Y' && /another program \("WHO RMNCH Tracker"/.test(prog._error) && stage?._analytics_cache_mismatch?.kind === 'stage' && /First antenatal care visit/.test(stage._error) && same === null && noMeta === null);
+    // count_records: a mismatched analytics answer → live tracker count.
+    const calls = [];
+    ctx.safeDhis2Fetch = async (p) => {
+      calls.push(p);
+      if (/^programStages\/Zj7UnCAulEk/.test(p)) return { program: { id: 'eBAyeGv0exc' } };
+      if (/^analytics\/events\/aggregate\/eBAyeGv0exc/.test(p)) return { _error: 'DHIS2 answered this analytics query with the cached result of another program', _analytics_cache_mismatch: { requested: 'eBAyeGv0exc', answered: 'WSGAb5XwJ3Y', kind: 'program' } };
+      if (/^tracker\/events\?/.test(p)) return { pager: { page: 1, pageSize: 1, total: 54022 } };
+      return {};
+    };
+    const savedOu = d.orgUnitContext;
+    const c = await ctx.executeTool('count_records', { record_type: 'events', program_override: 'eBAyeGv0exc', stage_id: 'Zj7UnCAulEk', date_after: '2026-01-01', date_before: '2026-12-31', include_children: true });
+    const tr = calls.find((p) => /^tracker\/events\?/.test(p)) || '';
+    truthy('count_records then counts the live records (54,022 in the thread, not 1,021) and says why; with no org unit it counts the user\'s own units (CAPTURE), not orgUnit=USER_ORGUNIT',
+      c.count === 54022 && c._method === 'tracker_live_count' && /cache/.test(c._note || '') && /ouMode=CAPTURE|orgUnitMode=CAPTURE/.test(tr) && !/orgUnit=USER_ORGUNIT/.test(tr));
+    d.orgUnitContext = savedOu;
+  } finally {
+    ctx.safeDhis2Fetch = savedFetch;
+    vm.runInContext(`_knownProgramsCache = ${progs ? 'null' : 'null'}; _knownProgramsCacheTs = 0; _programStageIdsCache.delete("WSGAb5XwJ3Y");`, ctx);
+  }
+
+  // tracker/* ouMode → orgUnitMode on 2.41+ (ouMode is silently ignored there).
+  {
+    const savedF = ctx.fetch; const savedVer = d.apiVersion; const savedBase = d.baseUrl;
+    const urls = [];
+    ctx.fetch = (url) => { urls.push(String(url)); return Promise.resolve({ ok: true, status: 200, type: 'basic', text: async () => '{"pager":{"page":1,"pageSize":1,"total":5},"events":[]}' }); };
+    d.baseUrl = d.baseUrl || 'https://verify.example/dhis';
+    try {
+      d.apiVersion = '42';
+      await ctx.__realSafeDhis2Fetch('tracker/enrollments?program=WSGAb5XwJ3Y&orgUnit=ImspTQPwCqd&ouMode=DESCENDANTS&pageSize=1&totalPages=true');
+      d.apiVersion = '40';
+      await ctx.__realSafeDhis2Fetch('tracker/enrollments?program=WSGAb5XwJ3Y&orgUnit=ImspTQPwCqd&ouMode=DESCENDANTS&pageSize=1&totalPages=true');
+      truthy('on 2.41+ a tracker request\'s ouMode is sent as orgUnitMode (2.42/2.43 ignore ouMode and answer 0); 2.40 keeps ouMode',
+        /orgUnitMode=DESCENDANTS/.test(urls[0]) && !/[?&]ouMode=/.test(urls[0]) && /[?&]ouMode=DESCENDANTS/.test(urls[1]));
+    } finally { ctx.fetch = savedF; d.apiVersion = savedVer; d.baseUrl = savedBase; }
+  }
+}
+
 // Security review 2026-10-29: patient data in model payloads, write scope,
 // skip_backup consent, generated-app runtime policy, multilingual intent.
 async function runSecurityReviewChecks() {
@@ -3386,6 +3753,10 @@ setImmediate(async () => {
   if (loaded) await runDashboardThreadChecks().catch((e) => bad(`dashboard-thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runSecurityReviewChecks().catch((e) => bad(`security-review checks threw: ${e && e.stack || e}`));
   if (loaded) await runDashboardLayoutChecks().catch((e) => bad(`dashboard layout checks threw: ${e && e.stack || e}`));
+  if (loaded) await runDashboardMapsTurnChecks().catch((e) => bad(`dashboard maps-turn checks threw: ${e && e.stack || e}`));
+  if (loaded) await runAppOrgUnitAndServerPinChecks().catch((e) => bad(`app org-unit / server-pin checks threw: ${e && e.stack || e}`));
+  if (loaded) await runAppRequestRoutingChecks().catch((e) => bad(`app request routing checks threw: ${e && e.stack || e}`));
+  if (loaded) await runAppScannerAndAnalyticsCacheChecks().catch((e) => bad(`app scanner / analytics cache checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

@@ -887,6 +887,7 @@ async function executeToolCall(name, args) {
       }
     }
 
+    const queryNotes = []; // corrections made to the query, returned with its result
     if (method === 'GET' && isAnalyticsPath(safePath)) {
       const ctxVizId = ctx.visualizationId || dhis2.visualizationContext?.id || extractVisualizationIdFromText(lastUserText);
       safePath = await enrichAnalyticsPathWithVisualizationContext(safePath, ctxVizId);
@@ -918,6 +919,14 @@ async function executeToolCall(name, args) {
       if (stageHeal.healed) {
         console.log(`[dhis2_query] Stage UID moved from dimension= to stage= → ${stageHeal.path}`);
         safePath = stageHeal.path;
+      }
+      // A saved chart / map id used as a data item → the items it plots.
+      const savedHeal = await healSavedObjectAsDataItem(safePath);
+      if (savedHeal.refusal) return savedHeal.refusal;
+      if (savedHeal.healed) {
+        console.log(`[dhis2_query] Saved chart/map id swapped for its data items → ${savedHeal.path}`);
+        safePath = savedHeal.path;
+        queryNotes.push(savedHeal.note);
       }
       // visualizations/<id>/data is the chart IMAGE (PNG), not its values
       // (live 2026-10-28: two "non-JSON response" errors) — read the values
@@ -1039,6 +1048,24 @@ async function executeToolCall(name, args) {
     if (method === 'GET' && isAnalyticsPath(safePath) && writeResult && typeof writeResult === 'object' && Array.isArray(writeResult.rows)) {
       const note = analyticsPeriodRowsNote(safePath);
       if (note) writeResult._period_rows_note = note;
+    }
+    // A 404 on GET <collection>/<uid>: the id often exists as ANOTHER type (a
+    // dashboard tile's visualization id read as a program indicator — RMNCH
+    // 2026-11-01). Name what it really is so the next call is right.
+    if (method === 'GET' && writeResult && writeResult._status === 404) {
+      const one = safePath.split('?')[0].match(/^(?:\/?api\/(?:\d+\/)?)?([A-Za-z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
+      if (one && isLikelyDhisUid(one[2])) {
+        const io = await safeDhis2Fetch(`identifiableObjects/${one[2]}?fields=id,displayName,href`);
+        const realType = io && !io._error && (String(io.href || '').match(/\/api\/(?:\d+\/)?([A-Za-z]+)\/[A-Za-z][A-Za-z0-9]{10}$/) || [])[1];
+        if (realType && realType !== one[1]) {
+          writeResult._hint = `${one[2]} is not in ${one[1]}: it is ${realType}/${one[2]} ("${io.displayName || ''}").${realType === 'visualizations' || realType === 'maps' ? ' To check its numbers, read its data items (manage_dashboards get lists them per tile) and query those.' : ''}`;
+          writeResult._actual_type = realType;
+        }
+      }
+    }
+    if (queryNotes.length && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult)) {
+      writeResult._query_corrected = queryNotes.join(' ');
+      writeResult._sent_path = safePath;
     }
     return writeResult;
   }
@@ -1202,6 +1229,12 @@ async function executeToolCall(name, args) {
       }
 
       const result = await safeDhis2Fetch(path);
+      // Another program's / stage's cached answer: count the live records.
+      if (result._analytics_cache_mismatch) {
+        const live = await countViaTracker(pid, ouid, { ...args, include_children: includeChildren || userRootsDefault }, progName, ouName, stageName);
+        if (!live._error) return { ...live, _method: 'tracker_live_count', _note: `Counted live records: DHIS2's analytics cache answered with ${result._analytics_cache_mismatch.kind} ${result._analytics_cache_mismatch.answered}'s figure (a server cache defect), so the analytics number was not used.` };
+        return { _error: result._error, _hint: result._hint, _details: live._error, _method: 'analytics_cache_mismatch' };
+      }
       if (result._error) {
         return {
           _error: 'Unable to return a reliable org-unit-scoped count from analytics.',
@@ -4893,6 +4926,37 @@ function dashboardItemType(it) {
 
 // A tool-call item as dashboardTileInfos reads it (inline visualizations are
 // described by prepareInlineVisualizations instead of a lookup).
+// A dashboard's saved tiles in reading order: top to bottom, left to right
+// (tiles without a position last, in saved order).
+function dashboardReadingOrder(items) {
+  const pos = (v) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : Number.MAX_SAFE_INTEGER);
+  return (items || []).map((it, i) => ({ it, i }))
+    .sort((a, b) => (pos(a.it.y) - pos(b.it.y)) || (pos(a.it.x) - pos(b.it.x)) || (a.i - b.i)).map(o => o.it);
+}
+
+// What a SAVED dashboard item shows, as a dashboardTileInfos entry.
+function savedDashboardEntry(it) {
+  return {
+    type: it.type, vizId: it.visualization?.id || it.chart?.id || it.reportTable?.id || null,
+    evId: it.eventVisualization?.id || it.eventChart?.id || it.eventReport?.id || null, text: it.text, appKey: it.appKey,
+  };
+}
+
+// small / half / full of a saved tile, from its width on the 60-column grid.
+function savedDashboardTileSize(it) {
+  const w = Number(it.width);
+  if (!Number.isFinite(w) || w <= 0 || it.width === null) return undefined;
+  return w / DASH_GRID_COLS <= 0.34 ? 'small' : w / DASH_GRID_COLS <= 0.67 ? 'half' : 'full';
+}
+
+// Short label of a saved tile for results ("MAP % of first ANC … by district").
+function savedDashboardTileLabel(it) {
+  const name = it.visualization?.displayName || it.visualization?.name || it.map?.displayName || it.map?.name
+    || it.eventVisualization?.displayName || it.eventVisualization?.name || it.appKey
+    || (it.text ? String(it.text).replace(/\s+/g, ' ').slice(0, 60) : '');
+  return `${it.type}${name ? ` "${name}"` : ''}`;
+}
+
 function dashboardEntryOf(it, inlineVizId) {
   const type = dashboardItemType(it);
   return {
@@ -4972,7 +5036,12 @@ function dashTileNeeds(info, levelCounts = {}) {
   const t = String(info.itemType || 'VISUALIZATION').toUpperCase();
   const vt = String(info.vizType || '').toUpperCase();
   const name = String(info.name || '');
-  if (t === 'TEXT') return { kind: 'text', wide: true, h: Math.min(16, Math.max(4, 3 + Math.ceil(String(info.text || '').length / 110))), name: name || 'Text' };
+  // ~110 characters a line at laptop width, and every line break starts a
+  // line (a bulleted explanation is many short lines, not one long one).
+  if (t === 'TEXT') {
+    const lines = String(info.text || '').split('\n').reduce((n, l) => n + Math.max(1, Math.ceil(l.length / 110)), 0);
+    return { kind: 'text', wide: true, h: Math.min(24, Math.max(4, 3 + lines)), name: name || 'Text' };
+  }
   if (t === 'MAP') return { kind: 'map', wide: false, h: 20, name };
   if (t === 'EVENT_REPORT' || (t === 'EVENT_VISUALIZATION' && (!vt || vt === 'LINE_LIST' || vt === 'PIVOT_TABLE'))) return { kind: 'list', wide: true, h: 24, name };
   if (t === 'REPORT_TABLE') return { kind: 'table', wide: true, h: 20, name };
@@ -5325,6 +5394,34 @@ function buildVisualizationObject(spec, typeMap) {
 // period on `filters` pe. Program is auto-attached for program-indicator/event
 // layers. Returns { ok, map } or { _error }.
 const MAP_THEMATIC_TYPES = new Set(['CHOROPLETH', 'BUBBLE']);
+// A mapView's colorScale is a comma-separated list of hex colours, one per
+// class — what the Maps app saves (verified 2.42.7: "#eff3ff,#bdd7e7,…").
+// A scale NAME ("YlOrRd") saved as-is draws every class black (RMNCH bubble
+// map, 2026-11-01). ColorBrewer 9-class ramps; n classes take n evenly spaced.
+const MAP_COLOR_SCALES = Object.freeze({
+  YLORRD: '#ffffcc,#ffeda0,#fed976,#feb24c,#fd8d3c,#fc4e2a,#e31a1c,#bd0026,#800026',
+  YLORBR: '#ffffe5,#fff7bc,#fee391,#fec44f,#fe9929,#ec7014,#cc4c02,#993404,#662506',
+  REDS: '#fff5f0,#fee0d2,#fcbba1,#fc9272,#fb6a4a,#ef3b2c,#cb181d,#a50f15,#67000d',
+  BLUES: '#f7fbff,#deebf7,#c6dbef,#9ecae1,#6baed6,#4292c6,#2171b5,#08519c,#08306b',
+  GREENS: '#f7fcf5,#e5f5e0,#c7e9c0,#a1d99b,#74c476,#41ab5d,#238b45,#006d2c,#00441b',
+  ORANGES: '#fff5eb,#fee6ce,#fdd0a2,#fdae6b,#fd8d3c,#f16913,#d94801,#a63603,#7f2704',
+  PURPLES: '#fcfbfd,#efedf5,#dadaeb,#bcbddc,#9e9ac8,#807dba,#6a51a3,#54278f,#3f007d',
+  GREYS: '#ffffff,#f0f0f0,#d9d9d9,#bdbdbd,#969696,#737373,#525252,#252525,#000000',
+  YLGN: '#ffffe5,#f7fcb9,#d9f0a3,#addd8e,#78c679,#41ab5d,#238443,#006837,#004529',
+  YLGNBU: '#ffffd9,#edf8b1,#c7e9b4,#7fcdbb,#41b6c4,#1d91c0,#225ea8,#253494,#081d58',
+  RDYLGN: '#d73027,#f46d43,#fdae61,#fee08b,#ffffbf,#d9ef8b,#a6d96a,#66bd63,#1a9850',
+  GNYLRD: '#1a9850,#66bd63,#a6d96a,#d9ef8b,#ffffbf,#fee08b,#fdae61,#f46d43,#d73027',
+});
+function mapColorScale(scale, classes) {
+  const raw = String(scale || 'YlOrRd').trim();
+  const n = Math.min(9, Math.max(2, Number.isFinite(Number(classes)) ? Math.round(Number(classes)) : 5));
+  const given = raw.split(',').map(c => c.trim()).filter(Boolean);
+  if (given.length > 1 && given.every(c => /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(c))) return { colors: given.join(','), classes: given.length };
+  const ramp = MAP_COLOR_SCALES[raw.toUpperCase().replace(/[^A-Z]/g, '')];
+  if (!ramp) return { _error: `color_scale "${raw}" is not known. Use one of ${Object.keys(MAP_COLOR_SCALES).map(k => k[0] + k.slice(1).toLowerCase()).join(', ')} (ColorBrewer names, any case) or a comma-separated list of hex colours.` };
+  const all = ramp.split(',');
+  return { colors: Array.from({ length: n }, (_, i) => all[Math.round(i * (all.length - 1) / (n - 1))]).join(','), classes: n };
+}
 function buildMapObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
   const name = String(spec.name || '').trim();
@@ -5360,14 +5457,16 @@ function buildMapObject(spec, typeMap) {
 
   const thematicMapType = MAP_THEMATIC_TYPES.has(String(spec.thematic_map_type || '').toUpperCase())
     ? String(spec.thematic_map_type).toUpperCase() : 'CHOROPLETH';
+  const scale = mapColorScale(spec.color_scale, spec.classes);
+  if (scale._error) return scale;
   const mapViewId = generateDhis2Uid();
   const mapView = {
     id: mapViewId,
     layer: 'thematic',
     renderingStrategy: 'SINGLE',
     thematicMapType,
-    classes: Number.isFinite(Number(spec.classes)) ? Number(spec.classes) : 5,
-    colorScale: spec.color_scale || 'YlOrRd',
+    classes: scale.classes,
+    colorScale: scale.colors,
     aggregationType: spec.aggregation_type || 'DEFAULT',
     opacity: spec.opacity != null ? Number(spec.opacity) : 0.9,
     hideTitle: false,
@@ -5383,6 +5482,39 @@ function buildMapObject(spec, typeMap) {
   // method 1 = predefined legend (legendSet); 2 = equal intervals (auto colours).
   if (spec.legend_set_id) { mapView.legendSet = { id: spec.legend_set_id }; mapView.method = 1; }
   else { mapView.method = 2; }
+  // Places without data get their own colour (Maps app "no data" style);
+  // without it they are simply not drawn.
+  if (spec.no_data_color != null && spec.no_data_color !== '') {
+    const c = String(spec.no_data_color).trim();
+    if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(c)) return { _error: `no_data_color "${c}" is not a hex colour like "#CCCCCC".` };
+    mapView.noDataColor = c;
+  }
+
+  // boundary_level: an outline layer of that level (e.g. 2 = district
+  // boundaries) under the same parents, drawn beneath the data layer — the
+  // RMNCH thread (2026-11-01) asked for district boundaries on a facility
+  // bubble map and the map had none. Same shape as the Maps app's boundary
+  // layers (layer "boundary", organisationUnits + organisationUnitLevels).
+  const mapViews = [mapView];
+  if (spec.boundary_level != null && spec.boundary_level !== '') {
+    const bl = Number(spec.boundary_level);
+    if (!Number.isInteger(bl) || bl < 1) return { _error: `boundary_level must be an org-unit level number (e.g. 2 for districts), not "${spec.boundary_level}".` };
+    const parents = organisationUnits.length ? organisationUnits : [];
+    mapViews.unshift({
+      id: generateDhis2Uid(),
+      layer: 'boundary',
+      renderingStrategy: 'SINGLE',
+      opacity: 1,
+      hidden: false,
+      radiusLow: 5,
+      labels: false,
+      rows: [{ dimension: 'ou', items: [...parents.map(o => ({ id: o.id })), ...Object.keys(ouFlags).map(k => ({ id: Object.keys(VIZ_REL_OU).find(kw => VIZ_REL_OU[kw] === k) })).filter(x => x.id), { id: `LEVEL-${bl}` }] }],
+      organisationUnitSelectionMode: 'SELECTED',
+      organisationUnitLevels: [bl],
+      organisationUnits: parents.map(o => ({ id: o.id })),
+      ...ouFlags,
+    });
+  }
 
   const map = {
     id: spec.id || generateDhis2Uid(),
@@ -5391,7 +5523,7 @@ function buildMapObject(spec, typeMap) {
     latitude: spec.latitude != null ? Number(spec.latitude) : 0,
     longitude: spec.longitude != null ? Number(spec.longitude) : 0,
     zoom: spec.zoom != null ? Number(spec.zoom) : 3,
-    mapViews: [mapView],
+    mapViews,
   };
   return { ok: true, map, needsProgram: t === 'PROGRAM_INDICATOR' && !spec.program_id, dataItemId: item };
 }
@@ -5418,7 +5550,7 @@ async function executeManageMaps(args) {
   if (action === 'get') {
     const id = extractMapIdFromInput(args.map_id) || args.map_id;
     if (!id) return { _error: 'map_id required for get.' };
-    const resp = await safeDhis2Fetch(`maps/${id}?fields=id,name,basemap,mapViews[id,layer,thematicMapType,columns[dimension,items[id,dimensionItemType]],organisationUnitLevels,program[id,name],legendSet[id,name]]`);
+    const resp = await safeDhis2Fetch(`maps/${id}?fields=id,name,basemap,mapViews[id,layer,thematicMapType,noDataColor,columns[dimension,items[id,dimensionItemType]],organisationUnitLevels,program[id,name],legendSet[id,name]]`);
     if (resp?._error) return resp;
     return { map: resp };
   }
@@ -5452,18 +5584,22 @@ async function executeManageMaps(args) {
     const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
     if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
     const newId = resp?.response?.uid || built.map.id;
-    const periodWarning = await periodsMissThisYearWarning([itemId], [built.map.mapViews[0].filters[0].items[0].id]);
+    const thematic = built.map.mapViews.find(v => v.layer === 'thematic');
+    const boundary = built.map.mapViews.find(v => v.layer === 'boundary');
+    const periodWarning = await periodsMissThisYearWarning([itemId], [thematic.filters[0].items[0].id]);
     return {
       success: true,
       ...(periodWarning ? { _warning: periodWarning } : {}),
       map_id: newId,
       name: built.map.name,
       layer: 'thematic',
-      thematic_map_type: built.map.mapViews[0].thematicMapType,
+      thematic_map_type: thematic.thematicMapType,
       data_item: itemId,
-      org_unit_levels: built.map.mapViews[0].organisationUnitLevels,
-      period: built.map.mapViews[0].filters[0].items[0].id,
+      org_unit_levels: thematic.organisationUnitLevels,
+      period: thematic.filters[0].items[0].id,
       legend_set: spec.legend_set_id || null,
+      ...(boundary ? { boundary_layer: `level ${boundary.organisationUnitLevels[0]} outlines, beneath the data layer` } : {}),
+      ...(thematic.noDataColor ? { no_data_color: thematic.noDataColor } : {}),
       _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]) — or reference it in a new dashboard's items.`,
     };
   }
@@ -5543,20 +5679,26 @@ async function executeManageDashboards(args) {
   if (action === 'get') {
     const dId = args.dashboard_id || args.object_id;
     if (!dId) return { _error: 'dashboard_id required for get' };
+    // Data items of each chart / map, so a check of a tile's numbers queries
+    // them — not the tile's own visualization id (409, RMNCH 2026-11-01).
+    const dimItems = `dataDimensionItems[${SAVED_OBJECT_ITEM_FIELDS}]`;
     const resp = await safeDhis2Fetch(
       `dashboards/${dId}?fields=id,displayName,description,` +
-      `dashboardItems[id,type,x,y,width,height,text,appKey,visualization[id,displayName,type],map[id,displayName],eventVisualization[id,displayName,type]]`
+      `dashboardItems[id,type,x,y,width,height,text,appKey,visualization[id,displayName,type,${dimItems}],map[id,displayName,mapViews[${dimItems}]],eventVisualization[id,displayName,type]]`
     );
     if (resp?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
     if (resp?._error) return { _error: `Could not load dashboard ${dId}: ${resp._error}` };
-    const items = (resp.dashboardItems || []).map(it => {
+    const items = dashboardReadingOrder(resp.dashboardItems || []).map((it, k) => {
       const need = dashTileNeeds({ itemType: it.type, vizType: it.visualization?.type || it.eventVisualization?.type, name: it.visualization?.displayName || it.eventVisualization?.displayName || it.map?.displayName || '', text: it.text });
       const tooSmall = dashTileTooSmall(need, it.width, it.height);
+      const vizItems = it.visualization ? savedObjectDataItems(it.visualization.dataDimensionItems) : [];
+      const mapItems = it.map ? savedObjectDataItems((it.map.mapViews || []).flatMap(mv => mv.dataDimensionItems || [])) : [];
       return {
         id: it.id,
+        position: k + 1,
         type: it.type,
-        visualization: it.visualization ? { id: it.visualization.id, name: it.visualization.displayName, type: it.visualization.type } : undefined,
-        map: it.map ? { id: it.map.id, name: it.map.displayName } : undefined,
+        visualization: it.visualization ? { id: it.visualization.id, name: it.visualization.displayName, type: it.visualization.type, ...(vizItems.length ? { data_items: vizItems } : {}) } : undefined,
+        map: it.map ? { id: it.map.id, name: it.map.displayName, ...(mapItems.length ? { data_items: mapItems } : {}) } : undefined,
         line_list: it.eventVisualization ? { id: it.eventVisualization.id, name: it.eventVisualization.displayName } : undefined,
         app_key: it.appKey || undefined,
         text: it.text || undefined,
@@ -5566,7 +5708,9 @@ async function executeManageDashboards(args) {
     });
     const small = items.filter(it => it.too_small);
     return {
-      success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length, items,
+      success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length,
+      _items_note: 'items are in reading order (position 1 = top left). id is the TILE id (for arrange order / insert_after_item_id / remove_item); a tile\'s numbers come from its data_items, never from the visualization or map id.',
+      items,
       ...(small.length ? { _layout_warning: `${small.length} tile(s) are too small to read on a laptop-width screen (~1000 px; DHIS2's grid is 60 columns, rows a fixed 20 px): ${small.map(it => `${it.id} ${it.too_small}`).join('; ')}. manage_dashboards(action="arrange", dashboard_id) re-sizes and re-flows every tile (backed up first) — offer it; it is a change to the dashboard.` } : {}),
     };
   }
@@ -5622,6 +5766,22 @@ async function executeManageDashboards(args) {
     const items = Array.isArray(args.items) ? args.items : [];
     if (!items.length) {
       return { _error: 'items must list at least one dashboard item (existing visualization/map UID, inline new_visualization, or text).' };
+    }
+    // A dashboard of this name already exists → create_dashboard would make a
+    // SECOND one beside it. RMNCH thread 2026-11-01: to reorder an existing
+    // dashboard the model tried create_dashboard with all 15 of its tiles.
+    {
+      const want = String(dash.name).trim();
+      const r = await safeDhis2Fetch(`dashboards?filter=name:ilike:${encodeURIComponent(want)}&fields=id,name&paging=false`);
+      const same = (r?.dashboards || []).find(d => String(d.name || '').trim().toLowerCase() === want.toLowerCase());
+      if (same) {
+        return {
+          _error: `Not created: a dashboard named "${same.name}" already exists (${same.id}). create_dashboard always makes a NEW dashboard, so this would leave two with the same name.`,
+          _hint: `Change the existing one in place: add_items (insert_after_item_id / insert_before_item_id put new tiles at a place in the order), arrange (order: [tile ids] to reorder, items:[{ item_id, size }] to resize), remove_item, update — get lists its tiles in reading order. Only when the user asked for a separate, second dashboard: use a different name.`,
+          _existing_dashboard: { id: same.id, name: same.name, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${same.id}` },
+          _scope: 'dashboard_name_exists',
+        };
+      }
     }
 
     // Inline visualizations: one batched data-item lookup, then build each.
@@ -5762,6 +5922,20 @@ async function executeManageDashboards(args) {
     if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
     const dashName = owner.name || owner.displayName || dId;
     const existingItems = Array.isArray(owner.dashboardItems) ? owner.dashboardItems : [];
+    // insert_after_item_id / insert_before_item_id: put the new tiles at that
+    // place in the reading order instead of below everything (RMNCH thread
+    // 2026-11-01: "maps between the district table and the detailed tables" —
+    // with append-only the model tried to rebuild the whole dashboard).
+    const anchorId = args.insert_after_item_id || args.insert_before_item_id || null;
+    if (args.insert_after_item_id && args.insert_before_item_id) {
+      return { _error: 'Pass insert_after_item_id OR insert_before_item_id, not both.' };
+    }
+    if (anchorId && !existingItems.some(it => it.id === anchorId)) {
+      return {
+        _error: `No tile with item_id "${anchorId}" on dashboard "${dashName}" — nothing was added.`,
+        _hint: `Use a TILE id from this dashboard (not the id of the chart, map or line list it shows). Tiles in reading order: ${dashboardReadingOrder(existingItems).map(it => `${it.id} ${savedDashboardTileLabel(it)}`).join('; ')}.`,
+      };
+    }
 
     // Resolve inline new_visualizations (reuse the create builder + batched type lookup).
     const prepared = await prepareInlineVisualizations(items);
@@ -5836,7 +6010,23 @@ async function executeManageDashboards(args) {
     );
     if (!backup.ok) return backup.error;
 
-    owner.dashboardItems = [...existingItems, ...newItems];
+    // At a place in the reading order: the whole dashboard is re-flowed with
+    // the new tiles there. Existing tiles keep their small / half / full.
+    let insertedRows = null;
+    if (anchorId) {
+      const ordered = dashboardReadingOrder(existingItems);
+      const k = ordered.findIndex(it => it.id === anchorId) + (args.insert_after_item_id ? 1 : 0);
+      const combined = [...ordered.slice(0, k), ...newItems, ...ordered.slice(k)];
+      const ex = await dashboardTileInfos(ordered.map(savedDashboardEntry), {});
+      const infoOf = new Map([...ordered.map((it, i) => [it, ex.infos[i]]), ...newItems.map((di, i) => [di, infos[i]])]);
+      const sizeOf = new Map([...ordered.map(it => [it, { size: savedDashboardTileSize(it) }]), ...newItems.map((di, i) => [di, { size: (items[i] || {}).size }])]);
+      const re = layoutDashboardItems(combined.map(x => sizeOf.get(x)), combined.map(x => infoOf.get(x)), 0, { ...ex.levelCounts, ...levelCounts });
+      combined.forEach((x, i) => Object.assign(x, re.shapes[i]));
+      owner.dashboardItems = combined;
+      insertedRows = re.rows;
+    } else {
+      owner.dashboardItems = [...existingItems, ...newItems];
+    }
     const payload = {};
     if (newVisualizations.length) payload.visualizations = newVisualizations;
     payload.dashboards = [owner];
@@ -5856,7 +6046,9 @@ async function executeManageDashboards(args) {
       items_after: after,
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
       ...(layoutNotes.length ? { _layout_corrected: layoutNotes } : {}),
-      tile_rows_added: laid.rows,
+      ...(insertedRows
+        ? { inserted: `${args.insert_after_item_id ? 'after' : 'before'} tile ${anchorId}`, tile_rows: insertedRows }
+        : { tile_rows_added: laid.rows }),
       ...(laid.note ? { _sizes_note: laid.note } : {}),
       added: summary,
       backup: backup.block,
@@ -5882,20 +6074,24 @@ async function executeManageDashboards(args) {
     if (!existing.length) return { _error: `Dashboard "${dashName}" has no tiles to arrange.` };
     const sizeById = {};
     for (const o of Array.isArray(args.items) ? args.items : []) if (o && o.item_id) sizeById[o.item_id] = o.size;
-    const unknown = Object.keys(sizeById).filter(id => !existing.some(it => it.id === id));
-    if (unknown.length) return { _error: `No tile with item_id ${unknown.join(', ')} on dashboard "${dashName}".`, _hint: 'action=get lists each tile\'s id.' };
-    const pos = (v) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : Number.MAX_SAFE_INTEGER);
-    const ordered = existing.map((it, i) => ({ it, i }))
-      .sort((a, b) => (pos(a.it.y) - pos(b.it.y)) || (pos(a.it.x) - pos(b.it.x)) || (a.i - b.i)).map(o => o.it);
-    const entries = ordered.map(it => ({
-      type: it.type, vizId: it.visualization?.id || it.chart?.id || it.reportTable?.id || null,
-      evId: it.eventVisualization?.id || it.eventChart?.id || it.eventReport?.id || null, text: it.text, appKey: it.appKey,
-    }));
-    const { infos, levelCounts } = await dashboardTileInfos(entries, {});
+    const orderIds = Array.isArray(args.order) ? args.order.map(x => (x && typeof x === 'object' ? x.item_id : x)).filter(Boolean).map(String) : [];
+    const unknown = [...new Set([...Object.keys(sizeById), ...orderIds])].filter(id => !existing.some(it => it.id === id));
+    if (unknown.length) return { _error: `No tile with item_id ${unknown.join(', ')} on dashboard "${dashName}".`, _hint: 'action=get lists each tile\'s id (items are in reading order). item_id is the TILE id, not the id of the chart, map or line list it shows.' };
+    // order: the tiles' new reading order. Tiles it leaves out follow, in
+    // their current order (reported, so nothing moves silently).
+    let ordered = dashboardReadingOrder(existing);
+    let unlisted = [];
+    if (orderIds.length) {
+      const picked = [...new Set(orderIds)].map(id => existing.find(it => it.id === id));
+      unlisted = ordered.filter(it => !picked.includes(it));
+      ordered = [...picked, ...unlisted];
+    }
+    const { infos, levelCounts } = await dashboardTileInfos(ordered.map(savedDashboardEntry), {});
     const laid = layoutDashboardItems(ordered.map(it => ({ size: sizeById[it.id] })), infos, 0, levelCounts);
     const changed = ordered.filter((it, k) => ['x', 'y', 'width', 'height'].some(f => Number(it[f]) !== laid.shapes[k][f])).length;
-    if (args.dry_run_only) return { success: true, dry_run: true, dashboard_id: dId, tiles: ordered.length, would_change: changed, tile_rows: laid.rows, message: 'Nothing saved (dry_run_only=true).' };
-    if (!changed) return { success: true, action: 'arrange', dashboard_id: dId, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dId}`, changed: 0, tile_rows: laid.rows, message: `Every tile on "${dashName}" already has this size and place; nothing changed.` };
+    const unlistedNote = unlisted.length ? { _unlisted_tiles: `${unlisted.length} tile(s) were not in order and follow the listed ones, in their current order: ${unlisted.map(it => `${it.id} ${savedDashboardTileLabel(it)}`).join('; ')}.` } : {};
+    if (args.dry_run_only) return { success: true, dry_run: true, dashboard_id: dId, tiles: ordered.length, would_change: changed, tile_rows: laid.rows, ...unlistedNote, message: 'Nothing saved (dry_run_only=true).' };
+    if (!changed) return { success: true, action: 'arrange', dashboard_id: dId, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dId}`, changed: 0, tile_rows: laid.rows, ...unlistedNote, message: `Every tile on "${dashName}" already has this size and place; nothing changed.` };
 
     const backup = await ensureBackupOrBail(
       { operation: 'update', tool: 'manage_dashboards', action: 'arrange', reason: `Re-size and re-flow the ${ordered.length} tiles of dashboard ${dashName}` },
@@ -5918,6 +6114,7 @@ async function executeManageDashboards(args) {
       dashboard_name: dashName,
       changed,
       tile_rows: laid.rows,
+      ...unlistedNote,
       backup: backup.block,
       ...(after?._error ? { _note: `Saved, but the read-back failed (${after._error}); check with action=get.` }
         : off.length ? { _warning: `The server reports different sizes for ${off.join(', ')} than were saved — check with action=get.` } : {}),

@@ -863,8 +863,12 @@ async function countViaTracker(pid, ouid, args, progName, ouName, stageName) {
     endpoint = 'tracker/trackedEntities';
   }
 
-  let path = `${endpoint}?program=${pid}&orgUnit=${ouid}&ouMode=SELECTED&totalPages=true&pageSize=1`;
-  if (args.include_children) path = path.replace('ouMode=SELECTED', 'ouMode=DESCENDANTS');
+  // A relative org unit (USER_ORGUNIT) is not a tracker orgUnit: count the
+  // user's own units and everything below them instead.
+  const ouParam = /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(ouid || ''))
+    ? `orgUnit=${ouid}&ouMode=${args.include_children ? 'DESCENDANTS' : 'SELECTED'}`
+    : 'ouMode=CAPTURE';
+  let path = `${endpoint}?program=${pid}&${ouParam}&totalPages=true&pageSize=1`;
   if (args.stage_id && args.record_type === 'events') path += `&programStage=${args.stage_id}`;
   if (args.status) path += `&status=${args.status}`;
   if (args.date_after) {

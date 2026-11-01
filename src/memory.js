@@ -455,7 +455,7 @@ function memoryBeginTurn(userText, ctx, toolNames) {
     learned: [],       // titles of lessons written at turn end (for the panel)
   };
   if (ctx && (ctx.teiId || ctx.enrollmentId || ctx.eventId)) memoryTaint('the page shows a patient record (tracked entity / enrollment / event in the URL)');
-  if (typeof SAVE_FAILURE_RE !== 'undefined' && SAVE_FAILURE_RE.test(String(userText || '').toLowerCase()) && ctx?.programId) {
+  if (typeof reportsSaveFailure === 'function' && reportsSaveFailure(userText) && ctx?.programId) {
     memoryTaint('save-error diagnosis reads the record\'s enrollments');
   }
 }
