@@ -2050,33 +2050,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     const finalStageName = resolvedStageNames[i];
     if (finalStageName !== stage.name) stageRenames.push({ original: stage.name, final: finalStageName });
 
-    const psdes = (stage.data_elements || []).map((de, j) => ({
-      dataElement: { id: deUidMap[de.name] },
-      compulsory: de.compulsory || false,
-      sortOrder: j + 1,
-    }));
-
-    // Optional visual sections: group a subset of this stage's data elements.
-    // DHIS2 renders a stage as sections when programStageSections exist; each
-    // section's dataElements must already be programStageDataElements of the
-    // stage (they are, by construction). UIDs are pre-generated so the atomic
-    // import wires the references. Unknown/empty sections are skipped, not sent.
-    const psSections = [];
-    for (let k = 0; k < (stage.sections || []).length; k++) {
-      const sec = stage.sections[k];
-      const deRefs = (sec && (sec.data_elements || sec.dataElements) || [])
-        .map(n => deUidMap[typeof n === 'string' ? n : (n && n.name)])
-        .filter(Boolean)
-        .map(id => ({ id }));
-      if (!sec || !sec.name || !deRefs.length) continue;
-      psSections.push({
-        id: generateDhis2Uid(),
-        name: sec.name,
-        sortOrder: k + 1,
-        programStage: { id: stageUid },
-        dataElements: deRefs,
-      });
-    }
+    const { psdes, psSections } = buildStageElementsAndSections(stage, stageUid, deUidMap);
 
     const stageObj = {
       id: stageUid,
@@ -3197,31 +3171,7 @@ async function addStageToProgram(args, defaultCatComboId) {
   }
 
   const stageUid = generateDhis2Uid();
-  const psdes = (stage.data_elements || []).map((de, j) => ({
-    dataElement: { id: deUidMap[de.name] },
-    compulsory: de.compulsory || false,
-    sortOrder: j + 1,
-  }));
-
-  // Optional visual sections — identical construction to create_program:
-  // sections are a TOP-LEVEL metadata collection (DHIS2 rejects full section
-  // objects nested inside the stage); the stage references them by id.
-  const psSections = [];
-  for (let k = 0; k < (stage.sections || []).length; k++) {
-    const sec = stage.sections[k];
-    const deRefs = (sec && (sec.data_elements || sec.dataElements) || [])
-      .map(n => deUidMap[typeof n === 'string' ? n : (n && n.name)])
-      .filter(Boolean)
-      .map(id => ({ id }));
-    if (!sec || !sec.name || !deRefs.length) continue;
-    psSections.push({
-      id: generateDhis2Uid(),
-      name: sec.name,
-      sortOrder: k + 1,
-      programStage: { id: stageUid },
-      dataElements: deRefs,
-    });
-  }
+  const { psdes, psSections } = buildStageElementsAndSections(stage, stageUid, deUidMap);
 
   const stageObj = {
     id: stageUid,
@@ -7623,6 +7573,38 @@ async function piRuntimeAnalyticsCheck(programId, ids) {
     ...(skipped.length ? { skipped } : {}),
     ...(unverified.length ? { unverified, unverified_note: `${unverified.length} indicator(s) returned no value and were not re-checked one by one — an empty result can also hide a failing indicator.` } : {}),
   };
+}
+
+// A stage's programStageDataElements and optional visual sections, shared by
+// create_program and add_stage. Each section groups a subset of the stage's
+// data elements (already programStageDataElements by construction); DHIS2
+// renders the stage as sections when any exist. Sections are a TOP-LEVEL
+// metadata collection (full section objects nested in the stage are
+// rejected) and the stage references them by id, so UIDs are pre-generated
+// for the atomic import. Unknown / empty sections are skipped, not sent.
+function buildStageElementsAndSections(stage, stageUid, deUidMap) {
+  const psdes = (stage.data_elements || []).map((de, j) => ({
+    dataElement: { id: deUidMap[de.name] },
+    compulsory: de.compulsory || false,
+    sortOrder: j + 1,
+  }));
+  const psSections = [];
+  for (let k = 0; k < (stage.sections || []).length; k++) {
+    const sec = stage.sections[k];
+    const deRefs = (sec && (sec.data_elements || sec.dataElements) || [])
+      .map(n => deUidMap[typeof n === 'string' ? n : (n && n.name)])
+      .filter(Boolean)
+      .map(id => ({ id }));
+    if (!sec || !sec.name || !deRefs.length) continue;
+    psSections.push({
+      id: generateDhis2Uid(),
+      name: sec.name,
+      sortOrder: k + 1,
+      programStage: { id: stageUid },
+      dataElements: deRefs,
+    });
+  }
+  return { psdes, psSections };
 }
 
 // applyRuleActionSugar — shared rewrite step for both create-rule paths.

@@ -216,6 +216,8 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   // "the style is off" stays read_only. redesign is unambiguous → unconstrained.
   + '|design\\s+(?:a|an|the|this|that|it|new|custom)\\b|redesign|customi[sz]e\\s+(?:a|an|the|this|that|it|new)\\b'
   + '|style\\s+(?:a|an|the|this|that|it)\\b|lay\\s?out\\s+(?:a|an|the|this)\\b'
+  // "Rearrange / tidy / resize the dashboard tiles" (manage_dashboards arrange).
+  + '|re-?arrange|arrange\\s+(?:a|an|the|this|that|it|my|its|them)\\b|tidy|resize|enlarge|widen'
   + '|restore|revert|roll ?back|undo|link|unlink'
   + '|enable|disable|turn (?:on|off)|share|grant|revoke|merge|split|rename|migrate|swap|convert|attach|assign|unassign|detach'
   + '|approve|confirm|proceed|continue|do it|do this|go ahead|just do it'
@@ -1957,6 +1959,28 @@ function healAnalyticsPeriodAndDates(path) {
   const hasDates = parts.some(x => /^(startDate|endDate)=/i.test(x));
   if (!hasPe || !hasDates) return { path: p, healed: false };
   return { path: `${base}?${parts.filter(x => !/^(startDate|endDate)=/i.test(x)).join('&')}`, healed: true };
+}
+
+// /api/analytics: dimension=A;B (two or more bare UIDs, no prefix) is never a
+// dimension — 409 E7125 "does not reference any dimension" (verified 2.43.2).
+// It can only mean data items: give it the dx: prefix. One bare UID is left
+// alone (a category or group-set dimension is written that way).
+function healBareDxList(path) {
+  const p = String(path || '');
+  if (!/^analytics(?:\.json)?\?/.test(p)) return { path: p, healed: false };
+  const [base, qs] = [p.slice(0, p.indexOf('?')), p.slice(p.indexOf('?') + 1)];
+  let healed = false;
+  const parts = qs.split('&').map(x => {
+    const m = x.match(/^(dimension|filter)=(.*)$/i);
+    if (!m) return x;
+    let v = m[2];
+    try { v = decodeURIComponent(v); } catch { /* keep raw */ }
+    const ids = v.split(';');
+    if (ids.length < 2 || !ids.every(id => /^[A-Za-z][A-Za-z0-9]{10}(?:\.[A-Za-z][A-Za-z0-9]{10})?$/.test(id))) return x;
+    healed = true;
+    return `${m[1]}=dx:${ids.join(';')}`;
+  });
+  return healed ? { path: `${base}?${parts.join('&')}`, healed } : { path: p, healed: false };
 }
 
 // count_records filters "<id>:<op>:<value>" → an analytics dimension
@@ -4613,7 +4637,38 @@ async function routeProgramIndicatorAnalytics(path) {
   }
   if (!items.length) return { path: p, routed: false };
   const r = await safeDhis2Fetch(`programIndicators?filter=id:in:[${[...new Set(items)].join(',')}]&fields=id&paging=false`);
-  if (!r || r._error || (r.programIndicators || []).length !== new Set(items).size) return { path: p, routed: false };
+  if (!r || r._error) return { path: p, routed: false };
+  const found = new Set((r.programIndicators || []).map(x => x.id));
+  if (found.size !== new Set(items).size) {
+    // Some ids are not program indicators. RMNCH replay 2026-11-01: twelve PI
+    // ids joined by ";" in one dimension=, one typed "lblLRKmS7Vs" for
+    // lblLRKmS7VS → 409 E7224. A case-only slip of one of this program's
+    // indicators is refused with the right id (UIDs are case-sensitive).
+    const missing = [...new Set(items)].filter(id => !found.has(id));
+    const pid = (p.match(/aggregate\/([A-Za-z][A-Za-z0-9]{10})/) || [])[1];
+    const all = found.size && pid ? await safeDhis2Fetch(`programIndicators?filter=program.id:eq:${pid}&fields=id,displayName&paging=false`) : null;
+    const byLower = new Map((all?.programIndicators || []).map(x => [x.id.toLowerCase(), x]));
+    const slips = missing.map(id => [id, byLower.get(id.toLowerCase())]).filter(([, hit]) => hit);
+    if (slips.length) {
+      return { path: p, routed: false, refusal: {
+        _error: `Not sent: ${slips.map(([id, hit]) => `"${id}" is not a program indicator — did you mean ${hit.id} ("${hit.displayName}")?`).join(' ')} UIDs are case-sensitive; DHIS2 would answer 409.`,
+        _hint: `Use the exact ids (also in any chart or dashboard you build next). Several program indicators at once: analytics?dimension=dx:<id1>;<id2>&dimension=pe:<period>&filter=ou:<orgUnit>.`,
+        _scope: 'analytics_uid_case_slip',
+      } };
+    }
+    // Several ids joined by ";" in ONE dimension= is never an event/enrollment
+    // analytics dimension (409 E7224, verified 2.43.2), and dx: there is a SQL
+    // error (42703) — so it cannot be sent as written.
+    const joined = parts.some(x => /^dimension=/i.test(x) && !/^dimension=(?:dx|ou|pe|co|ao)(?::|%3A)/i.test(x) && /;|%3B/i.test(x));
+    if (joined && found.size) {
+      return { path: p, routed: false, refusal: {
+        _error: `Not sent: event/enrollment analytics take one item per dimension= (several joined by ";" → 409), and ${missing.join(', ')} ${missing.length > 1 ? 'are not program indicators' : 'is not a program indicator'}, so the query could not be moved to /analytics.`,
+        _hint: 'Program indicators: analytics?dimension=dx:<id1>;<id2>&dimension=pe:<period>&filter=ou:<orgUnit> with exact ids. Data elements: one dimension=<stageUid>.<deUid> each.',
+        _scope: 'analytics_joined_dimension',
+      } };
+    }
+    return { path: p, routed: false };
+  }
   const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x));
   return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true };
 }

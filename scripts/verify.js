@@ -3119,12 +3119,153 @@ async function runDashboardThreadChecks() {
   truthy('count_records filters keep the analytics operator (the old "de:value" form 409\'d) and Yes/No becomes 1/0',
     ctx.countRecordsFilterDimension('FIHEeJwfhZH:eq:true', 'PFDfvmGpsR3.') === 'PFDfvmGpsR3.FIHEeJwfhZH:EQ:1' && ctx.countRecordsFilterDimension('vANAXwtLwcT:lt:11') === 'vANAXwtLwcT:LT:11' && ctx.countRecordsFilterDimension('nonsense') === null);
 
+  {
+    // create_dashboard / add_items end to end with stubbed DHIS2 (shared
+    // inline-visualization + grid helpers; a refactor once left create_dashboard
+    // referencing a removed local and throwing after the save).
+    const saved = { sdf: ctx.safeDhis2Fetch, wa: d.writeAuth, consent: d.harnessSkipBackupConsent };
+    const posts = [];
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    d.harnessSkipBackupConsent = true;
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (o.method === 'POST' || o.method === 'PUT') { posts.push(p); return { status: 'OK', httpStatus: 'OK', response: { status: 'OK', stats: { created: 1, updated: 0, deleted: 0, ignored: 0, total: 1 }, typeReports: [] } }; }
+      if (/^programIndicators/.test(p)) return { programIndicators: [{ id: 'piA0000000f', displayName: 'PI', program: { id: 'WSGAb5XwJ3Y' } }] };
+      if (/^(indicators|dataElements)/.test(p)) return { indicators: [], dataElements: [] };
+      if (/^dashboards\/Dash0000002/.test(p)) return { id: 'Dash0000002', name: 'D', dashboardItems: [{ id: 'Item0000001', type: 'TEXT', text: 'x', x: 0, y: 0, width: 58, height: 4 }] };
+      if (/^dataStore/.test(p)) return { status: 'OK' };
+      if (/^analytics/.test(p)) return { rows: [['piA0000000f', '5']] };
+      if (/^me\b|organisationUnits/.test(p)) return { organisationUnits: [{ id: 'ImspTQPwCqd', level: 1 }], dataViewOrganisationUnits: [{ id: 'ImspTQPwCqd' }] };
+      return {};
+    };
+    try {
+      const viz = { name: 'Monthly', vis_type: 'COLUMN', data_items: ['piA0000000f'], periods: ['THIS_YEAR'], org_units: ['USER_ORGUNIT'], layout: { columns: ['pe'], rows: ['dx'] } };
+      const cd = await ctx.executeTool('manage_dashboards', { action: 'create_dashboard', dashboard: { name: 'Verify dash' }, items: [{ type: 'TEXT', text: '# t' }, { new_visualization: viz }] });
+      const ai = await ctx.executeTool('manage_dashboards', { action: 'add_items', dashboard_id: 'Dash0000002', items: [{ new_visualization: { ...viz, name: 'Second' } }], skip_backup: true });
+      truthy('create_dashboard and add_items with an inline chart run end to end (shared helpers), correct the chart axes and return the dashboard link',
+        cd && cd.success && /dhis-web-dashboard\/#\//.test(cd.dashboard_url || '') && cd.items === 2 && Array.isArray(cd._layout_corrected)
+        && ai && ai.success && ai.items_added === 1);
+    } finally { ctx.safeDhis2Fetch = saved.sdf; d.writeAuth = saved.wa; d.harnessSkipBackupConsent = saved.consent; }
+  }
+  {
+    const problems = ctx.checkToolRegistry();
+    truthy('tool registry: router, write/manual sets, summaries, manual extras and patient-data tools all derive from / agree with TOOLS', Array.isArray(problems) && problems.length === 0 && Object.keys(ctx.__TOOL_ROUTER).length === vm.runInContext('TOOLS.length', ctx));
+  }
+
   // The system prompt teaches the feasibility check on analytics builds.
   const sp = await ctx.buildSystemPrompt('continue', false, false, ask);
   truthy('system prompt: the analytics feasibility section rides on a "continue" turn of a dashboard build', /first match each request to what DHIS2 can actually build/.test(sp) && /PIVOT_TABLE/.test(sp));
   d.apiVersion = savedApi;
 }
 
+
+// Dashboard layout 2026-11-01: the model sent x/y/width/height for a
+// 12-column grid and the RMNCH dashboard saved 70-px KPI tiles and sliver
+// charts. Tiles are now sized from what they show on the real 60-column grid.
+async function runDashboardLayoutChecks() {
+  console.log('\nDashboard layout (60-column grid, tiles sized from content, arrange) + analytics id lists:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = ctx.__dhis2();
+  const sv = (name) => ({ itemType: 'VISUALIZATION', vizType: 'SINGLE_VALUE', name, rows: [], columns: [{ dimension: 'dx', items: ['a'] }] });
+  const chart = (vizType, name, rows, columns) => ({ itemType: 'VISUALIZATION', vizType, name, rows, columns });
+  const kpis = [sv('New registrations (2026)'), sv('Follow-up ANC visits with hemoglobin below 11 (2026)'), sv('First ANC visits with hemoglobin below 11 (%)'), sv('Registrations with a low-hemoglobin follow-up ANC visit (2026)')];
+  const monthly5 = chart('COLUMN', 'Records by visit type, monthly', [{ dimension: 'pe', items: ['MONTHS_THIS_YEAR'] }], [{ dimension: 'dx', items: ['a', 'b', 'c', 'd', 'e'] }]);
+  const line2 = chart('LINE', 'Average hemoglobin, monthly', [{ dimension: 'pe', items: ['MONTHS_THIS_YEAR'] }], [{ dimension: 'dx', items: ['a', 'b'] }]);
+  const districts = chart('STACKED_COLUMN', 'Near-miss by district', [{ dimension: 'ou', items: ['ImspTQPwCqd', 'LEVEL-2'] }], [{ dimension: 'dx', items: ['y', 'n', 'u'] }]);
+  const infos = [...kpis, monthly5, line2, districts];
+  const rowsOf = (shapes) => { const by = {}; for (const s of shapes) (by[s.y] = by[s.y] || []).push(s); return Object.values(by); };
+  const wellFormed = (shapes) => rowsOf(shapes).every(r => r.reduce((a, s) => a + s.width, 0) === 60 && r.every(s => s.height === r[0].height))
+    && shapes.every((a, i) => shapes.every((b, j) => i === j || a.y + a.height <= b.y || b.y + b.height <= a.y || a.x + a.width <= b.x || b.x + b.width <= a.x));
+
+  // 1. The run's own numbers (a 12-column guess): KPIs 3 wide, charts 12 wide on their own rows.
+  const sent = [...[0, 3, 6, 9].map(x => ({ x, y: 0, width: 3, height: 2 })), { x: 0, y: 2, width: 12, height: 5 }, { x: 0, y: 7, width: 12, height: 5 }, { x: 0, y: 12, width: 12, height: 5 }];
+  const a = ctx.layoutDashboardItems(sent, infos, 0, { 2: 13 });
+  const kpiRow = a.shapes.slice(0, 4);
+  truthy('12-column numbers from the model: the 4 KPI tiles share one row at 15 of 60 columns, tall enough for a 3-line title (≥9 rows), and charts are never narrower than 20',
+    kpiRow.every(s => s.width === 15 && s.y === 0 && s.height >= 9) && a.shapes.slice(4).every(s => s.width >= 20 && s.height >= 14) && wellFormed(a.shapes) && /12-column/.test(a.note || ''));
+  // 2. No numbers: dense charts go full width; a half chart with no partner is widened.
+  const b = ctx.layoutDashboardItems(infos.map(() => ({})), infos, 0, { 2: 13 });
+  truthy('auto layout: KPI row, then the 60-bar monthly chart, the 13-district chart and the unpaired line chart each full width — rows fill 60 columns, nothing overlaps, no note',
+    b.shapes.slice(0, 4).every(s => s.width === 15) && b.shapes.slice(4).every(s => s.width === 60 && s.height === 20) && wellFormed(b.shapes) && !b.note && b.rows.length === 4);
+  // 3. Two ordinary charts pair up side by side; a pivot is full width and as tall as its rows.
+  const pie = chart('PIE', 'Share', [], [{ dimension: 'dx', items: ['a', 'b'] }]);
+  const pivot = { itemType: 'VISUALIZATION', vizType: 'PIVOT_TABLE', name: 'Districts', rows: [{ dimension: 'ou', items: ['ImspTQPwCqd', 'LEVEL-2'] }], columns: [{ dimension: 'dx', items: ['a', 'b'] }] };
+  const c = ctx.layoutDashboardItems([{}, {}, {}, { type: 'MAP' }], [line2, pie, pivot, { itemType: 'MAP', name: 'Map' }], 30, { 2: 13 });
+  truthy('two half charts sit side by side (30 + 30), a 13-row pivot is full width and ≥20 rows tall, a lone map is widened, all from startY',
+    c.shapes[0].x === 0 && c.shapes[1].x === 30 && c.shapes[0].y === 30 && c.shapes[1].y === 30 && c.shapes[2].width === 60 && c.shapes[2].height >= 20 && c.shapes[3].width === 60 && wellFormed(c.shapes));
+  // 4. size hints and real-scale numbers.
+  const e = ctx.layoutDashboardItems([{ size: 'full' }, { width: 30, height: 24 }, { width: 30 }], [line2, line2, pie], 0, {});
+  const f = ctx.layoutDashboardItems([{ size: 'half' }], [{ itemType: 'APP', name: 'Plugin' }], 0, {});
+  const g0 = ctx.layoutDashboardItems([{ width: 29 }], [line2], 0, {});
+  truthy('size:"full" is honoured; widths on the real 60-column scale keep their half and a taller height; an asked-for half stays half alone, a guessed width 29 alone is widened',
+    e.shapes[0].width === 60 && e.shapes[1].width === 30 && e.shapes[1].height === 24 && e.shapes[2].x === 30 && f.shapes[0].width === 30 && g0.shapes[0].width === 60);
+
+  const saved = { sdf: ctx.safeDhis2Fetch, wa: d.writeAuth, consent: d.harnessSkipBackupConsent, base: d.baseUrl };
+  const posts = [];
+  d.writeAuth = { scope: 'broad', reason: 'verify' };
+  d.harnessSkipBackupConsent = true;
+  d.baseUrl = d.baseUrl || 'https://verify.example/dhis';
+  const squeezed = [
+    { id: 'Item000000A', type: 'VISUALIZATION', x: 0, y: 0, width: 3, height: 6, visualization: { id: 'VizKpi0000A' } },
+    { id: 'Item000000B', type: 'VISUALIZATION', x: 3, y: 0, width: 3, height: 6, visualization: { id: 'VizKpi0000B' } },
+    { id: 'Item000000C', type: 'VISUALIZATION', x: 0, y: 6, width: 12, height: 11, visualization: { id: 'VizCol0000C' } },
+  ];
+  let stored = JSON.parse(JSON.stringify(squeezed));
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    if (o.method === 'POST' || o.method === 'PUT') {
+      posts.push({ p, body: typeof o.body === 'string' ? JSON.parse(o.body) : o.body });
+      const dash = posts[posts.length - 1].body?.dashboards?.[0];
+      if (dash && !/importMode=VALIDATE/.test(p)) stored = dash.dashboardItems;
+      return { status: 'OK', httpStatus: 'OK', response: { status: 'OK', stats: { created: 0, updated: 1, deleted: 0, ignored: 0, total: 1 }, typeReports: [] } };
+    }
+    if (/^dashboards\/Dash000000L\?fields=id,displayName/.test(p)) return { id: 'Dash000000L', displayName: 'L', dashboardItems: squeezed.map(it => ({ ...it, visualization: { ...it.visualization, displayName: it.id === 'Item000000C' ? 'Monthly' : 'Registrations with a low-hemoglobin follow-up ANC visit (2026)', type: it.id === 'Item000000C' ? 'COLUMN' : 'SINGLE_VALUE' } })) };
+    if (/^dashboards\/Dash000000L\?fields=:owner/.test(p)) return { id: 'Dash000000L', name: 'L', dashboardItems: JSON.parse(JSON.stringify(squeezed)) };
+    if (/^dashboards\/Dash000000L\?fields=dashboardItems/.test(p)) return { dashboardItems: stored };
+    if (/^visualizations\?filter=id:in/.test(p)) return { visualizations: [
+      { id: 'VizKpi0000A', displayName: 'New registrations (2026)', type: 'SINGLE_VALUE', rows: [], columns: [{ dimension: 'dx', items: [{ id: 'a' }] }] },
+      { id: 'VizKpi0000B', displayName: 'Registrations with a low-hemoglobin follow-up ANC visit (2026)', type: 'SINGLE_VALUE', rows: [], columns: [{ dimension: 'dx', items: [{ id: 'a' }] }] },
+      { id: 'VizCol0000C', displayName: 'Monthly', type: 'COLUMN', rows: [{ dimension: 'pe', items: [{ id: '202601' }, { id: '202602' }] }], columns: [{ dimension: 'dx', items: [{ id: 'a' }] }] }] };
+    if (/^dataStore/.test(p)) return { status: 'OK' };
+    return {};
+  };
+  try {
+    const g = await ctx.executeTool('manage_dashboards', { action: 'get', dashboard_id: 'Dash000000L' });
+    truthy('get flags the squeezed tiles (3 of 60 columns) and points to action="arrange"',
+      g && g.success && g.items.filter(it => it.too_small).length === 3 && /arrange/.test(g._layout_warning || ''));
+    const ar = await ctx.executeTool('manage_dashboards', { action: 'arrange', dashboard_id: 'Dash000000L' });
+    const kp = stored.filter(it => it.id !== 'Item000000C');
+    const ch = stored.find(it => it.id === 'Item000000C');
+    truthy('arrange re-sizes the saved tiles (2 KPIs at 30 columns side by side, ≥8 rows for a 2-line title; the unpaired chart widened to 60), backs up first and reads the shapes back',
+      ar && ar.success && ar.changed === 3 && kp.every(it => it.width === 30 && it.y === 0 && it.height >= 8) && ch.width === 60 && ch.y === kp[0].height && ch.height === 20 && ar.backup && !ar._warning && Array.isArray(ar.tile_rows));
+    const bad1 = await ctx.executeTool('manage_dashboards', { action: 'arrange', dashboard_id: 'Dash000000L', items: [{ item_id: 'NoSuchItem1', size: 'full' }] });
+    truthy('arrange refuses an unknown item_id instead of guessing', bad1 && /NoSuchItem1/.test(bad1._error || ''));
+  } finally { ctx.safeDhis2Fetch = saved.sdf; d.writeAuth = saved.wa; d.harnessSkipBackupConsent = saved.consent; d.baseUrl = saved.base; }
+
+  // The same replay's one failed call: twelve PI ids joined by ";" in one
+  // event-analytics dimension, one with a case slip (409 E7224).
+  {
+    const h = ctx.healBareDxList('analytics?dimension=Vr09z7YcgIH;lblLRKmS7VS&dimension=pe:2026&filter=ou:ImspTQPwCqd');
+    const one = ctx.healBareDxList('analytics?dimension=J5jldMd8OHv&dimension=pe:2026');
+    truthy('/analytics: a bare list of ids gets the dx: prefix (E7125 otherwise); one bare id (a category dimension) is left alone',
+      h.healed && /dimension=dx:Vr09z7YcgIH;lblLRKmS7VS&/.test(h.path) && !one.healed);
+    const savedF = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => {
+      if (/^programIndicators\?filter=id:in/.test(p)) return { programIndicators: [{ id: 'Vr09z7YcgIH' }] };
+      if (/^programIndicators\?filter=program\.id:eq:WSGAb5XwJ3Y/.test(p)) return { programIndicators: [{ id: 'Vr09z7YcgIH', displayName: 'Yes' }, { id: 'lblLRKmS7VS', displayName: 'No' }] };
+      return {};
+    };
+    try {
+      const slip = await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=pe:2026&dimension=Vr09z7YcgIH;lblLRKmS7Vs');
+      const other = await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=pe:2026&dimension=Vr09z7YcgIH;AAAAAAAAAAA');
+      truthy('event analytics: a case-slipped PI id is refused with the right one; a ";"-joined list that cannot move to /analytics is refused — neither is sent',
+        /did you mean lblLRKmS7VS/.test(slip.refusal?._error || '') && other.refusal?._scope === 'analytics_joined_dimension');
+    } finally { ctx.safeDhis2Fetch = savedF; }
+  }
+
+  const wa = ctx.classifyWriteAuthorization('The tiles on my dashboard are squeezed, please rearrange them neatly');
+  truthy('"please rearrange them" is a write request (arrange is reachable)', wa && wa.scope !== 'read_only');
+  truthy('the manage_dashboards schema offers size (small/half/full), arrange, and no raw x/y/width/height',
+    (() => { const t = vm.runInContext('TOOLS', ctx).find(x => x.function.name === 'manage_dashboards'); const p = t.function.parameters.properties; const ip = p.items.items.properties; return p.action.enum.includes('arrange') && ip.size && !ip.x && !ip.width && !/58-column/.test(t.function.description); })());
+}
 
 // Security review 2026-10-29: patient data in model payloads, write scope,
 // skip_backup consent, generated-app runtime policy, multilingual intent.
@@ -3244,6 +3385,7 @@ setImmediate(async () => {
   if (loaded) await runRuleScopeAndTetSharingChecks().catch((e) => bad(`rule scope / TET sharing checks threw: ${e && e.stack || e}`));
   if (loaded) await runDashboardThreadChecks().catch((e) => bad(`dashboard-thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runSecurityReviewChecks().catch((e) => bad(`security-review checks threw: ${e && e.stack || e}`));
+  if (loaded) await runDashboardLayoutChecks().catch((e) => bad(`dashboard layout checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

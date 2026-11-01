@@ -353,13 +353,70 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.33 — Dashboards are laid out so every tile can be read (2026-11-01)
+
+The RMNCH "Maternal Care and Follow-up" dashboard was built with correct numbers but could not be read. The four KPI tiles were about 70 px wide, every title was cut, and each chart was a sliver in the left third of the page with the rest of the row empty.
+
+**Cause.** The tool took the model's own `x/y/width/height` and saved them as given. Its schema did not say what scale they use, and the docs said "58-column grid". The model guessed a 12-column grid (KPI tiles 3 wide, charts about 12 wide). Earlier test replays sent widths of 3, 4, 6 and 24 too; those checks covered the numbers but not how the dashboard looked.
+
+**The real grid**, measured on 2.43.2:
+- The Dashboard app grid is 60 columns wide, and a column scales with the screen (width 14 is 397 px of a 1716 px grid).
+- Rows are a fixed 20 px at every screen width (height 6 is 116 px).
+- So a tile's height decides whether a wrapped title still leaves room for the number. At 1100 px, a 6-row KPI tile with a 3-line title cut off its own value.
+
+**What changed** (`tools-metadata.js`):
+- **Tiles are sized from what they show** (`layoutDashboardItems`):
+  - **Single values** share a row, up to 4 a row and balanced. Each is tall enough for its title wrapped on a ~1000 px screen (the side panel open on a laptop).
+  - **Charts** go two per row. A chart is full width when it is dense: more than 12 x-axis categories, more than 5 series or more than 24 bars. The tool counts the categories from the periods and org units; a `LEVEL-n` counts the real number of units at that level.
+  - **Pivot tables** are full width and as tall as their rows. **Line lists** are full width; **maps** and **plugins** half width.
+  - A half-width tile with no partner is widened, every row fills all 60 columns, and the tiles in a row share one height. No holes, no overlaps.
+- **The model's numbers are no longer saved.** `x/y/width/height` count only as the reading order and small / half / full. The scale is inferred from how far right the items reach (12, 24 or 60 columns). The result says so (`_sizes_note`).
+  - The schema drops `x/y/width/height` and offers `size: small | half | full`, only for when the user asks for a size. An asked-for half stays half even alone.
+  - The docs give the real grid, and `manage_custom_app` place takes `size` too.
+- **`tile_rows`** in the create_dashboard / add_items result lists the rows top to bottom, so the reply can describe the arrangement.
+- **New `arrange` action** re-sizes and re-flows every tile of an existing dashboard the same way. It keeps the current order, allows `items:[{ item_id, size }]` overrides, backs up first and reads the sizes back. `get` now flags tiles too small to read (`too_small`, `_layout_warning`) and points to `arrange`.
+- "Rearrange / tidy / resize" count as write requests.
+
+**Also fixed — analytics queries with a list of ids** (the replay's one failed call). The model sent 12 program-indicator ids joined by `;` in one `dimension=` of an event-analytics query, one with a wrong-case letter (`lblLRKmS7Vs` for `lblLRKmS7VS`). DHIS2 answered 409. Verified on 2.43.2: bare `dimension=A;B` → 409 on every analytics endpoint; `dimension=dx:A;B` on event analytics → SQL error 42703; `analytics?dimension=dx:A;B` works. Changes in `dhis2_query` (core.js):
+- A case slip of one of the program's indicators is refused before sending, with the right id and its name.
+- A `;`-joined list that cannot be moved to `/analytics` is refused, with the working form.
+- On `/analytics`, a bare list of 2+ ids gets the `dx:` prefix (`healBareDxList`). One bare id is left alone, because a category dimension is written that way.
+
+**Checks:**
+- `npm run verify` has a new dashboard-layout block: the run's 12-column numbers, auto layout, pairing, an asked-for half, `get` flags, `arrange` end to end with backup and read-back, and the analytics id-list refusals and heal.
+- The custom-apps suite places its plugin with `size:"half"`.
+
+### 2.8.32 — Maintainability: dead code removed, duplicated logic shared, one tool registry (2026-10-30)
+
+A code review listed six maintainability findings in v2.8.31. All six were confirmed and fixed without changing behaviour.
+
+- **Unused `callFireworks()`** (non-streaming, no callers) removed from providers.js.
+- **Unused `unresolvedIndicators` / `unresolvedDataElements` / `unresolvedProgramIndicators`** removed from `get_visualization_details` (tools-metadata.js).
+- **Provider retry / timeout logic** was copied in both streaming adapters. It is now one `postProviderRequest()`: connect timeout cleared when headers arrive, retries with exponential back-off, and progress messages. Each adapter passes its headers, retryable statuses and error wording.
+- **Dashboard visualization preparation** was copied in `create_dashboard` and `add_items`. It is now `prepareInlineVisualizations()` (one data-item lookup, overall row, layout correction, root-scope check), plus `dashboardItemType()` and a shared grid packer (replaced by the content-based layout in 2.8.33). The reference check in `create_dashboard` uses the same type rule, so a map given by `map_id` alone is now verified too.
+- **Stage data elements + sections** were built the same way twice (`create_program`, `add_stage`). They now use `buildStageElementsAndSections()`.
+- **Tool registration:** `TOOL_ROUTER` was a hand copy of the TOOLS names, and `WRITE_CAPABLE_TOOL_NAMES` and `MANUAL_TOOLS` were the same 22-name list kept twice.
+  - The router is now derived from TOOLS.
+  - Both sets come from one `WRITE_TOOL_LIST`.
+  - `PATIENT_DATA_TOOL_NAMES` moved next to them in the registry.
+  - `checkToolRegistry()` reports any disagreement (write list, summaries, manual extras, patient-data list vs TOOLS) at load time and in `npm run verify`.
+  - The side-panel maps were already pinned to the router by verify.
+
+**Verified.**
+- `npm run verify`: all checks pass, 2 new. One drives `create_dashboard` and `add_items` end to end with stubbed DHIS2. It was added after the playground scenario caught a regression during this refactor: `create_dashboard` still read a removed local and threw after saving. Fixed before anything was kept.
+- `npm run apps`: 346/346.
+- `scripts/scenario-mnch-dashboard.js` (play 2.43.2): 97 calls, 0 failed.
+- `scripts/scenario-line-lists.js` (localhost 2.42.5): 117 calls, 0 failed.
+- `create_program` + `add_stage` with sections, dry-run against play 2.43.2: DHIS2 validated program, stage, data elements and sections, nothing saved.
+- Real-model replay of the RMNCH dashboard + tables prompts (deepseek-v4p1-flash-1017): 139 DHIS2 calls, 0 failed, same correct figures (2,002 / 1,156 / 23.6 % / 202). This exercises the new shared streaming request code against a real provider.
+
 ### 2.8.31 — Security review fixes: patient data, write scope, backups, generated apps, other languages (2026-10-29)
 
 Five reported issues, each reproduced first; all were real.
 
 1. **Patient data could reach a cloud model through the save-error prefetch.** When a user reported a save error with a person open, the prefetch read that person's enrollments (ids, status, dates, org unit) with no privacy check and put them in a system message, whatever the provider.
    - The prefetch now reads them only when requests stay local. With a cloud model it says the check was skipped and what to look for.
-   - **Every request to a remote provider is now filtered at the single point all model-bound messages pass through** (`filterPatientDataForProvider` in `callProviderStreaming` / `callFireworks`). A system or tool message carrying a tracker record (a record identity next to record content) is replaced by a notice. The user's own messages are not touched, and the per-tool privacy gate is unchanged.
+   - **Every request to a remote provider is now filtered at the single point all model-bound messages pass through** (`filterPatientDataForProvider` in `callProviderStreaming`). A system or tool message carrying a tracker record (a record identity next to record content) is replaced by a notice. The user's own messages are not touched, and the per-tool privacy gate is unchanged.
 2. **Write permission was broader than the request.**
    - "Can you explain how to delete a program?", "How do I create a dashboard?", "What happens if I delete…" and "Do not make any changes; explain…" all granted full write permission. How-to questions and no-change requests are now read-only.
    - Permission is bound to the kind of action asked for. A create or update request does not authorize deleting existing objects; the assistant may still remove objects it created itself in the conversation.

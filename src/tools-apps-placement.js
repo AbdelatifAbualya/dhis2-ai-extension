@@ -554,6 +554,7 @@ async function placeCustomAppPlugin(args) {
     const gate = requireWriteAuth('manage_custom_app', 'place', { key: args.key, target, dashboard_id: args.dashboard_id || null });
     if (gate) return gate;
     const item = { type: 'APP', app_key: args.key };
+    if (args.size) item.size = args.size;
     if (Number.isFinite(Number(args.width))) item.width = Number(args.width);
     if (Number.isFinite(Number(args.height))) item.height = Number(args.height);
     let r;

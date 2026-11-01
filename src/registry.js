@@ -2076,11 +2076,12 @@ NEVER invent legend-set or legend UIDs — reuse UIDs from search_metadata / get
     function: {
       name: 'manage_dashboards',
       description: `Build and inspect DHIS2 **analytics dashboards and visualizations** — the charts, pivot tables and single-value tiles shown in the Dashboard app, and the dashboards that arrange them. Use this tool for ALL dashboard/visualization CREATION — NEVER hand-assemble /metadata visualizations or dashboards bodies via dhis2_query (a raw POST that only sets columns/rows/filters silently imports an EMPTY, un-renderable chart — DHIS2 stores the layout as columnDimensions/rowDimensions/filterDimensions and the data as dataDimensionItems / relativePeriods / organisationUnits; this tool assembles that exact structure for you).
-Actions: list / get / create_visualization / create_dashboard / add_items / remove_item / update / delete.
+Actions: list / get / create_visualization / create_dashboard / add_items / arrange / remove_item / update / delete.
 - create_visualization: one chart, pivot table or single-value tile. Supply name, vis_type (COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, …), data_items (aggregate indicator / AGGREGATE-domain dataElement / programIndicator UIDs — types are auto-resolved AND verified), periods (relative keywords like LAST_12_MONTHS or fixed ISO like 202401), and org_units (UIDs and/or USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2). Layout (which of dx/pe/ou sits on columns/rows/filters) defaults sensibly per vis_type; override with layout if needed. ⚠ data_items must be AGGREGATE dimensions: a TRACKER data element or a tracked-entity attribute CANNOT be plotted directly (the tile renders an error) — first create a PROGRAM INDICATOR (manage_program_indicators) that aggregates it, then plot that program indicator's UID. The tool refuses a raw tracker data element with this guidance.
-- create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). Items are auto-arranged on the 58-column grid. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
+- create_dashboard: a whole NEW dashboard in ONE atomic import. Each entry in items either references an EXISTING visualization/map by UID, or inline-creates a NEW visualization (same fields as create_visualization). The tool sizes and places every tile from what it shows (KPI tiles in one row, charts two per row or full width when dense, tables and line lists full width) — list items in reading order and never pass x/y/width/height; size:"small"|"half"|"full" only when the user asks for a size. New visualizations and the dashboard import together (VALIDATE then COMMIT) so a single bad UID rolls the whole thing back.
 - add_items: add chart(s)/map(s)/line-list(s)/text/app plugins to an EXISTING dashboard WITHOUT destroying what's already there. Provide dashboard_id + items[] (each item: { visualization_id } to embed an existing chart, { new_visualization:{…} } to create+embed a new one, { type:"MAP", map_id }, { type:"EVENT_VISUALIZATION", event_visualization_id } to embed a saved line list from manage_line_lists, { type:"APP", app_key } to embed an installed dashboard plugin, or { type:"TEXT", text }). This is the ONLY safe way to add to an existing dashboard — it reads the full dashboard, appends, and writes the complete item set back (a raw dashboard PUT would REPLACE and WIPE the existing tiles). It snapshots the dashboard to backups first.
-- remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All three snapshot first and are restorable via manage_backups.
+- arrange: re-size and re-flow every tile of an EXISTING dashboard the same way (keeps their order; items:[{ item_id, size }] to change one tile's size). For "the tiles are squeezed / tidy the layout / make the charts bigger"; get flags tiles too small to read.
+- remove_item: drop one tile by item_id (get the dashboard first to see item ids). update: change a dashboard's name/description. delete: remove a whole dashboard. All four snapshot first and are restorable via manage_backups.
 - list / get: list dashboards (optional name filter) / read one dashboard with its items (each item's id, type, and referenced visualization/map).
 Every mutating action is backed up first (undo via manage_backups). For sharing use manage_metadata(action=update_sharing). NEVER invent visualization, map or data-item UIDs — resolve them with search_metadata / get results first.`,
       parameters: {
@@ -2088,10 +2089,10 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
         properties: {
           action: {
             type: 'string',
-            enum: ['list', 'get', 'create_visualization', 'create_dashboard', 'add_items', 'remove_item', 'update', 'delete'],
-            description: 'list=dashboard list; get=one dashboard with items; create_visualization=one chart/pivot/single-value; create_dashboard=a NEW dashboard with items; add_items=safely APPEND item(s) to an EXISTING dashboard (never wipes existing tiles); remove_item=drop one tile; update=edit dashboard name/description; delete=remove a whole dashboard. All mutating actions snapshot to backups first.'
+            enum: ['list', 'get', 'create_visualization', 'create_dashboard', 'add_items', 'arrange', 'remove_item', 'update', 'delete'],
+            description: 'list=dashboard list; get=one dashboard with items; create_visualization=one chart/pivot/single-value; create_dashboard=a NEW dashboard with items; add_items=safely APPEND item(s) to an EXISTING dashboard (never wipes existing tiles); arrange=re-size and re-flow the tiles of an EXISTING dashboard; remove_item=drop one tile; update=edit dashboard name/description; delete=remove a whole dashboard. All mutating actions snapshot to backups first.'
           },
-          dashboard_id: { type: 'string', description: 'Existing dashboard UID (required for get, add_items, remove_item, update, delete).' },
+          dashboard_id: { type: 'string', description: 'Existing dashboard UID (required for get, add_items, arrange, remove_item, update, delete).' },
           item_id: { type: 'string', description: 'For remove_item: the dashboardItem UID to drop (see action=get for item ids).' },
           name_filter: { type: 'string', description: 'For list: case-insensitive ilike filter on dashboard name.' },
           limit: { type: 'integer', description: 'For list: max dashboards to return (1–200, default 50).' },
@@ -2131,7 +2132,7 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
           },
           items: {
             type: 'array',
-            description: 'For create_dashboard (items to place on a NEW dashboard) AND add_items (items to APPEND to an existing dashboard). Each entry either references an existing object OR inline-creates a new visualization.',
+            description: 'For create_dashboard (items to place on a NEW dashboard) AND add_items (items to APPEND to an existing dashboard), in reading order. Each entry either references an existing object OR inline-creates a new visualization. For arrange: optional [{ item_id, size }] to change one tile\'s size.',
             items: {
               type: 'object',
               properties: {
@@ -2145,14 +2146,12 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
                   type: 'object',
                   description: 'Inline-create a NEW visualization for this item (same fields as the create_visualization "visualization" spec): name, vis_type, data_items, periods, org_units, short_name, description, layout.'
                 },
-                x: { type: 'integer', description: 'Optional grid x (0–58). Auto-placed if omitted.' },
-                y: { type: 'integer', description: 'Optional grid y. Auto-placed if omitted.' },
-                width: { type: 'integer', description: 'Optional grid width (default 29 = half row).' },
-                height: { type: 'integer', description: 'Optional grid height (default 20).' }
+                size: { type: 'string', enum: ['small', 'half', 'full'], description: 'Only when the user asks for a size: small = a KPI-sized tile sharing a row (single values, text, plugins), half = two per row, full = the whole width. Omit it — the tool sizes each tile from what it shows.' },
+                item_id: { type: 'string', description: 'For arrange: the dashboardItem UID whose size to change.' }
               }
             }
           },
-          dry_run_only: { type: 'boolean', description: 'For create_visualization / create_dashboard: validate the metadata import without committing. Default false.' },
+          dry_run_only: { type: 'boolean', description: 'For create_visualization / create_dashboard: validate the metadata import without committing. For arrange: return the planned rows without saving. Default false.' },
           skip_backup: { type: 'boolean', description: 'DANGEROUS. Bypass the mandatory pre-write snapshot on add_items/remove_item/update/delete. Only after the user is told the backup failed AND explicitly authorizes proceeding without recovery.' }
         },
         required: ['action']
@@ -2492,8 +2491,8 @@ Guarantees: keys always start with "ai-"; apps not built by the assistant (no as
           target: { type: 'string', enum: ['dashboard', 'enrollment_dashboard', 'enrollment_event_new', 'enrollment_event_edit', 'form'], description: 'For place / unplace: where the plugin goes. dashboard = a Dashboard app item (DASHBOARD plugins). enrollment_dashboard / enrollment_event_new / enrollment_event_edit = a widget on that Capture page of one tracker program (CAPTURE plugins). form = a form-field plugin inside a Capture data entry form (CAPTURE plugins, needs field_map). unplace without target removes the plugin everywhere.' },
           dashboard_id: { type: 'string', description: 'For place target "dashboard": an existing dashboard to add the plugin to.' },
           dashboard_name: { type: 'string', description: 'For place target "dashboard": create a NEW dashboard with this name holding the plugin (when no dashboard_id).' },
-          width: { type: 'integer', description: 'For place target "dashboard": item width on the 58-column grid (default 29).' },
-          height: { type: 'integer', description: 'For place target "dashboard": item height (default 20).' },
+          size: { type: 'string', enum: ['small', 'half', 'full'], description: 'For place target "dashboard": tile width — small (shares a row with up to 3 others), half (default), full. Only when the user asks.' },
+          height: { type: 'integer', description: 'For place target "dashboard": tile height in 20-px grid rows (default 20 ≈ 400 px, minimum 6).' },
           program_id: { type: 'string', description: 'For place enrollment_* targets: the tracker program. For target "form": the program whose REGISTRATION form gets the plugin (instead of program_stage_id).' },
           program_stage_id: { type: 'string', description: 'For place target "form": the tracker program stage whose event form gets the plugin.' },
           column: { type: 'string', enum: ['left', 'right'], description: 'For enrollment_* targets: page column (default right).' },
@@ -2617,47 +2616,14 @@ Restore behavior: re-POSTs the "before" snapshot via /api/metadata?importStrateg
 }
 
 
-const TOOL_ROUTER = Object.freeze({
-  dhis2_query: true,
-  count_records: true,
-  get_event_analytics: true,
-  get_program_info: true,
-  get_program_recent_changes: true,
-  search_metadata: true,
-  resolve_option_codes: true,
-  detect_enrollment_abnormalities: true,
-  cross_stage_entity_intersection: true,
-  line_listing_guide: true,
-  get_visualization_details: true,
-  get_map_details: true,
-  browse_web: true,
-  render_chart: true,
-  create_metadata: true,
-  architect_metadata: true,
-  manage_program_rules: true,
-  manage_program_indicators: true,
-  manage_metadata: true,
-  manage_program_notifications: true,
-  manage_datasets: true,
-  manage_custom_forms: true,
-  manage_custom_translations: true,
-  manage_growth_chart_plugin: true,
-  manage_validation_rules: true,
-  manage_org_units: true,
-  manage_indicators: true,
-  manage_option_sets: true,
-  manage_legend_sets: true,
-  manage_dashboards: true,
-  manage_maps: true,
-  manage_line_lists: true,
-  manage_backups: true,
-  manage_users: true,
-  manage_data_values: true,
-  manage_metadata_translations: true,
-  manage_memory: true,
-  manage_custom_app: true,
-  manage_sql_views: true,
-});
+// ── Tool registry: TOOLS (above) is the single source of tool names and
+// schemas. The only other hand-kept facts about tools are the two lists
+// below; every set the code uses is derived from TOOLS + these lists, and
+// checkToolRegistry() (end of this section) reports any gap at load time and
+// in `npm run verify`. Adding a tool = its TOOLS schema, an executor case,
+// the side-panel icon/label/detail (verify pins those), and — if it writes —
+// a WRITE_TOOL_LIST entry with a TOOL_SUMMARIES routing description.
+const TOOL_ROUTER = Object.freeze(Object.fromEntries(TOOLS.map(t => [t.function.name, true])));
 
 // ── Lazy Tool Manuals (two-tier tool docs) ───────────────────────────────────
 // Progressive disclosure of tool documentation, so the per-iteration LLM
@@ -2687,49 +2653,32 @@ const TOOL_ROUTER = Object.freeze({
 //   - No instruction text is lost — it moves from "always in context" to
 //     "in context from the moment the tool is first used".
 
-// Write-capable / complex tools that use slim wire definitions + the
-// first-call manual gate. Read tools (dhis2_query, search_metadata, counts,
-// analytics, architect_metadata, …) and manage_backups (recovery path must be
-// zero-friction) keep their full definitions on the wire.
-// Tools that can MODIFY the server. Used to decide whether manage_backups
-// travels with the selection, and — the safety-critical use — which tools the
-// read-only save-diagnosis mode withholds. Shared with the agentic loop so a
-// withheld tool can never be late-admitted.
-const WRITE_CAPABLE_TOOL_NAMES = new Set([
+// Tools that can MODIFY the server. Every one of them ships a slim wire
+// definition + its full manual on first use (MANUAL_TOOLS — the same set, by
+// design). Used to decide whether manage_backups travels with the selection,
+// and — the safety-critical use — which tools the read-only save-diagnosis
+// mode withholds. Shared with the agentic loop so a withheld tool can never be
+// late-admitted.
+const WRITE_TOOL_LIST = Object.freeze([
   'manage_metadata', 'manage_program_rules', 'manage_program_indicators',
   'manage_program_notifications', 'create_metadata', 'manage_datasets',
   'manage_custom_forms', 'manage_validation_rules', 'manage_org_units',
   'manage_indicators', 'manage_option_sets', 'manage_legend_sets',
   'manage_dashboards', 'manage_maps', 'manage_line_lists',
-  'manage_custom_translations', 'manage_growth_chart_plugin',
-  'manage_users', 'manage_data_values', 'manage_metadata_translations',
-  'manage_custom_app', 'manage_sql_views',
-]);
-
-const MANUAL_TOOLS = new Set([
-  'create_metadata',
-  'manage_metadata',
-  'manage_program_rules',
-  'manage_program_indicators',
-  'manage_program_notifications',
-  'manage_datasets',
-  'manage_custom_forms',
-  'manage_validation_rules',
-  'manage_org_units',
-  'manage_indicators',
-  'manage_option_sets',
-  'manage_legend_sets',
-  'manage_dashboards',
-  'manage_maps',
-  'manage_line_lists',
-  'manage_custom_translations',
-  'manage_growth_chart_plugin',
-  'manage_users',
-  'manage_data_values',
-  'manage_metadata_translations',
-  'manage_custom_app',
+  'manage_custom_translations', 'manage_growth_chart_plugin', 'manage_users',
+  'manage_data_values', 'manage_metadata_translations', 'manage_custom_app',
   'manage_sql_views',
 ]);
+const WRITE_CAPABLE_TOOL_NAMES = new Set(WRITE_TOOL_LIST);
+
+// Slim wire definition + first-call manual gate: exactly the write tools.
+// Read tools (dhis2_query, search_metadata, counts, analytics,
+// architect_metadata, …) and manage_backups (recovery must be zero-friction)
+// keep their full definitions on the wire.
+const MANUAL_TOOLS = new Set(WRITE_TOOL_LIST);
+// Tools whose whole purpose is reading patient-level records — refused for
+// remote providers (enforcePatientDataPrivacyGate, providers.js).
+const PATIENT_DATA_TOOL_NAMES = new Set(['detect_enrollment_abnormalities']);
 
 // Short routing descriptions sent on the wire for MANUAL_TOOLS. These carry
 // WHAT the tool does and WHEN to pick it (including the safety-critical
@@ -2750,7 +2699,7 @@ const TOOL_SUMMARIES = {
   manage_indicators: 'CRUD for AGGREGATE indicators — (numerator ÷ denominator) × factor values shown on dashboards/pivots/maps: list, get, create, update, delete. Tracker/event PROGRAM indicators are a DIFFERENT object → manage_program_indicators. Expressions are server-validated before save; chain legend_set_id to render colour-coded. NEVER write indicator bodies via dhis2_query.',
   manage_option_sets: 'Standalone option-set lifecycle (reusable ordered code/label drop-downs): list, get, create, update (own fields), add_options, remove_options, reorder_options, delete. For an option set inline on a NEW data element use create_metadata instead; to convert a set to MULTI_TEXT use manage_metadata(action=convert_value_type). NEVER hand-write option bodies via dhis2_query.',
   manage_legend_sets: 'Standalone legend-set lifecycle (reusable colour bands for traffic-light / heat-map rendering): list, get, create (explicit legends or auto_bands red→amber→green), add_legends, remove_legends, update (own fields), delete. Attach to an aggregate indicator via manage_indicators(legend_set_id) — never via raw PATCH. NEVER hand-write legendSets bodies via dhis2_query.',
-  manage_dashboards: 'Build/inspect analytics dashboards and saved visualizations (charts, pivots, single-value tiles): list, get, create_visualization, create_dashboard (atomic, with inline new visualizations), add_items (the ONLY safe way to add to an EXISTING dashboard — a raw PUT wipes its tiles), remove_item, update, delete. NEVER hand-assemble visualizations/dashboards bodies via dhis2_query (they import as EMPTY charts). render_chart = inline chat preview; this tool SAVES to DHIS2.',
+  manage_dashboards: 'Build/inspect analytics dashboards and saved visualizations (charts, pivots, single-value tiles): list, get, create_visualization, create_dashboard (atomic, with inline new visualizations; tiles sized and placed automatically), add_items (the ONLY safe way to add to an EXISTING dashboard — a raw PUT wipes its tiles), arrange (re-size squeezed tiles), remove_item, update, delete. NEVER hand-assemble visualizations/dashboards bodies via dhis2_query (they import as EMPTY charts). render_chart = inline chat preview; this tool SAVES to DHIS2.',
   manage_maps: 'Create/inspect/delete thematic maps (choropleth / bubble): list, get, create (one data_item UID + org_unit_level/org_units + period, optional legend_set_id), delete. NEVER hand-assemble /api/maps bodies via dhis2_query. Place a map on a dashboard via manage_dashboards(action=add_items, items=[{type:"MAP", map_id}]).',
   manage_line_lists: 'Author SAVED line lists — the row-per-record tables of the Line Listing app (eventVisualizations type LINE_LIST): list, get, create (EVENT / ENROLLMENT with cross-stage + repeated-event columns / TRACKED_ENTITY; dimensions by UID or exact name, auto stage/option-code resolution, filters, sorting, legend; the layout is PROVEN against analytics BEFORE saving), update, delete, validate (re-run its query → row_count). NEVER hand-assemble eventVisualizations bodies via dhis2_query (the app cannot open them). Dashboard placement: manage_dashboards items [{type:"EVENT_VISUALIZATION", event_visualization_id}]. line_listing_guide = app UI help; THIS tool saves the actual line lists.',
   manage_users: 'Administer users, user roles, user groups and authorities: list, get, create (username + names + ≥1 role + policy-compliant password or generate_password, capture/data-view/search org units, groups — names resolve to UIDs), update (roles/org units/groups add/remove, password reset, profile), disable, enable, delete; list_roles, get_role, create_role, update_role, delete_role (authorities validated against /api/authorities — DHIS2 silently stores misspelled ones); list_groups, create_group, update_group (members), delete_group; list_authorities. NEVER POST /users or /userRoles via dhis2_query.',
@@ -3189,7 +3138,7 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 ### Rules
 - data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped. NEVER invent visualization, map or data-item UIDs.
 - add_items reads the full dashboard, appends below the current tiles, and writes the COMPLETE item set back, snapshotting to backups first. NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} — a dashboard PUT is a whole-object REPLACE that permanently wipes every existing tile (now blocked in code).
-- Items are auto-arranged on the 58-column grid (override per item with x/y/width/height). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"EVENT_VISUALIZATION", event_visualization_id } (a saved line list from manage_line_lists) | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.
+- **Layout is the tool's job.** The Dashboard app grid is 60 columns wide (a column scales with the screen) and its rows are a fixed 20 px, so a guessed width/height makes slivers. The tool sizes each tile from what it shows: single-value tiles share one row (up to 4, tall enough for their wrapped title), charts two per row — full width when dense (more than 12 x-axis categories, more than 5 series or more than 24 bars), pivot tables full width and as tall as their rows, line lists full width, a half tile with no partner widened to full. List items in reading order (KPIs first, then charts, then tables), never pass x/y/width/height (they count only as order + small/half/full), and use size:"small"|"half"|"full" only when the user asks for a size. The result's tile_rows lists the rows top to bottom — describe the arrangement from it. To fix an existing dashboard's squeezed or messy tiles, action="arrange" (get flags tiles too small to read). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"EVENT_VISUALIZATION", event_visualization_id } (a saved line list from manage_line_lists) | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }.
 - To delete a whole dashboard use action="delete" (snapshots first). Sharing/deletion of standalone visualizations/maps → manage_metadata.
 
 ### Examples
@@ -3622,6 +3571,24 @@ const MANUAL_EXTRAS = {
   manage_sql_views: KB_SQL_VIEWS_DETAILS,
   // manage_maps: full description already covers usage; no extra KB.
 };
+
+// Every registry fact must agree with TOOLS. Returns a list of problems (empty
+// when consistent); logged at load, asserted by `npm run verify`.
+function checkToolRegistry() {
+  const names = new Set(TOOLS.map(t => t.function.name));
+  const problems = [];
+  if (names.size !== TOOLS.length) problems.push('TOOLS has duplicate tool names');
+  for (const n of WRITE_TOOL_LIST) if (!names.has(n)) problems.push(`WRITE_TOOL_LIST names "${n}", which has no TOOLS schema`);
+  for (const n of PATIENT_DATA_TOOL_NAMES) if (!names.has(n)) problems.push(`PATIENT_DATA_TOOL_NAMES names "${n}", which has no TOOLS schema`);
+  for (const n of MANUAL_TOOLS) if (!TOOL_SUMMARIES[n]) problems.push(`write tool "${n}" has no TOOL_SUMMARIES routing description`);
+  for (const n of Object.keys(TOOL_SUMMARIES)) if (!MANUAL_TOOLS.has(n)) problems.push(`TOOL_SUMMARIES has "${n}", which is not a write tool`);
+  for (const n of Object.keys(MANUAL_EXTRAS)) if (!MANUAL_TOOLS.has(n)) problems.push(`MANUAL_EXTRAS has "${n}", which is not a write tool`);
+  return problems;
+}
+{
+  const problems = checkToolRegistry();
+  if (problems.length) console.error('[registry] tool registry is inconsistent:', problems);
+}
 
 // ── Slim wire definitions ──
 const SLIM_DESC_LIMIT = 180;

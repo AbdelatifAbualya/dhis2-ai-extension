@@ -68,92 +68,56 @@ function filterPatientDataForProvider(messages, cfg = getProviderConfig()) {
   return out;
 }
 
-async function callFireworks(messages, useTools = true, tools = TOOLS) {
-  messages = filterPatientDataForProvider(messages);
-  const stored = await chrome.storage.local.get(['fireworksApiKey', 'providerConfig']);
-  const key = sanitizeHeaderValue(stored.fireworksApiKey);
-  const cfg = { ...DEFAULT_PROVIDER_CONFIG, ...(stored.providerConfig || {}) };
-  const localOk = isLocalProvider(cfg);
-  if (!key && !localOk) {
-    throw new Error('No API key configured. Open settings to add your API key (or switch provider to "Ollama (local)" for a no-key local LLM).');
-  }
-  if (!isValidProviderUrl(cfg.apiBaseUrl)) {
-    throw new Error('Invalid provider URL. Open settings and enter an http(s) URL (e.g. http://localhost:11434/v1).');
-  }
-  const url = getChatCompletionsUrl(cfg.apiBaseUrl);
-  const isGoogle = cfg.providerType === 'google' || (cfg.apiBaseUrl || '').includes('googleapis.com');
-
-  const sanitizedMessages = sanitizeWireMessages(messages, isGoogle);
-
-  const body = {
-    model: cfg.modelId,
-    messages: sanitizedMessages,
-    temperature: cfg.temperature,
-    max_tokens: cfg.maxTokens,
-  };
-  if (!isGoogle) body.top_p = 1;
-  if (useTools) {
-    body.tools = tools;
-    body.tool_choice = 'auto';
-  }
-
-  const headers = {
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-  };
-  if (key) headers.Authorization = `Bearer ${key}`;
-
-  const bodyStr = JSON.stringify(body);
-  const RETRYABLE = new Set([429, 500, 502, 503]);
+// ── Provider request with connect timeout + retry (both streaming adapters) ──
+// POSTs the request and returns the Response once headers arrive. A connect
+// timer aborts a request that never connects; it is CLEARED the moment headers
+// arrive so the SSE body can read for as long as the model needs (passing
+// AbortSignal.timeout() into fetch would abort the body too — "BodyStreamBuffer
+// was aborted" mid-generation on slow/local LLMs). Network errors, timeouts and
+// `retryable` HTTP statuses are retried with exponential back-off (1s, 2s, 4s,
+// max 8s); the adapter supplies how a final failure is worded.
+//   opts: { url, headers, bodyStr, retryable:Set, iteration, logTag,
+//           networkError(e, isAbort) → Error, httpError(resp, errBody) → Error }
+async function postProviderRequest(opts) {
   const MAX_RETRIES = 3;
-  // 90s ceiling for non-streaming completions. Long enough for local CPUs on
-  // moderate prompts; short enough to surface stuck connections.
-  const REQUEST_TIMEOUT_MS = 90_000;
-
+  const CONNECT_TIMEOUT_MS = 60_000;
+  const backoffDelay = (attempt, label) => {
+    const delay = Math.min(1000 * 2 ** attempt, 8000);
+    console.warn(`[${opts.logTag}] ${label} on attempt ${attempt + 1}, retrying in ${delay}ms`);
+    return delay;
+  };
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
+    let timeoutFired = false;
+    controller.signal.addEventListener('abort', () => { timeoutFired = true; }, { once: true });
     let resp;
     try {
-      resp = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: bodyStr,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      resp = await fetch(opts.url, { method: 'POST', headers: opts.headers, body: opts.bodyStr, signal: controller.signal });
+      // Headers received — the connect timer must never fire on the body.
+      clearTimeout(timeoutId);
     } catch (e) {
-      // AbortError or network failure: retry transient, surface terminal.
-      const isAbort = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+      clearTimeout(timeoutId);
+      const isAbort = e?.name === 'TimeoutError' || e?.name === 'AbortError' || timeoutFired;
       if (attempt < MAX_RETRIES && (isAbort || /network|failed to fetch/i.test(e?.message || ''))) {
-        const delay = Math.min(1000 * 2 ** attempt, 8000);
-        console.warn(`[callFireworks] ${e.name || 'fetch'} on attempt ${attempt + 1}, retrying in ${delay}ms`);
+        const delay = backoffDelay(attempt, e?.name || 'fetch');
+        broadcast({ type: 'AI_THINKING', iteration: opts.iteration, label: `Connecting, retrying (${attempt + 1}/${MAX_RETRIES})` });
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      const local = isLocalProvider(cfg);
-      if (isAbort) {
-        throw new Error(local
-          ? `Local LLM at ${cfg.apiBaseUrl} did not respond within ${REQUEST_TIMEOUT_MS / 1000}s. Is Ollama running and the model loaded?`
-          : `LLM request timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`);
-      }
-      throw new Error(local
-        ? `Cannot connect to local LLM at ${cfg.apiBaseUrl}. Make sure Ollama is running (ollama serve).`
-        : `Network error reaching LLM: ${e?.message || 'unknown'}`);
+      throw opts.networkError(e, isAbort, CONNECT_TIMEOUT_MS);
     }
-
-    if (resp.ok) return resp.json();
-
+    if (resp.ok) return resp;
     const err = await resp.json().catch(() => ({}));
-    if (RETRYABLE.has(resp.status) && attempt < MAX_RETRIES) {
-      const delay = Math.min(1000 * 2 ** attempt, 8000);
-      console.warn(`[callFireworks] ${resp.status} on attempt ${attempt + 1}, retrying in ${delay}ms`);
+    if (opts.retryable.has(resp.status) && attempt < MAX_RETRIES) {
+      const delay = backoffDelay(attempt, String(resp.status));
+      broadcast({ type: 'AI_THINKING', iteration: opts.iteration, label: `API busy, retrying (${attempt + 1}/${MAX_RETRIES})` });
       await new Promise(r => setTimeout(r, delay));
       continue;
     }
-    if (resp.status === 404 && isLocalProvider(cfg)) {
-      const detail = err.error?.message || err.message || `model "${cfg.modelId}" not found`;
-      throw new Error(`${detail}. Try: ollama pull ${cfg.modelId}`);
-    }
-    throw new Error(err.error?.message || `LLM API error ${resp.status}`);
+    throw opts.httpError(resp, err);
   }
+  throw new Error('LLM request failed after retries.'); // unreachable: the last attempt returns or throws
 }
 
 // ── Stream stall guard ───────────────────────────────────────────────────────
@@ -221,70 +185,29 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
   };
   if (key) headers.Authorization = `Bearer ${key}`;
 
-  const bodyStr = JSON.stringify(body);
-  const RETRYABLE = new Set([429, 500, 502, 503]);
-  const MAX_RETRIES = 3;
-  // 60s timeout to *establish* the streaming connection. Once headers arrive
-  // we clearTimeout so the body stream can read for as long as the model needs
-  // — without this, AbortSignal.timeout would abort the body too, surfacing as
-  // "BodyStreamBuffer was aborted" mid-generation on slow/local LLMs.
-  const CONNECT_TIMEOUT_MS = 60_000;
-  let resp;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
-    let timeoutFired = false;
-    const onTimeoutFired = () => { timeoutFired = true; };
-    controller.signal.addEventListener('abort', onTimeoutFired, { once: true });
-    try {
-      resp = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: bodyStr,
-        signal: controller.signal,
-      });
-      // Headers received — release the connect-timer so it can NEVER fire
-      // against the body stream during long generations.
-      clearTimeout(timeoutId);
-    } catch (e) {
-      clearTimeout(timeoutId);
-      const isAbort = e?.name === 'TimeoutError' || e?.name === 'AbortError' || timeoutFired;
-      if (attempt < MAX_RETRIES && (isAbort || /network|failed to fetch/i.test(e?.message || ''))) {
-        const delay = Math.min(1000 * 2 ** attempt, 8000);
-        console.warn(`[callFireworksStreaming] ${e.name || 'fetch'} on attempt ${attempt + 1}, retrying in ${delay}ms`);
-        broadcast({ type: 'AI_THINKING', iteration, label: `Connecting, retrying (${attempt + 1}/${MAX_RETRIES})` });
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
+  const resp = await postProviderRequest({
+    url, headers, bodyStr: JSON.stringify(body), iteration, logTag: 'callFireworksStreaming',
+    retryable: new Set([429, 500, 502, 503]),
+    networkError: (e, isAbort, timeoutMs) => {
       const local = isLocalProvider(cfg);
       if (isAbort) {
-        throw new Error(local
-          ? `Could not reach local LLM at ${cfg.apiBaseUrl} within ${CONNECT_TIMEOUT_MS / 1000}s. Is Ollama running? Start it with: ollama serve`
-          : `Could not reach LLM at ${cfg.apiBaseUrl} within ${CONNECT_TIMEOUT_MS / 1000}s. Check the URL and your connection.`);
+        return new Error(local
+          ? `Could not reach local LLM at ${cfg.apiBaseUrl} within ${timeoutMs / 1000}s. Is Ollama running? Start it with: ollama serve`
+          : `Could not reach LLM at ${cfg.apiBaseUrl} within ${timeoutMs / 1000}s. Check the URL and your connection.`);
       }
-      throw new Error(local
+      return new Error(local
         ? `Cannot connect to local LLM at ${cfg.apiBaseUrl}. Make sure Ollama is running (ollama serve) and the model is pulled (ollama pull ${cfg.modelId}).`
         : `Network error reaching LLM at ${cfg.apiBaseUrl}: ${e?.message || 'unknown'}`);
-    }
-
-    if (resp.ok) break;
-
-    const err = await resp.json().catch(() => ({}));
-    if (RETRYABLE.has(resp.status) && attempt < MAX_RETRIES) {
-      const delay = Math.min(1000 * 2 ** attempt, 8000);
-      console.warn(`[callFireworksStreaming] ${resp.status} on attempt ${attempt + 1}, retrying in ${delay}ms`);
-      broadcast({ type: 'AI_THINKING', iteration, label: `API busy, retrying (${attempt + 1}/${MAX_RETRIES})` });
-      await new Promise(r => setTimeout(r, delay));
-      continue;
-    }
-    // Common Ollama 404: model not pulled. Surface the fix path.
-    if (resp.status === 404 && isLocalProvider(cfg)) {
-      const detail = err.error?.message || err.message || `model "${cfg.modelId}" not found on ${cfg.apiBaseUrl}`;
-      throw new Error(`${detail}. Try: ollama pull ${cfg.modelId}`);
-    }
-    throw new Error(err.error?.message || err.message || (err[0]?.error?.message) || `LLM API error ${resp.status}`);
-  }
+    },
+    httpError: (r, err) => {
+      // Common Ollama 404: model not pulled. Surface the fix path.
+      if (r.status === 404 && isLocalProvider(cfg)) {
+        const detail = err.error?.message || err.message || `model "${cfg.modelId}" not found on ${cfg.apiBaseUrl}`;
+        return new Error(`${detail}. Try: ollama pull ${cfg.modelId}`);
+      }
+      return new Error(err.error?.message || err.message || (err[0]?.error?.message) || `LLM API error ${r.status}`);
+    },
+  });
 
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
@@ -642,60 +565,16 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
     body.tool_choice = { type: 'auto' };
   }
 
-  const bodyStr = JSON.stringify(body);
-  const RETRYABLE = new Set([429, 500, 502, 503, 529]);
-  const MAX_RETRIES = 3;
-  // Connect-only timeout. Cleared the moment headers arrive so the SSE body
-  // can read freely — passing AbortSignal.timeout() into fetch would abort
-  // the body too and surface as "BodyStreamBuffer was aborted" mid-generation.
-  const CONNECT_TIMEOUT_MS = 60_000;
-  let resp;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
-    let timeoutFired = false;
-    const onTimeoutFired = () => { timeoutFired = true; };
-    controller.signal.addEventListener('abort', onTimeoutFired, { once: true });
-    try {
-      resp = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': key,
-          'anthropic-version': '2023-06-01',
-          Accept: 'text/event-stream',
-        },
-        body: bodyStr,
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-    } catch (e) {
-      clearTimeout(timeoutId);
-      const isAbort = e?.name === 'TimeoutError' || e?.name === 'AbortError' || timeoutFired;
-      if (attempt < MAX_RETRIES && (isAbort || /network|failed to fetch/i.test(e?.message || ''))) {
-        const delay = Math.min(1000 * 2 ** attempt, 8000);
-        console.warn(`[callAnthropic] ${e.name || 'fetch'} on attempt ${attempt + 1}, retrying in ${delay}ms`);
-        broadcast({ type: 'AI_THINKING', iteration, label: `Connecting, retrying (${attempt + 1}/${MAX_RETRIES})` });
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      if (isAbort) throw new Error(`Could not reach Anthropic within ${CONNECT_TIMEOUT_MS / 1000}s.`);
-      throw new Error(`Network error reaching Anthropic: ${e?.message || 'unknown'}`);
-    }
-
-    if (resp.ok) break;
-
-    const err = await resp.json().catch(() => ({}));
-    if (RETRYABLE.has(resp.status) && attempt < MAX_RETRIES) {
-      const delay = Math.min(1000 * 2 ** attempt, 8000);
-      console.warn(`[callAnthropic] ${resp.status} on attempt ${attempt + 1}, retrying in ${delay}ms`);
-      broadcast({ type: 'AI_THINKING', iteration, label: `API busy, retrying (${attempt + 1}/${MAX_RETRIES})` });
-      await new Promise(r => setTimeout(r, delay));
-      continue;
-    }
-    throw new Error(err.error?.message || `Anthropic API error ${resp.status}`);
-  }
+  const resp = await postProviderRequest({
+    url,
+    headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', Accept: 'text/event-stream' },
+    bodyStr: JSON.stringify(body), iteration, logTag: 'callAnthropic',
+    retryable: new Set([429, 500, 502, 503, 529]),
+    networkError: (e, isAbort, timeoutMs) => (isAbort
+      ? new Error(`Could not reach Anthropic within ${timeoutMs / 1000}s.`)
+      : new Error(`Network error reaching Anthropic: ${e?.message || 'unknown'}`)),
+    httpError: (r, err) => new Error(err.error?.message || `Anthropic API error ${r.status}`),
+  });
 
   // Parse Anthropic SSE stream
   const reader = resp.body.getReader();
@@ -1992,9 +1871,7 @@ async function detectEnrollmentAbnormalities(args, programId, orgUnitId) {
 // future? Put its name in PATIENT_DATA_TOOL_NAMES (or extend toolReadsPatientData)
 // and it is automatically gated. De-identified AGGREGATE analytics and metadata
 // are unaffected.
-const PATIENT_DATA_TOOL_NAMES = new Set([
-  'detect_enrollment_abnormalities',
-]);
+// PATIENT_DATA_TOOL_NAMES lives with the rest of the tool registry (registry.js).
 // The API path the server will actually serve, without query: fetch() resolves
 // dot segments (also as %2e) and backslashes and drops the #fragment, and DHIS2
 // decodes %-escapes — "programs/../tracker/trackedEntities" and
