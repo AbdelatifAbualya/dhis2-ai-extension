@@ -248,10 +248,11 @@ async function executeToolCall(name, args) {
       if (/^audits\/?$/i.test(_gp)) {
         return {
           _error: 'Not sent: "audits" is not an endpoint by itself (404).',
-          _hint: 'Audit endpoints are audits/dataValue and audits/dataApproval (aggregate); tracker audits (audits/trackedEntity, …) are patient-level and refused on a cloud model. Ownership-transfer history is not an audit — manage_sql_views reads it.',
+          _hint: `Audit endpoints are audits/dataValue and audits/dataApproval (aggregate); tracker audits (audits/trackedEntity, …) are patient-level and refused on a cloud model. Ownership-transfer history is not an audit — manage_sql_views reads it. ${DHIS2_LOG_SOURCES_HINT}`,
           _scope: 'known_endpoint_guidance',
         };
       }
+      if (isGuessedLogEndpoint(_gp)) return guessedLogEndpointRefusal(_gp);
       const _sm = /^schemas\/([^/]+)$/i.exec(_gp);
       if (_sm && typeof getSchemaIndex === 'function') {
         const _idx = await getSchemaIndex();

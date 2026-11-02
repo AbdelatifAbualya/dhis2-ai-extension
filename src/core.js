@@ -797,7 +797,15 @@ function harvestUidsInto(set, value, depth = 0) {
   }
   if (typeof value !== 'object') return;
   if (Array.isArray(value)) { for (const v of value) harvestUidsInto(set, v, depth + 1); return; }
-  for (const v of Object.values(value)) harvestUidsInto(set, v, depth + 1);
+  // Keys too: several DHIS2 responses are maps keyed by UID. system/tasks answers
+  // { ANALYTICS_TABLE: { WtMCtIQU6HS: [...] } }, so reading that job's messages
+  // was refused as a "hallucinated" id (live 2026-11-02, 2.42.7) although the
+  // model had it from the server.
+  for (const [k, v] of Object.entries(value)) {
+    const keyUids = k.match(DHIS_UID_RE);
+    if (keyUids) for (const m of keyUids) set.add(m);
+    harvestUidsInto(set, v, depth + 1);
+  }
 }
 
 function seedKnownIds(userText, ctx) {

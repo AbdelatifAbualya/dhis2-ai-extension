@@ -127,6 +127,21 @@ async function postProviderRequest(opts) {
 // indefinitely. 120s with zero bytes while a generation is in flight means the
 // stream is dead — reject so the caller can retry or surface a clear error.
 const STREAM_STALL_MS = 120_000;
+// How far a reply got before its stream died: the agent loop uses this to ask
+// for a smaller call when a long tool call was the thing being cut.
+function noteStreamProgress(err, fullContent, toolCallMap) {
+  try {
+    const calls = Object.values(toolCallMap || {});
+    const argsOf = (tc) => String(tc.function?.arguments ?? tc.arguments ?? '');
+    const longest = calls.reduce((best, tc) => (!best || argsOf(tc).length > argsOf(best).length ? tc : best), null);
+    err.streamProgress = {
+      textChars: String(fullContent || '').length,
+      toolName: longest ? (longest.function?.name || longest.name || null) : null,
+      toolArgChars: longest ? argsOf(longest).length : 0,
+    };
+  } catch { /* progress is advisory: never mask the real error */ }
+  return err;
+}
 async function readSseChunkWithStallGuard(reader, providerLabel) {
   let stallTimer = null;
   try {
@@ -236,7 +251,7 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
       // cancel() on a stream that already errored (connection dropped) returns
       // a promise rejected with that error — catch it or it is unhandled.
       try { reader.cancel().catch(() => {}); } catch {}
-      throw stallErr;
+      throw noteStreamProgress(stallErr, fullContent, toolCallMap);
     }
     const { done, value } = readResult;
     if (done) break;
@@ -600,7 +615,7 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
       // cancel() on a stream that already errored (connection dropped) returns
       // a promise rejected with that error — catch it or it is unhandled.
       try { reader.cancel().catch(() => {}); } catch {}
-      throw stallErr;
+      throw noteStreamProgress(stallErr, fullContent, toolCallMap);
     }
     const { done, value } = readResult;
     if (done) break;
@@ -1939,10 +1954,48 @@ function toolReadsPatientData(name, args) {
   return false;
 }
 const PATIENT_DATA_REFUSAL = 'Refused by hard privacy safeguard: patient-level tracker data (events, enrollments, tracked entities, individual event rows) can only be read when the assistant runs on a LOCAL model (Ollama / localhost). The current provider is remote/cloud, so this data cannot be accessed.';
+
+// ── Where DHIS2 keeps logs and job history ───────────────────────────────────
+// Verified on 2.41.11, 2.42.7, 2.43.2 and localhost:8081 (2026-11-02). A request
+// for a "logs" app burned a whole turn guessing endpoints that do not exist, then
+// misread the result. Every guess below answers 404 on all four. metadataAudits is
+// left out on purpose: detectMetadataAuditSupport treats it as possibly real, and
+// no 2.40 server was available to rule it out.
+const DHIS2_LOG_SOURCES_HINT = 'Verified log and history sources: '
+  + 'scheduling/completed = finished job runs by job type: { <JOB_TYPE>: [{ jobId, status, description, startedTime, completedTime, summary, stages }] }. '
+  + 'scheduling/running/types and scheduling/running = what is running now. '
+  + 'system/tasks = messages per job: { <JOB_TYPE>: { <jobId>: [{ id, level, category, message, completed, time }] } } — job ids are the KEYS and each item\'s id is a message id, so narrow it with system/tasks/<JOB_TYPE> or system/tasks/<JOB_TYPE>/<jobId> and go no deeper. '
+  + 'scheduler = next runs. jobConfigurations?fields=id,displayName,jobType,enabled,jobStatus,lastExecuted,lastExecutedStatus,nextExecutionTime = schedule and last result. '
+  + 'audits/dataValue and audits/dataApproval = aggregate audit trails (paged). '
+  + 'dataStatistics?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&interval=MONTH = usage counts (all three parameters required). dataSummary = object counts and active users. '
+  + 'NOT available: DHIS2 has no API for HTTP request logs, server errors or dhis.log — they stay in the server\'s log files. Say so plainly and never fill that gap with made-up or proxy data.';
+const GUESSED_LOG_ENDPOINT_RE = /^(?:logs?|logging|loggers|errors?|accesslogs?|errorlogs?|auditlogs?|apilogs?|requestlogs?|analyticstableslogs?|system\/(?:logs?|logging|errors?|audits?|auditlogs?|requests?|events?|notifications?|tasksextended|tasksummaries))\/?$/i;
+function isGuessedLogEndpoint(canonicalPath) {
+  const p = String(canonicalPath || '');
+  if (GUESSED_LOG_ENDPOINT_RE.test(p)) return true;
+  // Deeper than system/tasks/<JOB_TYPE>/<jobId> is a 404: a message has no endpoint.
+  if (/^system\/tasks\/[^/]+\/[^/]+\/./i.test(p)) return true;
+  // audits/<x> that is neither an aggregate audit nor about tracker records.
+  return /^audits\/./i.test(p) && !/^audits\/(?:datavalue|dataapproval|tracked|enrollment|event|tracker|relationship|ownership)/i.test(p);
+}
+function guessedLogEndpointRefusal(canonicalPath) {
+  return {
+    _error: `Not sent: "${canonicalPath}" is not a DHIS2 endpoint (404).`,
+    _hint: DHIS2_LOG_SOURCES_HINT,
+    _scope: 'known_endpoint_guidance',
+  };
+}
+
 // Returns a refusal object if the call must be blocked, else null.
 function enforcePatientDataPrivacyGate(name, args) {
   if (!toolReadsPatientData(name, args)) return null;
   if (providerRequestsStayLocal(getProviderConfig())) return null; // requests stay on this machine → permitted
+  // audits/<anything> stays closed (nothing is sent either way), but calling a
+  // path that does not exist "patient-level data" made a model report that the
+  // analytics log was blocked for privacy (live 2026-11-02, audits/analytics).
+  if (name === 'dhis2_query' && isGuessedLogEndpoint(canonicalApiPath(args && args.path))) {
+    return { ...guessedLogEndpointRefusal(canonicalApiPath(args.path)), _privacy_block: true };
+  }
   return {
     _error: PATIENT_DATA_REFUSAL,
     _privacy_block: true,
