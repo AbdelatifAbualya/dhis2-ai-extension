@@ -216,6 +216,8 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
   // "the style is off" stays read_only. redesign is unambiguous → unconstrained.
   + '|design\\s+(?:a|an|the|this|that|it|new|custom)\\b|redesign|customi[sz]e\\s+(?:a|an|the|this|that|it|new)\\b'
   + '|style\\s+(?:a|an|the|this|that|it)\\b|lay\\s?out\\s+(?:a|an|the|this)\\b'
+  // "Rearrange / tidy / resize the dashboard tiles" (manage_dashboards arrange).
+  + '|re-?arrange|arrange\\s+(?:a|an|the|this|that|it|my|its|them)\\b|tidy|resize|enlarge|widen'
   + '|restore|revert|roll ?back|undo|link|unlink'
   + '|enable|disable|turn (?:on|off)|share|grant|revoke|merge|split|rename|migrate|swap|convert|attach|assign|unassign|detach'
   + '|approve|confirm|proceed|continue|do it|do this|go ahead|just do it'
@@ -278,8 +280,151 @@ const SAVE_FAILURE_RE = new RegExp(
   'i'
 );
 
+// A REQUESTED feature that lists failure states ("include helpful loading,
+// error, invalid-filter and empty-result messages") is not a report that
+// saving failed. Inpatient app thread (2026-11-01): that sentence matched
+// "load … error", the turn switched to save-failure diagnosis, and every write
+// tool — manage_custom_app included — was withheld, so no app could be built.
+// Lists of two or more states, or one state after a feature verb ("show an
+// error message"), are removed before the test; "I get an error message when
+// saving" still reads as a failure report.
+const UI_STATE_WORD = '(?:loading|load|error|empty(?:[-\\s]results?)?|no[-\\s]results?|invalid[-\\s][\\w-]+|success|warning|validation|retry)';
+const UI_STATE_NOUN = '(?:messages?|states?|notices?|screens?|views?|indicators?|banners?|spinners?|handling|feedback|text)';
+const UI_STATE_SEP = '(?:\\s*[,/&]\\s*(?:and\\s+|or\\s+)?|\\s+(?:and|or)\\s+)';
+const UI_STATE_PHRASE_RE = new RegExp(
+  `\\b${UI_STATE_WORD}(?:${UI_STATE_SEP}${UI_STATE_WORD})+\\s+${UI_STATE_NOUN}\\b`
+  + `|\\b(?:include|includes|including|with|add|show|shows|display|provide|handle|clear|helpful|friendly)\\s+(?:(?:a|an|the|clear|helpful|friendly|proper|useful)\\s+){0,3}${UI_STATE_WORD}\\s+${UI_STATE_NOUN}\\b`,
+  'gi'
+);
+function reportsSaveFailure(text) {
+  return SAVE_FAILURE_RE.test(String(text || '').toLowerCase().replace(UI_STATE_PHRASE_RE, ' '));
+}
+
+// ── Multilingual write intent (security review 2026-10-29) ──────────────────
+// The authorization patterns below are English. "أنشئ لوحة معلومات لبرنامج
+// رعاية الأمومة" (create a dashboard…) and "احذف هذا المؤشر" (delete this
+// indicator) were classified read_only, so a model that understood the
+// request could not do it. writeIntentGloss() turns imperative / negated /
+// how-to verbs and bare "yes" of Arabic, French, Spanish and Portuguese into
+// the equivalent English phrase, and the SAME English rules then decide —
+// one policy, not one per language. Only unambiguous verb forms are listed
+// (no Arabic غير/حدث/عدل without shadda: they also mean "not"/"event"/"justice").
+const WI_LANGS = [
+  { // Arabic — imperatives; negative forms ("لا تحذف") use other verb forms and never match
+    info: /(?:^|[\s،؛.!?:"'(])(?:كيف|كيفية|اشرح|إشرح|شرح|ماذا\s+يحدث|ما\s+الذي\s+يحدث|طريقة)/,
+    noChange: /(?:لا\s+تقم\s+بأي\s+(?:تغيير|تعديل)|بدون\s+(?:أي\s+)?(?:تغيير|تعديل)|دون\s+(?:أي\s+)?(?:تغيير|تعديل)|لا\s+(?:تغير|تعدل|تغيّر|تعدّل)\s+(?:أي\s+)?شي|فقط\s+اشرح)/,
+    yes: /^\s*(?:نعم|أجل|اجل|موافق|تفضل|حسنا|حسناً|نفذ|نفّذ|تابع|استمر)\s*[.!؟?]*\s*$/,
+    verbs: [
+      ['create', /(?:^|[\s،؛.!?:"'(])(?:و|ف)?(?:أنشئ|انشئ|أنشِئ|اصنع|إصنع|أضف|اضف|أضِف|ابنِ|قم\s+ب(?:إنشاء|انشاء|إضافة|اضافة|بناء))/],
+      ['update', /(?:^|[\s،؛.!?:"'(])(?:و|ف)?(?:عدّل|عدِّل|أصلح|اصلح|صحّح|صحح|حدّث|حدِّث|غيّر|غيِّر|قم\s+ب(?:تعديل|تحديث|تغيير|إصلاح|اصلاح))/],
+      ['delete', /(?:^|[\s،؛.!?:"'(])(?:و|ف)?(?:احذف|إحذف|أزل|ازل|أزِل|امسح|إمسح|قم\s+ب(?:حذف|إزالة|ازالة|مسح))/],
+    ],
+  },
+  { // French
+    info: /(?<!\p{L})(?:comment|explique|expliquez|qu'est-ce\s+qui\s+se\s+passe)(?!\p{L})/iu,
+    noChange: /(?<!\p{L})(?:ne\s+(?:modifie|modifiez|change|changez|touche|touchez)\s+(?:à\s+)?rien|sans\s+(?:rien\s+)?(?:modifier|changer)|aucune\s+modification)(?!\p{L})/iu,
+    yes: /^\s*(?:oui|d'accord|ok|vas-y|allez-y|c'est\s+bon|confirme|confirmé)\s*[.!]*\s*$/iu,
+    neg: (v) => new RegExp(`(?<!\\p{L})ne\\s+(?:\\S+\\s+){0,2}(?:${v})\\s+(?:pas|jamais|rien)(?!\\p{L})`, 'iu'),
+    verbs: [
+      ['create', 'crée|créez|créer|construis|construisez|ajoute|ajoutez|génère|générez|fais|faites'],
+      ['update', 'modifie|modifiez|corrige|corrigez|change|changez|renomme|renommez|mets\\s+à\\s+jour|mettez\\s+à\\s+jour'],
+      ['delete', 'supprime|supprimez|efface|effacez|retire|retirez|enlève|enlevez'],
+    ],
+  },
+  { // Spanish
+    info: /(?<!\p{L})(?:cómo|explica|explícame|explique|qué\s+pasa\s+si)(?!\p{L})/iu,
+    noChange: /(?<!\p{L})(?:sin\s+(?:hacer\s+)?(?:ningún\s+)?cambios?|no\s+(?:cambies|modifiques|hagas)\s+nada)(?!\p{L})/iu,
+    yes: /^\s*(?:sí|si|claro|adelante|vale|de\s+acuerdo|confirmo|hazlo)\s*[.!]*\s*$/iu,
+    neg: (v) => new RegExp(`(?<!\\p{L})no\\s+(?:lo\\s+|la\\s+|los\\s+|las\\s+)?(?:${v})(?!\\p{L})`, 'iu'),
+    verbs: [
+      ['create', 'crea|cree|crear|construye|construir|agrega|añade|genera|haz'],
+      ['update', 'modifica|actualiza|corrige|cambia|edita|renombra'],
+      ['delete', 'elimina|borra|quita|suprime'],
+    ],
+  },
+  { // Portuguese — the negative imperative ("não exclua") uses the SAME form, so negation is checked
+    info: /(?<!\p{L})(?:como\s+(?:eu\s+|posso\s+|faço\s+para\s+|se\s+)|explique|explica|o\s+que\s+acontece)(?!\p{L})/iu,
+    noChange: /(?<!\p{L})(?:sem\s+(?:fazer\s+)?(?:nenhuma\s+)?(?:alteraç(?:ão|ões)|mudanças?)|não\s+(?:altere|mude|modifique|faça)\s+nada)(?!\p{L})/iu,
+    yes: /^\s*(?:sim|pode|claro|vai\s+em\s+frente|confirmo|faça)\s*[.!]*\s*$/iu,
+    neg: (v) => new RegExp(`(?<!\\p{L})não\\s+(?:o\\s+|a\\s+|os\\s+|as\\s+)?(?:${v})(?!\\p{L})`, 'iu'),
+    verbs: [
+      ['create', 'crie|cria|criar|construa|adicione|adiciona|gere|faça'],
+      ['update', 'modifique|atualize|corrija|altere|mude|edite|renomeie'],
+      ['delete', 'exclua|apague|remova|elimine'],
+    ],
+  },
+];
+// English noun glosses so the TOOL ROUTER also understands the request
+// (an Arabic "dashboard" request otherwise got no dashboard tools).
+const WI_NOUNS = [
+  [/لوحة\s+(?:معلومات|تحكم|القيادة|المعلومات)|(?<!\p{L})(?:tableau\s+de\s+bord|tablero|panel\s+de\s+control|painel)(?!\p{L})/iu, 'dashboard'],
+  [/مؤشرات?\s+(?:ال)?برنامج|(?<!\p{L})(?:indicateurs?\s+de\s+programme|indicadores?\s+de\s+programa)(?!\p{L})/iu, 'program indicator'],
+  [/مؤشر|(?<!\p{L})(?:indicateurs?|indicador(?:es)?)(?!\p{L})/iu, 'indicator'],
+  [/برنامج|برامج|(?<!\p{L})(?:programmes?|programas?)(?!\p{L})/iu, 'program'],
+  [/خريطة|خرائط|(?<!\p{L})(?:cartes?|mapas?)(?!\p{L})/iu, 'map'],
+  [/رسم\s+بياني|مخطط|(?<!\p{L})(?:graphiques?|gráficos?)(?!\p{L})/iu, 'chart'],
+  [/جدول|(?<!\p{L})(?:tableau|tabla|tabela)(?!\p{L})/iu, 'table'],
+  [/قائمة\s+(?:السجلات|الحالات)|(?<!\p{L})(?:liste\s+de\s+lignes|listado)(?!\p{L})/iu, 'line list'],
+  [/مرحلة|(?<!\p{L})(?:étape|etapa)(?!\p{L})/iu, 'stage'],
+  [/قاعدة|قواعد|(?<!\p{L})(?:règles?|reglas?|regras?)(?!\p{L})/iu, 'program rule'],
+];
+const WI_EN_VERB = { create: 'create', update: 'update', delete: 'delete' };
+
+function writeIntentGloss(text) {
+  const t = String(text || '');
+  if (!/[^\x00-\x7F]/.test(t) && !/\b(?:crée|créez|supprime|elimina|borra|crea|exclua|apague|oui|sí|sim|comment|cómo)\b/i.test(t)) return '';
+  const out = [];
+  for (const L of WI_LANGS) {
+    if (L.yes.test(t)) { out.push('yes'); continue; }
+    if (L.noChange.test(t)) out.push('do not make any changes.');
+    const info = L.info.test(t);
+    for (const [cls, v] of L.verbs) {
+      const re = v instanceof RegExp ? v : new RegExp(`(?<!\\p{L})(?:${v})(?!\\p{L})`, 'iu');
+      if (!re.test(t)) continue;
+      const negated = L.neg && typeof v === 'string' && L.neg(v).test(t);
+      out.push(`${negated ? 'do not ' : ''}${info ? 'how to ' : ''}${WI_EN_VERB[cls]} it.`);
+    }
+  }
+  for (const [re, en] of WI_NOUNS) if (re.test(t)) out.push(en);
+  return [...new Set(out)].join(' ');
+}
+
+// "Do not make any changes; explain how to…" — an explicit no-change request
+// overrides every verb in the message.
+const WRITE_AUTH_NO_CHANGE_RE = /\b(?:(?:do\s+not|don'?t|never|please\s+don'?t)\s+(?:make|do|apply|perform|save|commit)\s+(?:any\s+)?(?:changes?|edits?|modifications?|writes?|updates?)|without\s+(?:making\s+|doing\s+)?(?:any\s+)?(?:changes?|changing\s+anything|modifying\s+anything|edits?)|no\s+changes?(?!\s+(?:to|in|on|for|of)\b)|(?:do\s+not|don'?t)\s+(?:change|modify|touch|edit)\s+anything|(?:stay|remain|be|work|operate|act|go|run)\s+(?:in\s+)?read[-\s]?only|read[-\s]?only\s+(?:mode|please|for\s+now|this\s+time)|(?:in|use)\s+read[-\s]?only\s+mode|^\s*read[-\s]?only|just\s+(?:explain|tell|describe|answer|show)|only\s+(?:explain|tell|describe|answer))\b/i;
+// "How do I create…", "explain how to delete…", "what happens if I delete…" —
+// the verb is the SUBJECT of a question, not an instruction. Stripped (with
+// the verb) before looking for a write verb.
+const WRITE_AUTH_INFO_RE = new RegExp(
+  '\\b(?:how\\s+(?:do|can|could|should|would|might|does|did)\\s+(?:i|we|one|you|someone|users?|a\\s+user)\\s+(?:go\\s+about\\s+)?'
+  + '|how\\s+(?:is|are)\\s+\\w+\\s+'
+  + '|how\\s+to\\s+'
+  + '|(?:explain|describe|tell\\s+me|show\\s+me|teach\\s+me|walk\\s+me\\s+through|guide\\s+me(?:\\s+on)?)\\s+(?:to\\s+me\\s+)?(?:how|the\\s+(?:steps|way|process))(?:\\s+(?:to|for|of))?\\s+'
+  + '|what\\s+(?:happens|would\\s+happen|will\\s+happen)\\s+(?:if|when)\\s+(?:i|we|you|someone|a\\s+user)\\s+'
+  + '|is\\s+it\\s+(?:possible|safe|ok(?:ay)?)\\s+to\\s+'
+  + '|(?:steps|instructions|guide)\\s+(?:to|for|on(?:\\s+how\\s+to)?)\\s+'
+  + '|can\\s+(?:i|we|users?)\\s+'
+  + ')[\\w-]+',
+  'gi'
+);
+// Write classes a message's verbs ask for. Deletes are only allowed for
+// messages that ask for them (or for the assistant's own objects).
+const WRITE_DELETE_FAMILY_RE = /\b(?:delete|deleting|remove|removing|drop|destroy|wipe|prune|sweep|purge|clean\s*up|cleanup|clean|clear|erase|discard|get\s+rid\s+of|replace|swap|unassign|detach|unplace|uninstall|dedupe|de-?duplicate|merge|consolidate|fix|repair|correct|rebuild|redo|reorgani[sz]e|reset|restore|revert|undo|roll\s*back)\b/i;
+function writeVerbClasses(text) {
+  const t = String(text || '');
+  return {
+    delete: WRITE_DELETE_FAMILY_RE.test(t),
+    update: /\b(?:fix|repair|patch|correct|update|modify|change|edit|rewrite|overwrite|rename|set|apply|move|share|assign|enable|disable|grant|link|attach|configure)\b/i.test(t),
+    create: /\b(?:create|build|make|set\s*up|setup|add|insert|generate|design|install|place|import|enter|record|register|enrol+)\b/i.test(t),
+  };
+}
+
 function classifyWriteAuthorization(userText) {
-  const text = String(userText || '');
+  const original = String(userText || '');
+  // Non-English instructions are judged by the same English rules through
+  // their gloss (writeIntentGloss). The gloss carries negation and how-to.
+  const gloss = writeIntentGloss(original);
+  const text = gloss === 'yes' ? 'yes' : (gloss ? `${original}\n${gloss}` : original);
   // Turn bookkeeping lives here because this is the single per-turn entry
   // point shared by the agentic loop and the test harness. Guarded so the
   // function still works when `dhis2` isn't defined (unit tests).
@@ -337,17 +482,22 @@ function classifyWriteAuthorization(userText) {
     ),
     ' '
   );
+  // Questions about HOW to do something are not instructions to do it.
+  const infoStripped = inabilityStripped.replace(WRITE_AUTH_INFO_RE, ' ');
   const isDiag = WRITE_AUTH_DIAG_RE.test(text);
   const isProblem = WRITE_AUTH_PROBLEM_RE.test(text);
   // Narrative clauses ("when I enter data and then submit it…") describe what
   // the user DID, so their verbs are never instructions.
   const isNarrative = /\b(?:when|whenever|if|after|before|while|once|every\s+time)\s+(?:i|we|they|he|she|users?|someone|the\s+user)\b/i.test(text)
     || /\bfails?\b|\berrors?\b/i.test(text);
-  const isBroad = WRITE_AUTH_BROAD_RE.test(inabilityStripped)
-    || (!isProblem && !isNarrative && WRITE_AUTH_IMPERATIVE_RE.test(inabilityStripped.trim()));
-  // Hard refusal: an explicit "no, …" decline always wins over any verb match.
-  const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text);
-  if (isBroad && !isRefusal) {
+  const isBroad = WRITE_AUTH_BROAD_RE.test(infoStripped)
+    || (!isProblem && !isNarrative && WRITE_AUTH_IMPERATIVE_RE.test(infoStripped.trim()));
+  // Hard refusal: an explicit "no, …" decline, or "do not make any changes /
+  // just explain", always wins over any verb match.
+  const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text)
+    || WRITE_AUTH_NO_CHANGE_RE.test(text);
+  if (isRefusal) return { scope: 'read_only', reason: 'the user asked for no changes (explain / read-only)' };
+  if (isBroad) {
     // A BARE affirmation ("yes", "go ahead") directly after a refused write is
     // an answer to THAT proposal — scope the authorization to the proposed
     // tool so it cannot be spent on an unrelated write (observed live: "yes"
@@ -355,9 +505,19 @@ function classifyWriteAuthorization(userText) {
     const bareAffirm = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|confirm(?:ed)?|do\s+it|go\s+ahead(?:\s+and\s+(?:do|run)\s+it)?|proceed|continue|go\s+for\s+it|run\s+it|yes,?\s*please)[.!\s]*$/i.test(text);
     const lrw = D.lastRefusedWrite;
     if (bareAffirm && lrw && lrw.tool && lrw.turn === D.turnCounter - 1) {
-      return { scope: 'scoped', tool: lrw.tool, action: lrw.action, reason: `bare affirmation — authorization scoped to the write proposed last turn: ${lrw.tool}(${lrw.action})` };
+      // Approve EXACTLY what was refused last turn (every refused call of
+      // that turn): tool + action class, and for deletes the same targets.
+      const approved = (Array.isArray(D.lastRefusedWrites) ? D.lastRefusedWrites : [lrw]).filter(r => r && r.turn === D.turnCounter - 1);
+      return { scope: 'scoped', tool: lrw.tool, action: lrw.action, approved: approved.length ? approved : [lrw], reason: `bare affirmation — authorization scoped to the write(s) proposed last turn: ${(approved.length ? approved : [lrw]).map(r => `${r.tool}(${r.action})`).join(', ')}` };
     }
-    return { scope: 'broad', reason: 'user message contains explicit write/fix verb (or affirmative response)' };
+    // Which kinds of write the user asked for. A follow-up ("continue",
+    // "yes") carries the verbs of the request it continues.
+    let verbSource = infoStripped;
+    if (bareAffirm || (typeof FOLLOW_UP_ONLY_RE !== 'undefined' && FOLLOW_UP_ONLY_RE.test(original.trim()) && original.trim().split(/\s+/).length <= 8)) {
+      const prior = typeof lastSubstantiveUserRequest === 'function' ? lastSubstantiveUserRequest() : '';
+      if (prior) { const pg = writeIntentGloss(prior); verbSource = `${verbSource}\n${prior}\n${pg}`; }
+    }
+    return { scope: 'broad', verbs: writeVerbClasses(verbSource), reason: 'user message contains explicit write/fix verb (or affirmative response)' };
   }
   if (isDiag) return { scope: 'read_only', reason: 'user asked to diagnose/check/inspect — no fix authorization' };
   if (isProblem) return { scope: 'read_only', reason: 'user reported a problem — diagnose first, fix only after explicit "yes"' };
@@ -379,29 +539,87 @@ function classifyWriteAuthorization(userText) {
 //              live 2026-07-10 on the growth-chart transcript.
 //   'read_only' — refuse and RECORD the proposal so next turn's "yes" can be
 //              scoped to it.
+// The kind of write a call performs. dhis2_query passes its HTTP method.
+function writeActionClass(toolName, action, descriptor) {
+  const a = String(action || '').toLowerCase();
+  if (descriptor && typeof descriptor.path === 'string' && /importStrategy=DELETE/i.test(descriptor.path)) return 'delete';
+  if (/(?:^|_|\b)(?:delete|remove|purge|unplace|unassign|detach|clear|uninstall|drop)/.test(a)) return 'delete';
+  if (a === 'post' || /(?:^|_)(?:create|add|place|install|import|batch|insert)/.test(a)) return 'create';
+  return 'update';
+}
+function writeTargetsOf(descriptor) {
+  const out = new Set();
+  const walk = (v) => {
+    if (typeof v === 'string') { for (const m of v.match(/\b[A-Za-z][A-Za-z0-9]{10}\b/g) || []) out.add(m); }
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === 'object') Object.values(v).forEach(walk);
+  };
+  walk(descriptor);
+  return [...out];
+}
+// Objects the assistant created in this conversation — it may always remove
+// its own work (a broken chart it just built) without a separate "delete".
+function noteAssistantCreatedIds(ids) {
+  const list = Array.isArray(dhis2.assistantCreatedIds) ? dhis2.assistantCreatedIds : [];
+  for (const id of ids || []) if (typeof id === 'string' && /^[A-Za-z][A-Za-z0-9]{10}$/.test(id) && !list.includes(id)) list.push(id);
+  dhis2.assistantCreatedIds = list.slice(-500);
+}
+function targetsCreatedByAssistant(descriptor) {
+  const ids = writeTargetsOf(descriptor);
+  const mine = new Set(Array.isArray(dhis2.assistantCreatedIds) ? dhis2.assistantCreatedIds : []);
+  return ids.length > 0 && ids.every(id => mine.has(id));
+}
+function rememberRefusedWrite(toolName, action, descriptor) {
+  const entry = { tool: toolName, action, targets: writeTargetsOf(descriptor), turn: dhis2.turnCounter || 0 };
+  dhis2.lastRefusedWrite = entry;
+  const prev = Array.isArray(dhis2.lastRefusedWrites) ? dhis2.lastRefusedWrites.filter(r => r && r.turn === entry.turn) : [];
+  dhis2.lastRefusedWrites = [...prev, entry].slice(-20);
+}
+
 function requireWriteAuth(toolName, action, descriptor) {
   const wa = dhis2.writeAuth || {};
   const scope = wa.scope || 'read_only';
+  const cls = writeActionClass(toolName, action, descriptor);
   if (scope === 'broad') {
+    // Bound to the kind of change the user asked for: "create a dashboard"
+    // is not permission to delete anything (security review 2026-10-29).
+    // wa.verbs is set only by classifyWriteAuthorization (callers that set
+    // broad directly — tests — keep the old behaviour).
+    if (cls === 'delete' && wa.verbs && !wa.verbs.delete && !targetsCreatedByAssistant(descriptor)) {
+      rememberRefusedWrite(toolName, action, descriptor);
+      return {
+        _error: `Refused: ${toolName}(action=${action}) DELETES something, but the user asked only to ${['create', 'update'].filter(k => wa.verbs[k]).join('/') || 'change things'} — not to delete. Nothing was removed.`,
+        _hint: 'Tell the user exactly what you would delete (name + ID) and why, and ask. If they reply "yes" / "delete it", retry this same call. Objects you created yourself in this conversation can be removed without asking.',
+        _refused: { tool: toolName, action, target: descriptor || null },
+        _scope: 'delete_not_requested',
+      };
+    }
     if (dhis2.lastRefusedWrite && dhis2.lastRefusedWrite.tool === toolName) dhis2.lastRefusedWrite = null;
     return null;
   }
   if (scope === 'scoped') {
-    if (toolName === wa.tool) {
-      dhis2.writeAuth = { scope: 'broad', reason: `scoped approval fulfilled by ${toolName}(${action}) — follow-up writes this turn allowed` };
+    // A bare "yes" approves exactly what was proposed: the same tool and kind
+    // of action (and, for a delete, the same targets) — repeatable, but it
+    // never widens to other tools, other actions or other targets.
+    const approved = Array.isArray(wa.approved) && wa.approved.length ? wa.approved : [{ tool: wa.tool, action: wa.action, targets: [] }];
+    const targets = writeTargetsOf(descriptor);
+    const match = approved.some(p => p && p.tool === toolName
+      && writeActionClass(p.tool, p.action, null) === cls
+      && (cls !== 'delete' || !(p.targets || []).length || targets.every(t => p.targets.includes(t))));
+    if (match) {
       dhis2.lastRefusedWrite = null;
       return null;
     }
     return {
-      _error: `Refused: the user's bare "yes" authorizes ONLY the write you proposed last turn — ${wa.tool}(${wa.action || 'the proposed action'}) — not ${toolName}(action=${action}).`,
-      _hint: `Call ${wa.tool} NOW to do exactly what the user approved. Do NOT substitute a different tool, do NOT route the write through raw dhis2_query, and NEVER spend this approval on deletes/changes the user did not ask for. After the approved ${wa.tool} call succeeds, further writes this turn are allowed again.`,
+      _error: `Refused: the user's bare "yes" authorizes ONLY the write(s) you proposed last turn — ${(Array.isArray(wa.approved) && wa.approved.length ? wa.approved : [wa]).map(p => `${p.tool}(${p.action || 'the proposed action'})`).join(', ')} — not ${toolName}(action=${action}).`,
+      _hint: `Do exactly what the user approved, with the same tool. Do NOT substitute a different tool, do NOT route the write through raw dhis2_query, and NEVER spend this approval on deletes/changes the user did not ask for. Anything beyond the approved change needs its own confirmation: describe it and ask.`,
       _refused: { tool: toolName, action, target: descriptor || null, approved_tool: wa.tool, approved_action: wa.action || null },
       _scope: 'requires_matching_tool',
     };
   }
   // read_only: remember exactly what was proposed-and-refused so a bare "yes"
   // on the next turn authorizes THIS call and nothing else.
-  dhis2.lastRefusedWrite = { tool: toolName, action, turn: dhis2.turnCounter || 0 };
+  rememberRefusedWrite(toolName, action, descriptor);
   return {
     _error: `Refused: ${toolName}(action=${action}) is a destructive write, but this conversation turn does not authorize it. Reason: ${wa.reason || 'no authorization detected'}. NOTE: the tool itself IS available and working — this is a per-turn authorization gate, NOT a missing tool. Never tell the user the tool does not exist, and never fall back to a different tool for the same write.`,
     _hint: 'Tell the user EXACTLY what change you propose: object name + ID + before → after. Then ASK for confirmation. The user must reply with explicit authorization on the NEXT turn (e.g. "yes", "go ahead", "fix it", "update X", "delete it") — then retry THIS SAME tool call, not a substitute. A problem report ("I am getting error X", "this is broken") is NOT authorization — it is a request for diagnosis.',
@@ -756,10 +974,24 @@ function extractUidsFromCallArgs(toolName, args) {
 }
 
 // ── Per-turn HTTP error counter ────────────────────────────────────────────
-// After 3 consecutive 4xx errors in any turn, every further tool call is hard
-// blocked. This stops the failure mode where the chatbot kept retrying calls
-// against IDs/paths that did not exist (404s on rule lookups, etc.).
-function noteHttpErrorFromResult(toolName, result) {
+// After 3 consecutive 4xx/5xx errors, the LANE that produced them (the same
+// tool and action; for dhis2_query the same method) is blocked for the rest of
+// the turn. A successful call resets the count. This stops the failure mode
+// where the chatbot kept retrying calls against IDs/paths that did not exist
+// (404s on rule lookups, etc.).
+// Other tools stay open. In the RMNCH thread (2026-11-01, play 2.42.7), three
+// 409s from an optional verification query made the old stop-everything rule
+// refuse the dashboard write the task still needed, so two maps were built
+// but never placed. Six consecutive errors in any mix still stop every call.
+const HTTP_ERROR_LANE_LIMIT = 3;
+const HTTP_ERROR_HARD_LIMIT = 6;
+
+function httpErrorLane(toolName, args) {
+  if (toolName === 'dhis2_query') return `dhis2_query:${String(args?.method || 'GET').toUpperCase()}`;
+  return args && typeof args.action === 'string' && args.action ? `${toolName}:${args.action}` : toolName;
+}
+
+function noteHttpErrorFromResult(toolName, result, args) {
   if (!result || typeof result !== 'object') return;
   // Status comes from safeDhis2Fetch error envelopes (_status), nested error bodies,
   // or text-form _error like "DHIS2 API 404: ...".
@@ -771,16 +1003,28 @@ function noteHttpErrorFromResult(toolName, result) {
   if (status < 400) return;
   dhis2.httpErrorCount = (dhis2.httpErrorCount || 0) + 1;
   dhis2.httpErrorHistory = dhis2.httpErrorHistory || [];
-  dhis2.httpErrorHistory.push({ tool: toolName, status, url: result._url || null, error: (result._error || '').slice(0, 160) });
+  dhis2.httpErrorHistory.push({ tool: toolName, lane: httpErrorLane(toolName, args), status, url: result._url || null, error: (result._error || '').slice(0, 160) });
 }
 
-function httpErrorStopOrNull(threshold = 3) {
-  if ((dhis2.httpErrorCount || 0) < threshold) return null;
+function httpErrorStopOrNull(toolName, args) {
+  const n = dhis2.httpErrorCount || 0;
+  if (n < HTTP_ERROR_LANE_LIMIT) return null;
+  const history = dhis2.httpErrorHistory || [];
+  const failedLanes = [...new Set(history.map(h => h.lane || h.tool).filter(Boolean))];
+  const lane = httpErrorLane(toolName, args);
+  const all = n >= HTTP_ERROR_HARD_LIMIT;
+  if (!all && toolName && !failedLanes.includes(lane)) return null;
+  const laneText = failedLanes.map(l => l.replace(':', ' ')).join(', ');
   return {
-    _error: `STOP: ${dhis2.httpErrorCount} HTTP 4xx/5xx errors have occurred in this conversation turn. Further tool calls are blocked.`,
-    _hint: 'You are calling endpoints / IDs that do not exist (or constraints you have not satisfied). STOP. Show the user the error history and ask which CURRENT object should be acted on. Every API call MUST derive from prior verified data — never construct a path from a guess. To recover: (a) call a discovery endpoint (search_metadata, manage_program_rules action=list, etc.) for the resource type you need, (b) pick a UID from THAT response, (c) only then make the next call.',
+    _error: all
+      ? `STOP: ${n} HTTP 4xx/5xx errors in a row this turn. Further tool calls are blocked.`
+      : `STOP: ${n} HTTP 4xx/5xx errors in a row this turn from ${laneText}. More ${lane.replace(':', ' ')} calls are blocked for this turn.`,
+    _hint: all
+      ? 'Every tool is blocked now. Write your final answer: what was created or changed this turn (names + IDs), each failed call with its exact error from _history, and what is still left to do.'
+      : `Only ${laneText} is blocked; every other tool still works. Do NOT retry the same lookup through another tool. If the user's request still has steps that other tools do (building, adding, placing, saving), do them now. Then answer: what you did (names + IDs), the failed calls with their exact errors from _history, and what is left. Read each error before guessing its cause, and never build a path or ID from a guess.`,
     _scope: 'http_error_limit_reached',
-    _history: (dhis2.httpErrorHistory || []).slice(-6),
+    _blocked_lanes: all ? 'all' : failedLanes,
+    _history: history.slice(-6),
   };
 }
 
@@ -814,8 +1058,19 @@ function stableStringify(value) {
     .join(',') + '}';
 }
 
+// The same query with its parameters in another order is the same call (RMNCH
+// thread 2026-11-01: one events/aggregate query sent twice, parameters
+// reordered, and the repeat went unnoticed).
+function canonicalQueryPath(path) {
+  const p = String(path);
+  const q = p.indexOf('?');
+  if (q < 0) return p;
+  return `${p.slice(0, q)}?${p.slice(q + 1).split('&').filter(Boolean).sort().join('&')}`;
+}
+
 function failedCallSignature(toolName, args) {
-  return `${toolName}|${stableStringify(args || {})}`;
+  const a = args && typeof args.path === 'string' ? { ...args, path: canonicalQueryPath(args.path) } : args;
+  return `${toolName}|${stableStringify(a || {})}`;
 }
 
 // Extract the failure text from a tool result, or '' when the result is not a
@@ -1028,7 +1283,13 @@ function noteToolFailure(toolName, args, result) {
   // is allowed again — the environment may have changed.
   entry.successMark = dhis2.toolSuccessCount || 0;
   dhis2.failedCallSigs.set(sig, entry);
-  const famKey = `${toolName}:${args?.action || ''}|${toolErrorFamily(errText)}`;
+  // A refusal that lists its problems ("The code would fail at runtime: 2
+  // problem(s)") repeats only when the problems repeat: a model that fixes a
+  // different problem each time is making progress (Inpatient app thread,
+  // 2026-11-01: four different lint results were blocked as one error).
+  const problems = Array.isArray(result?.problems) && result.problems.length
+    ? ` ${result.problems.map((p) => toolErrorFamily((p && p.message) || p).slice(0, 60)).sort().join(' | ')}` : '';
+  const famKey = `${toolName}:${args?.action || ''}|${toolErrorFamily(errText)}${problems}`;
   const famCount = (dhis2.toolErrorFamilies.get(famKey) || 0) + 1;
   dhis2.toolErrorFamilies.set(famKey, famCount);
   return { famCount, error: entry.error };
@@ -1291,8 +1552,9 @@ function preflightCheckCall(toolName, args) {
   // so it is reported before the generic loop/HTTP counters.
   const placeholderStop = placeholderArgStopOrNull(toolName, args);
   if (placeholderStop) return placeholderStop;
-  // Hard stop on cumulative HTTP errors — prevents runaway retry loops.
-  const stop = httpErrorStopOrNull();
+  // Consecutive HTTP errors stop the lane that produced them (all tools after
+  // HTTP_ERROR_HARD_LIMIT) — prevents runaway retry loops.
+  const stop = httpErrorStopOrNull(toolName, args);
   if (stop) return stop;
   // Refuse calls that repeat a known failure (identical args that already
   // failed, or an operation stuck on the same error family). Applies to ALL
@@ -1763,6 +2025,130 @@ function healAnalyticsPeriodAndDates(path) {
   return { path: `${base}?${parts.filter(x => !/^(startDate|endDate)=/i.test(x)).join('&')}`, healed: true };
 }
 
+// /api/analytics: dimension=A;B (two or more bare UIDs, no prefix) is never a
+// dimension — 409 E7125 "does not reference any dimension" (verified 2.43.2).
+// It can only mean data items: give it the dx: prefix. One bare UID is left
+// alone (a category or group-set dimension is written that way).
+function healBareDxList(path) {
+  const p = String(path || '');
+  if (!/^analytics(?:\.json)?\?/.test(p)) return { path: p, healed: false };
+  const [base, qs] = [p.slice(0, p.indexOf('?')), p.slice(p.indexOf('?') + 1)];
+  let healed = false;
+  const parts = qs.split('&').map(x => {
+    const m = x.match(/^(dimension|filter)=(.*)$/i);
+    if (!m) return x;
+    let v = m[2];
+    try { v = decodeURIComponent(v); } catch { /* keep raw */ }
+    const ids = v.split(';');
+    if (ids.length < 2 || !ids.every(id => /^[A-Za-z][A-Za-z0-9]{10}(?:\.[A-Za-z][A-Za-z0-9]{10})?$/.test(id))) return x;
+    healed = true;
+    return `${m[1]}=dx:${ids.join(';')}`;
+  });
+  return healed ? { path: `${base}?${parts.join('&')}`, healed } : { path: p, healed: false };
+}
+
+// A saved chart, map, line list or dashboard UID sent as an analytics DATA
+// item. RMNCH thread 2026-11-01 (play 2.42.7): to re-check two KPI tiles the
+// model put the tiles' own visualization ids in dx
+// (analytics?dimension=dx:YMQkujLUT3e;XJruzyOnBWS → 409 E7124), then sent them
+// to the enrollment endpoint (409 "does not reference any data element…"),
+// and misread both errors. Three 409s, and the turn's HTTP-error stop then
+// refused the dashboard write the task still needed.
+// One metadata read says what each id really is. A chart or map id is swapped
+// for the data items it plots (what the model meant: "check that tile's
+// value"); a line list or dashboard id is refused with the tool that reads it.
+const _savedObjectByUid = new Map(); // uid → null (not a saved chart/map/list/dashboard) | { kind, type, name, items }
+const SAVED_OBJECT_ITEM_FIELDS = 'dataDimensionItemType,indicator[id,displayName],dataElement[id,displayName],programIndicator[id,displayName],programDataElement[id,displayName],programAttribute[id,displayName],reportingRate[id,displayName],expressionDimensionItem[id,displayName]';
+
+// Plain data-item UIDs of an analytics GET path: dx items on /analytics, the
+// item part of each non-ou/pe dimension on event/enrollment analytics.
+function analyticsDataItemUids(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q < 0) return [];
+  const head = p.slice(0, q).replace(/^\/?(?:api\/(?:\d+\/)?)?/i, '');
+  const aggregate = /^analytics(?:\/rawData|\/dataValueSet)?(?:\.json)?$/.test(head);
+  const tracker = /^analytics\/(?:events|enrollments)\/(?:aggregate|query)\/[A-Za-z][A-Za-z0-9]{10}(?:\.json)?$/.test(head);
+  if (!aggregate && !tracker) return [];
+  const out = new Set();
+  for (const part of p.slice(q + 1).split('&')) {
+    const m = part.match(/^(?:dimension|filter)=(.*)$/i);
+    if (!m) continue;
+    let v = m[1];
+    try { v = decodeURIComponent(v); } catch { /* keep raw */ }
+    if (aggregate && !/^dx:/i.test(v)) continue;
+    if (tracker && /^(?:ou|pe|co|ao|longitude|latitude):/i.test(v)) continue;
+    for (const item of v.replace(/^dx:/i, '').split(';')) {
+      const id = item.split(':')[0].split('.').pop().replace(/\[[^\]]*\]$/, '');
+      if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(id) && isLikelyDhisUid(id)) out.add(id);
+    }
+  }
+  return [...out];
+}
+
+function savedObjectDataItems(dims) {
+  const items = [];
+  for (const d of Array.isArray(dims) ? dims : []) {
+    const o = d && (d.programIndicator || d.indicator || d.dataElement || d.programDataElement || d.programAttribute || d.reportingRate || d.expressionDimensionItem);
+    if (o && o.id && !items.some(x => x.id === o.id)) items.push({ id: o.id, name: o.displayName || null, type: d.dataDimensionItemType || null });
+  }
+  return items;
+}
+
+async function healSavedObjectAsDataItem(path) {
+  const p = String(path || '');
+  const uids = analyticsDataItemUids(p);
+  if (!uids.length) return { path: p, healed: false };
+  const unknown = uids.filter(u => !_savedObjectByUid.has(u));
+  if (unknown.length) {
+    const r = await safeDhis2Fetch(`metadata?visualizations=true&maps=true&eventVisualizations=true&dashboards=true&filter=id:in:[${unknown.join(',')}]&fields=id,displayName,type,dataDimensionItems[${SAVED_OBJECT_ITEM_FIELDS}],mapViews[dataDimensionItems[${SAVED_OBJECT_ITEM_FIELDS}]]`);
+    if (!r || r._error) return { path: p, healed: false }; // never block a query on a failed lookup
+    for (const u of unknown) _savedObjectByUid.set(u, null);
+    for (const v of r.visualizations || []) _savedObjectByUid.set(v.id, { kind: 'chart', type: v.type, name: v.displayName, items: savedObjectDataItems(v.dataDimensionItems) });
+    for (const v of r.maps || []) _savedObjectByUid.set(v.id, { kind: 'map', name: v.displayName, items: savedObjectDataItems((v.mapViews || []).flatMap(mv => mv.dataDimensionItems || [])) });
+    for (const v of r.eventVisualizations || []) _savedObjectByUid.set(v.id, { kind: 'line list', type: v.type, name: v.displayName, items: [] });
+    for (const v of r.dashboards || []) _savedObjectByUid.set(v.id, { kind: 'dashboard', name: v.displayName, items: [] });
+  }
+  const hits = uids.map(u => [u, _savedObjectByUid.get(u)]).filter(([, o]) => o);
+  if (!hits.length) return { path: p, healed: false };
+  const what = ([u, o]) => `"${u}" is the saved ${o.type && o.kind === 'chart' ? `${o.type} ` : ''}${o.kind} "${o.name}"`;
+  const stuck = hits.filter(([, o]) => !o.items.length);
+  if (stuck.length) {
+    return { path: p, healed: false, refusal: {
+      _error: `Not sent: ${stuck.map(what).join('; ')} — not a data item, so analytics would answer 409.`,
+      _hint: `${stuck.some(([, o]) => o.kind === 'line list') ? 'A line list\'s rows and row count: manage_line_lists(action="validate", line_list_id). ' : ''}${stuck.some(([, o]) => o.kind === 'dashboard') ? 'A dashboard\'s tiles and the data items each one plots: manage_dashboards(action="get", dashboard_id). ' : ''}Analytics data items are indicator, data element or program indicator ids.`,
+      _scope: 'saved_object_as_data_item',
+    } };
+  }
+  // Swap each chart/map id for the data items it plots, in place.
+  const swap = new Map(hits.map(([u, o]) => [u, o.items.map(x => x.id)]));
+  const swapped = new Set();
+  const q = p.indexOf('?');
+  const parts = p.slice(q + 1).split('&').map(part => {
+    const m = part.match(/^(dimension|filter)=(.*)$/i);
+    if (!m) return part;
+    let v = m[2];
+    try { v = decodeURIComponent(v); } catch { /* keep raw */ }
+    const dx = /^dx:/i.test(v);
+    const list = v.replace(/^dx:/i, '').split(';');
+    if (!list.some(x => swap.has(x))) return part;
+    list.forEach(x => swap.has(x) && swapped.add(x));
+    const next = [...new Set(list.flatMap(x => swap.get(x) || [x]))];
+    if (!dx && next.length > 1) return next.map(x => `${m[1]}=${x}`).join('&'); // event/enrollment analytics: one item per dimension=
+    return `${m[1]}=${dx ? 'dx:' : ''}${next.join(';')}`;
+  });
+  const unswapped = hits.filter(([u]) => !swapped.has(u));
+  if (unswapped.length) {
+    return { path: p, healed: false, refusal: {
+      _error: `Not sent: ${unswapped.map(what).join('; ')} — not a data item, so analytics would answer 409.`,
+      _hint: `Query the data item${unswapped.length > 1 || unswapped[0][1].items.length > 1 ? 's' : ''} it plots instead: ${unswapped.map(([, o]) => o.items.map(x => `${x.id}${x.name ? ` ("${x.name}")` : ''}`).join(', ')).join('; ')}.`,
+      _scope: 'saved_object_as_data_item',
+    } };
+  }
+  const note = `${hits.map(([u, o]) => `${what([u, o])} (a dashboard tile, not a data item) — queried the data item${o.items.length > 1 ? 's' : ''} it plots instead: ${o.items.map(x => `${x.id}${x.name ? ` ("${x.name}")` : ''}`).join(', ')}`).join('; ')}. The saved item's own period and org units were NOT applied — this query's are.`;
+  return { path: `${p.slice(0, q)}?${parts.join('&')}`, healed: true, note };
+}
+
 // count_records filters "<id>:<op>:<value>" → an analytics dimension
 // "<prefix><id>:<OP>:<value>". The operator is REQUIRED by analytics — the old
 // conversion dropped it ("de:true"), so every filtered count 409'd (RMNCH run
@@ -1804,7 +2190,10 @@ function lastSubstantiveUserRequest(history = conversationHistory) {
 }
 
 function buildRoutingText(userText, history = conversationHistory) {
-  const cur = String(userText || '');
+  const raw = String(userText || '');
+  // Non-English requests also route through their English gloss.
+  const gl = writeIntentGloss(raw);
+  const cur = gl && gl !== 'yes' ? `${raw}\n${gl}` : raw;
   if (cur.trim().split(/\s+/).filter(Boolean).length > 25) return cur;
   const prior = lastSubstantiveUserRequest(history);
   return prior && prior !== cur.trim() ? `${cur}\n${prior}` : cur;
@@ -1817,7 +2206,7 @@ function buildRoutingText(userText, history = conversationHistory) {
 // refuse — never late-admit — a withheld tool).
 function isSaveDiagnosisReadOnly(userText) {
   const scope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
-  return SAVE_FAILURE_RE.test(String(userText || '').toLowerCase()) && scope === 'read_only';
+  return reportsSaveFailure(userText) && scope === 'read_only';
 }
 
 function snapshotDhis2ForPersistence() {
@@ -2374,7 +2763,7 @@ function buildBackupResultBlock(backupResult, skipBackup) {
     return {
       skipped: true,
       _warning:
-        'Backup was skipped (skip_backup:true). This operation is NOT recoverable via the extension. The user explicitly authorized this — say so in your summary.',
+        `Backup was skipped (skip_backup:true) with the user's recorded approval (${dhis2.backupSkipApproval || 'consent recorded'}). This operation is NOT recoverable via the extension — say so in your summary.`,
     };
   }
   if (!backupResult || backupResult._error) {
@@ -2394,6 +2783,26 @@ function buildBackupResultBlock(backupResult, skipBackup) {
 // Helper used at every write site: either returns a backup block (on success
 // or on intentional skip), or returns a tool-result-shaped error the caller
 // should bail with. Keeps the wiring at each site to two lines.
+// Recorded user consent to skip a backup (security review 2026-10-29: the
+// model could pass skip_backup:true on its own and the result then claimed
+// "the user explicitly authorized this"). Consent is EITHER the user's own
+// words this turn ("…without a backup", "skip the backup", any of the
+// supported languages) OR a bare "yes" right after a backup of THIS tool
+// failed and was reported. Test harnesses set dhis2.harnessSkipBackupConsent.
+const BACKUP_SKIP_WORDS_RE = /\b(?:skip(?:ping)?|without|no|bypass|don'?t\s+(?:take|make|create|need))\s+(?:the\s+|a\s+|any\s+)?backups?\b|\bbackups?\s+(?:is\s+)?not\s+needed\b|بدون\s+نسخ|دون\s+نسخ|sans\s+sauvegarde|sin\s+(?:copia|respaldo)|sem\s+(?:backup|cópia)/i;
+function backupSkipConsent(toolName, args) {
+  if (dhis2.harnessSkipBackupConsent === true) return { ok: true, reason: 'test harness' };
+  const said = String(typeof lastUserText === 'string' ? lastUserText : '');
+  if (BACKUP_SKIP_WORDS_RE.test(said)) return { ok: true, reason: `the user said so this turn ("${said.slice(0, 80)}")` };
+  const f = dhis2.lastBackupFailure;
+  const bareYes = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|go\s+ahead|proceed|do\s+it|confirm(?:ed)?)[.!\s]*$/i.test(said)
+    || (typeof writeIntentGloss === 'function' && writeIntentGloss(said) === 'yes');
+  if (bareYes && f && f.tool === toolName && f.turn === (dhis2.turnCounter || 0) - 1) {
+    return { ok: true, reason: `the user answered "yes" after the ${toolName} backup failed` };
+  }
+  return { ok: false };
+}
+
 async function ensureBackupOrBail(opMeta, targets, toolArgs) {
   if (toolArgs && toolArgs.skip_backup === true) {
     return { ok: true, block: buildBackupResultBlock(null, true), skipped: true };
@@ -2404,6 +2813,9 @@ async function ensureBackupOrBail(opMeta, targets, toolArgs) {
   }
   const snap = await snapshotBeforeWrite(opMeta, targets);
   if (snap && snap._error) {
+    // Recorded so that ONLY a "yes" to THIS failure (next turn, same tool)
+    // counts as consent to proceed without a backup.
+    dhis2.lastBackupFailure = { tool: (opMeta && opMeta.tool) || null, turn: dhis2.turnCounter || 0 };
     return {
       ok: false,
       error: {
@@ -2767,6 +3179,45 @@ function aggregateDataBlockHint(pathOrId) {
   return `This data element holds (or once held) AGGREGATE data values — their audit history keeps blocking deletion even after the values are cleared. Recommended: keep it as unused metadata. ONLY if the user explicitly confirms that ALL of its data and audit history may be destroyed permanently: dhis2_query(method="POST", path="maintenance/dataPruning/dataElements/${uid}"), then retry this SAME delete once. Never prune without that explicit confirmation.`;
 }
 
+// Event / enrollment analytics answered from ANOTHER program's or stage's cache
+// entry. DHIS2 2.42.7 and 2.43.2 (verified 2026-11-01 on both play instances,
+// analytics caching on) cache analytics/events/aggregate answers without their
+// program or stage: the same dimensions and period for program B return
+// program A's rows AND metaData, a second stage of one program gets the first
+// stage's count, and neither the stage / program parameters, parameter order
+// nor pe instead of dates avoids it. count_records reported 1,021 Inpatient
+// events for 2026 — the RMNCH first-ANC figure — when there were 54,022. The
+// answer names the program and stage it belongs to in metaData.items, so the
+// mismatch is refused instead of passing a wrong number on.
+async function analyticsCacheMismatch(cleanPath, data) {
+  const m = String(cleanPath).match(/^analytics\/(?:events|enrollments)\/(?:aggregate|query|count)\/([A-Za-z][A-Za-z0-9]{10})(?:\.json)?\?(.*)$/);
+  const items = m && data && typeof data === 'object' && data.metaData && data.metaData.items;
+  if (!items || typeof items !== 'object') return null;
+  const [, pid, qs] = m;
+  let other = null;
+  if (!items[pid]) {
+    const known = await getKnownPrograms();
+    const id = known && Object.keys(items).find((k) => k !== pid && known.has(k));
+    if (id) other = { kind: 'program', id, name: (items[id] && items[id].name) || known.get(id) };
+  }
+  const stage = (qs.match(/(?:^|&)stage=([A-Za-z][A-Za-z0-9]{10})(?:&|$)/) || [])[1];
+  if (!other && stage && !items[stage]) {
+    if (!_programStageIdsCache.has(pid)) {
+      const r = await safeDhis2Fetch(`programs/${pid}?fields=programStages[id]`);
+      _programStageIdsCache.set(pid, new Set(((r && !r._error && r.programStages) || []).map((st) => st.id)));
+    }
+    const id = [..._programStageIdsCache.get(pid)].find((st) => st !== stage && items[st]);
+    if (id) other = { kind: 'stage', id, name: (items[id] && items[id].name) || id };
+  }
+  if (!other) return null;
+  const asked = other.kind === 'program' ? `program ${pid}` : `stage ${stage}`;
+  return {
+    _error: `DHIS2 answered this analytics query with the cached result of another ${other.kind} ("${other.name}", ${other.id}), not ${asked} — its numbers belong to that ${other.kind}.`,
+    _hint: 'A DHIS2 analytics-cache defect (event analytics answers are cached without their program and stage; seen on 2.42.7 and 2.43.2). Do not use or repeat this result. Counts: count_records checks for this and counts live records instead. Values: /api/analytics with program indicators in dx (the indicator is part of the cache key). Otherwise tell the user the figure cannot be read reliably until the server\'s analytics cache is cleared (Data Administration → Maintenance → Clear analytics cache).',
+    _analytics_cache_mismatch: { requested: other.kind === 'program' ? pid : stage, answered: other.id, kind: other.kind },
+  };
+}
+
 async function safeDhis2Fetch(path, options = {}) {
   if (!dhis2.baseUrl || !dhis2.apiVersion) {
     const ok = await ensureConnected();
@@ -2792,6 +3243,13 @@ async function safeDhis2Fetch(path, options = {}) {
       _hint: 'Use the plain resource path, e.g. "programs/<uid>?fields=…": no ../ or ./ segments, backslashes, "#", ";" or %-escaped letters.',
       _refused_path: true,
     };
+  }
+  // tracker/* on 2.41+ takes orgUnitMode; the old ouMode is ignored WITHOUT
+  // an error (verified 2.42.7 and 2.43.2: ouMode=DESCENDANTS answers 0, i.e.
+  // SELECTED), so internal counts that sent it read 0 below a country.
+  if (Number(dhis2.apiVersion) >= 41 && /^tracker\/(?:events|enrollments|trackedEntities)\b[^?]*\?/.test(cleanPath)
+      && /[?&]ouMode=/.test(cleanPath) && !/[?&]orgUnitMode=/.test(cleanPath)) {
+    cleanPath = cleanPath.replace(/([?&])ouMode=/, '$1orgUnitMode=');
   }
   const qIdx = cleanPath.indexOf('?');
   let fullUrl;
@@ -3061,6 +3519,11 @@ async function safeDhis2Fetch(path, options = {}) {
       stamp('_pagerInfo', { page: data.pager.page, pageSize: data.pager.pageSize, total: data.pager.total });
     }
     stamp('_apiPath', fullUrl.replace(dhis2.baseUrl, ''));
+
+    if (!isWrite) {
+      const mismatch = await analyticsCacheMismatch(cleanPath, data);
+      if (mismatch) return { ...mismatch, _url: fullUrl };
+    }
 
     // ── Large-response truncation ────────────────────────────────────────────
     // Truncation protects the MODEL's context for responses that are relayed
@@ -4391,7 +4854,38 @@ async function routeProgramIndicatorAnalytics(path) {
   }
   if (!items.length) return { path: p, routed: false };
   const r = await safeDhis2Fetch(`programIndicators?filter=id:in:[${[...new Set(items)].join(',')}]&fields=id&paging=false`);
-  if (!r || r._error || (r.programIndicators || []).length !== new Set(items).size) return { path: p, routed: false };
+  if (!r || r._error) return { path: p, routed: false };
+  const found = new Set((r.programIndicators || []).map(x => x.id));
+  if (found.size !== new Set(items).size) {
+    // Some ids are not program indicators. RMNCH replay 2026-11-01: twelve PI
+    // ids joined by ";" in one dimension=, one typed "lblLRKmS7Vs" for
+    // lblLRKmS7VS → 409 E7224. A case-only slip of one of this program's
+    // indicators is refused with the right id (UIDs are case-sensitive).
+    const missing = [...new Set(items)].filter(id => !found.has(id));
+    const pid = (p.match(/aggregate\/([A-Za-z][A-Za-z0-9]{10})/) || [])[1];
+    const all = found.size && pid ? await safeDhis2Fetch(`programIndicators?filter=program.id:eq:${pid}&fields=id,displayName&paging=false`) : null;
+    const byLower = new Map((all?.programIndicators || []).map(x => [x.id.toLowerCase(), x]));
+    const slips = missing.map(id => [id, byLower.get(id.toLowerCase())]).filter(([, hit]) => hit);
+    if (slips.length) {
+      return { path: p, routed: false, refusal: {
+        _error: `Not sent: ${slips.map(([id, hit]) => `"${id}" is not a program indicator — did you mean ${hit.id} ("${hit.displayName}")?`).join(' ')} UIDs are case-sensitive; DHIS2 would answer 409.`,
+        _hint: `Use the exact ids (also in any chart or dashboard you build next). Several program indicators at once: analytics?dimension=dx:<id1>;<id2>&dimension=pe:<period>&filter=ou:<orgUnit>.`,
+        _scope: 'analytics_uid_case_slip',
+      } };
+    }
+    // Several ids joined by ";" in ONE dimension= is never an event/enrollment
+    // analytics dimension (409 E7224, verified 2.43.2), and dx: there is a SQL
+    // error (42703) — so it cannot be sent as written.
+    const joined = parts.some(x => /^dimension=/i.test(x) && !/^dimension=(?:dx|ou|pe|co|ao)(?::|%3A)/i.test(x) && /;|%3B/i.test(x));
+    if (joined && found.size) {
+      return { path: p, routed: false, refusal: {
+        _error: `Not sent: event/enrollment analytics take one item per dimension= (several joined by ";" → 409), and ${missing.join(', ')} ${missing.length > 1 ? 'are not program indicators' : 'is not a program indicator'}, so the query could not be moved to /analytics.`,
+        _hint: 'Program indicators: analytics?dimension=dx:<id1>;<id2>&dimension=pe:<period>&filter=ou:<orgUnit> with exact ids. Data elements: one dimension=<stageUid>.<deUid> each.',
+        _scope: 'analytics_joined_dimension',
+      } };
+    }
+    return { path: p, routed: false };
+  }
   const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x));
   return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true };
 }
@@ -4787,6 +5281,30 @@ function carryStickyContext(freshCtx, prevCtx) {
   return ctx;
 }
 
+// A request runs against the DHIS2 server it started on. The connection
+// follows the focused tab, and focusing a tab on ANOTHER server mid-turn used
+// to move every remaining call of the turn there: checks, installs and writes
+// (2026-11-01: a custom-app preview reported the playground program's ids as
+// "not on this server"). While a turn runs, a switch to another server is
+// held and applied when the turn ends; same-server navigation is unaffected.
+let _turnsRunning = 0;
+let _heldServerSwitchUrl = null;
+function beginServerPinnedTurn() { _turnsRunning += 1; }
+async function endServerPinnedTurn() {
+  _turnsRunning = Math.max(0, _turnsRunning - 1);
+  if (_turnsRunning || !_heldServerSwitchUrl) return null;
+  const url = _heldServerSwitchUrl;
+  _heldServerSwitchUrl = null;
+  console.log(`[DHIS2] Request finished — switching to the server of the focused tab: ${extractBaseUrl(url)}`);
+  return initializeFromUrl(url);
+}
+function heldServerSwitch(baseUrl, url) {
+  if (!_turnsRunning || !dhis2.connected || !dhis2.baseUrl || baseUrl === dhis2.baseUrl) return null;
+  _heldServerSwitchUrl = url;
+  console.log(`[DHIS2] A request is running on ${dhis2.baseUrl}; the switch to ${baseUrl} waits until it finishes.`);
+  return { success: true, deferred: `A request is running on ${dhis2.baseUrl}; switching to ${baseUrl} when it finishes.`, state: getSerializableState() };
+}
+
 // One in-app navigation reaches initializeFromUrl up to four times (tabs.onUpdated,
 // the webNavigation fragment event, content.js's hashchange message and its 2 s
 // poll), and every copy re-fetched the program metadata — measured 4× per
@@ -4824,6 +5342,8 @@ function initializeFromUrl(url) {
 async function initializeFromUrlNow(url) {
   const baseUrl = extractBaseUrl(url);
   if (!baseUrl) return { error: 'Not a DHIS2 page' };
+  const held = heldServerSwitch(baseUrl, url);
+  if (held) return held;
 
   // Gate on host permission. The auto-init listeners (tab updates, focus
   // changes, SPA fragment changes) fire on any DHIS2-looking URL; without this

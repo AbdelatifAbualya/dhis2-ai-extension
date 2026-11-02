@@ -333,6 +333,7 @@ async function backupCaptureConfig(dsKey, existed, value, action, reason) {
   };
   const put = await safeDhis2Fetch(`dataStore/${encodeURIComponent(BACKUP_NAMESPACE)}/${encodeURIComponent(backupKey)}`, { method: 'POST', body: entry });
   if (put && put._error) {
+    dhis2.lastBackupFailure = { tool: 'manage_custom_app', turn: dhis2.turnCounter || 0 };
     return {
       _error: `Could not back up dataStore/${CAPTURE_NAMESPACE}/${dsKey} before changing it: ${put._error}`,
       _requires_user_confirmation: true,
@@ -553,6 +554,7 @@ async function placeCustomAppPlugin(args) {
     const gate = requireWriteAuth('manage_custom_app', 'place', { key: args.key, target, dashboard_id: args.dashboard_id || null });
     if (gate) return gate;
     const item = { type: 'APP', app_key: args.key };
+    if (args.size) item.size = args.size;
     if (Number.isFinite(Number(args.width))) item.width = Number(args.width);
     if (Number.isFinite(Number(args.height))) item.height = Number(args.height);
     let r;

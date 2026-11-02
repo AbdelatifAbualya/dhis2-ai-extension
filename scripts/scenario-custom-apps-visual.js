@@ -1071,7 +1071,7 @@ async function main() {
       const apps = await appsSnapshot();
       if (!apps.includes('ai-test-kpi@')) await previewAndCreate({ name: 'AI test KPI tiles', key: 'ai-test-kpi', kind: 'plugin', plugin_type: 'DASHBOARD', datastore_namespace: false, files: { 'plugin.jsx': read('kpi.plugin.jsx') } });
       userSays('Build it and put it on a new dashboard called ai-test-placed');
-      const pl = await tool({ action: 'place', key: 'ai-test-kpi', target: 'dashboard', dashboard_name: 'ai-test-placed', width: 30, height: 20 });
+      const pl = await tool({ action: 'place', key: 'ai-test-kpi', target: 'dashboard', dashboard_name: 'ai-test-placed', size: 'half', height: 20 });
       check('place target "dashboard" creates the dashboard with the plugin item', pl.r.success === true && pl.r.dashboard && pl.r.dashboard.dashboard_id, pl.r._error || JSON.stringify(pl.r.dashboard));
       check('place made zero failed API calls', pl.failed.length === 0, pl.failed.map((f) => `${f.status} ${f.method} ${f.url}`).join(' | '));
       const dashId = pl.r.dashboard && pl.r.dashboard.dashboard_id;

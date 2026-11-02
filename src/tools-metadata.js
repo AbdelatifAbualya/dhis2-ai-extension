@@ -108,10 +108,25 @@ function dataStorePatientDataReason(body) {
 // once, when the outermost call finishes — see noteCaptureMetadataWrite.
 let _executeToolDepth = 0;
 async function executeTool(name, args) {
+  // skip_backup:true is honoured ONLY with recorded user consent (see
+  // backupSkipConsent in core.js). The model setting the flag is not consent:
+  // it is dropped, the backup is taken, and the result says so. One check
+  // here covers every tool and every internal hand-off of the args.
+  let skipNote = null;
+  if (args && typeof args === 'object' && args.skip_backup === true && _executeToolDepth === 0) {
+    const consent = backupSkipConsent(name, args);
+    if (!consent.ok) {
+      args = { ...args, skip_backup: false };
+      skipNote = 'skip_backup was ignored: the user has not approved skipping the backup, so a backup was taken as usual. Only if a backup FAILS, tell the user and ask whether to proceed without one.';
+    } else {
+      dhis2.backupSkipApproval = consent.reason;
+    }
+  }
   _executeToolDepth++;
   let result;
   try {
     result = await executeToolCall(name, args);
+    if (skipNote && result && typeof result === 'object' && !Array.isArray(result)) result._skip_backup_ignored = skipNote;
   } finally {
     _executeToolDepth--;
   }
@@ -872,6 +887,7 @@ async function executeToolCall(name, args) {
       }
     }
 
+    const queryNotes = []; // corrections made to the query, returned with its result
     if (method === 'GET' && isAnalyticsPath(safePath)) {
       const ctxVizId = ctx.visualizationId || dhis2.visualizationContext?.id || extractVisualizationIdFromText(lastUserText);
       safePath = await enrichAnalyticsPathWithVisualizationContext(safePath, ctxVizId);
@@ -904,6 +920,14 @@ async function executeToolCall(name, args) {
         console.log(`[dhis2_query] Stage UID moved from dimension= to stage= → ${stageHeal.path}`);
         safePath = stageHeal.path;
       }
+      // A saved chart / map id used as a data item → the items it plots.
+      const savedHeal = await healSavedObjectAsDataItem(safePath);
+      if (savedHeal.refusal) return savedHeal.refusal;
+      if (savedHeal.healed) {
+        console.log(`[dhis2_query] Saved chart/map id swapped for its data items → ${savedHeal.path}`);
+        safePath = savedHeal.path;
+        queryNotes.push(savedHeal.note);
+      }
       // visualizations/<id>/data is the chart IMAGE (PNG), not its values
       // (live 2026-10-28: two "non-JSON response" errors) — read the values
       // the way get_visualization_details does.
@@ -918,6 +942,7 @@ async function executeToolCall(name, args) {
         return details;
       }
       const piRoute = await routeProgramIndicatorAnalytics(safePath);
+      if (piRoute.refusal) return piRoute.refusal;
       if (piRoute.routed) {
         console.log(`[dhis2_query] Program indicators → /analytics: ${piRoute.path}`);
         safePath = piRoute.path;
@@ -939,6 +964,11 @@ async function executeToolCall(name, args) {
       if (dateHeal.healed) {
         console.log(`[dhis2_query] Dropped startDate/endDate next to a period → ${dateHeal.path}`);
         safePath = dateHeal.path;
+      }
+      const bareDx = healBareDxList(safePath);
+      if (bareDx.healed) {
+        console.log(`[dhis2_query] Bare data-item list given the dx: prefix → ${bareDx.path}`);
+        safePath = bareDx.path;
       }
     }
 
@@ -1018,6 +1048,24 @@ async function executeToolCall(name, args) {
     if (method === 'GET' && isAnalyticsPath(safePath) && writeResult && typeof writeResult === 'object' && Array.isArray(writeResult.rows)) {
       const note = analyticsPeriodRowsNote(safePath);
       if (note) writeResult._period_rows_note = note;
+    }
+    // A 404 on GET <collection>/<uid>: the id often exists as ANOTHER type (a
+    // dashboard tile's visualization id read as a program indicator — RMNCH
+    // 2026-11-01). Name what it really is so the next call is right.
+    if (method === 'GET' && writeResult && writeResult._status === 404) {
+      const one = safePath.split('?')[0].match(/^(?:\/?api\/(?:\d+\/)?)?([A-Za-z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
+      if (one && isLikelyDhisUid(one[2])) {
+        const io = await safeDhis2Fetch(`identifiableObjects/${one[2]}?fields=id,displayName,href`);
+        const realType = io && !io._error && (String(io.href || '').match(/\/api\/(?:\d+\/)?([A-Za-z]+)\/[A-Za-z][A-Za-z0-9]{10}$/) || [])[1];
+        if (realType && realType !== one[1]) {
+          writeResult._hint = `${one[2]} is not in ${one[1]}: it is ${realType}/${one[2]} ("${io.displayName || ''}").${realType === 'visualizations' || realType === 'maps' ? ' To check its numbers, read its data items (manage_dashboards get lists them per tile) and query those.' : ''}`;
+          writeResult._actual_type = realType;
+        }
+      }
+    }
+    if (queryNotes.length && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult)) {
+      writeResult._query_corrected = queryNotes.join(' ');
+      writeResult._sent_path = safePath;
     }
     return writeResult;
   }
@@ -1181,6 +1229,12 @@ async function executeToolCall(name, args) {
       }
 
       const result = await safeDhis2Fetch(path);
+      // Another program's / stage's cached answer: count the live records.
+      if (result._analytics_cache_mismatch) {
+        const live = await countViaTracker(pid, ouid, { ...args, include_children: includeChildren || userRootsDefault }, progName, ouName, stageName);
+        if (!live._error) return { ...live, _method: 'tracker_live_count', _note: `Counted live records: DHIS2's analytics cache answered with ${result._analytics_cache_mismatch.kind} ${result._analytics_cache_mismatch.answered}'s figure (a server cache defect), so the analytics number was not used.` };
+        return { _error: result._error, _hint: result._hint, _details: live._error, _method: 'analytics_cache_mismatch' };
+      }
       if (result._error) {
         return {
           _error: 'Unable to return a reliable org-unit-scoped count from analytics.',
@@ -1807,11 +1861,7 @@ async function executeToolCall(name, args) {
       return null;
     }).filter(Boolean);
 
-    // ── Batch-resolve data item names and descriptions ──
-    // Group unresolved items by type for efficient batch fetching
-    const unresolvedIndicators = dataItems.filter(d => d.type === 'INDICATOR' && !d.name).map(d => d.id);
-    const unresolvedDataElements = dataItems.filter(d => d.type === 'DATA_ELEMENT' && !d.name).map(d => d.id);
-    const unresolvedProgramIndicators = dataItems.filter(d => d.type === 'PROGRAM_INDICATOR' && !d.name).map(d => d.id);
+    // ── Batch-resolve data item names and descriptions (grouped by type) ──
     const allIndicatorIds = dataItems.filter(d => d.type === 'INDICATOR').map(d => d.id);
     const allDataElementIds = dataItems.filter(d => d.type === 'DATA_ELEMENT').map(d => d.id);
     const allProgramIndicatorIds = dataItems.filter(d => d.type === 'PROGRAM_INDICATOR').map(d => d.id);
@@ -4660,7 +4710,7 @@ async function createLegendSet(args) {
 //    (UID list) + organisationUnitLevels (PLAIN INTEGER list — [2], not
 //    [{level:2}]) + userOrganisationUnit / userOrganisationUnitChildren flags.
 //  • A dashboard's tiles are dashboardItems[{ type, visualization|map|text,
-//    x,y,width,height }]; the 58-column grid is auto-packed here.
+//    x,y,width,height }] on a 60-column grid; layoutDashboardItems sizes them.
 // All shared helpers (generateDhis2Uid, postMetadataPayload, safeDhis2Fetch,
 // requireWriteAuth) are reused with their existing signatures — no shared
 // code's behaviour changes.
@@ -4822,6 +4872,321 @@ async function periodsMissThisYearWarning(dataIds, periods) {
   if (!hasData(now)) return null;
   const year = new Date().getFullYear();
   return `${ps.join(' + ')} covers only COMPLETED periods (it ends on ${year - 1}-12-31) and this data shows nothing there — but it does have data in ${year}. As saved, the tile will show zeros/blank. DHIS2 "LAST_N_…" periods never include the current one: add THIS_YEAR (e.g. ["THIS_YEAR","LAST_5_YEARS"]) or use THIS_YEAR / LAST_12_MONTHS, then recreate it.`;
+}
+
+// ── Dashboard item helpers (create_dashboard and add_items) ──
+// Inline new_visualization entries: resolve every data item in ONE lookup,
+// then build each visualization (overall row, layout, root-scope checks).
+// → { newVisualizations, inlineVizIdByIndex, layoutNotes, inlineSpecs,
+//     inlineInfo (what each shows, for tile sizing) } or { _error }.
+async function prepareInlineVisualizations(items) {
+  const inlineSpecs = [];
+  const allDataItems = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i] || {};
+    if (it.new_visualization && typeof it.new_visualization === 'object') {
+      inlineSpecs.push({ index: i, spec: it.new_visualization });
+      for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
+    }
+  }
+  let typeMap = {};
+  if (allDataItems.length) {
+    const res = await resolveDataItemTypes(allDataItems);
+    if (res.unresolved.length) {
+      return { _error: `These data_items UIDs (across the new visualizations) do not exist as an indicator, data element or program indicator: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
+    }
+    typeMap = res.typeMap;
+  }
+  const newVisualizations = [];
+  const inlineVizIdByIndex = {};
+  const inlineInfo = {};
+  const layoutNotes = [];
+  for (const { index, spec } of inlineSpecs) {
+    const overall = await applyOverallRow(spec);
+    if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
+    if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
+    const built = buildVisualizationObject(spec, typeMap);
+    if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
+    const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
+    if (rootScope) return rootScope;
+    newVisualizations.push(built.viz);
+    if (built.layoutNote) layoutNotes.push(`"${built.viz.name}": ${built.layoutNote}`);
+    inlineVizIdByIndex[index] = built.id;
+    const axisItems = { dx: spec.data_items || [], pe: spec.periods || [], ou: spec.org_units || [] };
+    const axis = (dims) => dims.map(d => ({ dimension: d, items: axisItems[d] || [] }));
+    inlineInfo[index] = { itemType: 'VISUALIZATION', vizType: built.viz.type, name: built.viz.name, rows: axis(built.viz.rowDimensions), columns: axis(built.viz.columnDimensions) };
+  }
+  return { newVisualizations, inlineVizIdByIndex, layoutNotes, inlineSpecs, inlineInfo };
+}
+
+// The dashboard item type an entry stands for (explicit type wins).
+function dashboardItemType(it) {
+  return String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : (it.app_key || it.appKey) ? 'APP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
+}
+
+// A tool-call item as dashboardTileInfos reads it (inline visualizations are
+// described by prepareInlineVisualizations instead of a lookup).
+// A dashboard's saved tiles in reading order: top to bottom, left to right
+// (tiles without a position last, in saved order).
+function dashboardReadingOrder(items) {
+  const pos = (v) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : Number.MAX_SAFE_INTEGER);
+  return (items || []).map((it, i) => ({ it, i }))
+    .sort((a, b) => (pos(a.it.y) - pos(b.it.y)) || (pos(a.it.x) - pos(b.it.x)) || (a.i - b.i)).map(o => o.it);
+}
+
+// What a SAVED dashboard item shows, as a dashboardTileInfos entry.
+function savedDashboardEntry(it) {
+  return {
+    type: it.type, vizId: it.visualization?.id || it.chart?.id || it.reportTable?.id || null,
+    evId: it.eventVisualization?.id || it.eventChart?.id || it.eventReport?.id || null, text: it.text, appKey: it.appKey,
+  };
+}
+
+// small / half / full of a saved tile, from its width on the 60-column grid.
+function savedDashboardTileSize(it) {
+  const w = Number(it.width);
+  if (!Number.isFinite(w) || w <= 0 || it.width === null) return undefined;
+  return w / DASH_GRID_COLS <= 0.34 ? 'small' : w / DASH_GRID_COLS <= 0.67 ? 'half' : 'full';
+}
+
+// Short label of a saved tile for results ("MAP % of first ANC … by district").
+function savedDashboardTileLabel(it) {
+  const name = it.visualization?.displayName || it.visualization?.name || it.map?.displayName || it.map?.name
+    || it.eventVisualization?.displayName || it.eventVisualization?.name || it.appKey
+    || (it.text ? String(it.text).replace(/\s+/g, ' ').slice(0, 60) : '');
+  return `${it.type}${name ? ` "${name}"` : ''}`;
+}
+
+function dashboardEntryOf(it, inlineVizId) {
+  const type = dashboardItemType(it);
+  return {
+    type,
+    vizId: !inlineVizId && /^(?:VISUALIZATION|CHART|REPORT_TABLE)$/.test(type) ? (it.visualization_id || it.id || null) : null,
+    evId: type === 'EVENT_VISUALIZATION' ? (it.event_visualization_id || it.line_list_id || it.id || null) : null,
+    text: it.text, appKey: it.app_key || it.appKey,
+  };
+}
+
+// ── Dashboard layout ──
+// The Dashboard app grid is 60 columns wide (a column scales with the screen)
+// and its rows are a FIXED 20 px (measured on 2.43.2: width 14 → 397 px of a
+// 1716 px grid; height 6 → 116 px at every screen width). On 2026-11-01 the
+// model sent its own x/y/width/height as if the grid had 12 columns: KPI tiles
+// 3 wide (~70 px) and charts ~11 wide, every title cut and every chart a
+// sliver. So no raw number is saved: each tile is sized from what it shows,
+// and the model's numbers only say the order and small / half / full.
+const DASH_GRID_COLS = 60;
+const DASH_TILE_MIN = { kpi: [10, 6], chart: [20, 14], table: [24, 10], list: [30, 14], map: [20, 14], text: [10, 3], app: [10, 6] };
+
+// How many items a period keyword stands for (LAST_12_MONTHS → 12).
+function dashPeriodCount(p) {
+  const s = String(p || '').toUpperCase();
+  const n = s.match(/^LAST_(\d+)_/);
+  if (n) return Number(n[1]);
+  if (/^MONTHS_/.test(s)) return 12;
+  if (/^BIMONTHS_/.test(s)) return 6;
+  if (/^QUARTERS_/.test(s)) return 4;
+  if (/^WEEKS_/.test(s)) return 52;
+  if (/^BIWEEKS_/.test(s)) return 26;
+  return 1;
+}
+
+// Items on one layout axis ([{ dimension, items:[id] }]), multiplied across
+// its dimensions. A LEVEL-n stands for every unit at that level.
+function dashAxisCount(dims, levelCounts = {}) {
+  let total = 1;
+  for (const d of Array.isArray(dims) ? dims : []) {
+    const ids = (d.items || []).map(x => String(x && typeof x === 'object' ? x.id : x));
+    let n;
+    if (d.dimension === 'pe') n = ids.reduce((s, p) => s + dashPeriodCount(p), 0);
+    else if (d.dimension === 'ou') {
+      const levels = ids.filter(id => /^LEVEL-|^USER_ORGUNIT_(?:GRAND)?CHILDREN$/i.test(id));
+      n = levels.length
+        ? levels.reduce((s, id) => s + (/GRANDCHILDREN/i.test(id) ? 50 : (levelCounts[(id.match(/^LEVEL-(\d{1,2})$/i) || [])[1]] ?? 12)), 0)
+        : ids.length;
+    } else n = ids.length;
+    total *= Math.max(1, n || 1);
+  }
+  return total;
+}
+
+// A single-value tile shows its title (word-wrapped), a sub-title and the
+// number. Rows needed for the number to stay visible on a ~1000 px screen (the
+// side panel open on a laptop): a column is ~16 px, a title character ~7 px,
+// padding + the ⋯ menu ~50 px, a title line 18 px, the rest ~100 px. Measured
+// on 2.43.2 at 1100 px: a 6-row tile shows its number under a 2-line title and
+// cuts it under 3 lines.
+function dashKpiMinHeight(name, width) {
+  const perLine = Math.max(10, Math.floor((width * 16.2 - 50) / 7));
+  let lines = 1, cur = 0;
+  for (const word of String(name || '').split(/\s+/).filter(Boolean)) {
+    if (!cur) cur = word.length;
+    else if (cur + 1 + word.length <= perLine) cur += 1 + word.length;
+    else { lines++; cur = word.length; }
+    while (cur > perLine) { lines++; cur -= perLine; }
+  }
+  return Math.max(DASH_TILE_MIN.kpi[1], Math.ceil((100 + 18 * lines) / 20));
+}
+// New KPI tiles get a row more than the minimum, and never under 8 (156 px).
+const dashKpiHeight = (name, width) => Math.max(8, dashKpiMinHeight(name, width) + 1);
+
+// What a tile needs: kind, whether it must span the whole width, natural height.
+// info: { itemType, vizType, name, text, rows, columns } (rows/columns as above).
+function dashTileNeeds(info, levelCounts = {}) {
+  const t = String(info.itemType || 'VISUALIZATION').toUpperCase();
+  const vt = String(info.vizType || '').toUpperCase();
+  const name = String(info.name || '');
+  // ~110 characters a line at laptop width, and every line break starts a
+  // line (a bulleted explanation is many short lines, not one long one).
+  if (t === 'TEXT') {
+    const lines = String(info.text || '').split('\n').reduce((n, l) => n + Math.max(1, Math.ceil(l.length / 110)), 0);
+    return { kind: 'text', wide: true, h: Math.min(24, Math.max(4, 3 + lines)), name: name || 'Text' };
+  }
+  if (t === 'MAP') return { kind: 'map', wide: false, h: 20, name };
+  if (t === 'EVENT_REPORT' || (t === 'EVENT_VISUALIZATION' && (!vt || vt === 'LINE_LIST' || vt === 'PIVOT_TABLE'))) return { kind: 'list', wide: true, h: 24, name };
+  if (t === 'REPORT_TABLE') return { kind: 'table', wide: true, h: 20, name };
+  if (t !== 'VISUALIZATION' && t !== 'CHART' && t !== 'EVENT_VISUALIZATION' && t !== 'EVENT_CHART') return { kind: 'app', wide: false, h: 20, name };
+  if (vt === 'SINGLE_VALUE') return { kind: 'kpi', wide: false, h: DASH_TILE_MIN.kpi[1], name };
+  const rows = dashAxisCount(info.rows, levelCounts), cols = dashAxisCount(info.columns, levelCounts);
+  if (vt === 'PIVOT_TABLE') return { kind: 'table', wide: true, h: Math.min(30, Math.max(12, 6 + Math.ceil(1.25 * (rows + 1)))), name };
+  if (vt === 'GAUGE') return { kind: 'chart', wide: false, h: 16, name };
+  if (/^(?:PIE|RADAR|SCATTER|BUBBLE|YEAR_OVER_YEAR)/.test(vt)) return { kind: 'chart', wide: false, h: 20, name };
+  // Bar / line charts: rows are the x-axis categories, columns the series.
+  // More than a year of months, >5 legend entries or >24 bars get the full width.
+  const marks = (/LINE|AREA|STACKED/.test(vt)) ? rows : rows * cols;
+  return { kind: 'chart', wide: rows > 12 || cols > 5 || marks > 24, h: 20, name };
+}
+
+// The model's own x/y/width/height → reading order + size hints. The scale is
+// inferred from how far right its items reach (≤12 → a 12-column guess, ≤24 →
+// 24, else the real 60); heights count only on the real scale.
+function dashboardSizeHints(items) {
+  const num = (v) => (v === null || v === undefined || v === '' ? NaN : Number(v));
+  const list = items.map(it => it || {});
+  const order = list.map((_, i) => i);
+  if (list.length > 1 && list.every(it => Number.isFinite(num(it.x)) && Number.isFinite(num(it.y)))) {
+    order.sort((a, b) => (num(list[a].y) - num(list[b].y)) || (num(list[a].x) - num(list[b].x)) || (a - b));
+  }
+  const reach = Math.max(0, ...list.map(it => Number.isFinite(num(it.width)) ? num(it.width) + (Number.isFinite(num(it.x)) ? num(it.x) : 0) : 0));
+  const scale = !reach || reach > 24 ? DASH_GRID_COLS : reach <= 12 ? 12 : 24;
+  const hints = list.map(it => {
+    const s = String(it.size || '').toLowerCase().trim();
+    let size = /^(?:small|kpi|quarter|third|compact)$/.test(s) ? 'small' : /^(?:half|medium)$/.test(s) ? 'half' : /^(?:full|wide|large|full[_ -]?width)$/.test(s) ? 'full' : null;
+    const w = num(it.width);
+    if (!size && w > 0) { const f = w / scale; size = f <= 0.34 ? 'small' : f <= 0.67 ? 'half' : 'full'; }
+    const h = num(it.height);
+    return { size, strict: !!s && !!size, height: scale === DASH_GRID_COLS && h > 0 ? Math.min(h, 80) : null };
+  });
+  const gaveNumbers = list.some(it => ['x', 'y', 'width', 'height'].some(k => Number.isFinite(num(it[k]))));
+  return { order, hints, scale, gaveNumbers };
+}
+
+// Rows from startY down: a run of KPI tiles shares rows (≤4 a row, balanced),
+// half-width tiles pair up, a half with no partner (unless size:"half" was
+// asked for) and every wide tile take a whole row, and each row is as tall as
+// its tallest tile — no holes, no slivers.
+// tiles: [{ kind, wide, h, name, size?, strict?, height? }] in reading order.
+function packDashboardTiles(tiles, startY = 0) {
+  const cls = tiles.map(t => {
+    const want = t.size || (t.kind === 'kpi' ? 'small' : t.wide ? 'full' : 'half');
+    if (want === 'small') return ['kpi', 'text', 'app'].includes(t.kind) ? 'small' : 'half';
+    if (want === 'half' && t.kind === 'list') return 'full';
+    return want;
+  });
+  const rows = [];
+  for (let i = 0; i < tiles.length;) {
+    if (cls[i] === 'small') {
+      let j = i;
+      while (j < tiles.length && cls[j] === 'small') j++;
+      const n = j - i, rowCount = Math.ceil(n / 4), base = Math.floor(n / rowCount), extra = n % rowCount;
+      for (let r = 0, k = i; r < rowCount; r++) {
+        const m = base + (r < extra ? 1 : 0);
+        rows.push(Array.from({ length: m }, (_, q) => k + q));
+        k += m;
+      }
+      i = j;
+    } else if (cls[i] === 'half' && cls[i + 1] === 'half') { rows.push([i, i + 1]); i += 2; }
+    else { rows.push([i]); i++; }
+  }
+  const keepHalf = (row) => row.length === 1 && cls[row[0]] === 'half' && tiles[row[0]].strict;
+  const shapes = new Array(tiles.length);
+  const summary = [];
+  let y = startY;
+  for (const row of rows) {
+    const w = keepHalf(row) ? DASH_GRID_COLS / 2 : Math.floor(DASH_GRID_COLS / row.length);
+    const widths = keepHalf(row) ? [w] : row.map((_, n) => (n === row.length - 1 ? DASH_GRID_COLS - w * (row.length - 1) : w));
+    const heights = row.map((ti, n) => {
+      const t = tiles[ti];
+      const need = t.kind === 'kpi' ? dashKpiHeight(t.name, widths[n]) : t.h;
+      const min = t.kind === 'kpi' ? dashKpiMinHeight(t.name, widths[n]) : DASH_TILE_MIN[t.kind][1];
+      return t.height >= min ? t.height : need;
+    });
+    const h = Math.max(...heights);
+    let x = 0;
+    row.forEach((ti, n) => { shapes[ti] = { x, y, width: widths[n], height: h }; x += widths[n]; });
+    const names = row.map(ti => `"${String(tiles[ti].name || tiles[ti].kind).slice(0, 48)}"`).join(' | ');
+    summary.push(`${row.length > 1 ? `${row.length} side by side, ${w} of 60 columns each` : keepHalf(row) ? 'half width (as asked)' : 'full width'}, ${h * 20 - 4} px tall: ${names}`);
+    y += h;
+  }
+  return { shapes, rows: summary, endY: y };
+}
+
+// Sizes for dashboard entries, in the entries' order. infos[i] describes what
+// entry i shows (dashboardTileInfos); items[i] may carry the model's numbers.
+function layoutDashboardItems(items, infos, startY = 0, levelCounts = {}) {
+  const { order, hints, scale, gaveNumbers } = dashboardSizeHints(items);
+  const tiles = order.map(i => ({ ...dashTileNeeds(infos[i] || {}, levelCounts), ...(hints[i].size ? { size: hints[i].size, strict: hints[i].strict } : {}), ...(hints[i].height ? { height: hints[i].height } : {}) }));
+  const packed = packDashboardTiles(tiles, startY);
+  const shapes = new Array(items.length);
+  order.forEach((i, k) => { shapes[i] = packed.shapes[k]; });
+  const note = !gaveNumbers ? null
+    : `Positions and sizes are set by the tool on DHIS2's 60-column grid (20 px rows); the x/y/width/height you sent counted only as the order and small / half / full${scale !== DASH_GRID_COLS ? ` — they read as a ${scale}-column grid and, saved as sent, would have been ${Math.round(60 / scale)}× too narrow` : ''}. Use size:"small"|"half"|"full" only when the user asks for a size.`;
+  return { shapes, rows: packed.rows, note };
+}
+
+// What each entry shows, for sizing. entries: [{ type, vizId, evId, text,
+// appKey }]; inlineInfo[i] (from prepareInlineVisualizations) wins over a
+// lookup. Referenced visualizations and line lists: one batched read each.
+async function dashboardTileInfos(entries, inlineInfo = {}) {
+  const vizIds = [...new Set(entries.map((e, i) => (!inlineInfo[i] && e.vizId) || null).filter(Boolean))];
+  const evIds = [...new Set(entries.map(e => e.evId).filter(Boolean))];
+  const vizById = {}, evById = {};
+  if (vizIds.length) {
+    const r = await safeDhis2Fetch(`visualizations?filter=id:in:[${vizIds.join(',')}]&fields=id,displayName,type,rows[dimension,items[id]],columns[dimension,items[id]]&paging=false`);
+    for (const v of r?.visualizations || []) vizById[v.id] = v;
+  }
+  if (evIds.length) {
+    const r = await safeDhis2Fetch(`eventVisualizations?filter=id:in:[${evIds.join(',')}]&fields=id,displayName,type&paging=false`);
+    for (const v of r?.eventVisualizations || []) evById[v.id] = v;
+  }
+  const infos = entries.map((e, i) => {
+    if (inlineInfo[i]) return inlineInfo[i];
+    const v = e.vizId ? vizById[e.vizId] : null;
+    if (v) return { itemType: 'VISUALIZATION', vizType: v.type, name: v.displayName, rows: v.rows, columns: v.columns };
+    const ev = e.evId ? evById[e.evId] : null;
+    return { itemType: e.type, vizType: ev?.type || null, name: ev?.displayName || e.name || e.appKey || '', text: e.text };
+  });
+  // Org-unit levels on an axis count every unit at that level (one read each).
+  const levels = new Set();
+  for (const inf of infos) for (const d of [...(inf.rows || []), ...(inf.columns || [])]) {
+    if (d.dimension !== 'ou') continue;
+    for (const x of d.items || []) { const m = String(x && typeof x === 'object' ? x.id : x).match(/^LEVEL-(\d{1,2})$/i); if (m) levels.add(m[1]); }
+  }
+  const levelCounts = {};
+  for (const lv of levels) {
+    const r = await safeDhis2Fetch(`organisationUnits?filter=level:eq:${lv}&fields=id&pageSize=1`);
+    if (Number.isFinite(r?.pager?.total)) levelCounts[lv] = r.pager.total;
+  }
+  return { infos, levelCounts };
+}
+
+// A saved tile too small to read (the get action reports these).
+function dashTileTooSmall(need, width, height) {
+  if (![width, height].every(n => Number.isFinite(Number(n)) && n !== null)) return null;
+  const [minW, minH] = DASH_TILE_MIN[need.kind];
+  const needH = need.kind === 'kpi' ? dashKpiMinHeight(need.name, Number(width)) : minH;
+  if (Number(width) >= minW && Number(height) >= needH) return null;
+  return `${Number(width) < minW ? `${width} of 60 columns wide (a ${need.kind} needs ≥${minW})` : ''}${Number(width) < minW && Number(height) < needH ? ', ' : ''}${Number(height) < needH ? `${height} rows tall (needs ≥${needH})` : ''}`;
 }
 
 // overall_row: a table of org units WITH an overall row. DHIS2 pivot totals
@@ -5029,6 +5394,34 @@ function buildVisualizationObject(spec, typeMap) {
 // period on `filters` pe. Program is auto-attached for program-indicator/event
 // layers. Returns { ok, map } or { _error }.
 const MAP_THEMATIC_TYPES = new Set(['CHOROPLETH', 'BUBBLE']);
+// A mapView's colorScale is a comma-separated list of hex colours, one per
+// class — what the Maps app saves (verified 2.42.7: "#eff3ff,#bdd7e7,…").
+// A scale NAME ("YlOrRd") saved as-is draws every class black (RMNCH bubble
+// map, 2026-11-01). ColorBrewer 9-class ramps; n classes take n evenly spaced.
+const MAP_COLOR_SCALES = Object.freeze({
+  YLORRD: '#ffffcc,#ffeda0,#fed976,#feb24c,#fd8d3c,#fc4e2a,#e31a1c,#bd0026,#800026',
+  YLORBR: '#ffffe5,#fff7bc,#fee391,#fec44f,#fe9929,#ec7014,#cc4c02,#993404,#662506',
+  REDS: '#fff5f0,#fee0d2,#fcbba1,#fc9272,#fb6a4a,#ef3b2c,#cb181d,#a50f15,#67000d',
+  BLUES: '#f7fbff,#deebf7,#c6dbef,#9ecae1,#6baed6,#4292c6,#2171b5,#08519c,#08306b',
+  GREENS: '#f7fcf5,#e5f5e0,#c7e9c0,#a1d99b,#74c476,#41ab5d,#238b45,#006d2c,#00441b',
+  ORANGES: '#fff5eb,#fee6ce,#fdd0a2,#fdae6b,#fd8d3c,#f16913,#d94801,#a63603,#7f2704',
+  PURPLES: '#fcfbfd,#efedf5,#dadaeb,#bcbddc,#9e9ac8,#807dba,#6a51a3,#54278f,#3f007d',
+  GREYS: '#ffffff,#f0f0f0,#d9d9d9,#bdbdbd,#969696,#737373,#525252,#252525,#000000',
+  YLGN: '#ffffe5,#f7fcb9,#d9f0a3,#addd8e,#78c679,#41ab5d,#238443,#006837,#004529',
+  YLGNBU: '#ffffd9,#edf8b1,#c7e9b4,#7fcdbb,#41b6c4,#1d91c0,#225ea8,#253494,#081d58',
+  RDYLGN: '#d73027,#f46d43,#fdae61,#fee08b,#ffffbf,#d9ef8b,#a6d96a,#66bd63,#1a9850',
+  GNYLRD: '#1a9850,#66bd63,#a6d96a,#d9ef8b,#ffffbf,#fee08b,#fdae61,#f46d43,#d73027',
+});
+function mapColorScale(scale, classes) {
+  const raw = String(scale || 'YlOrRd').trim();
+  const n = Math.min(9, Math.max(2, Number.isFinite(Number(classes)) ? Math.round(Number(classes)) : 5));
+  const given = raw.split(',').map(c => c.trim()).filter(Boolean);
+  if (given.length > 1 && given.every(c => /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(c))) return { colors: given.join(','), classes: given.length };
+  const ramp = MAP_COLOR_SCALES[raw.toUpperCase().replace(/[^A-Z]/g, '')];
+  if (!ramp) return { _error: `color_scale "${raw}" is not known. Use one of ${Object.keys(MAP_COLOR_SCALES).map(k => k[0] + k.slice(1).toLowerCase()).join(', ')} (ColorBrewer names, any case) or a comma-separated list of hex colours.` };
+  const all = ramp.split(',');
+  return { colors: Array.from({ length: n }, (_, i) => all[Math.round(i * (all.length - 1) / (n - 1))]).join(','), classes: n };
+}
 function buildMapObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
   const name = String(spec.name || '').trim();
@@ -5064,14 +5457,16 @@ function buildMapObject(spec, typeMap) {
 
   const thematicMapType = MAP_THEMATIC_TYPES.has(String(spec.thematic_map_type || '').toUpperCase())
     ? String(spec.thematic_map_type).toUpperCase() : 'CHOROPLETH';
+  const scale = mapColorScale(spec.color_scale, spec.classes);
+  if (scale._error) return scale;
   const mapViewId = generateDhis2Uid();
   const mapView = {
     id: mapViewId,
     layer: 'thematic',
     renderingStrategy: 'SINGLE',
     thematicMapType,
-    classes: Number.isFinite(Number(spec.classes)) ? Number(spec.classes) : 5,
-    colorScale: spec.color_scale || 'YlOrRd',
+    classes: scale.classes,
+    colorScale: scale.colors,
     aggregationType: spec.aggregation_type || 'DEFAULT',
     opacity: spec.opacity != null ? Number(spec.opacity) : 0.9,
     hideTitle: false,
@@ -5087,6 +5482,39 @@ function buildMapObject(spec, typeMap) {
   // method 1 = predefined legend (legendSet); 2 = equal intervals (auto colours).
   if (spec.legend_set_id) { mapView.legendSet = { id: spec.legend_set_id }; mapView.method = 1; }
   else { mapView.method = 2; }
+  // Places without data get their own colour (Maps app "no data" style);
+  // without it they are simply not drawn.
+  if (spec.no_data_color != null && spec.no_data_color !== '') {
+    const c = String(spec.no_data_color).trim();
+    if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(c)) return { _error: `no_data_color "${c}" is not a hex colour like "#CCCCCC".` };
+    mapView.noDataColor = c;
+  }
+
+  // boundary_level: an outline layer of that level (e.g. 2 = district
+  // boundaries) under the same parents, drawn beneath the data layer — the
+  // RMNCH thread (2026-11-01) asked for district boundaries on a facility
+  // bubble map and the map had none. Same shape as the Maps app's boundary
+  // layers (layer "boundary", organisationUnits + organisationUnitLevels).
+  const mapViews = [mapView];
+  if (spec.boundary_level != null && spec.boundary_level !== '') {
+    const bl = Number(spec.boundary_level);
+    if (!Number.isInteger(bl) || bl < 1) return { _error: `boundary_level must be an org-unit level number (e.g. 2 for districts), not "${spec.boundary_level}".` };
+    const parents = organisationUnits.length ? organisationUnits : [];
+    mapViews.unshift({
+      id: generateDhis2Uid(),
+      layer: 'boundary',
+      renderingStrategy: 'SINGLE',
+      opacity: 1,
+      hidden: false,
+      radiusLow: 5,
+      labels: false,
+      rows: [{ dimension: 'ou', items: [...parents.map(o => ({ id: o.id })), ...Object.keys(ouFlags).map(k => ({ id: Object.keys(VIZ_REL_OU).find(kw => VIZ_REL_OU[kw] === k) })).filter(x => x.id), { id: `LEVEL-${bl}` }] }],
+      organisationUnitSelectionMode: 'SELECTED',
+      organisationUnitLevels: [bl],
+      organisationUnits: parents.map(o => ({ id: o.id })),
+      ...ouFlags,
+    });
+  }
 
   const map = {
     id: spec.id || generateDhis2Uid(),
@@ -5095,7 +5523,7 @@ function buildMapObject(spec, typeMap) {
     latitude: spec.latitude != null ? Number(spec.latitude) : 0,
     longitude: spec.longitude != null ? Number(spec.longitude) : 0,
     zoom: spec.zoom != null ? Number(spec.zoom) : 3,
-    mapViews: [mapView],
+    mapViews,
   };
   return { ok: true, map, needsProgram: t === 'PROGRAM_INDICATOR' && !spec.program_id, dataItemId: item };
 }
@@ -5122,7 +5550,7 @@ async function executeManageMaps(args) {
   if (action === 'get') {
     const id = extractMapIdFromInput(args.map_id) || args.map_id;
     if (!id) return { _error: 'map_id required for get.' };
-    const resp = await safeDhis2Fetch(`maps/${id}?fields=id,name,basemap,mapViews[id,layer,thematicMapType,columns[dimension,items[id,dimensionItemType]],organisationUnitLevels,program[id,name],legendSet[id,name]]`);
+    const resp = await safeDhis2Fetch(`maps/${id}?fields=id,name,basemap,mapViews[id,layer,thematicMapType,noDataColor,columns[dimension,items[id,dimensionItemType]],organisationUnitLevels,program[id,name],legendSet[id,name]]`);
     if (resp?._error) return resp;
     return { map: resp };
   }
@@ -5156,18 +5584,22 @@ async function executeManageMaps(args) {
     const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
     if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
     const newId = resp?.response?.uid || built.map.id;
-    const periodWarning = await periodsMissThisYearWarning([itemId], [built.map.mapViews[0].filters[0].items[0].id]);
+    const thematic = built.map.mapViews.find(v => v.layer === 'thematic');
+    const boundary = built.map.mapViews.find(v => v.layer === 'boundary');
+    const periodWarning = await periodsMissThisYearWarning([itemId], [thematic.filters[0].items[0].id]);
     return {
       success: true,
       ...(periodWarning ? { _warning: periodWarning } : {}),
       map_id: newId,
       name: built.map.name,
       layer: 'thematic',
-      thematic_map_type: built.map.mapViews[0].thematicMapType,
+      thematic_map_type: thematic.thematicMapType,
       data_item: itemId,
-      org_unit_levels: built.map.mapViews[0].organisationUnitLevels,
-      period: built.map.mapViews[0].filters[0].items[0].id,
+      org_unit_levels: thematic.organisationUnitLevels,
+      period: thematic.filters[0].items[0].id,
       legend_set: spec.legend_set_id || null,
+      ...(boundary ? { boundary_layer: `level ${boundary.organisationUnitLevels[0]} outlines, beneath the data layer` } : {}),
+      ...(thematic.noDataColor ? { no_data_color: thematic.noDataColor } : {}),
       _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]) — or reference it in a new dashboard's items.`,
     };
   }
@@ -5221,7 +5653,7 @@ async function checkDashboardAppItem(appKey) {
 async function executeManageDashboards(args) {
   const action = args?.action;
   if (!action) {
-    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, remove_item, update, delete.' };
+    return { _error: 'Missing required parameter: action', _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, arrange, remove_item, update, delete.' };
   }
 
   // ── list ──────────────────────────────────────────────────────────────
@@ -5247,23 +5679,40 @@ async function executeManageDashboards(args) {
   if (action === 'get') {
     const dId = args.dashboard_id || args.object_id;
     if (!dId) return { _error: 'dashboard_id required for get' };
+    // Data items of each chart / map, so a check of a tile's numbers queries
+    // them — not the tile's own visualization id (409, RMNCH 2026-11-01).
+    const dimItems = `dataDimensionItems[${SAVED_OBJECT_ITEM_FIELDS}]`;
     const resp = await safeDhis2Fetch(
       `dashboards/${dId}?fields=id,displayName,description,` +
-      `dashboardItems[id,type,x,y,width,height,text,appKey,visualization[id,displayName,type],map[id,displayName],eventVisualization[id,displayName]]`
+      `dashboardItems[id,type,x,y,width,height,text,appKey,visualization[id,displayName,type,${dimItems}],map[id,displayName,mapViews[${dimItems}]],eventVisualization[id,displayName,type]]`
     );
     if (resp?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
     if (resp?._error) return { _error: `Could not load dashboard ${dId}: ${resp._error}` };
-    const items = (resp.dashboardItems || []).map(it => ({
-      id: it.id,
-      type: it.type,
-      visualization: it.visualization ? { id: it.visualization.id, name: it.visualization.displayName, type: it.visualization.type } : undefined,
-      map: it.map ? { id: it.map.id, name: it.map.displayName } : undefined,
-      line_list: it.eventVisualization ? { id: it.eventVisualization.id, name: it.eventVisualization.displayName } : undefined,
-      app_key: it.appKey || undefined,
-      text: it.text || undefined,
-      layout: { x: it.x, y: it.y, width: it.width, height: it.height },
-    }));
-    return { success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length, items };
+    const items = dashboardReadingOrder(resp.dashboardItems || []).map((it, k) => {
+      const need = dashTileNeeds({ itemType: it.type, vizType: it.visualization?.type || it.eventVisualization?.type, name: it.visualization?.displayName || it.eventVisualization?.displayName || it.map?.displayName || '', text: it.text });
+      const tooSmall = dashTileTooSmall(need, it.width, it.height);
+      const vizItems = it.visualization ? savedObjectDataItems(it.visualization.dataDimensionItems) : [];
+      const mapItems = it.map ? savedObjectDataItems((it.map.mapViews || []).flatMap(mv => mv.dataDimensionItems || [])) : [];
+      return {
+        id: it.id,
+        position: k + 1,
+        type: it.type,
+        visualization: it.visualization ? { id: it.visualization.id, name: it.visualization.displayName, type: it.visualization.type, ...(vizItems.length ? { data_items: vizItems } : {}) } : undefined,
+        map: it.map ? { id: it.map.id, name: it.map.displayName, ...(mapItems.length ? { data_items: mapItems } : {}) } : undefined,
+        line_list: it.eventVisualization ? { id: it.eventVisualization.id, name: it.eventVisualization.displayName } : undefined,
+        app_key: it.appKey || undefined,
+        text: it.text || undefined,
+        layout: { x: it.x, y: it.y, width: it.width, height: it.height },
+        ...(tooSmall ? { too_small: tooSmall } : {}),
+      };
+    });
+    const small = items.filter(it => it.too_small);
+    return {
+      success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length,
+      _items_note: 'items are in reading order (position 1 = top left). id is the TILE id (for arrange order / insert_after_item_id / remove_item); a tile\'s numbers come from its data_items, never from the visualization or map id.',
+      items,
+      ...(small.length ? { _layout_warning: `${small.length} tile(s) are too small to read on a laptop-width screen (~1000 px; DHIS2's grid is 60 columns, rows a fixed 20 px): ${small.map(it => `${it.id} ${it.too_small}`).join('; ')}. manage_dashboards(action="arrange", dashboard_id) re-sizes and re-flows every tile (backed up first) — offer it; it is a change to the dashboard.` } : {}),
+    };
   }
 
   // ── create_visualization ────────────────────────────────────────────────
@@ -5318,63 +5767,36 @@ async function executeManageDashboards(args) {
     if (!items.length) {
       return { _error: 'items must list at least one dashboard item (existing visualization/map UID, inline new_visualization, or text).' };
     }
-
-    // First pass: collect every data_items UID across all inline visualizations
-    // so we resolve their types in ONE batched lookup.
-    const inlineSpecs = [];
-    const allDataItems = [];
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i] || {};
-      if (it.new_visualization && typeof it.new_visualization === 'object') {
-        inlineSpecs.push({ index: i, spec: it.new_visualization });
-        for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
+    // A dashboard of this name already exists → create_dashboard would make a
+    // SECOND one beside it. RMNCH thread 2026-11-01: to reorder an existing
+    // dashboard the model tried create_dashboard with all 15 of its tiles.
+    {
+      const want = String(dash.name).trim();
+      const r = await safeDhis2Fetch(`dashboards?filter=name:ilike:${encodeURIComponent(want)}&fields=id,name&paging=false`);
+      const same = (r?.dashboards || []).find(d => String(d.name || '').trim().toLowerCase() === want.toLowerCase());
+      if (same) {
+        return {
+          _error: `Not created: a dashboard named "${same.name}" already exists (${same.id}). create_dashboard always makes a NEW dashboard, so this would leave two with the same name.`,
+          _hint: `Change the existing one in place: add_items (insert_after_item_id / insert_before_item_id put new tiles at a place in the order), arrange (order: [tile ids] to reorder, items:[{ item_id, size }] to resize), remove_item, update — get lists its tiles in reading order. Only when the user asked for a separate, second dashboard: use a different name.`,
+          _existing_dashboard: { id: same.id, name: same.name, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${same.id}` },
+          _scope: 'dashboard_name_exists',
+        };
       }
     }
-    let typeMap = {};
-    if (allDataItems.length) {
-      const res = await resolveDataItemTypes(allDataItems);
-      if (res.unresolved.length) {
-        return { _error: `These data_items UIDs (across the dashboard's new visualizations) do not exist: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
-      }
-      typeMap = res.typeMap;
-    }
 
-    // Build inline visualizations.
-    const newVisualizations = [];
-    const inlineVizIdByIndex = {};
-    const layoutNotes = [];
-    for (const { index, spec } of inlineSpecs) {
-      const overall = await applyOverallRow(spec);
-      if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
-      if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
-      const built = buildVisualizationObject(spec, typeMap);
-      if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
-      const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
-      if (rootScope) return rootScope;
-      newVisualizations.push(built.viz);
-      if (built.layoutNote) layoutNotes.push(`"${built.viz.name}": ${built.layoutNote}`);
-      inlineVizIdByIndex[index] = built.id;
-    }
+    // Inline visualizations: one batched data-item lookup, then build each.
+    const prepared = await prepareInlineVisualizations(items);
+    if (prepared._error) return prepared;
+    const { newVisualizations, inlineVizIdByIndex, layoutNotes, inlineSpecs, inlineInfo } = prepared;
 
-    // Assemble dashboardItems with auto grid-packing (58-col grid, default
-    // 29×20 tiles, 2 per row) unless explicit x/y/width/height are given.
-    const GRID_W = 58, DEF_W = 29, DEF_H = 20;
-    let cursorX = 0, cursorY = 0, rowH = 0;
+    // Size every tile from what it shows (layoutDashboardItems).
+    const { infos, levelCounts } = await dashboardTileInfos(items.map((it, i) => dashboardEntryOf(it || {}, inlineVizIdByIndex[i])), inlineInfo);
+    const laid = layoutDashboardItems(items, infos, 0, levelCounts);
     const dashboardItems = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : (it.app_key || it.appKey) ? 'APP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
-      const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
-      const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
-      let x, y;
-      if (Number.isFinite(Number(it.x)) && Number.isFinite(Number(it.y))) {
-        x = Number(it.x); y = Number(it.y);
-      } else {
-        if (cursorX + w > GRID_W) { cursorX = 0; cursorY += rowH; rowH = 0; }
-        x = cursorX; y = cursorY;
-        cursorX += w; rowH = Math.max(rowH, h);
-      }
-      const di = { id: generateDhis2Uid(), type: itType, x, y, width: w, height: h };
+      const itType = dashboardItemType(it);
+      const di = { id: generateDhis2Uid(), type: itType, ...laid.shapes[i] };
       if (itType === 'VISUALIZATION') {
         const vizId = inlineVizIdByIndex[i] || it.visualization_id;
         if (!vizId) return { _error: `Item ${i + 1} is a VISUALIZATION but has neither new_visualization nor visualization_id.` };
@@ -5402,7 +5824,7 @@ async function executeManageDashboards(args) {
     // Verify referenced (existing) visualizations and maps exist, so a bad UID
     // fails clearly instead of importing a dashboard with a dangling tile.
     const refVizIds = [...new Set(items
-      .map((it, i) => (String(it.type || (it.map_id ? 'MAP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase() === 'VISUALIZATION' && !inlineVizIdByIndex[i]) ? it.visualization_id : null)
+      .map((it, i) => (dashboardItemType(it || {}) === 'VISUALIZATION' && !inlineVizIdByIndex[i]) ? it.visualization_id : null)
       .filter(Boolean))];
     if (refVizIds.length) {
       const vr = await safeDhis2Fetch(`visualizations.json?filter=id:in:[${refVizIds.join(',')}]&fields=id&paging=false`);
@@ -5410,7 +5832,7 @@ async function executeManageDashboards(args) {
       const missing = refVizIds.filter(id => !found.has(id));
       if (missing.length) return { _error: `These referenced visualization UIDs do not exist: ${missing.join(', ')}.`, _hint: 'Create them first (new_visualization) or fix the UIDs via search_metadata / list.' };
     }
-    const refMapIds = [...new Set(items.filter(it => String(it.type || '').toUpperCase() === 'MAP').map(it => it.map_id).filter(Boolean))];
+    const refMapIds = [...new Set(items.filter(it => dashboardItemType(it || {}) === 'MAP').map(it => it.map_id).filter(Boolean))];
     if (refMapIds.length) {
       const mr = await safeDhis2Fetch(`maps.json?filter=id:in:[${refMapIds.join(',')}]&fields=id&paging=false`);
       const foundM = new Set((mr?.maps || []).map(o => o.id));
@@ -5473,6 +5895,9 @@ async function executeManageDashboards(args) {
       items: dashboardItems.length,
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
       ...(layoutNotes.length ? { _layout_corrected: layoutNotes } : {}),
+      // Rows top to bottom, so the reply can describe the arrangement.
+      tile_rows: laid.rows,
+      ...(laid.note ? { _sizes_note: laid.note } : {}),
       message: `Created dashboard "${dashObj.name}" (${dashId}) with ${dashboardItems.length} item(s)${newVisualizations.length ? `, including ${newVisualizations.length} new visualization(s)` : ''}.`,
     };
   }
@@ -5497,56 +5922,38 @@ async function executeManageDashboards(args) {
     if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
     const dashName = owner.name || owner.displayName || dId;
     const existingItems = Array.isArray(owner.dashboardItems) ? owner.dashboardItems : [];
+    // insert_after_item_id / insert_before_item_id: put the new tiles at that
+    // place in the reading order instead of below everything (RMNCH thread
+    // 2026-11-01: "maps between the district table and the detailed tables" —
+    // with append-only the model tried to rebuild the whole dashboard).
+    const anchorId = args.insert_after_item_id || args.insert_before_item_id || null;
+    if (args.insert_after_item_id && args.insert_before_item_id) {
+      return { _error: 'Pass insert_after_item_id OR insert_before_item_id, not both.' };
+    }
+    if (anchorId && !existingItems.some(it => it.id === anchorId)) {
+      return {
+        _error: `No tile with item_id "${anchorId}" on dashboard "${dashName}" — nothing was added.`,
+        _hint: `Use a TILE id from this dashboard (not the id of the chart, map or line list it shows). Tiles in reading order: ${dashboardReadingOrder(existingItems).map(it => `${it.id} ${savedDashboardTileLabel(it)}`).join('; ')}.`,
+      };
+    }
 
     // Resolve inline new_visualizations (reuse the create builder + batched type lookup).
-    const inlineSpecs = [];
-    const allDataItems = [];
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i] || {};
-      if (it.new_visualization && typeof it.new_visualization === 'object') {
-        inlineSpecs.push({ index: i, spec: it.new_visualization });
-        for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
-      }
-    }
-    let typeMap = {};
-    if (allDataItems.length) {
-      const res = await resolveDataItemTypes(allDataItems);
-      if (res.unresolved.length) return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
-      typeMap = res.typeMap;
-    }
-    const newVisualizations = [];
-    const inlineVizIdByIndex = {};
-    const layoutNotes = [];
-    for (const { index, spec } of inlineSpecs) {
-      const overall = await applyOverallRow(spec);
-      if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
-      if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
-      const built = buildVisualizationObject(spec, typeMap);
-      if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
-      const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
-      if (rootScope) return rootScope;
-      newVisualizations.push(built.viz);
-      if (built.layoutNote) layoutNotes.push(`"${built.viz.name}": ${built.layoutNote}`);
-      inlineVizIdByIndex[index] = built.id;
-    }
+    const prepared = await prepareInlineVisualizations(items);
+    if (prepared._error) return prepared;
+    const { newVisualizations, inlineVizIdByIndex, layoutNotes, inlineInfo } = prepared;
 
-    // Build the NEW dashboardItems, grid-packed BELOW existing tiles (same
-    // 58-col / 29×20 convention as create_dashboard) so nothing overlaps.
-    const GRID_W = 58, DEF_W = 29, DEF_H = 20;
+    // Build the NEW dashboardItems, sized from what they show and placed
+    // BELOW the existing tiles so nothing overlaps.
     let startY = 0;
     for (const it of existingItems) { const y = Number(it.y) || 0, h = Number(it.height) || 0; if (y + h > startY) startY = y + h; }
-    let cursorX = 0, cursorY = startY, rowH = 0;
+    const { infos, levelCounts } = await dashboardTileInfos(items.map((it, i) => dashboardEntryOf(it || {}, inlineVizIdByIndex[i])), inlineInfo);
+    const laid = layoutDashboardItems(items, infos, startY, levelCounts);
     const newItems = [];
     const summary = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
-      const itType = String(it.type || (it.map_id ? 'MAP' : (it.event_visualization_id || it.line_list_id) ? 'EVENT_VISUALIZATION' : (it.app_key || it.appKey) ? 'APP' : it.text != null ? 'TEXT' : 'VISUALIZATION')).toUpperCase();
-      const w = Number.isFinite(Number(it.width)) ? Number(it.width) : DEF_W;
-      const h = Number.isFinite(Number(it.height)) ? Number(it.height) : DEF_H;
-      let x, y;
-      if (Number.isFinite(Number(it.x)) && Number.isFinite(Number(it.y))) { x = Number(it.x); y = Number(it.y); }
-      else { if (cursorX + w > GRID_W) { cursorX = 0; cursorY += rowH; rowH = 0; } x = cursorX; y = cursorY; cursorX += w; rowH = Math.max(rowH, h); }
-      const di = { id: generateDhis2Uid(), type: itType, x, y, width: w, height: h };
+      const itType = dashboardItemType(it);
+      const di = { id: generateDhis2Uid(), type: itType, ...laid.shapes[i] };
       if (itType === 'VISUALIZATION' || itType === 'CHART' || itType === 'REPORT_TABLE') {
         if (inlineVizIdByIndex[i] !== undefined) {
           di.type = 'VISUALIZATION';
@@ -5603,7 +6010,23 @@ async function executeManageDashboards(args) {
     );
     if (!backup.ok) return backup.error;
 
-    owner.dashboardItems = [...existingItems, ...newItems];
+    // At a place in the reading order: the whole dashboard is re-flowed with
+    // the new tiles there. Existing tiles keep their small / half / full.
+    let insertedRows = null;
+    if (anchorId) {
+      const ordered = dashboardReadingOrder(existingItems);
+      const k = ordered.findIndex(it => it.id === anchorId) + (args.insert_after_item_id ? 1 : 0);
+      const combined = [...ordered.slice(0, k), ...newItems, ...ordered.slice(k)];
+      const ex = await dashboardTileInfos(ordered.map(savedDashboardEntry), {});
+      const infoOf = new Map([...ordered.map((it, i) => [it, ex.infos[i]]), ...newItems.map((di, i) => [di, infos[i]])]);
+      const sizeOf = new Map([...ordered.map(it => [it, { size: savedDashboardTileSize(it) }]), ...newItems.map((di, i) => [di, { size: (items[i] || {}).size }])]);
+      const re = layoutDashboardItems(combined.map(x => sizeOf.get(x)), combined.map(x => infoOf.get(x)), 0, { ...ex.levelCounts, ...levelCounts });
+      combined.forEach((x, i) => Object.assign(x, re.shapes[i]));
+      owner.dashboardItems = combined;
+      insertedRows = re.rows;
+    } else {
+      owner.dashboardItems = [...existingItems, ...newItems];
+    }
     const payload = {};
     if (newVisualizations.length) payload.visualizations = newVisualizations;
     payload.dashboards = [owner];
@@ -5623,11 +6046,78 @@ async function executeManageDashboards(args) {
       items_after: after,
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
       ...(layoutNotes.length ? { _layout_corrected: layoutNotes } : {}),
+      ...(insertedRows
+        ? { inserted: `${args.insert_after_item_id ? 'after' : 'before'} tile ${anchorId}`, tile_rows: insertedRows }
+        : { tile_rows_added: laid.rows }),
+      ...(laid.note ? { _sizes_note: laid.note } : {}),
       added: summary,
       backup: backup.block,
       _note: (after !== null && after !== existingItems.length + newItems.length)
         ? `Warning: expected ${existingItems.length + newItems.length} items but server reports ${after}. Verify with action=get.`
         : undefined,
+    };
+  }
+
+  // ── arrange (re-size and re-flow every tile of an EXISTING dashboard) ──
+  // Same sizing as create_dashboard, in the order the tiles show now; items:
+  // [{ item_id, size }] overrides a tile's small / half / full. Snapshots first.
+  if (action === 'arrange') {
+    const _gate = requireWriteAuth('manage_dashboards', 'arrange', { dashboard_id: args.dashboard_id });
+    if (_gate) return _gate;
+    const dId = args.dashboard_id || args.object_id;
+    if (!dId) return { _error: 'dashboard_id required for arrange' };
+    const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
+    if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
+    if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
+    const dashName = owner.name || owner.displayName || dId;
+    const existing = Array.isArray(owner.dashboardItems) ? owner.dashboardItems : [];
+    if (!existing.length) return { _error: `Dashboard "${dashName}" has no tiles to arrange.` };
+    const sizeById = {};
+    for (const o of Array.isArray(args.items) ? args.items : []) if (o && o.item_id) sizeById[o.item_id] = o.size;
+    const orderIds = Array.isArray(args.order) ? args.order.map(x => (x && typeof x === 'object' ? x.item_id : x)).filter(Boolean).map(String) : [];
+    const unknown = [...new Set([...Object.keys(sizeById), ...orderIds])].filter(id => !existing.some(it => it.id === id));
+    if (unknown.length) return { _error: `No tile with item_id ${unknown.join(', ')} on dashboard "${dashName}".`, _hint: 'action=get lists each tile\'s id (items are in reading order). item_id is the TILE id, not the id of the chart, map or line list it shows.' };
+    // order: the tiles' new reading order. Tiles it leaves out follow, in
+    // their current order (reported, so nothing moves silently).
+    let ordered = dashboardReadingOrder(existing);
+    let unlisted = [];
+    if (orderIds.length) {
+      const picked = [...new Set(orderIds)].map(id => existing.find(it => it.id === id));
+      unlisted = ordered.filter(it => !picked.includes(it));
+      ordered = [...picked, ...unlisted];
+    }
+    const { infos, levelCounts } = await dashboardTileInfos(ordered.map(savedDashboardEntry), {});
+    const laid = layoutDashboardItems(ordered.map(it => ({ size: sizeById[it.id] })), infos, 0, levelCounts);
+    const changed = ordered.filter((it, k) => ['x', 'y', 'width', 'height'].some(f => Number(it[f]) !== laid.shapes[k][f])).length;
+    const unlistedNote = unlisted.length ? { _unlisted_tiles: `${unlisted.length} tile(s) were not in order and follow the listed ones, in their current order: ${unlisted.map(it => `${it.id} ${savedDashboardTileLabel(it)}`).join('; ')}.` } : {};
+    if (args.dry_run_only) return { success: true, dry_run: true, dashboard_id: dId, tiles: ordered.length, would_change: changed, tile_rows: laid.rows, ...unlistedNote, message: 'Nothing saved (dry_run_only=true).' };
+    if (!changed) return { success: true, action: 'arrange', dashboard_id: dId, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dId}`, changed: 0, tile_rows: laid.rows, ...unlistedNote, message: `Every tile on "${dashName}" already has this size and place; nothing changed.` };
+
+    const backup = await ensureBackupOrBail(
+      { operation: 'update', tool: 'manage_dashboards', action: 'arrange', reason: `Re-size and re-flow the ${ordered.length} tiles of dashboard ${dashName}` },
+      [{ object_type: 'dashboards', object_id: dId, role: 'primary' }],
+      args
+    );
+    if (!backup.ok) return backup.error;
+    ordered.forEach((it, k) => Object.assign(it, laid.shapes[k]));
+    const result = await postMetadataPayload({ dashboards: [owner] }, false);
+    if (!result.success) return { _error: result._error || 'arrange failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    // Read the shapes back: what the Dashboard app will draw.
+    const after = await safeDhis2Fetch(`dashboards/${dId}?fields=dashboardItems[id,x,y,width,height]`);
+    const want = Object.fromEntries(ordered.map((it, k) => [it.id, laid.shapes[k]]));
+    const off = (after?.dashboardItems || []).filter(it => want[it.id] && ['x', 'y', 'width', 'height'].some(f => Number(it[f]) !== want[it.id][f])).map(it => it.id);
+    return {
+      success: true,
+      action: 'arrange',
+      dashboard_id: dId,
+      dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dId}`,
+      dashboard_name: dashName,
+      changed,
+      tile_rows: laid.rows,
+      ...unlistedNote,
+      backup: backup.block,
+      ...(after?._error ? { _note: `Saved, but the read-back failed (${after._error}); check with action=get.` }
+        : off.length ? { _warning: `The server reports different sizes for ${off.join(', ')} than were saved — check with action=get.` } : {}),
     };
   }
 
@@ -5711,7 +6201,7 @@ async function executeManageDashboards(args) {
 
   return {
     _error: `Unknown action "${action}" for manage_dashboards.`,
-    _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, remove_item, update, delete.',
+    _hint: 'One of: list, get, create_visualization, create_dashboard, add_items, arrange, remove_item, update, delete.',
   };
 }
 

@@ -158,37 +158,123 @@ function loadCustomAppEcharts() {
 //   code — comments blanked, strings intact (URL / method / <script checks)
 //   bare — comments AND string contents blanked (identifier checks, so the UI
 //          text "data saved locally" can never trip a rule)
+// Regex literals and template expressions are read as such. Without that a
+// quote inside a regex — the CSV escape .replace(/"/g, '""') — opened a
+// "string" that ran to the next quote and the rest of the file was blanked:
+// the lint reported "Nothing is rendered" / "<App> is used but never declared"
+// for correct code (Inpatient app thread, 2026-11-01: four previews refused,
+// the app never built), and the safety rules no longer saw that code at all.
+// When unsure, "/" is read as division: a misread regex can only cause a false
+// lint warning, while a misread division would hide code from the safety scan.
+const CUSTOM_APP_REGEX_AFTER_WORD = /^(?:return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
+const CUSTOM_APP_REGEX_AFTER_CHAR = /[(,=:[!&|?{;+\-*%<>~^]/;
+function customAppStringEnd(s, i) {
+  const q = s[i];
+  let j = i + 1;
+  while (j < s.length && s[j] !== q) j += s[j] === '\\' ? 2 : 1;
+  return Math.min(s.length, j + 1);
+}
+// i at a "/" where a regex may start → index after its flags, or -1 (a
+// division after all: the "regex" would cross a line end).
+function customAppRegexEnd(s, i) {
+  let j = i + 1;
+  let inClass = false;
+  while (j < s.length) {
+    const c = s[j];
+    if (c === '\\') { j += 2; continue; }
+    if (c === '\n') return -1;
+    if (inClass) { if (c === ']') inClass = false; }
+    else if (c === '[') inClass = true;
+    else if (c === '/') { j++; while (j < s.length && /[a-z]/i.test(s[j])) j++; return j; }
+    j++;
+  }
+  return -1;
+}
+
+// code: comments blanked, literals kept. bare: also the inside of string,
+// template-text and regex literals blanked (template ${…} code stays). Both
+// keep every character position of the source.
 function customAppSourceViews(js) {
-  let code = '';
-  let bare = '';
   const s = String(js);
   const n = s.length;
+  let code = '';
+  let bare = '';
   const blank = (ch) => (ch === '\n' ? '\n' : ' ');
-  let i = 0;
-  while (i < n) {
-    const c = s[i];
-    const d = s[i + 1];
-    if (c === '/' && d === '/') {
-      while (i < n && s[i] !== '\n') { code += ' '; bare += ' '; i++; }
-      continue;
+  const keep = (from, to) => { const t = s.slice(from, to); code += t; bare += t; };
+  // A literal stretch: kept in code, blanked in bare (an escape = two spaces).
+  const hide = (from, to) => {
+    code += s.slice(from, to);
+    for (let k = from; k < to; k++) {
+      if (s[k] === '\\' && k + 1 < to) { bare += '  '; k++; } else bare += blank(s[k]);
     }
-    if (c === '/' && d === '*') {
-      code += '  '; bare += '  '; i += 2;
-      while (i < n && !(s[i] === '*' && s[i + 1] === '/')) { code += blank(s[i]); bare += blank(s[i]); i++; }
-      if (i < n) { code += '  '; bare += '  '; i += 2; }
-      continue;
-    }
-    if (c === '"' || c === "'" || c === '`') {
-      code += c; bare += c; i++;
-      while (i < n && s[i] !== c) {
-        if (s[i] === '\\' && i + 1 < n) { code += s[i] + s[i + 1]; bare += '  '; i += 2; continue; }
-        code += s[i]; bare += blank(s[i]); i++;
+  };
+  // Scan code from i; with stopAtBrace, return at the "}" closing a template
+  // expression (that brace is not consumed).
+  const scan = (i, stopAtBrace) => {
+    let prev = stopAtBrace ? '{' : '';
+    let word = '';
+    let depth = 0;
+    while (i < n) {
+      const c = s[i];
+      const d = s[i + 1];
+      if (c === '/' && d === '/') {
+        while (i < n && s[i] !== '\n') { code += ' '; bare += ' '; i++; }
+        continue;
       }
-      if (i < n) { code += s[i]; bare += s[i]; i++; }
-      continue;
+      if (c === '/' && d === '*') {
+        code += '  '; bare += '  '; i += 2;
+        while (i < n && !(s[i] === '*' && s[i + 1] === '/')) { code += blank(s[i]); bare += blank(s[i]); i++; }
+        if (i < n) { code += '  '; bare += '  '; i += 2; }
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const e = customAppStringEnd(s, i);
+        const closed = e - 1 > i && s[e - 1] === c;
+        keep(i, i + 1); hide(i + 1, closed ? e - 1 : e); if (closed) keep(e - 1, e);
+        i = e; prev = c; word = '';
+        continue;
+      }
+      if (c === '`') {
+        keep(i, i + 1); i++;
+        let from = i;
+        while (i < n && s[i] !== '`') {
+          if (s[i] === '\\') { i += 2; continue; }
+          if (s[i] === '$' && s[i + 1] === '{') {
+            hide(from, i); keep(i, i + 2);
+            i = scan(i + 2, true);
+            if (i < n) { keep(i, i + 1); i++; }
+            from = i;
+            continue;
+          }
+          i++;
+        }
+        hide(from, Math.min(i, n));
+        if (i < n) { keep(i, i + 1); i++; }
+        prev = '`'; word = '';
+        continue;
+      }
+      if (c === '/' && (!prev || CUSTOM_APP_REGEX_AFTER_CHAR.test(prev) || CUSTOM_APP_REGEX_AFTER_WORD.test(word))) {
+        const e = customAppRegexEnd(s, i);
+        if (e > 0) {
+          const close = s.lastIndexOf('/', e - 1);
+          keep(i, i + 1); hide(i + 1, close); keep(close, e);
+          i = e; prev = '/'; word = '';
+          continue;
+        }
+      }
+      if (stopAtBrace) {
+        if (c === '{') depth++;
+        else if (c === '}') { if (!depth) return i; depth--; }
+      }
+      keep(i, i + 1);
+      if (/[\w$]/.test(c)) word = /[\w$]/.test(s[i - 1] || '') ? word + c : c;
+      else if (!/\s/.test(c)) word = '';
+      if (!/\s/.test(c)) prev = c;
+      i++;
     }
-    code += c; bare += c; i++;
-  }
+    return i;
+  };
+  scan(0, false);
   return { code, bare };
 }
 
@@ -684,6 +770,14 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     if (/\bpageCount\b/.test(allCode) && !/\btotalPages\b/.test(allCode)) {
       errors.push({ message: 'tracker/* lists return no pager.pageCount (or total) unless the request sends totalPages: true — this loop stops after the first page and silently drops records. Add totalPages: true to the tracker params (and loop to pager.pageCount).' });
     }
+    // orgUnit without orgUnitMode = SELECTED: only records entered AT that
+    // unit. Live 2026-11-01 (2.42.7) a case explorer sent orgUnit=<country>
+    // and showed 0 of 100,332 events for "All locations" and every district.
+    if (/['"`]tracker\/(?:events|enrollments|trackedEntities)\b/.test(allCode)
+        && (/\borgUnits?\s*:/.test(allBare) || /[?&]orgUnits?=/.test(allCode))
+        && !/\b(?:orgUnitMode|ouMode)\b/.test(allCode)) {
+      errors.push({ message: 'tracker/events | enrollments | trackedEntities with orgUnit and no orgUnitMode return only the records entered AT that exact org unit (DHIS2 defaults to SELECTED). Records are entered at facilities, so a country or district — including "All locations" — shows 0 records. Send orgUnitMode: \'DESCENDANTS\' next to orgUnit for "this place and everything under it" (or orgUnitMode: \'SELECTED\' only when the picker lists the units where records are entered).' });
+    }
     const nested = allCode.match(/fields\s*:\s*['"`][^'"`]*\b(orgUnit|trackedEntity|enrollment|program|programStage)\[/);
     if (nested) {
       errors.push({ message: `Tracker records carry ${nested[1]} as a plain UID string — "${nested[1]}[…]" in fields is ignored, so any name read from it is undefined. Request ${nested[1]} and look the names up (organisationUnits with filter id:in:[…], fields id,displayName).` });
@@ -783,7 +877,9 @@ async function checkCustomAppUids(uids) {
       for (const o of arr) if (o && o.id) found[o.id] = type;
     }
   }
-  return { checked: uids.length, found, unknown: uids.filter((u) => !found[u]) };
+  // The server is named in the refusal: ids checked against another server
+  // than the one the conversation used read as "invented" (2026-11-01).
+  return { checked: uids.length, found, unknown: uids.filter((u) => !found[u]), server: dhis2.baseUrl };
 }
 
 // A plugin reading a SQL view fails for its users when nobody has DATA read
@@ -888,12 +984,61 @@ function escapeCustomAppHtml(s) {
 // had margin: 4px 0 and lost those pixels (frame 88 px, content 92 px).
 const CAPTURE_PLUGIN_CSS = '#root { display: flow-root; }\n';
 
+// Runtime enforcement of what the static scan (scanCustomAppCode) can only
+// lint: the scan matches literal strings, so `const u = 'https://x'; fetch(u)`
+// or `{ method: m }` passed it (security review 2026-10-29). Every generated
+// page therefore carries
+//   • a Content-Security-Policy: network requests only to the server the app
+//     is installed on (connect-src 'self'), no form posts, no plugins;
+//   • app-guard.js, loaded FIRST: for an app declared read-only it refuses
+//     any request but GET/HEAD (fetch, XMLHttpRequest, sendBeacon) and
+//     double-checks the origin. The viewer's own DHIS2 authorities remain the
+//     final limit on what any request can do.
+const CUSTOM_APP_CSP = "connect-src 'self'; form-action 'none'; object-src 'none'; base-uri 'self'";
+function buildCustomAppGuardJs(spec) {
+  const readOnly = !spec.needsWriteAccess;
+  return `/* generated: runtime request policy (see manage_custom_app) */
+(function () {
+  'use strict';
+  var READ_ONLY = ${readOnly ? 'true' : 'false'};
+  var ORIGIN = window.location.origin;
+  function sameOrigin(u) { try { return new URL(String(u), window.location.href).origin === ORIGIN; } catch (e) { return false; } }
+  function refuse(why) { var e = new Error('Blocked by app policy: ' + why); console.error(e.message); return e; }
+  var nativeFetch = window.fetch;
+  if (nativeFetch) {
+    var guardedFetch = function (input, init) {
+      var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+      var method = String((init && init.method) || (input && typeof input === 'object' && input.method) || 'GET').toUpperCase();
+      if (!sameOrigin(url)) return Promise.reject(refuse('requests may only go to this DHIS2 server'));
+      if (READ_ONLY && method !== 'GET' && method !== 'HEAD') return Promise.reject(refuse('this app is read-only (' + method + ')'));
+      return nativeFetch.apply(this, arguments);
+    };
+    try { Object.defineProperty(window, 'fetch', { value: guardedFetch, writable: false, configurable: false }); } catch (e) { window.fetch = guardedFetch; }
+  }
+  var XHR = window.XMLHttpRequest;
+  if (XHR && XHR.prototype && XHR.prototype.open) {
+    var nativeOpen = XHR.prototype.open;
+    var guardedOpen = function (method, url) {
+      if (!sameOrigin(url)) throw refuse('requests may only go to this DHIS2 server');
+      if (READ_ONLY && !/^(GET|HEAD)$/i.test(String(method))) throw refuse('this app is read-only (' + method + ')');
+      return nativeOpen.apply(this, arguments);
+    };
+    try { Object.defineProperty(XHR.prototype, 'open', { value: guardedOpen, writable: false, configurable: false }); } catch (e) { XHR.prototype.open = guardedOpen; }
+  }
+  if (navigator.sendBeacon) {
+    try { Object.defineProperty(navigator, 'sendBeacon', { value: function () { console.error('Blocked by app policy: sendBeacon'); return false; }, writable: false, configurable: false }); } catch (e) { /* CSP still limits it to this server */ }
+  }
+})();
+`;
+}
+
 function buildCustomAppHtml(spec, entryJs) {
-  const scripts = ['d2-kit.min.js', 'app-config.js'];
+  const scripts = ['app-guard.js', 'd2-kit.min.js', 'app-config.js'];
   if (spec.usesEcharts) scripts.push('echarts.min.js');
   if (spec.sources['shared.jsx']) scripts.push('shared.js');
   scripts.push(entryJs);
   return '<!doctype html>\n<html dir="auto">\n<head>\n<meta charset="utf-8">\n'
+    + `<meta http-equiv="Content-Security-Policy" content="${CUSTOM_APP_CSP}">\n`
     + '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
     + `<title>${escapeCustomAppHtml(spec.name)}</title>\n<link rel="stylesheet" href="d2-kit.css">\n`
     + (entryJs === 'plugin.js' && spec.pluginType === 'CAPTURE' ? '<link rel="stylesheet" href="capture-plugin.css">\n' : '')
@@ -953,6 +1098,7 @@ function packageCustomApp(spec, compiled, kit, echartsBytes) {
   const manifest = buildCustomAppManifest(spec);
   const aiManifest = buildCustomAppAiManifest(spec);
   add('manifest.webapp', enc.encode(JSON.stringify(manifest, null, 2)));
+  add('app-guard.js', enc.encode(buildCustomAppGuardJs(spec)));
   add('app-config.js', enc.encode(buildCustomAppConfigJs(spec)));
   if (compiled['shared.jsx'] != null) add('shared.js', enc.encode(compiled['shared.jsx']));
   // Entry files run in their own strict-mode IIFE (prefix on the SAME line, so
@@ -1182,6 +1328,7 @@ async function backupCustomAppVersion(key, source, action, reason) {
   };
   const put = await safeDhis2Fetch(`dataStore/${encodeURIComponent(BACKUP_NAMESPACE)}/${encodeURIComponent(backupKey)}`, { method: 'POST', body: entry });
   if (put && put._error) {
+    dhis2.lastBackupFailure = { tool: 'manage_custom_app', turn: dhis2.turnCounter || 0 };
     return {
       _error: `Could not back up ${key} v${source.aiManifest.version} before ${action}: ${put._error}`,
       _requires_user_confirmation: true,
@@ -1287,10 +1434,10 @@ async function prepareCustomAppBuild(spec, opts = {}) {
   const uidCheck = opts.skipUidCheck ? { skipped: 'not requested' } : await checkCustomAppUids(extractCustomAppUids(compiled));
   if (uidCheck.unknown && uidCheck.unknown.length) {
     return {
-      _error: `The code hard-codes ${uidCheck.unknown.length} id(s) that do not exist on this server: ${uidCheck.unknown.join(', ')}.`,
+      _error: `The code hard-codes ${uidCheck.unknown.length} id(s) that do not exist on ${uidCheck.server || 'this server'}: ${uidCheck.unknown.join(', ')}.`,
       unknown_uids: uidCheck.unknown,
       found_uids: uidCheck.found,
-      _hint: 'Never invent UIDs. Look the real ones up (search_metadata, get_program_info, dhis2_query) and resend. If an object exists but is not shared with this user it also shows as unknown.',
+      _hint: `Never invent UIDs. Look the real ones up (search_metadata, get_program_info, dhis2_query) and resend. If an object exists but is not shared with this user it also shows as unknown. If these ids came from this same server earlier in the conversation, say so to the user rather than replacing them with name lookups.`,
     };
   }
 

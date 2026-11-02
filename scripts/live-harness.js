@@ -118,6 +118,9 @@ function load(pageContext = { appType: 'Dashboard' }) {
   const boot = `\n;dhis2.baseUrl=${JSON.stringify(BASE)};dhis2.apiVersion=${APIVER};`
     + `dhis2.pageContext=${JSON.stringify(pageContext)};`
     + `dhis2.writeAuth={scope:'broad',reason:'live-harness'};`
+    // The harness stands in for a user who approves skipping backups in
+    // scenario CLEANUP (skip_backup:true needs recorded consent, core.js).
+    + `dhis2.harnessSkipBackupConsent=true;`
     + `dhis2.knownIds=new Set();dhis2.programMetadata=null;`
     + `globalThis.__getDhis2=()=>dhis2;`;
   const bundle = modules.map((m) => `\n//# ${m}\n` + fs.readFileSync(path.join(ROOT, m), 'utf8')).join('\n') + boot;
