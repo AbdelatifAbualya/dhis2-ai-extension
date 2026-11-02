@@ -1788,8 +1788,9 @@ async function runCustomAppChecks() {
     const where = ctx.customAppWhereToFind({ name: 'Meds', key: 'ai-meds', plugin_launch_url: 'http://x/api/apps/ai-meds/plugin.html' }, 'plugin', 'CAPTURE').join(' ');
     truthy('CAPTURE where_to_find says it is not placed yet and how to place it (place action / Configurator)', /Not placed yet/.test(where) && /action="place"/.test(where) && /Tracker Plugin Configurator/.test(where));
     truthy('the manual documents the verified Capture props', /teiId, programId, enrollmentId, orgUnitId/.test(ctx.MANUAL_EXTRAS.manage_custom_app || ''));
-    const agentSrc = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
-    truthy('a cut-off manage_custom_app call gets code-shrinking advice, not program-splitting advice', /toolName === 'manage_custom_app'\s*\n[^\n]*\n\s*\? `Write SHORTER source/.test(agentSrc));
+    truthy('a cut-off manage_custom_app call gets code-shrinking advice, not program-splitting advice', /Write SHORTER source/.test(ctx.smallerCallHint('manage_custom_app')) && !/create_program/.test(ctx.smallerCallHint('manage_custom_app')));
+    truthy('…and any other tool gets the split-into-smaller-calls advice', /add_stage/.test(ctx.smallerCallHint('create_metadata')));
+    truthy('…the corrupted-arguments path uses that advice', /smallerCallHint\(toolName\)/.test(vm.runInContext('_runAgenticLoopInner.toString()', ctx)));
   }
   const clean = "const { useState } = React;\nconst { DataProvider, useDataQuery } = D2Runtime;\nconst { Card, CircularLoader } = D2UI;\nconst Q = { me: { resource: 'me' } };\nfunction Box({ icon: Icon }) { return <Icon />; }\nfunction A() { const [n] = useState(0); const { loading } = useDataQuery(Q); return loading ? <CircularLoader /> : <Card>{n}</Card>; }\nReactDOMClient.createRoot(document.getElementById('root')).render(<DataProvider baseUrl={D2_APP_CONFIG.baseUrl} apiVersion={D2_APP_CONFIG.apiVersion}><A /></DataProvider>);";
   eq('a clean read-only app lints with no errors', lint(clean).errors, []);
@@ -2249,6 +2250,139 @@ async function runStreamDropChecks() {
   }
 }
 
+// ── A dropped LLM connection must not end or lose the turn (2026-11-02) ──────
+// "DHIS2 Logs" thread, play 2.42.7: after 15 tool calls the panel showed the bare
+// "network error" and nothing else. Retries were a budget shared by the whole
+// turn, and the failed turn was thrown away, so "continue" had no request to
+// continue. These drive the real loop against a fake provider.
+async function runStreamRecoveryChecks() {
+  console.log('\nDropped LLM connection: recovery, wording and kept history:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const enc = new TextEncoder();
+  const data = (delta, finish = null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+  const callDeltas = (name, args) => data({ tool_calls: [{ index: 0, id: `c${Math.random().toString(36).slice(2, 8)}`, type: 'function', function: { name, arguments: args } }] });
+  const sseHeaders = { status: 200, headers: { 'Content-Type': 'text/event-stream' } };
+  const body = (step) => {
+    if (step.call) return callDeltas(step.call, JSON.stringify(step.args || {})) + data({}, 'tool_calls') + 'data: [DONE]\n\n';
+    return data({ content: step.text }) + data({}, 'stop') + 'data: [DONE]\n\n';
+  };
+  const dropped = (prefix) => new Response(new ReadableStream({
+    start(c) { if (prefix) c.enqueue(enc.encode(prefix)); setTimeout(() => c.error(new TypeError('network error')), 1); },
+  }), sseHeaders);
+  const DROP = { drop: true };
+  const QUERY = { call: 'dhis2_query', args: { path: 'system/info' } };
+
+  const run = async (script, { text = 'tell me about this server', keepHistory = false, onRequest } = {}) => {
+    if (!keepHistory) vm.runInContext('conversationHistory = [];', ctx);
+    const events = []; const requests = [];
+    const savedFetch = ctx.fetch; const savedBroadcast = ctx.broadcast;
+    let n = 0;
+    ctx.broadcast = (d) => { events.push(d); };
+    ctx.fetch = async (url, opts) => {
+      if (!String(url).startsWith('https://llm.invalid')) return new Response('{"version":"2.42"}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      const step = script[Math.min(n++, script.length - 1)];
+      requests.push(JSON.parse(opts.body));
+      if (onRequest) onRequest(requests.length);
+      if (step.status) return new Response(JSON.stringify({ error: { message: `provider said ${step.status}` } }), { status: step.status, headers: { 'Content-Type': 'application/json' } });
+      if (step.drop) return dropped(step.prefix);
+      return new Response(new ReadableStream({ start(c) { c.enqueue(enc.encode(body(step))); c.close(); } }), sseHeaders);
+    };
+    let thrown = null; let result = null;
+    try { result = await ctx.runAgenticLoop(text, null, false); } catch (e) { thrown = e; }
+    ctx.fetch = savedFetch; ctx.broadcast = savedBroadcast;
+    const history = JSON.parse(JSON.stringify(vm.runInContext('conversationHistory', ctx)));
+    return { thrown, result, events, requests, history };
+  };
+
+  const d = vm.runInContext('dhis2', ctx);
+  const saved = { base: d.baseUrl, connected: d.connected, apiVersion: d.apiVersion, pageContext: d.pageContext };
+  Object.assign(d, { baseUrl: 'https://dhis.invalid', connected: true, apiVersion: 42, pageContext: { appType: 'Maintenance' } });
+  vm.runInContext(`_cachedApiKey = 'verify-key'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+  vm.runInContext('globalThis.__savedDropDelays = STREAM_DROP_RETRY_DELAYS_MS.splice(0, STREAM_DROP_RETRY_DELAYS_MS.length, 1, 1, 1);', ctx);
+  const savedWarn = console.warn; console.warn = () => {};
+  const savedLog = console.log; const quiet = (fn) => async (...a) => { console.log = () => {}; try { return await fn(...a); } finally { console.log = savedLog; } };
+  const loop = quiet(run);
+  try {
+    let r = await loop([DROP, DROP, DROP, QUERY, DROP, DROP, DROP, { text: 'All done.' }]);
+    truthy('three drops of one request, then three of the next, still finish the turn (the limit counts drops in a row)', !r.thrown && r.result && r.result.text === 'All done.');
+
+    r = await loop([DROP, DROP, DROP, QUERY, DROP, DROP, DROP, QUERY, DROP, DROP, DROP, QUERY, { text: 'All done.' }]);
+    truthy('…but a provider that keeps failing stops at the turn-wide limit of 8 retries', r.thrown && /did not get through/.test(r.thrown.message) && r.events.filter((e) => /Connection dropped/.test(e.label || '')).length === 8);
+
+    r = await loop([{ drop: true, prefix: data({ content: 'Partial answer' }) }, { text: 'The whole answer.' }]);
+    const iDiscard = r.events.findIndex((e) => e.type === 'AI_STREAM_DISCARD');
+    truthy('a drop after text streamed is retried too, and the partial text is taken off the screen first', !r.thrown && r.result.text === 'The whole answer.' && iDiscard !== -1 && iDiscard < r.events.findIndex((e) => /Connection dropped/.test(e.label || '')));
+
+    r = await loop([QUERY, DROP, DROP, DROP, DROP], { text: 'create an app called "DHIS2 Logs"' });
+    truthy('out of retries: the user reads what happened and what to do, not the bare "network error"', r.thrown && r.thrown.message !== 'network error' && /dropped while the model was writing/.test(r.thrown.message) && /llm\.invalid/.test(r.thrown.message) && /"continue"/.test(r.thrown.message));
+    truthy('…the request and the tool calls are kept for the next turn', r.history[0].role === 'user' && /DHIS2 Logs/.test(r.history[0].content) && r.history.some((m) => m.role === 'tool'));
+    truthy('…closing with a note, so no tool result is left waiting for a reply', r.history[r.history.length - 1].role === 'assistant' && /Interrupted:/.test(r.history[r.history.length - 1].content));
+    const calls = r.history.flatMap((m) => (m.tool_calls || []).map((c) => c.id));
+    truthy('…and every kept tool call still has its result', calls.length && calls.every((id) => r.history.some((m) => m.role === 'tool' && m.tool_call_id === id)));
+    const next = await loop([{ text: 'Carrying on.' }], { text: 'continue', keepHistory: true });
+    truthy('"continue" then reaches the model with the original request in context', !next.thrown && next.requests[0].messages.some((m) => m.role === 'user' && /DHIS2 Logs/.test(m.content)));
+
+    r = await loop([DROP, DROP, DROP, DROP]);
+    truthy('a dropped first reply is kept as well: "continue" still has the request', r.thrown && r.history.length === 2 && r.history[0].role === 'user');
+
+    r = await loop([{ status: 401 }]);
+    truthy('a rejected key on the first request keeps its own message and adds nothing to the thread', r.thrown && /provider said 401/.test(r.thrown.message) && r.history.length === 0);
+    r = await loop([QUERY, { status: 400 }]);
+    truthy('a provider rejection after tools ran keeps its message, and the work done so far', r.thrown && /provider said 400/.test(r.thrown.message) && r.history.some((m) => m.role === 'tool'));
+
+    const longPartial = callDeltas('manage_custom_app', '{"action":"preview","source":"' + 'x'.repeat(5000));
+    r = await loop([{ drop: true, prefix: longPartial }, QUERY, { text: 'Done.' }]);
+    const nudged = (req) => req.messages.some((m) => m.role === 'system' && /Your last reply was lost/.test(m.content || ''));
+    truthy('a long tool call that was cut: the retry asks for a smaller call', nudged(r.requests[1]) && r.requests[1].messages.some((m) => /SHORTER source/.test(m.content || '')));
+    truthy('…and that request is dropped once a reply arrives', !nudged(r.requests[2]) && !r.history.some((m) => /Your last reply was lost/.test(m.content || '')));
+    r = await loop([{ drop: true, prefix: callDeltas('dhis2_query', '{"path":"sys') }, { text: 'Done.' }]);
+    truthy('a short cut retries the same request, with no such note', !nudged(r.requests[1]) && r.result.text === 'Done.');
+
+    r = await loop([DROP, { text: 'Never read.' }], { onRequest: (n) => { if (n === 1) vm.runInContext('conversationEpoch++;', ctx); } });
+    truthy('a thread reset during the retry wait ends the old turn and keeps nothing of it', !r.thrown && r.result.aborted && r.requests.length === 1 && r.history.length === 0);
+  } finally {
+    console.warn = savedWarn; console.log = savedLog;
+    vm.runInContext('STREAM_DROP_RETRY_DELAYS_MS.splice(0, STREAM_DROP_RETRY_DELAYS_MS.length, ...globalThis.__savedDropDelays); conversationHistory = []; _cachedApiKey = null; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };', ctx);
+    Object.assign(d, { baseUrl: saved.base, connected: saved.connected, apiVersion: saved.apiVersion, pageContext: saved.pageContext });
+  }
+}
+
+// ── "DHIS2 Logs" thread: job ids and guessed log endpoints (2026-11-02) ──────
+async function runLogEndpointChecks() {
+  console.log('\nLog sources: job ids and guessed endpoints:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const harvested = vm.runInContext(`(() => { const s = new Set(); harvestUidsInto(s, { ANALYTICS_TABLE: { WtMCtIQU6HS: [{ id: 'P6fE5zF3tV7', message: 'x' }] } }); return [...s]; })()`, ctx);
+  truthy('a UID used as an object KEY counts as seen (system/tasks: job ids are keys)', harvested.includes('WtMCtIQU6HS') && harvested.includes('P6fE5zF3tV7'));
+  const guessed = ctx.isGuessedLogEndpoint;
+  for (const p of ['logs', 'system/logs', 'system/notifications', 'system/tasksExtended', 'system/errors', 'system/taskSummaries', 'audits/analytics', 'audits/scheduler', 'system/tasks/ANALYTICS_TABLE/bX0zP3zZB2a/P6fE5zF3tV7'])
+    truthy(`guessed, answers 404 on 2.42 and 2.43: ${p}`, guessed(p));
+  for (const p of ['metadataAudits', 'system/tasks', 'system/tasks/DATA_STATISTICS', 'system/tasks/ANALYTICS_TABLE/WtMCtIQU6HS', 'system/taskSummaries/ANALYTICS_TABLE', 'system/info', 'scheduling/completed', 'scheduling/running', 'scheduler', 'jobConfigurations', 'audits/dataValue', 'audits/dataApproval', 'dataStatistics', 'dataSummary'])
+    truthy(`real endpoint is not touched: ${p}`, !guessed(p));
+  vm.runInContext(`_cachedApiKey = 'k'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' }; globalThis.__savedGetCfg = getProviderConfig; getProviderConfig = () => _cachedProviderConfig;`, ctx);
+  try {
+    const gate = ctx.enforcePatientDataPrivacyGate;
+    const made = gate('dhis2_query', { path: 'audits/analytics' });
+    truthy('cloud model: a made-up audits/ path is refused as what it is, not as patient data', made && /is not a DHIS2 endpoint/.test(made._error) && !/patient/i.test(made._error) && /scheduling\/completed/.test(made._hint));
+    for (const p of ['audits/trackedEntity', 'audits/trackedEntityDataValue', 'audits/enrollment', 'audits/event', 'audits/trackerAnything']) {
+      const r = gate('dhis2_query', { path: p });
+      truthy(`cloud model: tracker audit stays a privacy refusal: ${p}`, r && /hard privacy safeguard/.test(r._error));
+    }
+    truthy('cloud model: audits/dataValue stays readable', gate('dhis2_query', { path: 'audits/dataValue' }) === null);
+  } finally {
+    vm.runInContext(`getProviderConfig = globalThis.__savedGetCfg; _cachedApiKey = null; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };`, ctx);
+  }
+  const savedFetch = ctx.fetch; let fetched = 0;
+  ctx.fetch = async () => { fetched++; return new Response('{}', { status: 200 }); };
+  try {
+    for (const path of ['system/notifications', 'logs', 'system/tasks/ANALYTICS_TABLE/bX0zP3zZB2a/P6fE5zF3tV7']) {
+      const r = await ctx.executeTool('dhis2_query', { path });
+      truthy(`dhis2_query ${path}: not sent, and the answer lists the real sources`, /Not sent/.test(r._error) && /scheduling\/completed/.test(r._hint) && /dhis\.log/.test(r._hint) && fetched === 0);
+    }
+  } finally { ctx.fetch = savedFetch; }
+  const manual = vm.runInContext(`buildManualGateResult('manage_custom_app').manual`, ctx);
+  truthy('the app manual lists the sources and says request/error logs are in no API', /Apps about the server itself/.test(manual) && /scheduling\/completed/.test(manual) && /dhis\.log/.test(manual));
+}
+
 // A dropped provider stream is retried like a stalled one (no text yet).
 function runStreamRetryChecks() {
   console.log('\nProvider stream drops are retried before any text streams:');
@@ -2258,7 +2392,9 @@ function runStreamRetryChecks() {
   for (const m of ['HTTP 401 Unauthorized', 'No API key configured', 'Invalid provider URL'])
     (!r(new Error(m)) ? ok : bad)(`not retryable: "${m}"`);
   const src = fs.readFileSync(path.join(ROOT, 'src/agent.js'), 'utf8');
-  (/isRetryableStreamDrop\(provErr\) && !streamStartBroadcast/.test(src) ? ok : bad)('the agent loop retries only while nothing has streamed to the panel');
+  (/AI_STREAM_DISCARD/.test(src) ? ok : bad)('a retry after text streamed takes the partial reply off the screen');
+  const panelSrc = fs.readFileSync(path.join(ROOT, 'sidepanel/panel.js'), 'utf8');
+  (/case 'AI_STREAM_DISCARD'/.test(panelSrc) ? ok : bad)('the panel handles the discard message');
 }
 
 // ── SQL views + transfer-history thread fixes (2026-10-23) ──────────────────
@@ -3744,6 +3880,8 @@ async function runSecurityReviewChecks() {
 setImmediate(async () => {
   if (loaded) await runStreamDropChecks().catch((e) => bad(`stream-drop checks threw: ${e && e.stack || e}`));
   if (loaded) { try { runStreamRetryChecks(); } catch (e) { bad(`stream-retry checks threw: ${e && e.stack || e}`); } }
+  if (loaded) await runStreamRecoveryChecks().catch((e) => bad(`stream recovery checks threw: ${e && e.stack || e}`));
+  if (loaded) await runLogEndpointChecks().catch((e) => bad(`log endpoint checks threw: ${e && e.stack || e}`));
   if (loaded) await runStatePersistenceChecks().catch((e) => bad(`state persistence checks threw: ${e && e.stack || e}`));
   if (loaded) await runPlacementChecks().catch((e) => bad(`placement checks threw: ${e && e.stack || e}`));
   if (loaded) await runSqlViewChecks().catch((e) => bad(`SQL view checks threw: ${e && e.stack || e}`));

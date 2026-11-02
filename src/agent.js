@@ -203,6 +203,64 @@ function isRetryableStreamDrop(err) {
   return /stream stalled|\bterminated\b|network ?error|failed to fetch|other side closed|socket hang up|ECONNRESET|connection (?:reset|closed)|BodyStreamBuffer/i.test(String((err && err.message) || err || ''));
 }
 
+// Retries of ONE provider request. The limit counts drops in a row, not drops
+// per turn: a long build on a flaky connection could use up a per-turn budget on
+// early steps, and the next drop then ended the whole turn (live 2026-11-02).
+// The turn-wide cap only stops a provider that never gets through.
+const STREAM_DROP_RETRY_DELAYS_MS = [2000, 5000, 10000];
+const STREAM_DROP_TURN_LIMIT = 8;
+// A cut this far into a tool call's arguments points at the reply's length, so
+// the retry asks for a smaller call. An identical request from a low-temperature
+// model would be the same length and could be cut the same way.
+const STREAM_DROP_LONG_CALL_CHARS = 4000;
+
+// How to make a tool call smaller. An app's source cannot be split across calls,
+// so its code has to shrink; everything else can be sent in several calls.
+function smallerCallHint(toolName) {
+  return toolName === 'manage_custom_app'
+    ? 'Write SHORTER source: drive repeated fields from one array of UIDs mapped over (never one block per field), drop comments and decorative markup, and put helpers used by both app and plugin in shared.jsx once. Write the code directly in the call — do not draft it in your reasoning first.'
+    : 'Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.';
+}
+
+function providerHostForMessage(cfg) {
+  try { return new URL(cfg.apiBaseUrl).host; } catch { return 'the AI provider'; }
+}
+
+// What the user reads when a reply's connection could not be restored. Chrome's
+// own text for this is the bare "network error", which says nothing about what
+// failed or what to do next.
+function streamDropFailureMessage(err, retries, host) {
+  const detail = String((err && err.message) || err || 'unknown');
+  const browserSaid = /stream stalled/i.test(detail) ? 'no data arrived for 2 minutes' : `browser error: "${detail}"`;
+  // streamProgress is set only once a reply had started arriving.
+  const what = err && err.streamProgress
+    ? `The connection to ${host} dropped while the model was writing its reply`
+    : `${host} could not be reached`;
+  return `${what}${retries ? `, and ${retries} ${retries === 1 ? 'retry' : 'retries'} did not get through` : ''} (${browserSaid}). `
+    + 'Steps marked ✓ above did run; nothing after them did. '
+    + 'Say "continue" to pick up from here — your request and what was found so far are kept. '
+    + 'If this keeps happening, check your connection or try another model in Settings.';
+}
+
+// The closing note of a turn that ended on a provider failure: tells the model on
+// the next turn where things stand, so "continue" does not repeat the research.
+const INTERRUPTED_TURN_NOTE = '[Interrupted: the connection to the AI provider failed before this reply was finished. Every tool result above is real. The step being written at that moment did NOT run. If the user says to continue, carry on from here without repeating the research.]';
+
+// Keep a turn that a provider failure cut short. Without this the request and
+// every tool call were lost, so "continue" reached a model with no memory of
+// them, and one that had already created objects could create them again.
+function persistInterruptedTurnHistory(messages, turnStartIdx, historyText) {
+  const hist = buildTurnHistory(messages, turnStartIdx, historyText);
+  if (!hist.length) return [];
+  const last = hist[hist.length - 1];
+  if (last.role === 'assistant' && !(last.tool_calls && last.tool_calls.length)) {
+    last.content = `${last.content || ''}\n\n${INTERRUPTED_TURN_NOTE}`.trim();
+  } else {
+    hist.push({ role: 'assistant', content: INTERRUPTED_TURN_NOTE });
+  }
+  return hist;
+}
+
 // ── Agentic Loop ─────────────────────────────────────────────────────────────
 
 async function runAgenticLoop(userText, imageBase64, browseWeb = false) {
@@ -584,7 +642,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   let lastToolName = null;
   let emptyResponseCount = 0;
   let leakedToolCallCount = 0; // tool calls emitted as plain text instead of native calls // Guard against infinite think-only loops
-  let providerStallRetries = 0; // Transparent retries for mid-stream stalls (nothing shown to the user yet)
+  let streamDropsInARow = 0; // drops of the current provider request; a response that arrives resets it
+  let streamDropsThisTurn = 0; // all drops this turn, against STREAM_DROP_TURN_LIMIT
+  let streamDropNudge = null; // transient "send it smaller" message, removed once a reply arrives
   let unfinishedTextNudges = 0; // text-only replies that are provably not a finished answer (cut by token limit / announcement-only)
   let anyToolCallThisTurn = false; // at least one tool call was emitted this turn (marks the turn as mid-task)
 
@@ -655,17 +715,50 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     } catch (provErr) {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       chunkBuffer = '';
-      // A mid-stream stall before ANY text reached the panel can be retried
-      // transparently — `messages` was not mutated for this iteration, so the
-      // request is safely repeatable. If text already streamed, rethrow so the
-      // user sees the error rather than duplicated output.
-      if (isRetryableStreamDrop(provErr) && !streamStartBroadcast && providerStallRetries < 2) {
-        providerStallRetries++;
-        console.warn(`[AgenticLoop] provider stream stalled — retrying (${providerStallRetries}/2)`);
-        broadcast({ type: 'AI_THINKING', iteration: i + 1, label: `Connection dropped — retrying (${providerStallRetries}/2)` });
+      // The partial reply was never saved and will be written again, so take it
+      // off the screen: otherwise the retry shows the same words twice.
+      if (streamStartBroadcast) broadcast({ type: 'AI_STREAM_DISCARD' });
+      const isDrop = isRetryableStreamDrop(provErr);
+      // `messages` is not changed until a response arrives, so the request can
+      // be repeated safely.
+      if (isDrop && streamDropsInARow < STREAM_DROP_RETRY_DELAYS_MS.length && streamDropsThisTurn < STREAM_DROP_TURN_LIMIT) {
+        const delay = STREAM_DROP_RETRY_DELAYS_MS[streamDropsInARow];
+        streamDropsInARow++;
+        streamDropsThisTurn++;
+        const progress = provErr.streamProgress || {};
+        console.warn(`[AgenticLoop] provider stream dropped (${provErr.message}) after ${progress.textChars || 0} text / ${progress.toolArgChars || 0} tool-argument chars — retry ${streamDropsInARow}/${STREAM_DROP_RETRY_DELAYS_MS.length} in ${delay}ms`);
+        if (progress.toolArgChars >= STREAM_DROP_LONG_CALL_CHARS) {
+          const content = `Your last reply was lost: the connection to the AI provider dropped after about ${progress.toolArgChars} characters of ${progress.toolName || 'tool'} arguments. Nothing from that reply ran. Send this step again in a SMALLER form. ${smallerCallHint(progress.toolName)}`;
+          if (streamDropNudge) streamDropNudge.content = content;
+          else { streamDropNudge = { role: 'system', content }; messages.push(streamDropNudge); }
+        }
+        broadcast({ type: 'AI_THINKING', iteration: i + 1, label: `Connection dropped — retrying (${streamDropsInARow}/${STREAM_DROP_RETRY_DELAYS_MS.length})` });
+        await new Promise(r => setTimeout(r, delay));
+        // The thread may have been reset during the wait.
+        if (turnEpoch !== conversationEpoch) return { text: '', charts, streamed: false, aborted: true };
         continue;
       }
+      // Out of retries, or a failure a retry cannot fix (bad key, rejected
+      // request). Keep what this turn did, unless it did nothing yet and the
+      // failure was not a dropped connection: there is nothing to continue from.
+      const turnDidWork = messages.slice(turnStartIdx).some(m => m.role === 'tool');
+      if ((turnDidWork || isDrop) && turnEpoch === conversationEpoch) {
+        const turnHist = persistInterruptedTurnHistory(messages, turnStartIdx, historyText);
+        if (turnHist.length) {
+          conversationHistory.push(...turnHist);
+          conversationHistory = trimConversationHistory(conversationHistory);
+          lastInteraction = { question: userText, apiCalls: apiCallsLog, answer: `(interrupted: ${provErr.message})` };
+          await saveState();
+        }
+      }
+      if (isDrop) throw new Error(streamDropFailureMessage(provErr, streamDropsInARow, providerHostForMessage(_cachedProviderConfig || {})));
       throw provErr;
+    }
+    streamDropsInARow = 0;
+    if (streamDropNudge) {
+      const at = messages.indexOf(streamDropNudge);
+      if (at !== -1) messages.splice(at, 1);
+      streamDropNudge = null;
     }
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (chunkBuffer) {
@@ -809,10 +902,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           // still get one "resend the same call" pass before split advice.
           const hitTokenLimit = argsCorrupted.finishReason === 'length';
           const persistent = hitTokenLimit || dhis2.corruptedCallCount >= 3;
-          const splitHint = toolName === 'manage_custom_app'
-            // An app's source cannot be split across calls — the code must shrink.
-            ? `Write SHORTER source: drive repeated fields from one array of UIDs mapped over (never one block per field), drop comments and decorative markup, and put helpers used by both app and plugin in shared.jsx once. Write the code directly in the call — do not draft it in your reasoning first.`
-            : `Build incrementally with SMALLER calls: create_metadata(action=create_program) with the program shell + attributes + ONLY the first stage and its rules, then add each remaining stage with create_metadata(action=add_stage, program_id=…) and each batch of rules (10–15 at a time) with create_metadata(action=add_program_rules, program_id=…). Each smaller call streams reliably. For non-program payloads, send the items in smaller batches across several calls.`;
+          const splitHint = smallerCallHint(toolName);
           const feedback = {
             _error: `The arguments for ${toolName} did not arrive intact — the tool-call JSON was ${hitTokenLimit ? `cut off by the response token limit after ${argsCorrupted.rawLength} characters` : `truncated or corrupted (${argsCorrupted.rawLength} characters received, not valid JSON)`}. NOTHING was executed.`,
             _hint: persistent

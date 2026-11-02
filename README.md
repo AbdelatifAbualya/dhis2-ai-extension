@@ -353,6 +353,39 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.35 — A dropped connection no longer ends or loses the turn; a "logs" app no longer starts with guessed endpoints (2026-11-02)
+
+The request was: create an app called "DHIS2 Logs" that logs everything on the instance. The chatbot made 15 tool calls, 7 of which failed, then stopped with the bare text `network error`. No app was built.
+
+**What went wrong, in order:**
+1. **The connection to the AI provider dropped while the model was replying.** `network error` is Chrome's own text when a response stream breaks. It reached the panel unchanged.
+2. **The retries were a budget for the whole turn.** Only 2 retries were allowed per turn, sent immediately, and only if no text had appeared yet. On a long turn, earlier drops could use them up.
+3. **The failed turn was thrown away.** The request and all its tool calls were dropped from the conversation, so saying "continue" reached a model that saw only the word "continue". A turn that had already created objects could then create them again.
+4. **The model had to guess where DHIS2 keeps logs.** `system/notifications`, `system/tasksExtended`, `audits/analytics` and a path below a job id do not exist.
+5. **Two refusals were false.**
+   - `system/tasks/ANALYTICS_TABLE/WtMCtIQU6HS` was refused as a "hallucinated" id, although the model had it from the server. `system/tasks` returns job ids as object KEYS, and the known-id check read only values.
+   - `audits/analytics` was refused as "patient-level data", but that path does not exist.
+
+**Fixes (no task-specific code):**
+- **Retries count drops in a row, per request** (agent.js). Up to 3 retries after 2, 5 and 10 seconds. A reply that arrives resets the count. A turn-wide limit of 8 stops a provider that never gets through.
+- **A drop after text appeared is retried too.** A new `AI_STREAM_DISCARD` message takes the partial text off the screen first, so nothing shows twice. Narration from earlier steps stays.
+- **A long tool call that was cut is retried smaller.** After 4,000 or more characters of arguments, the retry carries a transient note asking for a smaller call. An identical request could be cut the same way. The note is removed once a reply arrives.
+- **A failed turn is kept** (`persistInterruptedTurnHistory`). The request, the tool calls and a closing note go into the conversation, so "continue" carries on without repeating the research. This covers any provider failure after a tool ran, and any dropped connection. A rejected key on the first request still adds nothing to the thread.
+- **The error says what happened and what to do:** which host dropped, how many retries ran, what the browser said, what did and did not run, and to say "continue".
+- **Job ids are recognised.** `harvestUidsInto` reads object keys as well as values, which also covers other UID-keyed responses.
+- **Guessed log endpoints are answered without a request** (`isGuessedLogEndpoint`, `DHIS2_LOG_SOURCES_HINT`). The refusal lists the real sources, so the first wrong guess is also the last. A made-up `audits/` path is now called what it is. Real tracker audits stay refused on a cloud model, and nothing is sent in either case.
+- **The app manual has a new section on apps about the server itself.** It also states the limit plainly: **DHIS2 has no API for HTTP request logs, server errors or `dhis.log`.** They stay in the server's log files, and a SQL view cannot read them, so an app must say so instead of showing made-up rows.
+
+**Verified facts (2.41.11, 2.42.7, 2.43.2, localhost:8081; no 2.40 server was available):**
+- Sources that answer: `scheduling/completed`, `scheduling/running`, `scheduling/running/types`, `system/tasks`, `system/tasks/<TYPE>`, `system/tasks/<TYPE>/<jobId>`, `scheduler`, `jobConfigurations`, `audits/dataValue`, `audits/dataApproval`, `dataSummary`, and `dataStatistics` (400 without `startDate`, `endDate` and `interval`).
+- 404 on all four: `logs`, `system/logs`, `system/errors`, `system/notifications`, `system/tasksExtended`, `system/taskSummaries` (it needs a job type), `audits/metadata`, `audits/analytics`, `audits/scheduler`, and anything below `system/tasks/<TYPE>/<jobId>`.
+
+**Verified:**
+- `npm run verify`, with new checks that drive the real loop against a fake provider.
+- Real extension in real Chrome 155, with a local server cutting the connection. The old release reproduced the report exactly: panel text `network error`, and "continue" reached the model alone. The fixed build shows the new message and keeps the request. After a drop with text on screen, the partial text disappears, earlier narration stays, and the final reply appears once.
+- The real loop and tools on 2.42.7, 2.43.2 and localhost:8081, with a scripted model and two dropped streams: research, preview and install of a real "DHIS2 Logs" app, 0 failed DHIS2 API calls. The installed app opened in a browser with all four tabs showing real data and no failed call, then was removed.
+- Not run: the same prompt with a real model, because that needs a provider key. The provider's own reason for dropping the connection is outside the extension and was not determined.
+
 ### 2.8.34 — A failed check no longer stops the build; tiles can be inserted and reordered; maps draw correctly; apps read every location; app requests are not mistaken for bug reports (2026-11-01)
 
 The RMNCH "Maternal Care and Follow-up" thread (play 2.42.7) built the dashboard, its charts and its tables correctly in the first two prompts. The third prompt asked for two maps, an explanation, a new tile order and some checks. It ended with the maps built but never placed on the dashboard.

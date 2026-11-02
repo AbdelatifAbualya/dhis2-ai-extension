@@ -481,6 +481,9 @@
       case 'AI_STREAM_END':
         handleStreamEnd(msg.text);
         break;
+      case 'AI_STREAM_DISCARD':
+        handleStreamDiscard();
+        break;
       case 'AI_RESPONSE':
         removeThinking();
         markAllToolsDone();
@@ -743,6 +746,16 @@
     streamingRawText = '';
     streamingLastHtml = '';
     scrollToBottom();
+  }
+
+  // The connection dropped mid-reply. The worker will write the reply again (or
+  // report the failure), so the partial text must not stay on screen.
+  function handleStreamDiscard() {
+    // Not by id: narration from earlier steps of the turn keeps #streaming-msg,
+    // so an id lookup would find the oldest bubble and delete the wrong text.
+    const partial = streamingBubble && streamingBubble.closest('.msg');
+    finalizeStream();
+    if (partial) partial.remove();
   }
 
   function finalizeStream() {
