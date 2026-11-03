@@ -4144,10 +4144,6 @@ async function executeManageMetadata(args) {
     if (progResp?._error) return { _error: `Could not load program ${progId}: ${progResp._error}` };
     if (!progResp?.id) return { _error: `Program ${progId} not found.` };
 
-    // Resolve default categoryCombo for any new TEAs (not strictly required on TEA but safe-guard).
-    const catComboResp = await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1');
-    const defaultCatComboId = catComboResp?.categoryCombos?.[0]?.id || null;
-
     const existingPtas = progResp.programTrackedEntityAttributes || [];
     const existingTeaIds = new Set(existingPtas.map(p => p.trackedEntityAttribute?.id).filter(Boolean));
     const maxSort = existingPtas.reduce((m, p) => Math.max(m, p.sortOrder || 0), 0);
@@ -7513,12 +7509,18 @@ async function piRuntimeAnalyticsCheck(programId, ids) {
   // answered 200 / 0.0 for an indicator that 409s with any single period or
   // as a dimension (live 2.43.2, 2026-10-29) — the filter form hid it.
   const PERIOD = 'THIS_YEAR;LAST_5_YEARS';
-  const query = (chunk) => safeDhis2Fetch(`analytics?dimension=dx:${chunk.join(';')}&dimension=pe:${PERIOD}&filter=ou:USER_ORGUNIT&skipMeta=true`);
+  const query = (chunk, period = PERIOD) => safeDhis2Fetch(`analytics?dimension=dx:${chunk.join(';')}&dimension=pe:${period}&filter=ou:USER_ORGUNIT&skipMeta=true`);
   const rowHasValue = (row) => { const v = row && row[row.length - 1]; return !!(row && row[0] && v !== '' && v != null); };
   const isIndicatorFault = (r) => !!r?._error && /SqlState|syntax error|Expression violation|invalid types|division by zero|ctx\.uid0/i.test(String(r._error));
+  // `column "<uid>" does not exist`: the indicator is right, but the analytics
+  // tables were built before that data element existed. Live 2026-11-02: a data
+  // element added to a stage stayed missing through three partial hourly runs, a
+  // KPI tile showed "Something went wrong", and this check said ok with no data.
+  const missingColumn = (r) => (/column\s+"?(?:\w+\.)?([A-Za-z][A-Za-z0-9]{10})"?\s+does not exist/i.exec(String(r?._body?.devMessage || '')) || [])[1] || null;
   const withData = new Set();
   const broken = [];
   const skipped = [];
+  const needsRebuild = [];
   for (let i = 0; i < ids.length; i += 50) {
     const chunk = ids.slice(i, i + 50);
     const r = await query(chunk);
@@ -7547,28 +7549,38 @@ async function piRuntimeAnalyticsCheck(programId, ids) {
   // 409'd only on its own). So every "no value" indicator of a multi-item
   // query is re-asked alone; it is the only way to tell empty from broken.
   // Capped so a program without data cannot cost hundreds of calls.
+  //
+  // Re-asked with ONE period, the way a KPI tile asks: only pe:THIS_YEAR or
+  // pe:LAST_YEAR alone surfaces a failing query; LAST_12_MONTHS, MONTHS_THIS_YEAR
+  // and any list of periods answer an empty 200 (verified 2.42.5, 2026-11-02). So
+  // a single indicator is re-asked as well.
   const RECHECK_MAX = 40;
   let unverified = [];
-  if (ids.length > 1) {
-    let recheck = ids.filter(id => !withData.has(id) && !broken.some(b => b.id === id) && !skipped.some(sk => sk.ids.length === 1 && sk.ids[0] === id));
-    if (recheck.length > RECHECK_MAX) { unverified = recheck.slice(RECHECK_MAX); recheck = recheck.slice(0, RECHECK_MAX); }
-    let cur = 0;
-    const one = async () => {
-      while (cur < recheck.length) {
-        const id = recheck[cur++];
-        const r = await query([id]);
-        if (!r?._error) { for (const row of (r?.rows || [])) if (rowHasValue(row)) withData.add(row[0]); }
-        else if (isIndicatorFault(r)) broken.push({ id, error: String(r._error).slice(0, 240) });
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(4, recheck.length) }, one));
-  }
+  let recheck = ids.filter(id => !withData.has(id) && !broken.some(b => b.id === id) && !skipped.some(sk => sk.ids.length === 1 && sk.ids[0] === id));
+  if (recheck.length > RECHECK_MAX) { unverified = recheck.slice(RECHECK_MAX); recheck = recheck.slice(0, RECHECK_MAX); }
+  let cur = 0;
+  const one = async () => {
+    while (cur < recheck.length) {
+      const id = recheck[cur++];
+      const r = await query([id], 'THIS_YEAR');
+      if (!r?._error) { for (const row of (r?.rows || [])) if (rowHasValue(row)) withData.add(row[0]); continue; }
+      const col = missingColumn(r);
+      if (col) needsRebuild.push({ id, data_element: col });
+      else if (isIndicatorFault(r)) broken.push({ id, error: String(r._error).slice(0, 240) });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, recheck.length) }, one));
+  const rebuildIds = new Set(needsRebuild.map(b => b.id));
   return {
     ok: broken.length === 0,
     checked: ids.length,
-    query: `aggregate analytics, org unit USER_ORGUNIT, periods ${PERIOD.replace(';', ' + ')}`,
+    query: `aggregate analytics, org unit USER_ORGUNIT, periods ${PERIOD.replace(';', ' + ')}, and THIS_YEAR alone for any without a value`,
     with_data: ids.filter(id => withData.has(id)),
-    no_data: ids.filter(id => !withData.has(id) && !broken.some(b => b.id === id)),
+    no_data: ids.filter(id => !withData.has(id) && !rebuildIds.has(id) && !broken.some(b => b.id === id)),
+    ...(needsRebuild.length ? {
+      needs_full_analytics_run: needsRebuild,
+      needs_full_analytics_note: `These indicators are valid, but the analytics tables have no column yet for their data element(s) ${[...new Set(needsRebuild.map(b => b.data_element))].join(', ')}, because the tables were built before it existed. Until a FULL Analytics Tables run (a scheduled partial or last-years run may not add it), a tile showing them says "Something went wrong". Tell the user this. Do not say they will fill in as data is entered.`,
+    } : {}),
     ...(broken.length ? { broken } : {}),
     ...(skipped.length ? { skipped } : {}),
     ...(unverified.length ? { unverified, unverified_note: `${unverified.length} indicator(s) returned no value and were not re-checked one by one — an empty result can also hide a failing indicator.` } : {}),
@@ -8203,12 +8215,12 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   const collectSuggestions = (name) => {
     const nLower = name.toLowerCase();
     const suggestions = [];
-    for (const [_, e] of deBySanitized) {
+    for (const e of deBySanitized.values()) {
       if (e.displayName && (e.displayName.toLowerCase().includes(nLower) || nLower.includes(sanitizeVariableName(e.displayName)))) {
         suggestions.push({ kind: 'dataElement', id: e.id, displayName: e.displayName });
       }
     }
-    for (const [_, e] of teaBySanitized) {
+    for (const e of teaBySanitized.values()) {
       if (e.displayName && (e.displayName.toLowerCase().includes(nLower) || nLower.includes(sanitizeVariableName(e.displayName)))) {
         suggestions.push({ kind: 'trackedEntityAttribute', id: e.id, displayName: e.displayName });
       }

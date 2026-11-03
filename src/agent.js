@@ -207,8 +207,10 @@ function isRetryableStreamDrop(err) {
 // per turn: a long build on a flaky connection could use up a per-turn budget on
 // early steps, and the next drop then ended the whole turn (live 2026-11-02).
 // The turn-wide cap only stops a provider that never gets through.
-const STREAM_DROP_RETRY_DELAYS_MS = [2000, 5000, 10000];
-const STREAM_DROP_TURN_LIMIT = 8;
+// The delays reach past a one-minute outage: three retries over 17 s gave up on
+// two long builds at once when the network blinked (live 2026-11-02).
+const STREAM_DROP_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000, 40000];
+const STREAM_DROP_TURN_LIMIT = 12;
 // A cut this far into a tool call's arguments points at the reply's length, so
 // the retry asks for a smaller call. An identical request from a low-temperature
 // model would be the same length and could be cut the same way.
@@ -1791,11 +1793,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
-    case 'GET_STATE': {
-      sendResponse({ state: getSerializableState() });
-      return true;
-    }
-
     case 'AGENT_STATUS': {
       // Liveness probe from the side panel's watchdog. `busy` distinguishes a
       // worker that is still mid-task (keepalive held) from one that Chrome
@@ -2060,18 +2057,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       };
       broadcast({ type: 'SCREENSHOT_ERROR', error: errors[msg.reason] || 'Screenshot failed: ' + (msg.error || 'unknown error') });
       return false;
-    }
-
-    case 'GET_FEEDBACK_LOG': {
-      chrome.storage.local.get(['feedbackLog'])
-        .then(d => sendResponse({ log: d.feedbackLog || [] }))
-        .catch(e => sendResponse({ error: e.message }));
-      return true;
-    }
-
-    case 'GET_LAST_INTERACTION': {
-      sendResponse(lastInteraction);
-      return true;
     }
 
     // Learning memory (settings → Learning memory): view / delete / clear /

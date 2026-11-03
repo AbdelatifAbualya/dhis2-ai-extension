@@ -121,7 +121,10 @@ const chrome = {
   storage: { local: localStore, session: sessionStore, onChanged: evt() },
   tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve([]), sendMessage: () => Promise.resolve() },
   action: { onClicked: evt() },
-  permissions: { onAdded: evt(), onRemoved: evt(), getAll: () => Promise.resolve({ origins: [] }) },
+  // `contains: true`: the harness stands in for a user who granted host access.
+  // Without it initializeFromUrlNow refuses silently and a page-bound prompt
+  // ("this form") runs with no page context at all.
+  permissions: { onAdded: evt(), onRemoved: evt(), getAll: () => Promise.resolve({ origins: [] }), contains: () => Promise.resolve(true) },
   scripting: { getRegisteredContentScripts: () => Promise.resolve([]), executeScript: () => Promise.resolve([]) },
   sidePanel: { setOptions: noop, open: () => Promise.resolve() },
 };

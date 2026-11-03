@@ -856,16 +856,23 @@ async function lineListBuildFromSpec(args, { requireName }) {
   if (colRes._error) return colRes;
   const filtRes = await resolveAxis(args.filters, 'filter');
   if (filtRes._error) return filtRes;
-  const columns = colRes.dims, filters = filtRes.dims;
-
-  if (!columns.length) return { _error: 'columns[] is required — at least one column (org unit, time, data element, attribute or program indicator).' };
-  const allDims = [...columns, ...filters];
   // The same data element from DIFFERENT stages is a different column
   // ("Hb at first ANC", "Hb at birth care"): DHIS2 stores one
   // dataElementDimension per stage and the query is stage-qualified (verified
-  // 2.43.2, 2026-10-29). Only a true repeat of the same stage is a duplicate —
-  // the old check refused the RMNCH register outright.
+  // 2.43.2, 2026-10-29). Only a true repeat of the same stage is a duplicate.
   const dimKey = (d) => (d.kind === 'de' && d.stageId ? `${d.stageId}.${d.dimension}` : d.dimension);
+  // "Show systolic, only where it is 140 or more" is ONE dimension: a column that
+  // carries a filter. Sending it on both axes is the natural reading, and two
+  // threads in one day were refused for it (live 2026-11-02), so merge them.
+  const columns = colRes.dims, filters = [];
+  for (const f of filtRes.dims) {
+    const col = f.filter ? columns.find(c => dimKey(c) === dimKey(f) && !c.filter) : null;
+    if (col) col.filter = f.filter;
+    else filters.push(f);
+  }
+
+  if (!columns.length) return { _error: 'columns[] is required — at least one column (org unit, time, data element, attribute or program indicator).' };
+  const allDims = [...columns, ...filters];
   const dupes = allDims.map(dimKey).filter((v, i, a) => a.indexOf(v) !== i);
   if (dupes.length) return { _error: `Dimension(s) appear more than once across columns+filters: ${[...new Set(dupes)].join(', ')}. Each dimension can appear on ONE axis only.` };
 

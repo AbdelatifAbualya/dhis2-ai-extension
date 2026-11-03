@@ -64,6 +64,10 @@ jobs:
             -x 'node_modules/*' \
             -x '*/node_modules/*' \
             -x '*.md' \
+            -x 'scripts/*' \
+            -x 'test-results/*' \
+            -x 'package.json' \
+            -x '.gitignore' \
             -x 'generate-icons.js' \
             -x 'screenshot.png' \
             -x '*.zip'

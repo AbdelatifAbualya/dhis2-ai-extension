@@ -319,6 +319,23 @@ function findJsxTagMismatch(source, opts = {}) {
     }
     return n;
   };
+  // End of the regex literal opening at i, or -1 if the line holds no closing /.
+  const skipRegexLiteral = (i) => {
+    let inClass = false;
+    for (let k = i + 1; k < n; k++) {
+      const ch = s[k];
+      if (ch === '\n') return -1;
+      if (ch === '\\') { k++; continue; }
+      if (ch === '[') inClass = true;
+      else if (ch === ']') inClass = false;
+      else if (ch === '/' && !inClass) {
+        let e = k + 1;
+        while (/[a-z]/.test(s[e] || '')) e++;
+        return e;
+      }
+    }
+    return -1;
+  };
   // Parse a tag starting at `<`; returns { end, name, closing, selfClosing } or null.
   const readTag = (i) => {
     const closing = s[i + 1] === '/';
@@ -344,6 +361,13 @@ function findJsxTagMismatch(source, opts = {}) {
       if (c === '/' && s[i + 1] === '/') { const e = s.indexOf('\n', i); i = e < 0 ? n : e; continue; }
       if (c === '/' && s[i + 1] === '*') { const e = s.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
       if (c === '"' || c === "'" || c === '`') { i = skipString(i); lastSig = 'x'; continue; }
+      // A regex literal: its quotes are not strings. Without this, CSV code's
+      // .replace(/"/g, '""') opened a "string" that swallowed the rest of the file
+      // and every later tag went unchecked (live 2026-11-02).
+      if (c === '/' && exprStart()) {
+        const end = skipRegexLiteral(i);
+        if (end > 0) { i = end; lastSig = 'x'; continue; }
+      }
       if (c === '(' || c === '[') { m.parens.push({ ch: c, at: i }); lastSig = c; i++; continue; }
       if (c === ')' || c === ']') {
         const open = m.parens.pop();
@@ -399,6 +423,20 @@ function findJsxTagMismatch(source, opts = {}) {
   return open ? { line: open.line, column: 1, message: `<${open.name}> opened on line ${open.line} is never closed` } : null;
 }
 
+// JSX text is not a JavaScript string: `Due {d} \u2014 late` shows the six
+// characters \u2014 on screen and nothing errors. Models write these escapes
+// constantly, because they do it for every string (live 2026-11-02: an overdue
+// alert in Capture, a table header). The compiler emits JSX text with its
+// backslash doubled and leaves real JS strings alone, so a doubled escape in the
+// compiled code is exactly this mistake. ASCII stays escaped: it is never what a
+// model meant to show, and a decoded quote could end the string it sits in.
+function decodeJsxTextEscapes(compiledCode) {
+  return String(compiledCode).replace(/\\\\(?:u([0-9a-fA-F]{4})|u\{([0-9a-fA-F]{1,6})\}|x([0-9a-fA-F]{2}))/g, (whole, a, b, c) => {
+    const code = parseInt(a || b || c, 16);
+    return code >= 0xA0 && code <= 0x10FFFF ? String.fromCodePoint(code) : whole;
+  });
+}
+
 // Compile one JSX file. Production JSX (React.createElement, React is a kit
 // global); ES syntax is left as-is (disableESTransforms) — every browser DHIS2
 // supports runs it natively, and transpiling optional chaining would inject
@@ -426,7 +464,7 @@ function compileCustomAppFile(file, source) {
         },
       };
     }
-    return { code: out.code };
+    return { code: decodeJsxTextEscapes(out.code) };
   } catch (e) {
     let loc = e && e.loc ? e.loc : null;
     let msg = String((e && e.message) || e).replace(/\s*\(\d+:\d+\)\s*$/, '');
@@ -794,6 +832,14 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
       && !/\.(?:slice|substring|substr)\(\s*0\s*,\s*10\s*\)|split\(\s*['"`]T['"`]\s*\)/.test(allCode)) {
     errors.push({ message: 'Tracker timestamps (occurredAt, enrolledAt, scheduledAt, completedAt, createdAt, updatedAt) come back as "2026-01-23T00:00:00.000" — date AND time. Appending \'T00:00:00\' to one gives Invalid Date (a "days since" shows nothing, dates print raw). Take the day first: const day = String(ev.occurredAt).slice(0, 10); then new Date(day + \'T00:00:00\') and display day.' });
   }
+  // Event and enrollment analytics have no fixed column order: enrollments come
+  // back as [value, ou, pe] and events as [ou, pe, value], and ou and pe swap
+  // between requests (verified 2.42.5, 2.43.3). A value read by position is not an
+  // error, it is a wrong number: an app showed "Enrollments this year: 0" where
+  // the server had 23, because Number(<org unit id>) || 0 is 0 (live 2026-11-02).
+  if (/analytics\/(?:events|enrollments)\/aggregate/.test(allCode) && /\brows\b/.test(allBare) && !/\bheaders\b(?!\s*:\s*\{)/.test(allBare)) {
+    errors.push({ message: 'analytics/events|enrollments/aggregate rows are read by position, but these endpoints have no fixed column order (enrollments: [value, ou, pe]; events: [ou, pe, value]; ou and pe swap between requests). row[row.length - 1] or row[0] then gives 0 or wrong numbers with no error. Read every column by name: const col = (r, name) => r.headers.findIndex((h) => h.name === name); r.rows.map((row) => ({ pe: row[col(r, \'pe\')], value: Number(row[col(r, \'value\')]) }));' });
+  }
   if (/\btype\s*:\s*['"`]delete['"`]/.test(allCode) && !/\bModal\b/.test(allBare)) {
     warnings.push({ message: 'The app deletes data without a confirmation step — ask in a Modal (ModalTitle / ModalContent / ModalActions + ButtonStrip) before every delete.' });
   }
@@ -857,7 +903,8 @@ function extractCustomAppUids(compiled) {
     for (const lit of code.match(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g) || []) {
       for (const tok of lit.match(/(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]{10}(?![A-Za-z0-9])/g) || []) {
         if (!isLikelyDhisUid(tok) || RESERVED_UID_SHAPED_WORDS.has(tok)) continue;
-        if (/^[A-Za-z][a-z]+(?:[A-Z][a-z]+)+$/.test(tok)) continue; // camelCase words: indicatorId, dataElement
+        // camelCase words: indicatorId, dataElement, and with an acronym inside, toISOString.
+        if (/^[A-Za-z][a-z]+(?:[A-Z]+[a-z]+)+$/.test(tok)) continue;
         out.add(tok);
       }
     }
@@ -1004,6 +1051,9 @@ function buildCustomAppGuardJs(spec) {
   var ORIGIN = window.location.origin;
   function sameOrigin(u) { try { return new URL(String(u), window.location.href).origin === ORIGIN; } catch (e) { return false; } }
   function refuse(why) { var e = new Error('Blocked by app policy: ' + why); console.error(e.message); return e; }
+  // Without this an app with a program picker silently shows the first program's
+  // event counts for every program it opens (see withEventAggregateCacheKey).
+  ${withEventAggregateCacheKey.toString().replace(/\n/g, '\n  ')}
   var nativeFetch = window.fetch;
   if (nativeFetch) {
     var guardedFetch = function (input, init) {
@@ -1011,6 +1061,10 @@ function buildCustomAppGuardJs(spec) {
       var method = String((init && init.method) || (input && typeof input === 'object' && input.method) || 'GET').toUpperCase();
       if (!sameOrigin(url)) return Promise.reject(refuse('requests may only go to this DHIS2 server'));
       if (READ_ONLY && method !== 'GET' && method !== 'HEAD') return Promise.reject(refuse('this app is read-only (' + method + ')'));
+      if (method === 'GET') {
+        var keyed = withEventAggregateCacheKey(url);
+        if (keyed !== url) return nativeFetch.call(this, typeof input === 'object' && input.url ? new Request(keyed, input) : keyed, init);
+      }
       return nativeFetch.apply(this, arguments);
     };
     try { Object.defineProperty(window, 'fetch', { value: guardedFetch, writable: false, configurable: false }); } catch (e) { window.fetch = guardedFetch; }
@@ -1055,6 +1109,21 @@ function buildCustomAppHtml(spec, entryJs) {
 // window.D2_APP_CONFIG — what the generated code needs to know about where it
 // runs. baseUrl is computed at runtime (the server root above /api/apps/), so
 // the same zip works behind any context path.
+// OrganisationUnitTree takes roots as UID strings. Handed the objects that come
+// straight from me.organisationUnits, it shows only "Invalid query - Property id
+// must be a string" where the tree should be, with no error anywhere else. An app
+// whose every form needs a facility then cannot save anything, and a preview cannot
+// see that (live 2026-11-02). The intent is plain, so the kit takes either.
+const CUSTOM_APP_TREE_ROOTS_SHIM = `  if (window.D2UI && window.D2UI.OrganisationUnitTree && window.React) {
+    var Tree = window.D2UI.OrganisationUnitTree;
+    var uid = function (o) { return o && typeof o === 'object' ? o.id : o; };
+    window.D2UI = Object.assign({}, window.D2UI, { OrganisationUnitTree: function (props) {
+      var r = props.roots;
+      return window.React.createElement(Tree, Object.assign({}, props, { roots: Array.isArray(r) ? r.map(uid) : uid(r) }));
+    } });
+  }
+`;
+
 function buildCustomAppConfigJs(spec) {
   const cfg = {
     key: spec.key, name: spec.name, version: spec.version, kind: spec.kind,
@@ -1066,7 +1135,9 @@ function buildCustomAppConfigJs(spec) {
     + `  var p = location.pathname, i = p.indexOf('/api/apps/');\n`
     + `  var cfg = ${JSON.stringify(cfg)};\n`
     + `  cfg.baseUrl = location.origin + (i >= 0 ? p.slice(0, i) : '');\n`
-    + `  window.D2_APP_CONFIG = Object.freeze(cfg);\n})();\n`;
+    + `  window.D2_APP_CONFIG = Object.freeze(cfg);\n`
+    + CUSTOM_APP_TREE_ROOTS_SHIM
+    + `})();\n`;
 }
 
 function buildCustomAppAiManifest(spec) {
@@ -1626,7 +1697,7 @@ function customAppFilesArg(args) {
   return out;
 }
 
-async function buildAndInstallCustomApp(spec, mode) {
+async function buildAndInstallCustomApp(spec) {
   const prep = await prepareCustomAppBuild(spec);
   if (prep._error) return prep;
   const inst = await installCustomAppZip(prep.pkg.zip, spec.key);
@@ -1658,6 +1729,9 @@ function customAppResult(action, spec, built, extra) {
     problems: built.ver.problems.length ? built.ver.problems : undefined,
     installed_key_differs: built.inst.installedKey !== spec.key ? built.inst.installedKey : undefined,
     where_to_find: customAppWhereToFind(s, spec.kind, spec.pluginType),
+    // Live 2026-11-02: an app whose form could never be saved was reported as
+    // "installed and live" with every requirement ticked. Nothing here clicks.
+    _not_run: 'This confirms the code compiled, its names exist and the app installed. Nothing has opened the app or clicked anything. Do not say it works, is live or is tested: say it is installed and not yet exercised, and give the user the 2 or 3 clicks that prove its main flow.',
     ...extra,
   };
 }
@@ -1686,7 +1760,7 @@ async function reinstallCustomAppFromBackup(backupKey, entry, apps, opts = {}) {
   spec.sources = { ...ca.files };
   const conflicts = customAppConflicts(spec, apps, 'replace');
   if (conflicts.length) return { _error: conflicts.map((c) => c.message).join(' '), conflicts };
-  const built = await buildAndInstallCustomApp(spec, 'rollback');
+  const built = await buildAndInstallCustomApp(spec);
   if (built._error) return built;
   return customAppResult('rollback', spec, built, {
     restored_from_backup: backupKey,

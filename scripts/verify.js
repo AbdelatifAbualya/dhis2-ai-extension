@@ -2306,8 +2306,10 @@ async function runStreamRecoveryChecks() {
     let r = await loop([DROP, DROP, DROP, QUERY, DROP, DROP, DROP, { text: 'All done.' }]);
     truthy('three drops of one request, then three of the next, still finish the turn (the limit counts drops in a row)', !r.thrown && r.result && r.result.text === 'All done.');
 
-    r = await loop([DROP, DROP, DROP, QUERY, DROP, DROP, DROP, QUERY, DROP, DROP, DROP, QUERY, { text: 'All done.' }]);
-    truthy('…but a provider that keeps failing stops at the turn-wide limit of 8 retries', r.thrown && /did not get through/.test(r.thrown.message) && r.events.filter((e) => /Connection dropped/.test(e.label || '')).length === 8);
+    const dropLimit = vm.runInContext('STREAM_DROP_TURN_LIMIT', ctx);
+    r = await loop([...Array.from({ length: Math.ceil(dropLimit / 3) + 1 }, () => [DROP, DROP, DROP, QUERY]).flat(), { text: 'All done.' }]);
+    const droppedTimes = r.events.filter((e) => /Connection dropped/.test(e.label || '')).length;
+    truthy(`…but a provider that keeps failing stops at the turn-wide limit of ${dropLimit} retries`, r.thrown && /Say "continue"/.test(r.thrown.message) && droppedTimes === dropLimit);
 
     r = await loop([{ drop: true, prefix: data({ content: 'Partial answer' }) }, { text: 'The whole answer.' }]);
     const iDiscard = r.events.findIndex((e) => e.type === 'AI_STREAM_DISCARD');
@@ -2348,6 +2350,152 @@ async function runStreamRecoveryChecks() {
 }
 
 // ── "DHIS2 Logs" thread: job ids and guessed log endpoints (2026-11-02) ──────
+// What the real-model stress threads of 2026-11-02 stumbled on.
+async function runStressThreadChecks() {
+  console.log('\nStress threads (2026-11-02):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+
+  // JSX text: a JS escape there is shown as those characters.
+  const comp = (src) => ctx.compileCustomAppFile('app.jsx', src).code;
+  truthy('\\u2014 in JSX text compiles to the character', comp('const a = <p>Due {d} \\u2014 late</p>;').includes('—') && !comp('const a = <p>Due {d} \\u2014 late</p>;').includes('\\u2014'));
+  truthy('…also after a regex holding a quote (CSV code)', comp('const r = /"/g;\nconst a = <p>From \\u2192 To</p>;').includes('→'));
+  truthy('an escape in a real JS string is left as written', comp("const a = '\\u2014';").includes("'\\u2014'"));
+  truthy('an ASCII escape in JSX text stays escaped', comp('const a = <p>\\u003c tag</p>;').includes('\\\\u003c'));
+  truthy('a tag mismatch AFTER a regex holding a quote is still caught', !!ctx.compileCustomAppFile('app.jsx', 'const r = /"/g;\nconst a = <h1>x</h2>;').error);
+  truthy('a regex with a tag-like body is not read as a tag', !ctx.compileCustomAppFile('app.jsx', 'const r = /<div>/g;\nconst a = <p>x</p>;').error);
+  truthy('a division is not read as a regex', !ctx.compileCustomAppFile('app.jsx', 'const a = b / 2; const c = d / 3;\nconst e = <p>{a / c}</p>;').error);
+
+  // OrganisationUnitTree: roots as objects are UIDs.
+  const cfgJs = ctx.buildCustomAppConfigJs({ key: 'k', name: 'n', version: '1.0.0', kind: 'app', apiVersion: 42, kitVersion: '1' });
+  const seen = {};
+  const fakeWin = { D2UI: { OrganisationUnitTree: 'TREE', Button: 'B' }, React: { createElement: (t, p) => { seen.type = t; seen.roots = p.roots; return null; } } };
+  new Function('window', 'location', cfgJs)(fakeWin, { pathname: '/api/apps/k/index.html', origin: 'http://x' });
+  fakeWin.D2UI.OrganisationUnitTree({ roots: [{ id: 'abcdefghij1', path: '/abcdefghij1' }, 'abcdefghij2'], singleSelection: true });
+  truthy('tree roots given as objects reach the tree as UID strings', seen.type === 'TREE' && JSON.stringify(seen.roots) === '["abcdefghij1","abcdefghij2"]');
+  fakeWin.D2UI.OrganisationUnitTree({ roots: { id: 'abcdefghij3' } });
+  truthy('…a single root object too', seen.roots === 'abcdefghij3');
+  fakeWin.D2UI.OrganisationUnitTree({ roots: 'abcdefghij4' });
+  truthy('…and a correct string passes through', seen.roots === 'abcdefghij4');
+  truthy('every other kit component is still there', fakeWin.D2UI.Button === 'B');
+
+  // Analytics status parameters.
+  const st = ctx.healAnalyticsStatusParams;
+  const q = (x) => st(`analytics/events/aggregate/P?${x}`);
+  truthy('dimension=eventStatus:X moves to the query parameter', q('dimension=eventStatus:COMPLETED&dimension=pe:THIS_YEAR').path === 'analytics/events/aggregate/P?eventStatus=COMPLETED&dimension=pe:THIS_YEAR');
+  truthy('filter=eventStatus:eq:X moves too', q('filter=eventStatus:eq:ACTIVE').path === 'analytics/events/aggregate/P?eventStatus=ACTIVE');
+  truthy('; between statuses becomes , (a ; is a 400)', q('eventStatus=COMPLETED;ACTIVE').path === 'analytics/events/aggregate/P?eventStatus=COMPLETED,ACTIVE');
+  truthy('enrollmentStatus, silently ignored by analytics, becomes programStatus', q('enrollmentStatus=COMPLETED').path === 'analytics/events/aggregate/P?programStatus=COMPLETED');
+  truthy('a correct status parameter is not touched', q('eventStatus=COMPLETED').healed === false);
+  const enr = st('analytics/enrollments/aggregate/P?dimension=pe:THIS_YEAR&filter=ou:USER_ORGUNIT');
+  truthy('enrollment aggregate: filter=ou becomes dimension=ou (E7145 on 2.42)', enr.path === 'analytics/enrollments/aggregate/P?dimension=pe:THIS_YEAR&dimension=ou:USER_ORGUNIT' && /dimension=ou/.test(enr.note));
+  truthy('event aggregate keeps filter=ou (it works there)', q('dimension=pe:THIS_YEAR&filter=ou:USER_ORGUNIT').healed === false);
+  truthy('the note tells the model to use this form in app code', /app or plugin code/.test(q('dimension=eventStatus:COMPLETED').note));
+  truthy('other endpoints are left alone', st('analytics?dimension=eventStatus:COMPLETED').healed === false);
+
+  // Analytics rows read by position show wrong numbers with no error.
+  const kit = { exports: { D2UI: [], D2Runtime: [] } };
+  const lintOf = (src) => ctx.lintCustomAppCode({ 'app.jsx': src }, 'app', kit).errors.filter((e) => /no fixed column order/.test(e.message));
+  truthy('enrollment rows read by position are refused', lintOf("const q = { r: { resource: 'analytics/enrollments/aggregate/' + id } }; const t = (x) => x.rows.reduce((a, row) => a + Number(row[row.length - 1]), 0);").length === 1);
+  truthy('…a fetch header does not count as reading the columns by name', lintOf("fetch(u, { headers: { 'Content-Type': 'text/plain' } }); const q = { r: { resource: 'analytics/events/aggregate/' + id } }; const v = d.r.rows[0][1];").length === 1);
+  truthy('reading the columns by header name passes', lintOf("const q = { r: { resource: 'analytics/events/aggregate/' + id } }; const col = (r, n) => r.headers.findIndex((h) => h.name === n); const v = d.r.rows[0][col(d.r, 'value')];").length === 0);
+  truthy('plain analytics is not affected (value is last there)', lintOf("const q = { r: { resource: 'analytics' } }; const v = d.r.rows[0][1];").length === 0);
+
+  // Empty rows and empty x-axis places.
+  const build = (spec) => ctx.buildVisualizationObject({ name: 'x', data_items: ['abcdefghij1'], periods: ['THIS_YEAR'], ...spec }, { abcdefghij1: 'PROGRAM_INDICATOR' }).viz;
+  truthy('a table of facilities at a level hides its empty rows', build({ vis_type: 'PIVOT_TABLE', org_units: ['USER_ORGUNIT', 'LEVEL-4'], layout: { rows: ['ou'], columns: ['pe'], filters: ['dx'] } }).hideEmptyRows === true);
+  truthy('a chart by district hides its empty x-axis places', build({ vis_type: 'STACKED_COLUMN', org_units: ['USER_ORGUNIT', 'LEVEL-3'], layout: { category: ['ou'], series: ['dx'], filters: ['pe'] } }).hideEmptyRowItems === 'ALL');
+  truthy('show_empty:true keeps them (a report of who has not reported)', build({ vis_type: 'PIVOT_TABLE', show_empty: true, org_units: ['USER_ORGUNIT', 'LEVEL-4'], layout: { rows: ['ou'], columns: ['pe'], filters: ['dx'] } }).hideEmptyRows === undefined);
+  truthy('a monthly trend keeps its empty months: a gap in a trend is information', build({ vis_type: 'LINE', org_units: ['USER_ORGUNIT'], periods: ['LAST_12_MONTHS'], layout: { category: ['pe'], series: ['dx'], filters: ['ou'] } }).hideEmptyRowItems === undefined);
+  truthy('one named org unit on the rows is not touched', build({ vis_type: 'PIVOT_TABLE', org_units: ['USER_ORGUNIT'], layout: { rows: ['ou'], columns: ['pe'], filters: ['dx'] } }).hideEmptyRows === undefined);
+  // Sort: the sign is the reverse of what it looks like, and tables have none.
+  const chartSpec = { org_units: ['USER_ORGUNIT', 'LEVEL-3'], layout: { category: ['ou'], series: ['dx'], filters: ['pe'] } };
+  truthy('sort:"desc" on a chart is sortOrder 1: highest first, as rendered', build({ vis_type: 'BAR', sort: 'desc', ...chartSpec }).sortOrder === 1);
+  truthy('sort:"asc" on a chart is sortOrder -1', build({ vis_type: 'COLUMN', sort: 'asc', ...chartSpec }).sortOrder === -1);
+  const sortedTable = ctx.buildVisualizationObject({ name: 'x', data_items: ['abcdefghij1'], periods: ['THIS_YEAR'], vis_type: 'PIVOT_TABLE', sort: 'desc', org_units: ['USER_ORGUNIT', 'LEVEL-4'], layout: { rows: ['ou'], columns: ['pe'], filters: ['dx'] } }, { abcdefghij1: 'PROGRAM_INDICATOR' });
+  truthy('a table takes no sort fields, and the model is told it cannot be sorted', sortedTable.viz.sortOrder === undefined && sortedTable.viz.sorting === undefined && /cannot be sorted/.test(sortedTable.layoutNote));
+  truthy('no top limit is ever saved: DHIS2 ignores it', build({ vis_type: 'BAR', top: 10, ...chartSpec }).topLimit === undefined);
+
+  // Periods DHIS2 does not have (409 on 2.42.5).
+  const refusePe = ctx.analyticsUnknownPeriodRefusal;
+  truthy('LAST_5_QUARTERS is refused before it is sent', /not a DHIS2 period/.test((refusePe('analytics/events/aggregate/P?dimension=pe:LAST_5_QUARTERS&stage=S') || {})._error));
+  truthy('…URL-encoded too', !!refusePe('analytics?dimension=pe%3ALAST_24_MONTHS&filter=ou:USER_ORGUNIT'));
+  for (const good of ['pe:LAST_12_MONTHS;THIS_YEAR', 'pe:2025Q4;2026Q1', 'pe:202601', 'pe:QUARTERS_THIS_YEAR;QUARTERS_LAST_YEAR', 'pe:TODAY']) truthy(`${good} goes through`, refusePe(`analytics?dimension=${good}`) === null);
+  const badPe = ctx.buildVisualizationObject({ name: 'x', vis_type: 'LINE', data_items: ['abcdefghij1'], periods: ['LAST_5_QUARTERS'], org_units: ['USER_ORGUNIT'] }, { abcdefghij1: 'PROGRAM_INDICATOR' });
+  truthy('a chart with an invented period is refused, not saved as a broken tile', /not a DHIS2 period/.test(badPe._error));
+  truthy('a fixed period still builds', !!ctx.buildVisualizationObject({ name: 'x', vis_type: 'LINE', data_items: ['abcdefghij1'], periods: ['2026Q1'], org_units: ['USER_ORGUNIT'] }, { abcdefghij1: 'PROGRAM_INDICATOR' }).viz);
+  truthy('TODAY maps to its flag', build({ vis_type: 'SINGLE_VALUE', periods: ['TODAY'], org_units: ['USER_ORGUNIT'] }).relativePeriods.thisDay === true);
+
+  // Word-shaped strings are not hard-coded UIDs.
+  const uids = ctx.extractCustomAppUids({ 'app.jsx': `const a = "x.toISOString() y"; const b = 'abcDEF12345';` });
+  truthy('toISOString is not taken for a UID, a real one is', !uids.includes('toISOString') && uids.includes('abcDEF12345'));
+
+  // A dataStore key it created itself may be removed; another key may not.
+  const d2 = vm.runInContext('dhis2', ctx);
+  const savedAuth = d2.writeAuth;
+  d2.writeAuth = { scope: 'broad', verbs: { create: true, update: false, delete: false } };
+  ctx.noteAssistantCreatedDataStoreKey('dataStore/ns/__probe');
+  truthy('deleting a dataStore key it created is allowed', ctx.requireWriteAuth('dhis2_query', 'DELETE', { path: 'dataStore/ns/__probe' }) === null);
+  truthy('deleting another key still needs the user', !!ctx.requireWriteAuth('dhis2_query', 'DELETE', { path: 'dataStore/ns/other' })?._error);
+  truthy('…and a key elsewhere with the same name', !!ctx.requireWriteAuth('dhis2_query', 'DELETE', { path: 'dataStore/capture/__probe' })?._error);
+  d2.writeAuth = savedAuth;
+
+  // A valid indicator on a data element the analytics tables do not have yet.
+  const savedFetch = ctx.safeDhis2Fetch;
+  const asked = [];
+  ctx.safeDhis2Fetch = async (p) => {
+    asked.push(p);
+    if (/pe:THIS_YEAR&/.test(p)) return { _error: 'DHIS2 API 409: Query failed because of a syntax error (SqlState: 42703)', _status: 409, _body: { devMessage: 'ERROR: column "vmC72UnyEMf" does not exist\n  Position: 40', errorCode: 'E7145' } };
+    return { rows: [] };
+  };
+  const rt = await ctx.piRuntimeAnalyticsCheck(null, ['SXQEOCJz91n']);
+  truthy('one period alone is asked too: a list of periods answers an empty 200', asked.some((p) => /pe:THIS_YEAR&/.test(p)));
+  truthy('a missing column is reported as needing a full run', rt.needs_full_analytics_run && rt.needs_full_analytics_run[0].data_element === 'vmC72UnyEMf' && /FULL Analytics/.test(rt.needs_full_analytics_note));
+  truthy('…the indicator is not "broken", so nothing rolls it back', rt.ok === true && !rt.broken && !rt.no_data.includes('SXQEOCJz91n'));
+  ctx.safeDhis2Fetch = async (p) => (/pe:THIS_YEAR&/.test(p) ? { _error: 'DHIS2 API 409: Query failed because of a syntax error (SqlState: 42883)', _status: 409, _body: { devMessage: 'ERROR: operator does not exist: boolean = integer' } } : { rows: [] });
+  const rt2 = await ctx.piRuntimeAnalyticsCheck(null, ['SXQEOCJz91n']);
+  truthy('a real expression fault is still reported as broken', rt2.ok === false && rt2.broken.length === 1);
+  ctx.safeDhis2Fetch = savedFetch;
+
+  // A backup of a data-shareable type must be able to restore its sharing.
+  for (const t of ['programs', 'programStages', 'programIndicators', 'trackedEntityTypes', 'optionSets', 'indicators', 'dataSets', 'dashboards', 'someOtherType']) truthy(`a ${t} snapshot starts from :owner, so a restore wipes nothing`, /^:owner\b/.test(ctx.getSnapshotFields(t)));
+  truthy('…and still carries the nested collections it spells out', /programRuleActions\[/.test(ctx.getSnapshotFields('programRules')));
+  truthy('a name with a colon is searched as written', decodeURIComponent(ctx._filterValue(' C:( Om-Aldalia ) ')) === 'C:( Om-Aldalia )');
+
+  // Event aggregate answers are cached without program or stage; limit is in the key.
+  const ck = ctx.withEventAggregateCacheKey;
+  const limOf = (p) => Number((/[?&]limit=(\d+)/.exec(ck(p)) || [])[1]);
+  const pA = 'analytics/events/aggregate/AAAAAAAAAAA?dimension=pe:THIS_YEAR', pB = 'analytics/events/aggregate/BBBBBBBBBBB?dimension=pe:THIS_YEAR';
+  truthy('two programs get different limits', limOf(pA) && limOf(pB) && limOf(pA) !== limOf(pB));
+  truthy('two stages get different limits', limOf(`${pA}&stage=S1111111111`) !== limOf(`${pA}&stage=S2222222222`));
+  truthy('the same query gets the same limit, so the cache still works', limOf(pA) === limOf(pA));
+  truthy('the limit stays under the server maximum, and over any chart', limOf(pA) >= 10000 && limOf(pA) < 50000);
+  truthy('a full URL works too', /limit=\d+$/.test(ck(`http://x/api/42/${pA}`)));
+  truthy('a limit already there is kept', ck(`${pA}&limit=5`) === `${pA}&limit=5`);
+  truthy('no query string: starts one', /aggregate\/AAAAAAAAAAA\?limit=\d+$/.test(ck('analytics/events/aggregate/AAAAAAAAAAA')));
+  for (const other of ['analytics?dimension=dx:A', 'analytics/events/query/AAAAAAAAAAA?stage=B', 'analytics/enrollments/aggregate/AAAAAAAAAAA?dimension=pe:THIS_YEAR']) truthy(`not touched: ${other.slice(0, 40)}`, ck(other) === other);
+  const guardJs = ctx.buildCustomAppGuardJs({ needsWriteAccess: false });
+  let sent = null;
+  const fakeGuardWin = { location: { origin: 'http://x', href: 'http://x/a' }, fetch: function (u) { sent = u; return Promise.resolve(); }, XMLHttpRequest: null };
+  new Function('window', 'navigator', 'Request', guardJs)(fakeGuardWin, {}, function () {});
+  fakeGuardWin.fetch('http://x/api/42/analytics/events/aggregate/AAAAAAAAAAA?dimension=pe:THIS_YEAR');
+  truthy('a generated app keys its event aggregate requests', /limit=\d+/.test(String(sent)));
+  fakeGuardWin.fetch('http://x/api/42/programs?fields=id');
+  truthy('…and leaves every other request alone', sent === 'http://x/api/42/programs?fields=id');
+
+  // Plain editing instructions authorize; questions and reports about the same verbs do not.
+  const scopeOf = (m) => ctx.classifyWriteAuthorization(m).scope;
+  for (const m of ['Replace the bar chart by district with a horizontal one showing only the top 10 districts, and move the map next to the epidemic curve.', 'Move the map next to the curve.', 'Put the map on the left', 'Sort the chart from highest to lowest', 'Use a line chart instead', 'Turn this into a stacked column', 'Duplicate the dashboard', 'Shrink the map', 'Reorder the tiles', 'Now do the same for tuberculosis', 'Can you move the map?', 'please replace the table with a chart']) {
+    truthy(`authorizes: ${m.slice(0, 60)}`, scopeOf(m) === 'broad');
+  }
+  for (const m of ['Why is the map empty?', 'What would happen if I replace the chart?', 'Is it possible to move the map?', 'how do I move the map next to the chart', 'can you tell me if replacing the map would break anything', 'the map moved and now the chart is broken', 'When I move the map it fails', 'the replace button does not work', 'do not move the map', 'Use the Malaria program and tell me how many cases', 'Show the top 10 districts']) {
+    truthy(`stays read-only: ${m.slice(0, 60)}`, scopeOf(m) === 'read_only');
+  }
+  truthy('"move" is not permission to delete', ctx.classifyWriteAuthorization('Move the map next to the curve.').verbs.delete === false);
+  truthy('"replace" is: the old tile goes', ctx.classifyWriteAuthorization('Replace the bar chart with a pie chart').verbs.delete === true);
+  const hidden = ctx.dashTileNeeds({ itemType: 'VISUALIZATION', vizType: 'PIVOT_TABLE', hideEmptyRows: true, rows: [{ dimension: 'ou', items: ['LEVEL-4'] }], columns: [{ dimension: 'pe', items: ['THIS_YEAR'] }] }, { 4: 900 });
+  truthy('a table hiding empty rows is not sized for every unit at the level', hidden.h <= 20);
+}
+
 async function runLogEndpointChecks() {
   console.log('\nLog sources: job ids and guessed endpoints:');
   const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
@@ -3895,6 +4043,7 @@ setImmediate(async () => {
   if (loaded) await runAppOrgUnitAndServerPinChecks().catch((e) => bad(`app org-unit / server-pin checks threw: ${e && e.stack || e}`));
   if (loaded) await runAppRequestRoutingChecks().catch((e) => bad(`app request routing checks threw: ${e && e.stack || e}`));
   if (loaded) await runAppScannerAndAnalyticsCacheChecks().catch((e) => bad(`app scanner / analytics cache checks threw: ${e && e.stack || e}`));
+  if (loaded) await runStressThreadChecks().catch((e) => bad(`stress thread checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');
