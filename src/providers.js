@@ -99,7 +99,7 @@ async function postProviderRequest(opts) {
     } catch (e) {
       clearTimeout(timeoutId);
       const isAbort = e?.name === 'TimeoutError' || e?.name === 'AbortError' || timeoutFired;
-      if (attempt < MAX_RETRIES && (isAbort || /network|failed to fetch/i.test(e?.message || ''))) {
+      if (attempt < MAX_RETRIES && (isAbort || /network|failed to fetch|fetch failed/i.test(e?.message || ''))) {
         const delay = backoffDelay(attempt, e?.name || 'fetch');
         broadcast({ type: 'AI_THINKING', iteration: opts.iteration, label: `Connecting, retrying (${attempt + 1}/${MAX_RETRIES})` });
         await new Promise(r => setTimeout(r, delay));
@@ -1778,14 +1778,11 @@ async function detectEnrollmentAbnormalities(args, programId, orgUnitId) {
         reasons.push({ code: 'future_enrollment_date', detail: `Enrollment date is in the future (${enr.enrolledAt || enr.incidentDate}).` });
       }
 
-      let hasCompletedEvent = false;
       let hasOverdueScheduled = false;
       let hasEventBeforeEnrollment = false;
       let hasMissingMandatory = false;
 
       for (const ev of events) {
-        if (ev.status === 'COMPLETED') hasCompletedEvent = true;
-
         const scheduledAt = parseIsoDate(ev.scheduledAt);
         if (scheduledAt && scheduledAt < now && (ev.status === 'SCHEDULE' || ev.status === 'ACTIVE' || !ev.occurredAt)) {
           hasOverdueScheduled = true;

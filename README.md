@@ -305,7 +305,7 @@ dhis2-AI/
 │   ├── live-harness.js        real executeTool against a live DHIS2 (basic-auth fetch shim)
 │   ├── build-runtime-kit.js   DEV-ONLY: rebuilds libs/d2-kit + sucrase + fflate (pinned)
 │   ├── custom-app-scenarios/  JSX of the acceptance-test apps
-│   └── scenario-*.js          live regression scenarios (npm run admin / sticky / apps, …)
+│   └── scenario-*.js          live regression scenarios (npm run admin / sticky / apps / dashboards, …)
 ├── content.js                 URL monitor with self-heal on extension reload
 ├── sidepanel/
 │   ├── panel.html             Side panel UI
@@ -352,6 +352,63 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 ## Changelog
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
+
+### 2.8.36 — Fixes from stress-testing a real model on dashboards, plugins and apps (2026-11-02)
+
+Sixteen multi-step threads ran through the real agent loop on `deepseek-v4p1-flash-1017` against localhost:8081, and the results were then opened and used in the real Dashboard and Capture apps. Most API calls succeeded, and that hid the worst problems: an app that could not save, a KPI showing 0 where the server had 23, a tile the model said would fill in but which showed an error. Each fix below comes from a failure seen on the live server, and each DHIS2 behaviour was confirmed there before it went into a tool.
+
+**Backups that could not restore what they promised (found while checking a sharing change):**
+- **A restore wiped whatever the snapshot left out.** Restore is a full-replace import, and each snapshot listed only some properties. Measured on 2.42.5: a restored program lost its labels and style, a stage its date labels and standard interval, an indicator `displayInForm` and style, a data element its aggregation levels, an option set its sharing, an indicator its form name and style.
+- **A tracked entity type or attribute could not be restored at all** ("Missing required property"), and a backup taken before a sharing change could not undo it.
+- Snapshots now start from `:owner` plus the nested collections. All eight types tested come back exactly, and `npm run restore` checks this on real objects. Backups taken before this version still hold the old partial snapshots.
+
+**Wrong numbers and unusable apps (no error anywhere):**
+- **Event analytics answered with another program's numbers.** DHIS2 caches `analytics/events/aggregate` without the program or stage in the key. With caching on, every program answered 213 (true: 213, 133, 135, 20) and every stage 87 (true: 87, 64, 57, 0), so an app with a program picker silently kept showing the first program. `limit` is part of the key, so the worker and every generated app now add a stable `limit` derived from the query. Apps built before this version need updating to get it.
+- **Org units with a colon in their name could not be found by name.** The lookup replaced `:` with a space. On localhost:8081 that is 694 of 1,477 units. It failed `npm run admin` (16 checks) on the released code too; it passes now.
+- **An app's org unit picker failed when given objects.** `OrganisationUnitTree` takes UID strings. Given `me.organisationUnits` it shows only "Invalid query - Property id must be a string", so a form that needs a facility can never be saved. The kit now accepts either, and the manual has a verified recipe.
+- **Analytics rows read by position gave wrong numbers.** Enrollment analytics returns `[value, ou, pe]`, event analytics `[ou, pe, value]`, and `ou` and `pe` swap between requests. `row[row.length - 1]` showed "Enrollments this year: 0" where the server had 23. The preview now refuses this and gives the header-name recipe.
+- **`—` appeared literally on screen.** In JSX text a JS escape is just characters. Compiled output now carries the character. The JSX tag check also no longer stops working after a regex holding a quote, such as CSV code's `/"/g`.
+- **Status filters that cannot work.** `eventStatus` and `programStatus` are query parameters, never dimensions (409), several are comma-separated (`;` is a 400), and **`enrollmentStatus` is silently ignored**, so the number looks right and is the unfiltered total. `dhis2_query` corrects all of these and tells the model the correct form, because app code gets no such correction. On 2.42 `analytics/enrollments/aggregate` also needs the org unit as a dimension (`filter=ou` is 409 E7145).
+- **The indicator health check hid a broken tile.** Only `pe:THIS_YEAR` or `pe:LAST_YEAR` alone surfaces a failing query; `LAST_12_MONTHS`, `MONTHS_THIS_YEAR` and lists of periods answer an empty 200. A KPI on a newly added data element showed "Something went wrong" while the check said `ok`, and the model told the user it would fill in as data was entered. The check now asks the way a tile asks, and reports `needs_full_analytics_run` with the data element. Partial scheduled runs may not add the column; a full run does (verified).
+
+**Dashboards:**
+- **Units with no data are hidden.** A level on the rows stands for every unit there: 3 facilities with numbers among dozens of blank rows, 2 bars among 26 empty places. Tables and charts by org unit now hide them unless `show_empty:true`. Trend charts keep their empty months.
+- **`sort` on charts.** The model titled charts "highest to lowest" with no way to sort them. In DHIS2 `sortOrder: 1` is high to low and `-1` low to high. A saved table cannot be sorted: `sortOrder` and `sorting` both save and the Dashboard app ignores both.
+- **There is no saved "top N".** `topLimit` saves and neither charts nor tables apply it, so the tool does not offer it. The manual gives the real choices: every unit sorted, a fixed snapshot said to be one, or a plugin that ranks live.
+- **`replace_item_id` on add_items.** A new tile takes the old one's place and width in one write. Remove-then-insert with a stale anchor put a chart between two KPI rows.
+- **A map whose data sits on units with no boundary now warns.** It would otherwise be an empty basemap, found only if someone checks.
+- **Invented periods are refused.** `LAST_5_QUARTERS`, `LAST_24_MONTHS` and `LAST_2_YEARS` are 409s in a query and error tiles when saved. `TODAY` was missing from the keyword map, and `THIS_DAY`, which is not a DHIS2 period, is gone.
+
+**Write authorization:**
+- **Plain editing instructions now authorize.** "Replace the chart… and move the map next to it" was read as no authorization, so the model asked leave for what it had just been told. Added in imperative position only: replace, move, swap, put, sort, reorder, rearrange, resize, shrink, enlarge, widen, duplicate, clone, copy, convert, "use … instead", "turn this into", "do the same". "The map moved", "how do I move" and "when I move it, it fails" stay read-only, and "move" is not permission to delete.
+- **"Its own work" now means this conversation.** The list of objects the assistant created was never cleared by New chat, so a later thread could delete them without asking. It is now cleared. A dataStore key it created itself can be removed: a model wrote a test key and was refused removing it three times.
+
+**Fewer wasted calls:**
+- `get_program_info` finds the program from a stage UID, and an option set needs no program.
+- A line-list dimension sent as both column and filter becomes one filtered column. Two threads were refused for this.
+- `sharing?type=dataStore&id=<namespace>` is answered without a request: sharing is per entry, and a namespace is always a 404.
+- The hard-coded UID check took `toISOString` for a missing UID, which forced a 28 KB resend.
+- Provider retries now reach past a one-minute outage (2, 5, 10, 20, 40 s; turn limit 12). Three retries over 17 s ended two long builds at once when the network blinked.
+
+**What the model says about an app:** nothing can run an app before the user does, and a model reported a form that could not be saved as "installed and live". The install result now says nothing has opened it, and the manual has a walk-through to do before sending code: each control's state key against what validation and save read, each button, each number, each list state.
+
+**Removed:**
+- Unused: `hasCompletedEvent`, `pidSource`, `dhis2.knownIdsSeedSize`, `streamingRenderTimer`, the `GET_STATE`, `GET_FEEDBACK_LOG` and `GET_LAST_INTERACTION` message handlers (nothing sends them), and a `categoryCombos` request whose answer nothing read.
+- Dev files from the store package: `scripts/` (932 KB), `package.json`, `.gitignore`.
+
+**Also fixed:**
+- Feedback buttons now go on the reply that just finished, not on the first narration bubble of the turn.
+- `count_records` reads its value column correctly when a header is missing: `findIndex(...) ?? fallback` could never fall back.
+- `llm-harness.js` had no `permissions.contains`, so every page-bound real-model test ran with no page context at all, including the earlier apps acceptance cases.
+
+**Verified:**
+- `npm run verify`: all pass, 1,004 checks.
+- `npm run apps:llm` with `deepseek-v4p1-flash-1017`: 62 of 62 checks in the real Dashboard and Capture apps, with page context working for the first time.
+- New `npm run dashboards`: all pass, 68 calls, 0 failed. New `npm run restore`: 8 object types come back exactly.
+- `npm run admin`: all pass (16 checks failed on the released code). `sqlviews`, line lists, stage context, sticky context, soft-deleted data elements: all pass on localhost:8081. `npm run mnch` on dev-2-43: 105 calls, 0 failed.
+- Real Chrome, real extension, a mock provider that cuts the connection: recovery works; feedback buttons are on `[narration, final reply]` = `[false, true]` (released build: `[true, false]`).
+- Final real-model builds used in the real apps: a workflow app saved a request on its first build (the earlier one could not), and an app's KPIs matched the server across three programs (the earlier one showed 0).
+- **Not run on the final code:** `npm run apps` (346 checks). It deletes every `ai-test-*` app on the target and hard-codes localhost:8081 program ids. All 14 of its app sources were checked to compile and pass the new lints.
 
 ### 2.8.35 — A dropped connection no longer ends or loses the turn; a "logs" app no longer starts with guessed endpoints (2026-11-02)
 

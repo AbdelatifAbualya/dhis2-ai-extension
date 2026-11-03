@@ -14,7 +14,7 @@ is the source that ships. Three runtime pieces:
 | Background service worker | `background.js` → `src/*.js` | All AI + DHIS2 logic: LLM streaming, the agentic loop, 30+ tools, safety gates, metadata/tracker writes. |
 | Side panel | `sidepanel/panel.{html,css,js}` | The chat UI, streaming display, tool cards, charts, exports. |
 
-## The background worker is 11 modules (+ 2 vendored libs), not one file
+## The background worker is 12 modules (+ 2 vendored libs), not one file
 
 `background.js` used to be a single ~26k-line service worker. It is now a thin
 loader that pulls in two vendored libraries and twelve focused modules **in order**

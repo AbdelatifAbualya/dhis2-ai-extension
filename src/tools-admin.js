@@ -59,8 +59,11 @@ function _adminCacheSync() {
 
 // Every import call site needs the same "sanitize a free-text name into a
 // filter value" step: DHIS2 filters split on ':' so a raw colon breaks them.
+// A colon in the value is fine: DHIS2 splits a filter on its first two colons only
+// (verified 2.42.5 and 2.43.3). Replacing it made the 694 of 1,477 org units on
+// localhost:8081 with a colon in their name impossible to find by name.
 function _filterValue(s) {
-  return encodeURIComponent(String(s ?? '').replace(/:/g, ' ').trim());
+  return encodeURIComponent(String(s ?? '').trim());
 }
 
 function _lc(s) { return String(s ?? '').trim().toLowerCase(); }

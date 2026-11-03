@@ -404,7 +404,6 @@
   // ── Streaming state ────────────────────────────────────────────────────
   let streamingBubble = null;      // The DOM element currently being streamed into
   let streamingRawText = '';       // Accumulated raw markdown text during streaming
-  let streamingRenderTimer = null; // Debounce timer for re-rendering markdown
   let streamingRafId = null;       // requestAnimationFrame ID for smooth rendering
   let streamingDirty = false;      // Whether new chunks arrived since last render
   let streamingLastHtml = '';      // Last rendered HTML — used for incremental DOM patching
@@ -515,7 +514,6 @@
     // Create the assistant message bubble for streaming
     const el = document.createElement('div');
     el.className = 'msg msg-assistant';
-    el.id = 'streaming-msg';
 
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
@@ -733,13 +731,10 @@
       streamingBubble.classList.remove('streaming');
       streamingBubble.innerHTML = renderMarkdown(finalText);
 
-      // Add feedback buttons to the streaming message
-      const msgEl = document.getElementById('streaming-msg');
-      if (msgEl) {
-        msgEl.removeAttribute('id');
-        const feedbackBar = buildFeedbackBar(finalText, streamingBubble.innerHTML);
-        msgEl.appendChild(feedbackBar);
-      }
+      // Feedback buttons go on the reply that just finished. Steps of a turn each
+      // stream their own bubble, so there is no single "the streaming message".
+      const msgEl = streamingBubble.closest('.msg');
+      if (msgEl) msgEl.appendChild(buildFeedbackBar(finalText, streamingBubble.innerHTML));
     }
 
     streamingBubble = null;
@@ -751,8 +746,6 @@
   // The connection dropped mid-reply. The worker will write the reply again (or
   // report the failure), so the partial text must not stay on screen.
   function handleStreamDiscard() {
-    // Not by id: narration from earlier steps of the turn keeps #streaming-msg,
-    // so an id lookup would find the oldest bubble and delete the wrong text.
     const partial = streamingBubble && streamingBubble.closest('.msg');
     finalizeStream();
     if (partial) partial.remove();

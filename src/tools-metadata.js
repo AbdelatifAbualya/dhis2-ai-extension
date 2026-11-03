@@ -107,6 +107,18 @@ function dataStorePatientDataReason(body) {
 // Tool calls can nest (a tool calling executeTool); the Capture refresh runs
 // once, when the outermost call finishes — see noteCaptureMetadataWrite.
 let _executeToolDepth = 0;
+// An analytics response's value column, summed over its rows (a breakdown gives
+// several). `findIndex` gives -1, not null, when a column is missing.
+function sumAnalyticsValueColumn(result) {
+  const named = (result?.headers || []).findIndex((h) => h.name === 'value');
+  let total = 0;
+  for (const row of result?.rows || []) {
+    const v = parseInt(row[named >= 0 ? named : row.length - 1], 10);
+    if (!isNaN(v)) total += v;
+  }
+  return total;
+}
+
 async function executeTool(name, args) {
   // skip_backup:true is honoured ONLY with recorded user consent (see
   // backupSkipConsent in core.js). The model setting the flag is not consent:
@@ -114,7 +126,7 @@ async function executeTool(name, args) {
   // here covers every tool and every internal hand-off of the args.
   let skipNote = null;
   if (args && typeof args === 'object' && args.skip_backup === true && _executeToolDepth === 0) {
-    const consent = backupSkipConsent(name, args);
+    const consent = backupSkipConsent(name);
     if (!consent.ok) {
       args = { ...args, skip_backup: false };
       skipNote = 'skip_backup was ignored: the user has not approved skipping the backup, so a backup was taken as usual. Only if a backup FAILS, tell the user and ask whether to proceed without one.';
@@ -253,6 +265,16 @@ async function executeToolCall(name, args) {
         };
       }
       if (isGuessedLogEndpoint(_gp)) return guessedLogEndpointRefusal(_gp);
+      // Sharing exists per dataStore ENTRY, by its UID; a namespace has none, so
+      // this is always a 404 (live 2026-11-02, two in a row while sizing an app).
+      const _dsShare = /^sharing\?(?=.*\btype=dataStore\b).*\bid=([^&]+)/i.exec(safePath);
+      if (_dsShare && !/^[A-Za-z][A-Za-z0-9]{10}$/.test(_dsShare[1])) {
+        return {
+          _error: `Not sent: "${_dsShare[1]}" is a dataStore namespace, and a namespace has no sharing object (404).`,
+          _hint: 'Sharing is per entry: read the entry UID from dataStore/<namespace>/<key>/metaData (its "id"), then sharing?type=dataStore&id=<that UID>. The namespace an app declares is protected by the app itself: only users with access to that app can write to it.',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
       const _sm = /^schemas\/([^/]+)$/i.exec(_gp);
       if (_sm && typeof getSchemaIndex === 'function') {
         const _idx = await getSchemaIndex();
@@ -948,6 +970,14 @@ async function executeToolCall(name, args) {
         console.log(`[dhis2_query] Program indicators → /analytics: ${piRoute.path}`);
         safePath = piRoute.path;
       }
+      const periodRefusal = analyticsUnknownPeriodRefusal(safePath);
+      if (periodRefusal) return periodRefusal;
+      const statusHeal = healAnalyticsStatusParams(safePath);
+      if (statusHeal.healed) {
+        console.log(`[dhis2_query] Moved analytics status to its query parameter → ${statusHeal.path}`);
+        safePath = statusHeal.path;
+        queryNotes.push(statusHeal.note);
+      }
       const dxHeal = healEventAnalyticsDxDimension(safePath);
       if (dxHeal.healed) {
         console.log(`[dhis2_query] Healed dx: dimension for an event/enrollment analytics query → ${dxHeal.path}`);
@@ -1021,6 +1051,7 @@ async function executeToolCall(name, args) {
     }
 
     const writeResult = await safeDhis2Fetch(safePath, opts);
+    if (method === 'POST' && !writeResult?._error) noteAssistantCreatedDataStoreKey(safePath);
     // Surface the backup block alongside the write result so the model — and
     // the user — can see how to restore.
     if (opts._backup_block && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult)) {
@@ -1079,14 +1110,12 @@ async function executeToolCall(name, args) {
     // four counts with "no program in context" although the stage ids — and
     // the program — were already known, and the 5th was blocked.
     let pid = args.program_override || args.program_id || programId;
-    let pidSource = null;
     if (!pid && args.stage_id && /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(args.stage_id))) {
       const st = await safeDhis2Fetch(`programStages/${args.stage_id}?fields=program[id]`);
-      if (st?.program?.id) { pid = st.program.id; pidSource = 'the program of the given stage'; }
+      if (st?.program?.id) pid = st.program.id;
     }
     if (!pid && dhis2.lastProgramLookup?.id && dhis2.lastProgramLookup.turn === (dhis2.turnCounter || 0)) {
       pid = dhis2.lastProgramLookup.id;
-      pidSource = `the program looked up earlier in this request (${dhis2.lastProgramLookup.name || pid})`;
     }
     // No org unit anywhere → count across all of the user's own org units
     // (USER_ORGUNIT: one subtree-wide row per top unit, summed below) instead
@@ -1181,19 +1210,8 @@ async function executeToolCall(name, args) {
         };
       }
 
-      // Extract count from analytics response
-      let total = 0;
-      if (result.rows?.length) {
-        // Sum up all row values (there may be multiple rows if broken down)
-        for (const row of result.rows) {
-          const valIdx = result.headers?.findIndex(h => h.name === 'value') ?? (result.headers?.length - 1 ?? 0);
-          const v = parseInt(row[valIdx], 10);
-          if (!isNaN(v)) total += v;
-        }
-      }
-
       return {
-        count: total,
+        count: sumAnalyticsValueColumn(result),
         record_type: args.record_type,
         program: { id: pid, name: progName },
         org_unit: { id: ouid, name: ouName },
@@ -1247,17 +1265,8 @@ async function executeToolCall(name, args) {
         };
       }
 
-      let total = 0;
-      if (result.rows?.length) {
-        for (const row of result.rows) {
-          const valIdx = result.headers?.findIndex(h => h.name === 'value') ?? (result.headers?.length - 1 ?? 0);
-          const v = parseInt(row[valIdx], 10);
-          if (!isNaN(v)) total += v;
-        }
-      }
-
       return {
-        count: total,
+        count: sumAnalyticsValueColumn(result),
         record_type: args.record_type,
         program: { id: pid, name: progName },
         org_unit: { id: ouid, name: ouName },
@@ -1420,6 +1429,10 @@ async function executeToolCall(name, args) {
 
   // ── get_program_info ──
   if (name === 'get_program_info') {
+    // An option set belongs to no program (live 2026-11-02: refused for that).
+    if (args.info_type === 'option_set' && args.target_id) {
+      return await safeDhis2Fetch(`optionSets/${args.target_id}?fields=id,displayName,valueType,options[id,displayName,code,sortOrder]`);
+    }
     // Target program: an explicit program_id / program_name overrides the page
     // context so this tool works from ANY page (e.g. the Dashboard app, which
     // has no program in context) instead of dead-ending on "No program in
@@ -1431,6 +1444,12 @@ async function executeToolCall(name, args) {
       if (resolved?._error) return resolved;
       effProgramId = resolved.id;
       effProgramName = resolved.displayName || effProgramName;
+    }
+    // A stage UID names its program, so a stage question needs nothing else
+    // (live 2026-11-02: two refusals in a row while the model held the stage UID).
+    if (!effProgramId && /^(?:stage_details|rules_for_stage)$/.test(String(args.info_type)) && /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(args.target_id || ''))) {
+      const st = await safeDhis2Fetch(`programStages/${args.target_id}?fields=program[id,displayName]`);
+      if (st?.program?.id) { effProgramId = st.program.id; effProgramName = st.program.displayName || null; }
     }
     if (!effProgramId) {
       return { _error: 'No program in context. Pass program_id or program_name to target a specific program.' };
@@ -1554,10 +1573,6 @@ async function executeToolCall(name, args) {
         stages: result.programStages || [],
         _note: 'Use target_id with stage_details to get full data elements for a specific stage.',
       };
-    }
-
-    if (args.info_type === 'option_set' && args.target_id) {
-      return await safeDhis2Fetch(`optionSets/${args.target_id}?fields=id,displayName,valueType,options[id,displayName,code,sortOrder]`);
     }
 
     return { _error: `Unknown info_type: ${args.info_type}` };
@@ -4747,7 +4762,7 @@ const VIZ_TYPES = new Set([
 
 // Relative-period keyword → relativePeriods flag (DHIS2 camelCase).
 const VIZ_REL_PERIOD_FLAG = Object.freeze({
-  THIS_DAY: 'thisDay', YESTERDAY: 'yesterday', LAST_3_DAYS: 'last3Days', LAST_7_DAYS: 'last7Days',
+  TODAY: 'thisDay', YESTERDAY: 'yesterday', LAST_3_DAYS: 'last3Days', LAST_7_DAYS: 'last7Days',
   LAST_14_DAYS: 'last14Days', LAST_30_DAYS: 'last30Days', LAST_60_DAYS: 'last60Days',
   LAST_90_DAYS: 'last90Days', LAST_180_DAYS: 'last180Days',
   THIS_WEEK: 'thisWeek', LAST_WEEK: 'lastWeek', THIS_BIWEEK: 'thisBiWeek', LAST_BIWEEK: 'lastBiWeek',
@@ -4915,7 +4930,7 @@ async function prepareInlineVisualizations(items) {
     inlineVizIdByIndex[index] = built.id;
     const axisItems = { dx: spec.data_items || [], pe: spec.periods || [], ou: spec.org_units || [] };
     const axis = (dims) => dims.map(d => ({ dimension: d, items: axisItems[d] || [] }));
-    inlineInfo[index] = { itemType: 'VISUALIZATION', vizType: built.viz.type, name: built.viz.name, rows: axis(built.viz.rowDimensions), columns: axis(built.viz.columnDimensions) };
+    inlineInfo[index] = { itemType: 'VISUALIZATION', vizType: built.viz.type, name: built.viz.name, rows: axis(built.viz.rowDimensions), columns: axis(built.viz.columnDimensions), hideEmptyRows: built.viz.hideEmptyRows };
   }
   return { newVisualizations, inlineVizIdByIndex, layoutNotes, inlineSpecs, inlineInfo };
 }
@@ -5048,7 +5063,9 @@ function dashTileNeeds(info, levelCounts = {}) {
   if (t === 'REPORT_TABLE') return { kind: 'table', wide: true, h: 20, name };
   if (t !== 'VISUALIZATION' && t !== 'CHART' && t !== 'EVENT_VISUALIZATION' && t !== 'EVENT_CHART') return { kind: 'app', wide: false, h: 20, name };
   if (vt === 'SINGLE_VALUE') return { kind: 'kpi', wide: false, h: DASH_TILE_MIN.kpi[1], name };
-  const rows = dashAxisCount(info.rows, levelCounts), cols = dashAxisCount(info.columns, levelCounts);
+  // Empty rows hidden: the unit count says nothing about the rows actually drawn.
+  const rows = info.hideEmptyRows ? Math.min(10, dashAxisCount(info.rows, levelCounts)) : dashAxisCount(info.rows, levelCounts);
+  const cols = dashAxisCount(info.columns, levelCounts);
   if (vt === 'PIVOT_TABLE') return { kind: 'table', wide: true, h: Math.min(30, Math.max(12, 6 + Math.ceil(1.25 * (rows + 1)))), name };
   if (vt === 'GAUGE') return { kind: 'chart', wide: false, h: 16, name };
   if (/^(?:PIE|RADAR|SCATTER|BUBBLE|YEAR_OVER_YEAR)/.test(vt)) return { kind: 'chart', wide: false, h: 20, name };
@@ -5153,7 +5170,7 @@ async function dashboardTileInfos(entries, inlineInfo = {}) {
   const evIds = [...new Set(entries.map(e => e.evId).filter(Boolean))];
   const vizById = {}, evById = {};
   if (vizIds.length) {
-    const r = await safeDhis2Fetch(`visualizations?filter=id:in:[${vizIds.join(',')}]&fields=id,displayName,type,rows[dimension,items[id]],columns[dimension,items[id]]&paging=false`);
+    const r = await safeDhis2Fetch(`visualizations?filter=id:in:[${vizIds.join(',')}]&fields=id,displayName,type,hideEmptyRows,rows[dimension,items[id]],columns[dimension,items[id]]&paging=false`);
     for (const v of r?.visualizations || []) vizById[v.id] = v;
   }
   if (evIds.length) {
@@ -5163,7 +5180,7 @@ async function dashboardTileInfos(entries, inlineInfo = {}) {
   const infos = entries.map((e, i) => {
     if (inlineInfo[i]) return inlineInfo[i];
     const v = e.vizId ? vizById[e.vizId] : null;
-    if (v) return { itemType: 'VISUALIZATION', vizType: v.type, name: v.displayName, rows: v.rows, columns: v.columns };
+    if (v) return { itemType: 'VISUALIZATION', vizType: v.type, name: v.displayName, rows: v.rows, columns: v.columns, hideEmptyRows: v.hideEmptyRows };
     const ev = e.evId ? evById[e.evId] : null;
     return { itemType: e.type, vizType: ev?.type || null, name: ev?.displayName || e.name || e.appKey || '', text: e.text };
   });
@@ -5213,6 +5230,25 @@ async function applyOverallRow(spec) {
   return { note: `Overall row added: the parent org unit is its own row, computed by DHIS2 from all records (not a sum or average of the ${kids.length} rows below it). The ${kids.length} level-${lvl[1]} units are saved explicitly, so a unit added later needs the table updated.` };
 }
 
+// A relative period DHIS2 does not have. Models extrapolate the pattern
+// (LAST_5_QUARTERS, LAST_24_MONTHS, LAST_2_YEARS): analytics answers 409, and a
+// saved chart would treat the word as a fixed period id and show an error tile.
+// Fixed ISO periods all start with a digit. Verified on 2.42.5, 2026-11-02.
+const PERIOD_KEYWORD_HINT = 'Relative periods exist only as: LAST_3_MONTHS, LAST_6_MONTHS, LAST_12_MONTHS, MONTHS_THIS_YEAR, MONTHS_LAST_YEAR, LAST_4_QUARTERS, QUARTERS_THIS_YEAR, QUARTERS_LAST_YEAR, THIS_YEAR, LAST_YEAR, LAST_5_YEARS, LAST_10_YEARS, LAST_4_WEEKS, LAST_12_WEEKS, LAST_52_WEEKS, WEEKS_THIS_YEAR, LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS. For another span, combine them ("QUARTERS_LAST_YEAR" + "QUARTERS_THIS_YEAR") or list fixed periods (2025Q4, 202601, 2026).';
+function unknownPeriodKeywords(periods) {
+  return (periods || []).map(p => String(p).trim()).filter(p => /^[A-Za-z]/.test(p) && !VIZ_REL_PERIOD_FLAG[p.toUpperCase()]);
+}
+// The same check for a dhis2_query analytics path. Only keyword-shaped words count.
+function analyticsUnknownPeriodRefusal(path) {
+  const bad = [];
+  for (const m of String(path || '').matchAll(/[?&](?:dimension|filter)=pe(?::|%3A)([^&]+)/gi)) {
+    for (const p of decodeURIComponent(m[1]).split(';')) if (/^(?:LAST|THIS|MONTHS|QUARTERS|WEEKS|BIWEEKS|BIMONTHS)_/i.test(p)) bad.push(p);
+  }
+  const unknown = unknownPeriodKeywords(bad);
+  if (!unknown.length) return null;
+  return { _error: `Not sent: ${unknown.join(', ')} is not a DHIS2 period (409 "Period not valid").`, _hint: PERIOD_KEYWORD_HINT, _scope: 'known_endpoint_guidance' };
+}
+
 function buildVisualizationObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'visualization spec object is required.' };
   const type = String(spec.vis_type || spec.type || 'COLUMN').toUpperCase();
@@ -5229,6 +5265,8 @@ function buildVisualizationObject(spec, typeMap) {
   if (!dataItems.length) return { _error: 'data_items must list at least one indicator / data element / program indicator UID.' };
   const periods = (Array.isArray(spec.periods) ? spec.periods : []).map(p => String(p).trim()).filter(Boolean);
   if (!periods.length) return { _error: 'periods must list at least one period (relative keyword like LAST_12_MONTHS or fixed like 202401).' };
+  const badPeriods = unknownPeriodKeywords(periods);
+  if (badPeriods.length) return { _error: `${badPeriods.join(', ')} is not a DHIS2 period, so this tile would show an error.`, _hint: PERIOD_KEYWORD_HINT };
   const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : []).map(o => String(o).trim()).filter(Boolean);
   if (!orgUnits.length) return { _error: 'org_units must list at least one org-unit UID or relative keyword (USER_ORGUNIT, USER_ORGUNIT_CHILDREN, LEVEL-2).' };
 
@@ -5322,7 +5360,6 @@ function buildVisualizationObject(spec, typeMap) {
   // Guarantee every present dimension is placed exactly once; if a custom
   // layout omits one, fall back to the type default so no data is orphaned.
   const placed = new Set([...axisDims(layoutSpec.columns), ...axisDims(layoutSpec.rows), ...axisDims(layoutSpec.filters)]);
-  const def = vizDefaultLayout(type);
   const fallbackFilters = [];
   for (const d of ['dx', 'pe', 'ou']) {
     if (hasData[d] && !placed.has(d)) fallbackFilters.push(d);
@@ -5376,6 +5413,25 @@ function buildVisualizationObject(spec, typeMap) {
     viz.columns = columnDimensions.map(d => ({ dimension: d, items: items[d] }));
     viz.rows = rowDimensions.map(d => ({ dimension: d, items: items[d] }));
     viz.filters = filterDimensions.map(d => ({ dimension: d, items: items[d] }));
+  }
+  // A level or "children" on the row axis stands for every unit there, and most
+  // have no data for one program: 3 facilities with numbers among a table of 200
+  // blank rows, 2 bars among 26 empty places on the x-axis (live 2026-11-02).
+  // A report of who has NOT reported asks for show_empty:true.
+  if (spec.show_empty !== true && rowDimensions.includes('ou')
+    && (organisationUnitLevels.length || userOrganisationUnitChildren || userOrganisationUnitGrandChildren)) {
+    if (type === 'PIVOT_TABLE') viz.hideEmptyRows = true;
+    else if (isChart) viz.hideEmptyRowItems = 'ALL';
+  }
+  // "Highest to lowest". In a chart sortOrder 1 is HIGH to low and -1 low to high,
+  // the reverse of what the numbers suggest. A saved table has no sort: sortOrder
+  // and `sorting` both save and the Dashboard app ignores both (verified 2.42.5,
+  // rendered 2026-11-02). topLimit is not offered: it saves too, and neither charts
+  // nor tables apply it, so a saved "top 10" does not exist.
+  const sortDir = String(spec.sort || '').toLowerCase();
+  if (sortDir === 'desc' || sortDir === 'asc') {
+    if (isChart) viz.sortOrder = sortDir === 'desc' ? 1 : -1;
+    else layoutNote = [layoutNote, `A saved ${type === 'PIVOT_TABLE' ? 'table' : 'tile of this type'} cannot be sorted, so sort was ignored: say so, and tell the user that clicking a table's column header sorts it on screen.`].filter(Boolean).join(' ');
   }
   if (spec.short_name) viz.shortName = String(spec.short_name).slice(0, 50);
   if (spec.description) viz.description = String(spec.description);
@@ -5435,6 +5491,7 @@ function buildMapObject(spec, typeMap) {
   if (!ddiKey) return { _error: `Data item "${item}" has unsupported type ${t} for a map.` };
 
   const period = String(spec.period || (Array.isArray(spec.periods) ? spec.periods[0] : '') || 'LAST_12_MONTHS').trim();
+  if (unknownPeriodKeywords([period]).length) return { _error: `${period} is not a DHIS2 period, so this map would show an error.`, _hint: PERIOD_KEYWORD_HINT };
   const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : (spec.org_units ? [spec.org_units] : [])).map(o => String(o).trim()).filter(Boolean);
   const level = spec.org_unit_level != null ? Number(spec.org_unit_level) : null;
 
@@ -5536,6 +5593,28 @@ async function resolveProgramForProgramIndicator(piId) {
   return resp?.program?.id || null;
 }
 
+// A thematic layer only draws units that have a boundary: with data on units
+// without one the saved map is an empty basemap, and nothing reports it. On
+// localhost:8081 the 121 NCD visits sat on units with no geometry, and the map was
+// found empty only when the user asked the model to check every tile (2026-11-02).
+// Null unless the numbers prove it; a query that cannot run says nothing.
+async function mapNoBoundariesWarning(itemId, thematic) {
+  try {
+    const ouItems = (thematic.rows || []).find(r => r.dimension === 'ou')?.items?.map(i => i.id) || [];
+    const period = thematic.filters?.[0]?.items?.[0]?.id;
+    if (!ouItems.length || !period) return null;
+    const data = await safeDhis2Fetch(`analytics?dimension=dx:${itemId}&dimension=ou:${ouItems.join(';')}&filter=pe:${period}&skipMeta=true`);
+    if (data?._error) return null;
+    const ouCol = (data.headers || []).findIndex(h => h.name === 'ou');
+    if (ouCol < 0) return null;
+    const withData = [...new Set((data.rows || []).map(r => r[ouCol]))];
+    if (!withData.length || withData.length > 500) return null;
+    const drawn = await safeDhis2Fetch(`organisationUnits?filter=id:in:[${withData.join(',')}]&filter=geometry:!null&fields=id&paging=false`);
+    if (drawn?._error || (drawn.organisationUnits || []).length) return null;
+    return `This map will look EMPTY: the ${withData.length} org unit(s) holding this data have no boundary (geometry) on this server, and a thematic layer only draws units with one. Tell the user and suggest a table or chart by org unit instead, or adding boundaries in Maintenance. Do not present the map as showing data.`;
+  } catch { return null; }
+}
+
 async function executeManageMaps(args) {
   const action = args.action;
   if (!action) return { _error: 'action required', _hint: 'One of: list, get, create, delete.' };
@@ -5588,9 +5667,11 @@ async function executeManageMaps(args) {
     const thematic = built.map.mapViews.find(v => v.layer === 'thematic');
     const boundary = built.map.mapViews.find(v => v.layer === 'boundary');
     const periodWarning = await periodsMissThisYearWarning([itemId], [thematic.filters[0].items[0].id]);
+    const boundaryWarning = await mapNoBoundariesWarning(itemId, thematic);
+    const mapWarning = [periodWarning, boundaryWarning].filter(Boolean).join(' ');
     return {
       success: true,
-      ...(periodWarning ? { _warning: periodWarning } : {}),
+      ...(mapWarning ? { _warning: mapWarning } : {}),
       map_id: newId,
       name: built.map.name,
       layer: 'thematic',
@@ -5927,9 +6008,17 @@ async function executeManageDashboards(args) {
     // place in the reading order instead of below everything (RMNCH thread
     // 2026-11-01: "maps between the district table and the detailed tables" —
     // with append-only the model tried to rebuild the whole dashboard).
-    const anchorId = args.insert_after_item_id || args.insert_before_item_id || null;
-    if (args.insert_after_item_id && args.insert_before_item_id) {
-      return { _error: 'Pass insert_after_item_id OR insert_before_item_id, not both.' };
+    // replace_item_id: the new tile takes that tile's place, in one write. Doing
+    // it as remove + insert with a stale anchor put a chart between two KPI rows
+    // (live 2026-11-02). The tile goes; the chart it showed stays on the server.
+    const replaceId = args.replace_item_id || null;
+    const anchorId = replaceId || args.insert_after_item_id || args.insert_before_item_id || null;
+    if ([replaceId, args.insert_after_item_id, args.insert_before_item_id].filter(Boolean).length > 1) {
+      return { _error: 'Pass only one of replace_item_id, insert_after_item_id, insert_before_item_id.' };
+    }
+    if (replaceId) {
+      const _rmGate = requireWriteAuth('manage_dashboards', 'remove_item', { dashboard_id: args.dashboard_id });
+      if (_rmGate) return _rmGate;
     }
     if (anchorId && !existingItems.some(it => it.id === anchorId)) {
       return {
@@ -6016,11 +6105,14 @@ async function executeManageDashboards(args) {
     let insertedRows = null;
     if (anchorId) {
       const ordered = dashboardReadingOrder(existingItems);
-      const k = ordered.findIndex(it => it.id === anchorId) + (args.insert_after_item_id ? 1 : 0);
-      const combined = [...ordered.slice(0, k), ...newItems, ...ordered.slice(k)];
+      const anchorAt = ordered.findIndex(it => it.id === anchorId);
+      const replaced = replaceId ? ordered[anchorAt] : null;
+      const k = anchorAt + (args.insert_after_item_id ? 1 : 0);
+      const combined = [...ordered.slice(0, k), ...newItems, ...ordered.slice(replaced ? k + 1 : k)];
       const ex = await dashboardTileInfos(ordered.map(savedDashboardEntry), {});
       const infoOf = new Map([...ordered.map((it, i) => [it, ex.infos[i]]), ...newItems.map((di, i) => [di, infos[i]])]);
-      const sizeOf = new Map([...ordered.map(it => [it, { size: savedDashboardTileSize(it) }]), ...newItems.map((di, i) => [di, { size: (items[i] || {}).size }])]);
+      // A replacement keeps the width its tile had, unless a new size was asked for.
+      const sizeOf = new Map([...ordered.map(it => [it, { size: savedDashboardTileSize(it) }]), ...newItems.map((di, i) => [di, { size: (items[i] || {}).size || (replaced ? savedDashboardTileSize(replaced) : undefined) }])]);
       const re = layoutDashboardItems(combined.map(x => sizeOf.get(x)), combined.map(x => infoOf.get(x)), 0, { ...ex.levelCounts, ...levelCounts });
       combined.forEach((x, i) => Object.assign(x, re.shapes[i]));
       owner.dashboardItems = combined;
@@ -6048,13 +6140,13 @@ async function executeManageDashboards(args) {
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
       ...(layoutNotes.length ? { _layout_corrected: layoutNotes } : {}),
       ...(insertedRows
-        ? { inserted: `${args.insert_after_item_id ? 'after' : 'before'} tile ${anchorId}`, tile_rows: insertedRows }
+        ? { [replaceId ? 'replaced' : 'inserted']: `${replaceId ? '' : `${args.insert_after_item_id ? 'after' : 'before'} `}tile ${anchorId}`, tile_rows: insertedRows }
         : { tile_rows_added: laid.rows }),
       ...(laid.note ? { _sizes_note: laid.note } : {}),
       added: summary,
       backup: backup.block,
-      _note: (after !== null && after !== existingItems.length + newItems.length)
-        ? `Warning: expected ${existingItems.length + newItems.length} items but server reports ${after}. Verify with action=get.`
+      _note: (after !== null && after !== existingItems.length + newItems.length - (replaceId ? 1 : 0))
+        ? `Warning: expected ${existingItems.length + newItems.length - (replaceId ? 1 : 0)} items but server reports ${after}. Verify with action=get.`
         : undefined,
     };
   }

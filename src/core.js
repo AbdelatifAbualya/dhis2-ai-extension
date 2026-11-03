@@ -236,7 +236,13 @@ const WRITE_AUTH_BROAD_RE = new RegExp(
 // and refused (verified 2026-10-20) although nothing in them is a complaint.
 const WRITE_AUTH_IMPERATIVE_RE = new RegExp(
   '(?:^|[.!?;:\\n]\\s*|\\b(?:please|pls|kindly|and|then|also|now|next|can\\s+you|could\\s+you|would\\s+you|i\\s+want\\s+you\\s+to|i\\s+need\\s+you\\s+to)\\s+)'
-  + '(?:enter|record|submit|input|key\\s+in|fill\\s+in|type\\s+in|mark|reset|lock|unlock|deactivate|reactivate|onboard|invite|register|enrol+|import)\\b',
+  + '(?:enter|record|submit|input|key\\s+in|fill\\s+in|type\\s+in|mark|reset|lock|unlock|deactivate|reactivate|onboard|invite|register|enrol+|import'
+  // Plain editing instructions. "Replace the bar chart with a horizontal one and
+  // move the map next to the curve" was read as no authorization and the model
+  // had to ask leave for what it was just told (live 2026-11-02). Imperative
+  // position only: "the map moved" and "when I move it, it fails" stay reports.
+  + '|replace|move|swap|put|sort|reorder|rearrange|resize|shrink|enlarge|widen|duplicate|clone|copy|convert'
+  + '|use\\s+[^.!?\\n]*\\binstead\\b|turn\\s+(?:it|this|that|these|those|the)\\b[^.!?\\n]*\\binto\\b|do\\s+the\\s+same\\b)\\b',
   'i'
 );
 const WRITE_AUTH_DIAG_RE = new RegExp(
@@ -414,8 +420,8 @@ function writeVerbClasses(text) {
   const t = String(text || '');
   return {
     delete: WRITE_DELETE_FAMILY_RE.test(t),
-    update: /\b(?:fix|repair|patch|correct|update|modify|change|edit|rewrite|overwrite|rename|set|apply|move|share|assign|enable|disable|grant|link|attach|configure)\b/i.test(t),
-    create: /\b(?:create|build|make|set\s*up|setup|add|insert|generate|design|install|place|import|enter|record|register|enrol+)\b/i.test(t),
+    update: /\b(?:fix|repair|patch|correct|update|modify|change|edit|rewrite|overwrite|rename|set|apply|move|share|assign|enable|disable|grant|link|attach|configure|rearrange|reorder|resize|sort|put|shrink|enlarge|widen|convert|turn|use)\b/i.test(t),
+    create: /\b(?:create|build|make|set\s*up|setup|add|insert|generate|design|install|place|import|enter|record|register|enrol+|duplicate|clone|copy)\b/i.test(t),
   };
 }
 
@@ -513,7 +519,7 @@ function classifyWriteAuthorization(userText) {
     // Which kinds of write the user asked for. A follow-up ("continue",
     // "yes") carries the verbs of the request it continues.
     let verbSource = infoStripped;
-    if (bareAffirm || (typeof FOLLOW_UP_ONLY_RE !== 'undefined' && FOLLOW_UP_ONLY_RE.test(original.trim()) && original.trim().split(/\s+/).length <= 8)) {
+    if (bareAffirm || /\bdo\s+the\s+same\b/i.test(original) || (typeof FOLLOW_UP_ONLY_RE !== 'undefined' && FOLLOW_UP_ONLY_RE.test(original.trim()) && original.trim().split(/\s+/).length <= 8)) {
       const prior = typeof lastSubstantiveUserRequest === 'function' ? lastSubstantiveUserRequest() : '';
       if (prior) { const pg = writeIntentGloss(prior); verbSource = `${verbSource}\n${prior}\n${pg}`; }
     }
@@ -564,7 +570,21 @@ function noteAssistantCreatedIds(ids) {
   for (const id of ids || []) if (typeof id === 'string' && /^[A-Za-z][A-Za-z0-9]{10}$/.test(id) && !list.includes(id)) list.push(id);
   dhis2.assistantCreatedIds = list.slice(-500);
 }
+// dataStore keys it created this conversation, by path: they have no UID. A model
+// that wrote a test key was refused removing it three times and left it on the
+// server (live 2026-11-02).
+function noteAssistantCreatedDataStoreKey(path) {
+  const m = /^dataStore\/[^/?]+\/[^/?]+/.exec(String(path || '').replace(/^\/+/, '').replace(/^api\/(?:\d+\/)?/, ''));
+  if (!m) return;
+  const list = Array.isArray(dhis2.assistantCreatedDataStoreKeys) ? dhis2.assistantCreatedDataStoreKeys : [];
+  if (!list.includes(m[0])) list.push(m[0]);
+  dhis2.assistantCreatedDataStoreKeys = list.slice(-200);
+}
 function targetsCreatedByAssistant(descriptor) {
+  if (descriptor && typeof descriptor.path === 'string') {
+    const key = descriptor.path.replace(/^\/+/, '').replace(/^api\/(?:\d+\/)?/, '').split('?')[0];
+    if (/^dataStore\/[^/]+\/[^/]+$/.test(key) && (dhis2.assistantCreatedDataStoreKeys || []).includes(key)) return true;
+  }
   const ids = writeTargetsOf(descriptor);
   const mine = new Set(Array.isArray(dhis2.assistantCreatedIds) ? dhis2.assistantCreatedIds : []);
   return ids.length > 0 && ids.every(id => mine.has(id));
@@ -636,7 +656,7 @@ function noteDestructive404(toolName, action, id) {
   dhis2.destructive404History = dhis2.destructive404History || [];
   dhis2.destructive404History.push({ tool: toolName, action, id });
 }
-function destructive404StopOrNull(toolName, action) {
+function destructive404StopOrNull(toolName) {
   const n = dhis2.destructive404Count || 0;
   if (n < 2) return null;
   return {
@@ -828,7 +848,6 @@ function seedKnownIds(userText, ctx) {
   // System-level UIDs that always exist in DHIS2 instances — pre-add common ones.
   set.add('bjDvmb4bfuf'); // default categoryCombo / attributeCombo
   dhis2.knownIds = set;
-  dhis2.knownIdsSeedSize = set.size;
 }
 
 function recordKnownIdsFromResult(result) {
@@ -1601,7 +1620,7 @@ function preflightCheckCall(toolName, args) {
 // On 404, bumps the counter and returns the refusal payload (also returns the
 // hard-STOP if the limit has been hit). Returns { exists: true, data } on success.
 async function verifyTargetExists(resourcePath, id, toolName, action, fields) {
-  const stop = destructive404StopOrNull(toolName, action);
+  const stop = destructive404StopOrNull(toolName);
   if (stop) return { exists: false, refusal: stop };
   const fetchPath = fields
     ? `${resourcePath}/${id}?fields=${fields}`
@@ -1912,7 +1931,7 @@ async function ensureConnected() {
 // with "set.add is not a function". Counters/history reset every turn anyway.
 const PER_TURN_DHIS2_FIELDS = new Set([
   'lastProgramLookup',
-  'knownIds', 'knownIdsSeedSize', 'knownIcons',
+  'knownIds', 'knownIcons',
   'recentCreations',
   'writeAuth',
   'destructive404Count', 'destructive404History',
@@ -2388,9 +2407,12 @@ async function clearConversationState() {
   // each turn, but drop them here too so no created-metadata memory from the
   // previous thread can leak into the new one.
   dhis2.knownIds = null;
-  dhis2.knownIdsSeedSize = 0;
   dhis2.knownIcons = null;
   dhis2.recentCreations = null;
+  // "Its own work" means this conversation: a new chat must ask before deleting
+  // what an earlier one created.
+  dhis2.assistantCreatedIds = [];
+  dhis2.assistantCreatedDataStoreKeys = [];
   // Cross-turn write-approval memory: a proposal from the old thread must not
   // be redeemable by a bare "yes" in the new one.
   dhis2.lastRefusedWrite = null;
@@ -2528,7 +2550,13 @@ const BULK_DELETE_SOFT_CAP = 100;
 // Fields used to build a restorable snapshot. DHIS2's `:owner` preset returns
 // every "owned" property of an object (i.e. exactly what /metadata expects
 // back on import) but it does NOT auto-include referenced collections that
-// live on OTHER tables. For those we have to spell the fields out.
+// live on OTHER tables. Those are spelled out below, ON TOP OF :owner.
+// Restore is a full-replace import, so a property a snapshot leaves out is WIPED
+// by restoring it. These lists used to be the whole snapshot: on 2.42.5 (2026-11-02)
+// a restore lost a program's and a stage's labels, an indicator's boundaries and
+// legend sets, an option set's sharing; a tracked entity type or attribute could not
+// be restored at all ("Missing required property"); and a backup taken before a
+// sharing change could not undo it.
 const SNAPSHOT_FIELDS = {
   programRules:
     'id,name,description,condition,priority,program[id],' +
@@ -2549,7 +2577,7 @@ const SNAPSHOT_FIELDS = {
     'openAfterEnrollment,reportDateToUse,generatedByEnrollmentDate,blockEntryForm,hideDueDate,' +
     'programStageDataElements[id,dataElement[id],compulsory,allowProvidedElsewhere,sortOrder,' +
     'displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics],' +
-    'programStageSections[id,name,sortOrder,dataElements[id]]',
+    'programStageSections[id,name,sortOrder,dataElements[id]],sharing',
   programs:
     'id,name,shortName,description,programType,trackedEntityType[id],categoryCombo[id],' +
     'onlyEnrollOnce,displayIncidentDate,ignoreOverdueEvents,relatedProgram[id],' +
@@ -2576,7 +2604,7 @@ const SNAPSHOT_FIELDS = {
     'id,name,code,description,sortOrder,optionSet[id],style',
   trackedEntityTypes:
     'id,name,description,minAttributesRequiredToSearch,maxTeiCountToReturn,' +
-    'trackedEntityTypeAttributes[id,trackedEntityAttribute[id],mandatory,displayInList,sortOrder,searchable]',
+    'trackedEntityTypeAttributes[id,trackedEntityAttribute[id],mandatory,displayInList,sortOrder,searchable],sharing',
   categoryCombos: 'id,name,code,description,dataDimensionType,skipTotal,categories[id]',
   categories: 'id,name,shortName,code,description,dataDimensionType,categoryOptions[id]',
   categoryOptions: 'id,name,shortName,code,description,startDate,endDate,style',
@@ -2602,7 +2630,7 @@ const SNAPSHOT_FIELDS = {
 };
 
 function getSnapshotFields(objectType) {
-  return SNAPSHOT_FIELDS[objectType] || ':owner';
+  return SNAPSHOT_FIELDS[objectType] ? `:owner,${SNAPSHOT_FIELDS[objectType]}` : ':owner';
 }
 
 function buildBackupKey(operation) {
@@ -2798,7 +2826,7 @@ function buildBackupResultBlock(backupResult, skipBackup) {
 // supported languages) OR a bare "yes" right after a backup of THIS tool
 // failed and was reported. Test harnesses set dhis2.harnessSkipBackupConsent.
 const BACKUP_SKIP_WORDS_RE = /\b(?:skip(?:ping)?|without|no|bypass|don'?t\s+(?:take|make|create|need))\s+(?:the\s+|a\s+|any\s+)?backups?\b|\bbackups?\s+(?:is\s+)?not\s+needed\b|بدون\s+نسخ|دون\s+نسخ|sans\s+sauvegarde|sin\s+(?:copia|respaldo)|sem\s+(?:backup|cópia)/i;
-function backupSkipConsent(toolName, args) {
+function backupSkipConsent(toolName) {
   if (dhis2.harnessSkipBackupConsent === true) return { ok: true, reason: 'test harness' };
   const said = String(typeof lastUserText === 'string' ? lastUserText : '');
   if (BACKUP_SKIP_WORDS_RE.test(said)) return { ok: true, reason: `the user said so this turn ("${said.slice(0, 80)}")` };
@@ -3226,6 +3254,24 @@ async function analyticsCacheMismatch(cleanPath, data) {
   };
 }
 
+// DHIS2 caches analytics/events/aggregate answers WITHOUT the program or stage in
+// the key: with caching on, every program answered 213 (true: 213, 133, 135, 20)
+// and every stage 87 (true: 87, 64, 57, 0), still so after 70 s, with no error
+// (verified 2.42.5, 2026-11-03; also seen on 2.42.7 and 2.43.2). `limit` IS in the
+// key and is harmless on an aggregate, so a stable one derived from the query keeps
+// each query's own entry: the same query still hits the cache, another program or
+// stage no longer gets its answer. Below the default keyAnalyticsMaxLimit of 100,000
+// (over it is 409 E7209). Pure and self-contained: its source is also written into
+// every generated app's app-guard.js. Works on a path or a full URL.
+function withEventAggregateCacheKey(pathOrUrl) {
+  var s = String(pathOrUrl);
+  var at = s.indexOf('analytics/events/aggregate/');
+  if (at < 0 || /[?&]limit=/.test(s)) return s;
+  var key = s.slice(at), h = 0;
+  for (var i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) | 0;
+  return s + (s.indexOf('?') < 0 ? '?' : '&') + 'limit=' + (10000 + (Math.abs(h) % 40000));
+}
+
 async function safeDhis2Fetch(path, options = {}) {
   if (!dhis2.baseUrl || !dhis2.apiVersion) {
     const ok = await ensureConnected();
@@ -3243,7 +3289,7 @@ async function safeDhis2Fetch(path, options = {}) {
     };
   }
 
-  let cleanPath = path.replace(/^\//, '').replace(/^api\/\d+\//, '');
+  let cleanPath = withEventAggregateCacheKey(path.replace(/^\//, '').replace(/^api\/\d+\//, ''));
   const ambiguous = ambiguousApiPathReason(cleanPath);
   if (ambiguous) {
     return {
@@ -4714,7 +4760,7 @@ function healDuplicateDxDimension(path) {
   if (dxCount < 2) return { path: p, healed: false };
   const merged = parts
     .filter((part, i) => !/^dimension=dx(?::|%3A)/i.test(part) || i === firstDxAt)
-    .map((part, i) => (/^dimension=dx(?::|%3A)/i.test(part) ? `dimension=dx:${[...new Set(dxItems)].join(';')}` : part));
+    .map((part) => (/^dimension=dx(?::|%3A)/i.test(part) ? `dimension=dx:${[...new Set(dxItems)].join(';')}` : part));
   return { path: `${p.slice(0, qIdx)}?${merged.join('&')}`, healed: true };
 }
 
@@ -4761,6 +4807,56 @@ function healPackedAnalyticsDimensions(path) {
     for (const g of groups) out.push(`${key}=${g.join(';')}`);
   }
   return { path: healed ? `${p.slice(0, qIdx)}?${out.join('&')}` : p, healed };
+}
+
+// Status on analytics/events|enrollments is its own query parameter, never a
+// dimension or filter. Verified on 2.42.5 and 2.43.3 (2026-11-02):
+//   dimension=eventStatus:COMPLETED, filter=eventStatus:eq:COMPLETED → 409
+//   eventStatus=COMPLETED;ACTIVE → 400; eventStatus=COMPLETED,ACTIVE works
+//   enrollmentStatus=… → 200 and SILENTLY IGNORED: the number looks right and is
+//     the unfiltered total. programStatus is the name that filters.
+//   analytics/enrollments/aggregate with filter=ou:… → 409 E7145 on 2.42 (works on
+//     2.43); dimension=ou:… works on both.
+// The note goes back to the model, because an app it writes next calls the API
+// with no healing in between. Pure — safe to unit test.
+function healAnalyticsStatusParams(path) {
+  const p = String(path || '');
+  if (!/^analytics\/(events|enrollments)\//.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  const isEnrollmentAggregate = /^analytics\/enrollments\/aggregate\//.test(p);
+  const notes = [];
+  const parts = p.slice(qIdx + 1).split('&').map((part) => {
+    const eq = part.indexOf('=');
+    if (eq === -1) return part;
+    const key = part.slice(0, eq);
+    let val = part.slice(eq + 1);
+    if (/^(?:dimension|filter)$/i.test(key)) {
+      const m = val.match(/^(eventStatus|programStatus|enrollmentStatus)(?::|%3A)(?:(?:eq|in)(?::|%3A))?(.+)$/i);
+      if (m) {
+        const name = /^event/i.test(m[1]) ? 'eventStatus' : 'programStatus';
+        notes.push(`${m[1]} is a query parameter, not a ${key}: ${name}=<STATUS>`);
+        return `${name}=${m[2].replace(/;|%3B/gi, ',')}`;
+      }
+      if (isEnrollmentAggregate && /^filter$/i.test(key) && /^ou(?::|%3A)/i.test(val)) {
+        notes.push('analytics/enrollments/aggregate needs the org unit as dimension=ou:…, because filter=ou:… is a server error on DHIS2 2.42 (the rows gain an org-unit column)');
+        return `dimension=${val}`;
+      }
+      return part;
+    }
+    if (/^enrollmentStatus$/i.test(key)) {
+      notes.push('enrollmentStatus is silently ignored by analytics, so the number would be the unfiltered total: the parameter that filters is programStatus');
+      return `programStatus=${val}`;
+    }
+    if (/^(?:eventStatus|programStatus)$/i.test(key) && /;|%3B/i.test(val)) {
+      notes.push('several statuses are comma-separated (; is a 400)');
+      val = val.replace(/;|%3B/gi, ',');
+      return `${key}=${val}`;
+    }
+    return part;
+  });
+  if (!notes.length) return { path: p, healed: false };
+  return { path: `${p.slice(0, qIdx)}?${parts.join('&')}`, healed: true, note: `Query corrected: ${notes.join('; ')}. Use this form in any app or plugin code too.` };
 }
 
 function healEventAnalyticsDxDimension(path) {
@@ -5411,7 +5507,6 @@ async function initializeFromUrlNow(url) {
     dhis2.lastFacilityOu = null;
     dhis2.metadataAuditSupport = null;
     dhis2.knownIds = null;
-    dhis2.knownIdsSeedSize = 0;
     dhis2.knownIcons = null;
     console.log(`[initializeFromUrl] Server switched: ${previousBaseUrl} → ${baseUrl}. Cleared server-tied caches.`);
   }
