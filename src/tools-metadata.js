@@ -169,6 +169,8 @@ async function executeToolCall(name, args) {
   // and so does a SQL view whose current SQL reads metadata tables only.
   const _privacyBlock = await enforcePatientDataPrivacyGateAsync(name, args);
   if (_privacyBlock) return _privacyBlock;
+  const _metadataOnlyBlock = metadataOnlyGate(name, args);
+  if (_metadataOnlyBlock) return _metadataOnlyBlock;
 
   // Named-program substitution gate: after a name-filtered program search
   // returned 0 matches this turn, program-bound writes against a DIFFERENT
@@ -629,7 +631,9 @@ async function executeToolCall(name, args) {
     // Guard: prevent fetching ALL programIndicators or programRules at once via paging=false.
     // Large programs can have 500+ indicators (300KB+) or hundreds of rules — responses will be
     // truncated and the LLM will get stuck. Redirect to the appropriate managed tool instead.
-    if (method === 'GET' && /paging=false/i.test(safePath)) {
+    if (method === 'GET') safePath = healBareInFilter(safePath);
+    // A lookup of named ids is small whatever the program's size, so it passes.
+    if (method === 'GET' && /paging=false/i.test(safePath) && !/[?&]filter=id(?:%3A|:)(?:eq|in)(?:%3A|:)/i.test(safePath)) {
       // Try to extract program ID from the path itself first, fall back to context
       const pathProgramMatch = safePath.match(/filter=program\.id(?:%3A|:)eq(?:%3A|:)([A-Za-z][A-Za-z0-9]{10})/i);
       const pathProgramId = pathProgramMatch?.[1] || null;
@@ -922,6 +926,8 @@ async function executeToolCall(name, args) {
     if (method === 'GET') {
       const invalidProg = await validateAnalyticsProgramId(safePath);
       if (invalidProg) return invalidProg;
+      const idDimension = analyticsRecordIdDimension(safePath);
+      if (idDimension) return idDimension;
       // `dimension=dx:<uid>` on an event/enrollment analytics endpoint is a
       // guaranteed 409 whose message names an internal SQL column. Heal it to
       // the bare-UID form the endpoint actually takes.
@@ -942,6 +948,14 @@ async function executeToolCall(name, args) {
       if (stageHeal.healed) {
         console.log(`[dhis2_query] Stage UID moved from dimension= to stage= → ${stageHeal.path}`);
         safePath = stageHeal.path;
+      }
+      const emptyAxes = collectionReadEmptyAxesNote(safePath);
+      if (emptyAxes) queryNotes.push(emptyAxes);
+      const aggHeal = healEventAggregationValue(safePath);
+      if (aggHeal.healed) {
+        console.log(`[dhis2_query] Event aggregation corrected → ${aggHeal.path}`);
+        safePath = aggHeal.path;
+        queryNotes.push(aggHeal.note);
       }
       // A saved chart / map id used as a data item → the items it plots.
       const savedHeal = await healSavedObjectAsDataItem(safePath);
@@ -1498,7 +1512,7 @@ async function executeToolCall(name, args) {
 
     if (args.info_type === 'indicators') {
       const result = await safeDhis2Fetch(
-        `programIndicators?filter=program.id:eq:${effProgramId}&fields=id,displayName,description,expression,filter,displayInForm&paging=false`
+        `programIndicators?filter=program.id:eq:${effProgramId}&fields=id,displayName,description,expression,filter,analyticsType,aggregationType,displayInForm&paging=false`
       );
       if (result._error) return result;
       return {
@@ -1506,7 +1520,7 @@ async function executeToolCall(name, args) {
         program: { id: effProgramId, name: effProgramName },
         indicators: result.programIndicators?.map(pi => ({
           id: pi.id, name: pi.displayName, description: pi.description,
-          expression: pi.expression, filter: pi.filter
+          expression: pi.expression, filter: pi.filter, analytics_type: pi.analyticsType, aggregation_type: pi.aggregationType,
         })),
       };
     }
@@ -2182,6 +2196,7 @@ async function executeToolCall(name, args) {
         owner: viz.user?.displayName || null,
       },
       human_summary: humanSummary,
+      ...(VIZ_CHARTS_NEEDING_CATEGORY.has(viz.type) && !(rowDims || []).length ? { _will_not_render: 'This chart has no category (x-axis): on a dashboard it shows "There was an error loading data for this item", whatever its values. Create it again with manage_dashboards(create_visualization) and swap it with add_items replace_item_id.' } : {}),
       layout: {
         columns: parseDimAxis(viz.columns),
         rows: parseDimAxis(viz.rows),
@@ -3691,10 +3706,10 @@ async function executeManageIndicators(args) {
     if (!exists.exists) return exists.refusal;
     const objName = exists.data?.displayName || id;
 
-    // indicators is an unmapped type in checkMetadataReferences → returns
-    // has_references:false; DHIS2's atomic DELETE is the authoritative net for
-    // any remaining association (dataSets, visualizations, indicatorGroups,
-    // predictors) and its exact reason is surfaced below.
+    // checkMetadataReferences reports the charts and maps that plot it (DHIS2
+    // would strip it from them silently). DHIS2's atomic DELETE is the net for
+    // any other association (dataSets, indicatorGroups, predictors) and its exact
+    // reason is surfaced below.
     const refsResult = await checkMetadataReferences('indicators', id);
     if (refsResult.has_references) {
       return {
@@ -4918,6 +4933,8 @@ async function prepareInlineVisualizations(items) {
   const inlineInfo = {};
   const layoutNotes = [];
   for (const { index, spec } of inlineSpecs) {
+    const levelWarning = await orgLevelNameWarning(spec.name, spec.org_units);
+    if (levelWarning) layoutNotes.push(`"${spec.name}": ${levelWarning}`);
     const overall = await applyOverallRow(spec);
     if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
     if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
@@ -4933,6 +4950,45 @@ async function prepareInlineVisualizations(items) {
     inlineInfo[index] = { itemType: 'VISUALIZATION', vizType: built.viz.type, name: built.viz.name, rows: axis(built.viz.rowDimensions), columns: axis(built.viz.columnDimensions), hideEmptyRows: built.viz.hideEmptyRows };
   }
   return { newVisualizations, inlineVizIdByIndex, layoutNotes, inlineSpecs, inlineInfo };
+}
+
+// 2.43 limits a dashboard's description to 255 characters and refuses the whole
+// import over it (2.42 has no limit). Malaria replay, 2026-11-03.
+function clampDashboardDescription(text) {
+  const t = String(text ?? '').trim();
+  if (t.length <= 255) return t;
+  const cut = t.slice(0, 254);
+  const end = Math.max(cut.lastIndexOf('. ') + 1, cut.lastIndexOf('; '), cut.lastIndexOf(', '), cut.lastIndexOf(' '));
+  return `${cut.slice(0, end > 120 ? end : 254).trimEnd()}…`;
+}
+
+// A title naming one org-unit level on an object built at another: "by district"
+// at level 3, where level 3 is Chiefdom (Malaria replay, 2026-11-03: the wrong map
+// and table were only noticed later and rebuilt). Null when they agree, when the
+// title names no level, or when the levels cannot be read.
+async function orgLevelNameWarning(title, orgUnits, level) {
+  const list = Array.isArray(orgUnits) ? orgUnits : orgUnits ? [orgUnits] : [];
+  const chosen = [...new Set([...(Number(level) > 0 ? [Number(level)] : []), ...list.map(o => Number((String(o).match(/^LEVEL-(\d+)$/i) || [])[1])).filter(Boolean)])];
+  if (!chosen.length) return null;
+  if (!dhis2.orgLevelNames) {
+    const r = await safeDhis2Fetch('organisationUnitLevels?fields=level,displayName&paging=false');
+    if (r?._error || !Array.isArray(r?.organisationUnitLevels)) return null;
+    dhis2.orgLevelNames = r.organisationUnitLevels.map(l => ({ level: Number(l.level), name: String(l.displayName || '') })).filter(l => l.level && l.name);
+  }
+  const t = String(title || '');
+  const named = dhis2.orgLevelNames.filter(l => {
+    const stem = l.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/y$/i, '(?:y|ie)');
+    return new RegExp(`\\b${stem}s?\\b`, 'i').test(t);
+  });
+  if (!named.length || named.some(l => chosen.includes(l.level))) return null;
+  const actual = dhis2.orgLevelNames.filter(l => chosen.includes(l.level)).map(l => `"${l.name}"`).join(', ');
+  return `The title says "${named[0].name}", but this was built at org-unit level ${chosen.join(', ')}${actual ? ` (${actual})` : ''}. "${named[0].name}" is level ${named[0].level} on this server. Check which one the user asked for: rebuild it at level ${named[0].level} if the title is right.`;
+}
+
+// A text tile's bold is *x* and its italic _x_: **x** shows as bold with a
+// literal star on each side (rendered 2.42.7, 2026-11-03).
+function dashboardTextMarkup(text) {
+  return String(text ?? '').replace(/\*\*([^*\n]+)\*\*/g, '*$1*').replace(/__([^_\n]+)__/g, '_$1_');
 }
 
 // The dashboard item type an entry stands for (explicit type wins).
@@ -5072,7 +5128,11 @@ function dashTileNeeds(info, levelCounts = {}) {
   // Bar / line charts: rows are the x-axis categories, columns the series.
   // More than a year of months, >5 legend entries or >24 bars get the full width.
   const marks = (/LINE|AREA|STACKED/.test(vt)) ? rows : rows * cols;
-  return { kind: 'chart', wide: rows > 12 || cols > 5 || marks > 24, h: 20, name };
+  // Data items on the axis have long labels; a horizontal bar needs a line for
+  // each category.
+  const itemsOnAxis = (info.rows || []).some(d => d.dimension === 'dx');
+  const h = /^(?:STACKED_)?BAR$/.test(vt) ? Math.min(40, Math.max(20, Math.ceil((rows * 24 + 120) / 20))) : 20;
+  return { kind: 'chart', wide: rows > 12 || cols > 5 || marks > 24 || (itemsOnAxis && rows > 6), h, name };
 }
 
 // The model's own x/y/width/height → reading order + size hints. The scale is
@@ -5249,6 +5309,34 @@ function analyticsUnknownPeriodRefusal(path) {
   return { _error: `Not sent: ${unknown.join(', ')} is not a DHIS2 period (409 "Period not valid").`, _hint: PERIOD_KEYWORD_HINT, _scope: 'known_endpoint_guidance' };
 }
 
+// Chart types the Data Visualizer plugin draws as series over a category. Saved
+// with no category (rows: []) the object imports with HTTP 201 and the Dashboard
+// shows "There was an error loading data for this item". Malaria thread,
+// 2026-11-03: two of the four charts; nothing in the API reports it. PIE, GAUGE
+// and SINGLE_VALUE have no category. YEAR_OVER_YEAR, SCATTER and BUBBLE are
+// laid out differently and are left alone.
+const VIZ_CHARTS_NEEDING_CATEGORY = new Set(['COLUMN', 'STACKED_COLUMN', 'BAR', 'STACKED_BAR', 'LINE', 'AREA', 'STACKED_AREA', 'RADAR']);
+
+// "Start with 2026" names a year. MONTHS_THIS_YEAR draws the same bars today and
+// other ones in January, while the fixed tiles beside it stay on 2026 (Malaria
+// thread, 2026-11-03). Only when the request names exactly one year and does not
+// also speak of "this year". Returns the periods to save and a note, or null.
+function namedYearPeriods(periods, text = lastUserText) {
+  const said = String(text || '');
+  const years = [...new Set(said.match(/\b20\d{2}\b/g) || [])];
+  if (years.length !== 1 || /\b(?:this|current|the present)\s+year\b/i.test(said)) return null;
+  const y = years[0];
+  const expand = {
+    THIS_YEAR: [y],
+    MONTHS_THIS_YEAR: Array.from({ length: 12 }, (_, i) => `${y}${String(i + 1).padStart(2, '0')}`),
+    QUARTERS_THIS_YEAR: [1, 2, 3, 4].map(q => `${y}Q${q}`),
+  };
+  const list = (Array.isArray(periods) ? periods : [periods]).map(p => String(p).trim());
+  if (!list.some(p => expand[p.toUpperCase()])) return null;
+  const fixed = list.flatMap(p => expand[p.toUpperCase()] || [p]);
+  return { periods: fixed, note: `The request names ${y}, so "this year" keywords were saved as fixed ${y} periods: this tile stays on ${y} next year, like the other tiles of the request.` };
+}
+
 function buildVisualizationObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'visualization spec object is required.' };
   const type = String(spec.vis_type || spec.type || 'COLUMN').toUpperCase();
@@ -5263,8 +5351,10 @@ function buildVisualizationObject(spec, typeMap) {
 
   const dataItems = (Array.isArray(spec.data_items) ? spec.data_items : []).map(u => String(u).trim()).filter(Boolean);
   if (!dataItems.length) return { _error: 'data_items must list at least one indicator / data element / program indicator UID.' };
-  const periods = (Array.isArray(spec.periods) ? spec.periods : []).map(p => String(p).trim()).filter(Boolean);
+  let periods = (Array.isArray(spec.periods) ? spec.periods : []).map(p => String(p).trim()).filter(Boolean);
   if (!periods.length) return { _error: 'periods must list at least one period (relative keyword like LAST_12_MONTHS or fixed like 202401).' };
+  const yearFix = namedYearPeriods(periods);
+  if (yearFix) { periods = yearFix.periods; spec.periods = periods; }
   const badPeriods = unknownPeriodKeywords(periods);
   if (badPeriods.length) return { _error: `${badPeriods.join(', ')} is not a DHIS2 period, so this tile would show an error.`, _hint: PERIOD_KEYWORD_HINT };
   const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : []).map(o => String(o).trim()).filter(Boolean);
@@ -5349,13 +5439,47 @@ function buildVisualizationObject(spec, typeMap) {
       filters: spec.layout.filters ?? spec.layout.filter,
     };
   }
-  let layoutNote = null;
+  let layoutNote = yearFix ? yearFix.note : null;
+  const addLayoutNote = (n) => { layoutNote = layoutNote ? `${layoutNote} ${n}` : n; };
+  // How many items each dimension holds (a level or "children" = many units).
+  const dimCount = {
+    dx: dataDimensionItems.length,
+    pe: periods.reduce((n, p) => n + dashPeriodCount(p), 0),
+    ou: orgUnits.some(o => /^LEVEL-|CHILDREN$/i.test(o)) ? 99 : orgUnits.length,
+  };
   if (isChart && spec.keep_layout !== true) {
     const cols = axisDims(layoutSpec.columns), rows = axisDims(layoutSpec.rows);
-    if (rows.length === 1 && rows[0] === 'dx' && !cols.includes('dx') && cols.some(d => d === 'pe' || d === 'ou')) {
+    // Not for several data items with ONE period and ONE place: items on the axis
+    // is the right chart for "each of these counts in 2026", and the swap would
+    // turn it into one cluster and a legend of them.
+    const severalItemsOnePoint = dimCount.dx > 1 && !cols.some(d => dimCount[d] > 1);
+    if (rows.length === 1 && rows[0] === 'dx' && !cols.includes('dx') && cols.some(d => d === 'pe' || d === 'ou') && !severalItemsOnePoint) {
       layoutSpec = { columns: rows, rows: cols, filters: layoutSpec.filters };
-      layoutNote = `Layout corrected: a chart draws ROWS on the x-axis (category) and COLUMNS as series. As sent, only the data items were on the x-axis and ${cols.join(' + ')} became the series; swapped so ${cols.join(' + ')} is the x-axis and each data item is a series. Pass keep_layout:true to keep the original.`;
+      addLayoutNote(`Layout corrected: a chart draws ROWS on the x-axis (category) and COLUMNS as series. As sent, only the data items were on the x-axis and ${cols.join(' + ')} became the series; swapped so ${cols.join(' + ')} is the x-axis and each data item is a series. Pass keep_layout:true to keep the original.`);
     }
+  }
+  // Every chart here needs a category and a series. keep_layout does not excuse
+  // this one: no layout without a category can be drawn.
+  if (VIZ_CHARTS_NEEDING_CATEGORY.has(type)) {
+    let cols = axisDims(layoutSpec.columns);
+    let rows = axisDims(layoutSpec.rows).filter(d => !cols.includes(d));
+    if (!cols.length) cols = rows.length === 1 && rows[0] === 'dx' ? [] : ['dx'];
+    if (!rows.length) {
+      const free = ['pe', 'ou'].filter(d => hasData[d] && !cols.includes(d));
+      const many = free.find(d => dimCount[d] > 1);
+      if (many) rows = [many];
+      else if (cols.includes('dx') && dimCount.dx > 1) {
+        // One period, one place, several data items: the items are the bars.
+        rows = ['dx'];
+        cols = [free[0] || 'pe'];
+      } else rows = [free[0] || 'pe'];
+      addLayoutNote(`Layout corrected: a chart without a category (x-axis) saves but shows "There was an error loading data". Saved with category ${rows.join(' + ')} and series ${cols.join(' + ')}.`);
+    }
+    if (!cols.length) {
+      const free = ['pe', 'ou'].filter(d => hasData[d] && !rows.includes(d));
+      cols = [free[0] || 'pe'];
+    }
+    layoutSpec = { columns: cols, rows, filters: axisDims(layoutSpec.filters).filter(d => !cols.includes(d) && !rows.includes(d)) };
   }
   // Guarantee every present dimension is placed exactly once; if a custom
   // layout omits one, fall back to the type default so no data is orphaned.
@@ -5365,8 +5489,9 @@ function buildVisualizationObject(spec, typeMap) {
     if (hasData[d] && !placed.has(d)) fallbackFilters.push(d);
   }
   const columnDimensions = axisDims(layoutSpec.columns);
-  const rowDimensions = axisDims(layoutSpec.rows);
-  const filterDimensions = [...axisDims(layoutSpec.filters), ...fallbackFilters];
+  const rowDimensions = axisDims(layoutSpec.rows).filter(d => !columnDimensions.includes(d));
+  // A dimension is on one axis only.
+  const filterDimensions = [...new Set([...axisDims(layoutSpec.filters), ...fallbackFilters])].filter(d => !columnDimensions.includes(d) && !rowDimensions.includes(d));
   // A visualization must have at least one column dimension to render.
   if (!columnDimensions.length) {
     const firstPresent = ['dx', 'pe', 'ou'].find(d => hasData[d]);
@@ -5431,7 +5556,7 @@ function buildVisualizationObject(spec, typeMap) {
   const sortDir = String(spec.sort || '').toLowerCase();
   if (sortDir === 'desc' || sortDir === 'asc') {
     if (isChart) viz.sortOrder = sortDir === 'desc' ? 1 : -1;
-    else layoutNote = [layoutNote, `A saved ${type === 'PIVOT_TABLE' ? 'table' : 'tile of this type'} cannot be sorted, so sort was ignored: say so, and tell the user that clicking a table's column header sorts it on screen.`].filter(Boolean).join(' ');
+    else addLayoutNote(`A saved ${type === 'PIVOT_TABLE' ? 'table' : 'tile of this type'} cannot be sorted, so sort was ignored: say so, and tell the user that clicking a table's column header sorts it on screen.`);
   }
   if (spec.short_name) viz.shortName = String(spec.short_name).slice(0, 50);
   if (spec.description) viz.description = String(spec.description);
@@ -5490,7 +5615,9 @@ function buildMapObject(spec, typeMap) {
   const ddiKey = VIZ_DDI_KEY[t];
   if (!ddiKey) return { _error: `Data item "${item}" has unsupported type ${t} for a map.` };
 
-  const period = String(spec.period || (Array.isArray(spec.periods) ? spec.periods[0] : '') || 'LAST_12_MONTHS').trim();
+  let period = String(spec.period || (Array.isArray(spec.periods) ? spec.periods[0] : '') || 'LAST_12_MONTHS').trim();
+  const yearFix = namedYearPeriods([period]);
+  if (yearFix && yearFix.periods.length === 1) period = yearFix.periods[0];
   if (unknownPeriodKeywords([period]).length) return { _error: `${period} is not a DHIS2 period, so this map would show an error.`, _hint: PERIOD_KEYWORD_HINT };
   const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : (spec.org_units ? [spec.org_units] : [])).map(o => String(o).trim()).filter(Boolean);
   const level = spec.org_unit_level != null ? Number(spec.org_unit_level) : null;
@@ -5540,6 +5667,17 @@ function buildMapObject(spec, typeMap) {
   // method 1 = predefined legend (legendSet); 2 = equal intervals (auto colours).
   if (spec.legend_set_id) { mapView.legendSet = { id: spec.legend_set_id }; mapView.method = 1; }
   else { mapView.method = 2; }
+  // Bubble sizes. Unset, the Maps default of 5–30 px turned 600 facilities into
+  // one solid blob on a dashboard tile (Malaria thread, 2026-11-03). Sized from
+  // how many places are drawn; radius_low / radius_high override it.
+  if (thematicMapType === 'BUBBLE') {
+    const pts = Number(spec._drawn_units) || 0;
+    const auto = pts > 200 ? [2, 10] : pts > 40 ? [3, 16] : [5, 30];
+    const low = Number(spec.radius_low), high = Number(spec.radius_high);
+    mapView.radiusLow = Number.isFinite(low) && low > 0 ? Math.round(low) : auto[0];
+    mapView.radiusHigh = Number.isFinite(high) && high > mapView.radiusLow ? Math.round(high) : Math.max(auto[1], mapView.radiusLow + 1);
+    if (spec.opacity == null && pts > 40) mapView.opacity = 0.75;
+  }
   // Places without data get their own colour (Maps app "no data" style);
   // without it they are simply not drawn.
   if (spec.no_data_color != null && spec.no_data_color !== '') {
@@ -5554,7 +5692,11 @@ function buildMapObject(spec, typeMap) {
   // bubble map and the map had none. Same shape as the Maps app's boundary
   // layers (layer "boundary", organisationUnits + organisationUnitLevels).
   const mapViews = [mapView];
-  if (spec.boundary_level != null && spec.boundary_level !== '') {
+  // Finer outlines than the shaded areas only draw lines across them (a district
+  // map with every chiefdom outlined, Malaria replay 2026-11-03).
+  const boundaryTooFine = thematicMapType === 'CHOROPLETH' && Number.isFinite(level) && Number(spec.boundary_level) > level;
+  const boundaryNote = boundaryTooFine ? `boundary_level ${spec.boundary_level} is finer than the shaded level ${level}, so it was left out: an outline layer is for a coarser level.` : null;
+  if (spec.boundary_level != null && spec.boundary_level !== '' && !boundaryTooFine) {
     const bl = Number(spec.boundary_level);
     if (!Number.isInteger(bl) || bl < 1) return { _error: `boundary_level must be an org-unit level number (e.g. 2 for districts), not "${spec.boundary_level}".` };
     const parents = organisationUnits.length ? organisationUnits : [];
@@ -5583,7 +5725,7 @@ function buildMapObject(spec, typeMap) {
     zoom: spec.zoom != null ? Number(spec.zoom) : 3,
     mapViews,
   };
-  return { ok: true, map, needsProgram: t === 'PROGRAM_INDICATOR' && !spec.program_id, dataItemId: item };
+  return { ok: true, map, needsProgram: t === 'PROGRAM_INDICATOR' && !spec.program_id, dataItemId: item, boundaryNote };
 }
 
 // Resolve the owning program for a program-indicator data item (maps need it on
@@ -5657,6 +5799,21 @@ async function executeManageMaps(args) {
       const pid = await resolveProgramForProgramIndicator(itemId);
       if (pid) spec.program_id = pid;
     }
+    // A bubble map is sized by the places it draws; every map reports how many
+    // places can be drawn at all (the model used to spend two calls finding out,
+    // and then often did not mention it).
+    const mapLevel = Number(spec.org_unit_level) || Number((String((Array.isArray(spec.org_units) ? spec.org_units : []).find(o => /^LEVEL-\d+$/i.test(String(o))) || '').match(/\d+/) || [])[0]) || null;
+    let locationCoverage = null;
+    if (mapLevel) {
+      const [withGeo, noGeo] = await Promise.all([
+        safeDhis2Fetch(`organisationUnits?filter=level:eq:${mapLevel}&filter=geometry:!null&fields=id&pageSize=1`),
+        safeDhis2Fetch(`organisationUnits?filter=level:eq:${mapLevel}&filter=geometry:null&fields=id&pageSize=1`),
+      ]);
+      if (Number.isFinite(withGeo?.pager?.total) && Number.isFinite(noGeo?.pager?.total)) {
+        locationCoverage = { level: mapLevel, with_location: withGeo.pager.total, without_location: noGeo.pager.total };
+        spec._drawn_units = withGeo.pager.total;
+      }
+    }
     const built = buildMapObject(spec, typeMap);
     if (built._error) return built;
     const rootScope = await singleRootScopeRefusal(spec.org_units, `Map "${built.map.name}"`);
@@ -5668,7 +5825,8 @@ async function executeManageMaps(args) {
     const boundary = built.map.mapViews.find(v => v.layer === 'boundary');
     const periodWarning = await periodsMissThisYearWarning([itemId], [thematic.filters[0].items[0].id]);
     const boundaryWarning = await mapNoBoundariesWarning(itemId, thematic);
-    const mapWarning = [periodWarning, boundaryWarning].filter(Boolean).join(' ');
+    const levelNameWarning = await orgLevelNameWarning(built.map.name, spec.org_units, spec.org_unit_level);
+    const mapWarning = [periodWarning, boundaryWarning, levelNameWarning, built.boundaryNote].filter(Boolean).join(' ');
     return {
       success: true,
       ...(mapWarning ? { _warning: mapWarning } : {}),
@@ -5682,6 +5840,8 @@ async function executeManageMaps(args) {
       legend_set: spec.legend_set_id || null,
       ...(boundary ? { boundary_layer: `level ${boundary.organisationUnitLevels[0]} outlines, beneath the data layer` } : {}),
       ...(thematic.noDataColor ? { no_data_color: thematic.noDataColor } : {}),
+      ...(thematic.thematicMapType === 'BUBBLE' ? { bubble_radius_px: `${thematic.radiusLow}–${thematic.radiusHigh}` } : {}),
+      ...(locationCoverage ? { location_coverage: locationCoverage, ...(locationCoverage.without_location ? { _location_note: `${locationCoverage.without_location} of ${locationCoverage.with_location + locationCoverage.without_location} level-${mapLevel} org units have no location, so their data is not drawn on this map. Tell the user.` } : {}) } : {}),
       _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]) — or reference it in a new dashboard's items.`,
     };
   }
@@ -5693,6 +5853,14 @@ async function executeManageMaps(args) {
     if (!id) return { _error: 'map_id required for delete.' };
     const _verify = await verifyTargetExists('maps', id, 'manage_maps', 'delete', 'id,name');
     if (!_verify.exists) return _verify.refusal;
+    // DHIS2 deletes the map's tiles with it, silently (verified 2.42.7).
+    const onDash = await safeDhis2Fetch(`dashboards?filter=dashboardItems.map.id:eq:${id}&fields=id,displayName&pageSize=20`);
+    if ((onDash?.dashboards || []).length) {
+      return {
+        _error: `Cannot delete this map: ${onDash.dashboards.length} dashboard(s) still show it: ${onDash.dashboards.map(d => `${d.displayName} (${d.id})`).join(', ')}. Deleting it would silently remove the tile.`,
+        _hint: 'To replace the map, use manage_dashboards(action="add_items", replace_item_id=<tile id>, items=[{ type:"MAP", map_id:<new map> }]) first, or remove_item, then delete it.',
+      };
+    }
     // Snapshot before delete so it can be restored.
     const backup = await ensureBackupOrBail(
       { operation: 'delete_map', tool: 'manage_maps', action: 'delete', user_text: lastUserText },
@@ -5766,7 +5934,7 @@ async function executeManageDashboards(args) {
     const dimItems = `dataDimensionItems[${SAVED_OBJECT_ITEM_FIELDS}]`;
     const resp = await safeDhis2Fetch(
       `dashboards/${dId}?fields=id,displayName,description,` +
-      `dashboardItems[id,type,x,y,width,height,text,appKey,visualization[id,displayName,type,${dimItems}],map[id,displayName,mapViews[${dimItems}]],eventVisualization[id,displayName,type]]`
+      `dashboardItems[id,type,x,y,width,height,text,appKey,visualization[id,displayName,type,rowDimensions,columnDimensions,${dimItems}],map[id,displayName,mapViews[${dimItems}]],eventVisualization[id,displayName,type]]`
     );
     if (resp?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
     if (resp?._error) return { _error: `Could not load dashboard ${dId}: ${resp._error}` };
@@ -5786,13 +5954,16 @@ async function executeManageDashboards(args) {
         text: it.text || undefined,
         layout: { x: it.x, y: it.y, width: it.width, height: it.height },
         ...(tooSmall ? { too_small: tooSmall } : {}),
+        ...(it.visualization && VIZ_CHARTS_NEEDING_CATEGORY.has(it.visualization.type) && !(it.visualization.rowDimensions || []).length ? { will_not_render: 'chart has no category (x-axis): the Dashboard shows "There was an error loading data for this item"' } : {}),
       };
     });
     const small = items.filter(it => it.too_small);
+    const unrenderable = items.filter(it => it.will_not_render);
     return {
       success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length,
       _items_note: 'items are in reading order (position 1 = top left). id is the TILE id (for arrange order / insert_after_item_id / remove_item); a tile\'s numbers come from its data_items, never from the visualization or map id.',
       items,
+      ...(unrenderable.length ? { _broken_tiles: `${unrenderable.length} tile(s) show an error in the Dashboard because the saved chart has no category: ${unrenderable.map(it => `"${it.visualization.name}" (tile ${it.id})`).join(', ')}. Fix: create the chart again with the same data_items (the tool now saves a category) and swap it in place with add_items replace_item_id, then delete the old chart.` } : {}),
       ...(small.length ? { _layout_warning: `${small.length} tile(s) are too small to read on a laptop-width screen (~1000 px; DHIS2's grid is 60 columns, rows a fixed 20 px): ${small.map(it => `${it.id} ${it.too_small}`).join('; ')}. manage_dashboards(action="arrange", dashboard_id) re-sizes and re-flows every tile (backed up first) — offer it; it is a change to the dashboard.` } : {}),
     };
   }
@@ -5809,6 +5980,7 @@ async function executeManageDashboards(args) {
     if (unresolved.length) {
       return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${unresolved.join(', ')}.`, _hint: 'Resolve the correct UIDs with search_metadata first; never invent UIDs.' };
     }
+    const levelWarning = await orgLevelNameWarning(spec.name, spec.org_units);
     const overall = await applyOverallRow(spec);
     if (overall?._error) return overall;
     const built = buildVisualizationObject(spec, typeMap);
@@ -5821,7 +5993,7 @@ async function executeManageDashboards(args) {
     if (args.dry_run_only) {
       return { success: true, dry_run: true, message: `Validation passed for "${built.viz.name}". No visualization created (dry_run_only=true).`, would_create: { id: built.id, name: built.viz.name, type: built.viz.type } };
     }
-    const periodWarning = await periodsMissThisYearWarning(spec.data_items, spec.periods);
+    const periodWarning = [await periodsMissThisYearWarning(spec.data_items, spec.periods), levelWarning].filter(Boolean).join(' ');
     return {
       success: true,
       action: 'create_visualization',
@@ -5891,7 +6063,7 @@ async function executeManageDashboards(args) {
         if (!evId) return { _error: `Item ${i + 1} is an EVENT_VISUALIZATION (line list) but has no event_visualization_id / line_list_id.` };
         di.eventVisualization = { id: evId };
       } else if (itType === 'TEXT') {
-        di.text = String(it.text || '');
+        di.text = dashboardTextMarkup(it.text);
       } else if (itType === 'APP') {
         const appKey = it.app_key || it.appKey;
         const chk = await checkDashboardAppItem(appKey);
@@ -5931,7 +6103,7 @@ async function executeManageDashboards(args) {
 
     const dashId = generateDhis2Uid();
     const dashObj = { id: dashId, name: String(dash.name).trim(), dashboardItems };
-    if (dash.description) dashObj.description = String(dash.description);
+    if (dash.description) dashObj.description = clampDashboardDescription(dash.description);
 
     const payload = {};
     if (newVisualizations.length) payload.visualizations = newVisualizations;
@@ -6078,7 +6250,7 @@ async function executeManageDashboards(args) {
         di.eventVisualization = { id: evId };
         summary.push({ item_id: di.id, type: 'EVENT_VISUALIZATION', object_id: evId, object_name: er.displayName || null });
       } else if (itType === 'TEXT') {
-        di.text = String(it.text || '');
+        di.text = dashboardTextMarkup(it.text);
         summary.push({ item_id: di.id, type: 'TEXT' });
       } else if (itType === 'APP') {
         const appKey = it.app_key || it.appKey;
@@ -6261,7 +6433,7 @@ async function executeManageDashboards(args) {
     if (!backup.ok) return backup.error;
     const applied = {};
     if (d.name !== undefined) { owner.name = String(d.name); applied.name = owner.name; }
-    if (d.description !== undefined) { owner.description = String(d.description); applied.description = owner.description; }
+    if (d.description !== undefined) { owner.description = clampDashboardDescription(d.description); applied.description = owner.description; }
     if (Object.keys(applied).length === 0) return { _error: 'dashboard supplied no recognized own-fields to update.', _hint: 'Recognized: name, description. For tiles use add_items / remove_item.', backup: backup.block };
     const result = await postMetadataPayload({ dashboards: [owner] }, false);
     if (!result.success) return { _error: result._error || 'update failed.', phase: result.phase, errors: result.errors, backup: backup.block };

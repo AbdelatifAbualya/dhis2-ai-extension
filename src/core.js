@@ -596,9 +596,24 @@ function rememberRefusedWrite(toolName, action, descriptor) {
   dhis2.lastRefusedWrites = [...prev, entry].slice(-20);
 }
 
+// An app the assistant built in this conversation, kept to the same write access:
+// when it does not work, the user reporting that or the install check finding it
+// is reason enough to repair it (backed up first, rollback available). ANC Follow-up
+// Explorer thread: every repair cost the user a separate "yes". Never when the user
+// said to change nothing.
+function ownAppRepairAllowed(toolName, action, descriptor, wa) {
+  if (toolName !== 'manage_custom_app' || action !== 'update' || !descriptor || descriptor.own_app_same_access !== true) return false;
+  if (/no changes/.test(String(wa.reason || ''))) return false;
+  return wa.scope !== 'read_only' || /reported a problem/.test(String(wa.reason || ''));
+}
+
 function requireWriteAuth(toolName, action, descriptor) {
   const wa = dhis2.writeAuth || {};
   const scope = wa.scope || 'read_only';
+  if (ownAppRepairAllowed(toolName, action, descriptor, wa)) {
+    if (dhis2.lastRefusedWrite && dhis2.lastRefusedWrite.tool === toolName) dhis2.lastRefusedWrite = null;
+    return null;
+  }
   const cls = writeActionClass(toolName, action, descriptor);
   if (scope === 'broad') {
     // Bound to the kind of change the user asked for: "create a dashboard"
@@ -909,6 +924,36 @@ function seedKnownIcons() {
 // this Map, so the probe still errors the way it always has.
 function seedRecentCreations() {
   dhis2.recentCreations = new Map();
+}
+
+// What this turn really saved, by kind, handed back with every write. Malaria
+// thread, 2026-11-03: the final answer said five visualizations; there were eight.
+const TURN_LEDGER_KEYS = Object.freeze({
+  visualization_id: 'visualizations', map_id: 'maps', line_list_id: 'line lists', legend_set_id: 'legend sets',
+  indicator_id: 'indicators', program_indicator_ids: 'program indicators', program_indicator_id: 'program indicators',
+});
+function noteTurnLedger(toolName, args, result) {
+  if (!result || typeof result !== 'object' || result._error || result.dry_run || result.success === false) return null;
+  if (result._idempotent_reuse || result._idempotent_replay) return null; // not new
+  const action = String(args?.action || '');
+  const led = dhis2.turnLedger || (dhis2.turnLedger = {});
+  if (action === 'delete') {
+    const gone = [args?.object_id, args?.map_id, args?.line_list_id, args?.visualization_id, args?.dashboard_id, args?.indicator_id, args?.program_indicator_id, args?.legend_set_id, args?.id].filter(Boolean);
+    let hit = false;
+    for (const set of Object.values(led)) for (const id of gone) if (set.delete(id)) hit = true;
+    if (!hit) return null;
+  } else if (/^(?:create|add_items)/.test(action)) {
+    const add = (kind, id) => { if (typeof id === 'string' && id) (led[kind] || (led[kind] = new Set())).add(id); };
+    for (const [key, kind] of Object.entries(TURN_LEDGER_KEYS)) {
+      const v = result[key];
+      if (Array.isArray(v)) v.forEach(id => add(kind, id)); else add(kind, v);
+    }
+    for (const o of Array.isArray(result.new_visualizations) ? result.new_visualizations : []) add('visualizations', o?.id);
+    if (action === 'create_dashboard') add('dashboards', result.dashboard_id);
+    if (!Object.keys(led).length) return null;
+  } else return null;
+  const parts = Object.entries(led).filter(([, set]) => set.size).map(([kind, set]) => `${set.size} ${set.size === 1 ? kind.replace(/s$/, '') : kind}`);
+  return parts.length ? parts.join(', ') : null;
 }
 
 function recordRecentCreation(kind, name, id, summary) {
@@ -1465,6 +1510,10 @@ function noProgressStopOrNull(toolName, args) {
 // The counter (dhis2.consecutiveDiscoveryCalls) is reset by the agent loop on
 // any successful non-discovery (write/action) call and at the start of a turn.
 const DISCOVERY_STREAK_LIMIT = 12;
+// A long request with many parts has more to look up before its first write: an
+// eight-part dashboard on a program with existing indicators hit 12 while reading
+// them (Malaria replay, 2026-11-03).
+const discoveryStreakLimit = () => (String(typeof lastUserText === 'string' ? lastUserText : '').length > 800 ? 20 : DISCOVERY_STREAK_LIMIT);
 const DISCOVERY_ONLY_TOOLS = new Set([
   'architect_metadata',            // lookup_schema/check_existing/verify/browse_docs/inspect — all read-only
   'search_metadata', 'count_records', 'get_program_info',
@@ -1500,7 +1549,7 @@ function discoveryStreakStopOrNull(toolName, args) {
   const scope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
   if (scope === 'read_only') return null;
   const streak = dhis2.consecutiveDiscoveryCalls || 0;
-  if (streak < DISCOVERY_STREAK_LIMIT) return null;
+  if (streak < discoveryStreakLimit()) return null;
   return {
     _error: `STOP researching: ${streak} read-only/discovery calls in a row this turn with NOTHING created or changed. You already have enough information to act.`,
     _hint: `Issue the actual write the task needs NOW (an app or plugin: manage_custom_app preview; data no endpoint has: manage_sql_views create). To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
@@ -3254,6 +3303,64 @@ async function analyticsCacheMismatch(cleanPath, data) {
   };
 }
 
+// Tracker list parameters differ per endpoint, and a wrong name is usually ignored
+// WITHOUT an error. Verified on 2.42.5, 2.42.7 and 2.43.2 (2026-11-03) by comparing
+// totals:
+//   enrollments, trackedEntities: orgUnit → 400 "At least one org unit is required";
+//     the name is orgUnits (comma-separated; ";" is a 400)
+//   events: orgUnits → the same 400; the name is orgUnit
+//   events: enrollment=<id> is IGNORED: 1000 rows, 992 of them other registrations'.
+//     The name is enrollments
+//   ouMode, programStartDate/EndDate, eventStatus, stage, startDate/endDate,
+//     trackedEntity on trackedEntities: ignored, the answer is unfiltered or empty
+//   orgUnit(s)=USER_ORGUNIT → 400 (not a UID); a mode that needs an org unit, with
+//     none → 400
+// ANC Follow-up Explorer thread: an app sent orgUnit= to tracker/enrollments, this
+// assistant's own prompt taught that form, the 400 was blamed on something else, and
+// two rounds of "fixes" changed nothing. count_records' tracker fallback sent it too.
+// 2.41 is from its documentation: no such server was available to test.
+// Pure and self-contained: its source is also written into every generated app's
+// app-guard.js. Works on a path or a full URL; anything else comes back unchanged.
+function normalizeTrackerQuery(pathOrUrl, apiVersion) {
+  var s = String(pathOrUrl || '');
+  var q = s.indexOf('?');
+  if (q === -1 || !(Number(apiVersion) >= 41)) return s;
+  var m = s.slice(0, q).match(/(?:^|\/)tracker\/(enrollments|events|trackedEntities)\/?$/);
+  if (!m) return s;
+  var kind = m[1];
+  var names = {
+    enrollments: { ouMode: 'orgUnitMode', orgUnit: 'orgUnits', programStartDate: 'enrolledAfter', programEndDate: 'enrolledBefore', enrollmentEnrolledAfter: 'enrolledAfter', enrollmentEnrolledBefore: 'enrolledBefore', enrollmentStatus: 'status' },
+    trackedEntities: { ouMode: 'orgUnitMode', orgUnit: 'orgUnits', programStartDate: 'enrollmentEnrolledAfter', programEndDate: 'enrollmentEnrolledBefore', trackedEntity: 'trackedEntities' },
+    events: { ouMode: 'orgUnitMode', orgUnits: 'orgUnit', enrollment: 'enrollments', startDate: 'occurredAfter', endDate: 'occurredBefore', eventStatus: 'status', stage: 'programStage' },
+  }[kind];
+  var ouName = kind === 'events' ? 'orgUnit' : 'orgUnits';
+  var parts = s.slice(q + 1).split('&').filter(Boolean).map(function (p) {
+    var i = p.indexOf('=');
+    return { name: i === -1 ? p : p.slice(0, i), value: i === -1 ? '' : p.slice(i + 1) };
+  });
+  var has = function (n) { return parts.some(function (p) { return p.name === n; }); };
+  var out = [];
+  parts.forEach(function (p) {
+    var right = Object.prototype.hasOwnProperty.call(names, p.name) ? names[p.name] : null;
+    if (right && has(right)) return; // the right name is there too: the wrong one means nothing
+    out.push({ name: right || p.name, value: p.value });
+  });
+  var own = function (n) { for (var i = 0; i < out.length; i++) if (out[i].name === n) return out[i]; return null; };
+  var ou = own(ouName);
+  var mode = own('orgUnitMode');
+  if (ou) {
+    if (kind !== 'events') ou.value = ou.value.replace(/;|%3B/gi, ',');
+    var isUser = /^USER_ORGUNIT(?:_CHILDREN|_GRANDCHILDREN)?$/i.test(ou.value);
+    if (isUser || !ou.value) {
+      out.splice(out.indexOf(ou), 1);
+      ou = null;
+      if (isUser) { if (mode) mode.value = 'CAPTURE'; else out.push(mode = { name: 'orgUnitMode', value: 'CAPTURE' }); }
+    }
+  }
+  if (!ou && mode && /^(?:DESCENDANTS|SELECTED|CHILDREN)$/i.test(mode.value)) mode.value = 'ACCESSIBLE';
+  return s.slice(0, q) + '?' + out.map(function (p) { return p.name + '=' + p.value; }).join('&');
+}
+
 // DHIS2 caches analytics/events/aggregate answers WITHOUT the program or stage in
 // the key: with caching on, every program answered 213 (true: 213, 133, 135, 20)
 // and every stage 87 (true: 87, 64, 57, 0), still so after 70 s, with no error
@@ -3298,13 +3405,8 @@ async function safeDhis2Fetch(path, options = {}) {
       _refused_path: true,
     };
   }
-  // tracker/* on 2.41+ takes orgUnitMode; the old ouMode is ignored WITHOUT
-  // an error (verified 2.42.7 and 2.43.2: ouMode=DESCENDANTS answers 0, i.e.
-  // SELECTED), so internal counts that sent it read 0 below a country.
-  if (Number(dhis2.apiVersion) >= 41 && /^tracker\/(?:events|enrollments|trackedEntities)\b[^?]*\?/.test(cleanPath)
-      && /[?&]ouMode=/.test(cleanPath) && !/[?&]orgUnitMode=/.test(cleanPath)) {
-    cleanPath = cleanPath.replace(/([?&])ouMode=/, '$1orgUnitMode=');
-  }
+  // Internal counts and pages used the older names: see normalizeTrackerQuery.
+  if (String(options?.method || 'GET').toUpperCase() === 'GET') cleanPath = normalizeTrackerQuery(cleanPath, dhis2.apiVersion);
   const qIdx = cleanPath.indexOf('?');
   let fullUrl;
   if (qIdx !== -1) {
@@ -4992,6 +5094,81 @@ async function routeProgramIndicatorAnalytics(path) {
   }
   const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x));
   return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true };
+}
+
+// An average or sum on event analytics names its item in value=; aggregationType
+// without it is a 409 "Value dimension or aggregate data must be specified" (verified
+// 2.42.7, inpatient test 2026-11-03: dimension=<stage>.<age>&aggregationType=AVERAGE).
+// One item given as a dimension moves to value=. A count needs no aggregation type
+// at all (with or without a field to split by; same 409, tracker test 2026-11-03).
+// Anything else is left for the server to answer. Pure.
+function healEventAggregationValue(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q === -1 || !/^\/?analytics\/events\/aggregate\//i.test(p)) return { path: p, healed: false };
+  const parts = p.slice(q + 1).split('&');
+  const aggPart = parts.find(x => /^aggregationType=/i.test(x));
+  if (!aggPart || parts.some(x => /^value=/i.test(x))) return { path: p, healed: false };
+  const items = parts.filter(x => /^dimension=(?:[A-Za-z][A-Za-z0-9]{10}(?:\.|%2E))?[A-Za-z][A-Za-z0-9]{10}$/i.test(x));
+  const kind = aggPart.split('=')[1].toUpperCase();
+  if (kind === 'COUNT' || kind === 'DEFAULT') {
+    return { path: `${p.slice(0, q)}?${parts.filter(x => x !== aggPart).join('&')}`, healed: true, note: `aggregationType=${kind} was dropped: event analytics counts events by default.` };
+  }
+  if (items.length !== 1) return { path: p, healed: false };
+  const item = items[0].slice('dimension='.length).split(/\.|%2E/i).pop();
+  return { path: `${p.slice(0, q)}?${[...parts.filter(x => x !== items[0]), `value=${item}`].join('&')}`, healed: true, note: `${item} was moved from dimension= to value=: an ${kind} on event analytics names its item in value=.` };
+}
+
+// A collection read of eventVisualizations or maps answers columns: [], rows: [] and
+// filters: [] for every object; only a read of ONE object fills them (verified 2.42.7
+// and 2.43.2, 2026-11-03). A model read that as "saved with no columns and no period",
+// rewrote two healthy line lists and reported a defect that did not exist. Pure.
+function collectionReadEmptyAxesNote(path) {
+  const p = String(path || '');
+  const base = p.split('?')[0].replace(/^\/+/, '').replace(/\.json$/i, '');
+  if (!/^(?:eventVisualizations|maps)$/i.test(base)) return null;
+  let query = p.split('?')[1] || '';
+  try { query = decodeURIComponent(query); } catch { /* keep the raw form */ }
+  const fields = (query.match(/(?:^|&)fields=([^&]*)/i) || [])[1] || '';
+  if (!/\b(?:columns|rows|filters)\b|:all|\*/.test(fields)) return null;
+  const kind = /^maps$/i.test(base) ? 'map layers' : 'line lists';
+  return `Empty columns, rows and filters in this answer mean nothing: DHIS2 fills them only when ONE object is read. These ${kind} are not empty, and nothing here is a reason to rebuild them. To see a layout use ${kind === 'map layers' ? 'manage_maps(action="get", map_id)' : 'manage_line_lists(action="get", line_list_id)'}.`;
+}
+
+// filter=id:in:a,b without brackets → 400 "Collection size must be integer"
+// (Malaria replay, 2026-11-03). The meaning is plain, so add them. Pure.
+function healBareInFilter(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q === -1) return p;
+  const parts = p.slice(q + 1).split('&').map((part) => {
+    if (!/^filter=/i.test(part)) return part;
+    let value;
+    try { value = decodeURIComponent(part.slice(7)); } catch { return part; }
+    const m = value.match(/^([\w.]+):(!?in):(?!\[)(.+)$/);
+    return m ? `filter=${m[1]}:${m[2]}:[${m[3]}]` : part;
+  });
+  return `${p.slice(0, q)}?${parts.join('&')}`;
+}
+
+// A record's id is not an analytics dimension: psi, event, eventId and EVENT_ID
+// all answer 409 (verified 2.42.7, Malaria thread 2026-11-03, where the model was
+// looking for an id column for a table). Pure.
+function analyticsRecordIdDimension(path) {
+  const p = String(path || '');
+  if (!/^\/?analytics\/(?:events|enrollments)\//i.test(p)) return null;
+  const query = p.split('?')[1] || '';
+  for (const part of query.split('&')) {
+    const m = part.match(/^(?:dimension|filter)=([^:;%&]+)/i);
+    if (m && /^(?:psi|pi|tei|event|enrollment|uid|id|event_?id|event_?uid|enrollment_?id|tracked_?entity(?:_?id)?)$/i.test(m[1])) {
+      return {
+        _error: `Not sent: "${m[1]}" is not an analytics dimension, so DHIS2 would answer 409. Records have no id dimension, and a saved line list has no id column either.`,
+        _hint: 'For a table of records use manage_line_lists with the fields that exist and say under "Changed from your request" that the identifier could not be included.',
+        _scope: 'analytics_no_record_id',
+      };
+    }
+  }
+  return null;
 }
 
 async function validateAnalyticsProgramId(path) {

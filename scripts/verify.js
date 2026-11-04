@@ -4023,6 +4023,303 @@ async function runSecurityReviewChecks() {
   }
 }
 
+// ── Malaria Testing and Treatment Review thread (2026-11-03, play 2.42.7) ─────
+// Two charts saved with no category showed "There was an error loading data"; the
+// line-list tool was not offered for "a detailed table of events" while a refusal
+// said it was; a metadata-only request ran 13 analytics queries; a 600-point bubble
+// map was one blob; **bold** showed its stars on a text tile.
+async function runMalariaThreadChecks() {
+  console.log('\nMalaria thread (charts need a category, line lists reachable, metadata only):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const pis = Array.from({ length: 12 }, (_, i) => `piA${String(i).padStart(8, '0')}`);
+  const typeMap = Object.fromEntries(pis.map(id => [id, 'PROGRAM_INDICATOR']));
+  const build = (over) => ctx.buildVisualizationObject({ name: 'T', vis_type: 'BAR', data_items: pis, periods: ['2026'], org_units: ['ImspTQPwCqd'], ...over }, typeMap);
+  const axes = (b) => `${(b.viz.rowDimensions || []).join('+')}|${(b.viz.columnDimensions || []).join('+')}|${(b.viz.filterDimensions || []).join('+')}`;
+
+  const noCat = build({ layout: { columns: ['dx'], rows: [], filters: ['ou', 'pe'] } });
+  truthy('several data items, one period, one place, no category: the items become the bars', axes(noCat) === 'dx|pe|ou');
+  truthy('…and the model is told', /without a category/.test(noCat.layoutNote || ''));
+  truthy('…keep_layout does not save a chart that cannot draw', axes(build({ keep_layout: true, layout: { columns: ['dx'], rows: [], filters: ['ou', 'pe'] } })) === 'dx|pe|ou');
+  truthy('no category with one data item: the period is the category', axes(build({ data_items: pis.slice(0, 1), layout: { columns: ['dx'], filters: ['ou', 'pe'] } })) === 'pe|dx|ou');
+  truthy('no category with a level in the filter: the units are the category', axes(build({ org_units: ['ImspTQPwCqd', 'LEVEL-2'], layout: { columns: ['dx'], rows: [], filters: ['ou', 'pe'] } })) === 'ou|dx|pe');
+  truthy('no category with months in the filter: the months are the category', axes(build({ periods: ['LAST_12_MONTHS'], layout: { columns: ['dx'], rows: [], filters: ['ou', 'pe'] } })) === 'pe|dx|ou');
+  truthy('a radar needs a category too', axes(build({ vis_type: 'RADAR' })) === 'dx|pe|ou');
+  truthy('pie, gauge and single value still have none', ['PIE', 'GAUGE', 'SINGLE_VALUE'].every(t => (build({ vis_type: t }).viz.rowDimensions || []).length === 0));
+  truthy('data items on the axis with one period are left there', axes(build({ layout: { category: ['dx'], series: ['pe'], filters: ['ou'] } })) === 'dx|pe|ou');
+  truthy('data items on the axis with twelve months are still swapped', axes(build({ periods: ['LAST_12_MONTHS'], layout: { category: ['dx'], series: ['pe'], filters: ['ou'] } })) === 'pe|dx|ou');
+  truthy('a dimension sent on two axes is saved on one', axes(build({ periods: ['LAST_12_MONTHS'], layout: { series: ['dx'], category: ['pe'], filters: ['pe', 'ou'] } })) === 'pe|dx|ou');
+  truthy('a pivot layout is untouched', axes(build({ vis_type: 'PIVOT_TABLE', layout: { rows: ['ou'], columns: ['dx'], filters: ['pe'] } })) === 'ou|dx|pe');
+
+  const need = (rows, vt) => ctx.dashTileNeeds({ itemType: 'VISUALIZATION', vizType: vt, name: 'x', rows: [{ dimension: 'dx', items: pis.slice(0, rows) }], columns: [{ dimension: 'pe', items: ['2026'] }] });
+  truthy('long labels on the axis take the full width', need(9, 'COLUMN').wide === true && need(4, 'COLUMN').wide === false);
+  truthy('horizontal bars get a line each', ctx.dashTileNeeds({ itemType: 'VISUALIZATION', vizType: 'BAR', name: 'x', rows: [{ dimension: 'dx', items: Array(20).fill('a') }], columns: [] }).h >= 30);
+
+  const y = ctx.namedYearPeriods;
+  truthy('a named year fixes "this year" periods', JSON.stringify(y(['THIS_YEAR'], 'Start with 2026 across all locations').periods) === '["2026"]');
+  truthy('…months', y(['MONTHS_THIS_YEAR'], 'for 2026').periods.length === 12 && y(['MONTHS_THIS_YEAR'], 'for 2026').periods[11] === '202612');
+  truthy('…quarters', y(['QUARTERS_THIS_YEAR'], 'for 2026').periods[3] === '2026Q4');
+  truthy('no year, two years, or "this year" in the request: left relative',
+    y(['THIS_YEAR'], 'monthly chart') === null && y(['THIS_YEAR'], '2025 and 2026') === null && y(['THIS_YEAR'], 'this year against 2025') === null);
+  truthy('other relative periods are left alone', y(['LAST_12_MONTHS'], 'for 2026') === null);
+
+  truthy('a text tile\'s **bold** becomes *bold*, __italic__ becomes _italic_', ctx.dashboardTextMarkup('a **b c** d __e__ *f*') === 'a *b c* d _e_ *f*');
+
+  const toolsFor = (text, appType = 'Maintenance') => ctx.getContextualTools({ appType }, text, false, text).map(t => t.function.name);
+  truthy('"a detailed table of events" offers the line-list tool', toolsFor('A detailed table of events recorded as Referred ACT stockout, showing date and facility').includes('manage_line_lists'));
+  truthy('"a table of Positive or Mixed RDT events" offers it', toolsFor('A separate table of Positive or Mixed RDT events ordered by date').includes('manage_line_lists'));
+  truthy('any dashboard request offers line lists, maps and legend sets', ['manage_line_lists', 'manage_maps', 'manage_legend_sets'].every(n => toolsFor('Create a dashboard called X').includes(n)));
+  truthy('so does the Dashboard app', toolsFor('add a tile', 'Dashboard').includes('manage_line_lists'));
+  truthy('an unrelated question does not', !toolsFor('how many data elements does this program have').includes('manage_line_lists'));
+
+  const m = ctx.userAskedMetadataOnly;
+  truthy('"use metadata only during development" is a metadata-only request', m('Discover it yourself. Use metadata only during development.'));
+  truthy('…"do not fetch any data"', m('Build it but do not fetch any data'));
+  truthy('…not "metadata-only sharing", "export metadata only", "do not touch the data", "no patient data"',
+    !m('create it with metadata only sharing') && !m('export metadata only') && !m('change the form, do not touch the data') && !m('Check definitions without fetching patient data'));
+  {
+    const d = vm.runInContext('dhis2', ctx);
+    const was = d.metadataOnlyTurn;
+    d.metadataOnlyTurn = true;
+    const gate = ctx.metadataOnlyGate;
+    truthy('metadata only: analytics is refused', /metadata only/.test(gate('dhis2_query', { path: 'analytics?dimension=dx:a' })?._error || ''));
+    truthy('…event aggregates too', !!gate('dhis2_query', { path: '/api/42/analytics/events/aggregate/abcdefghij1?dimension=x' }));
+    truthy('…record counts too', !!gate('count_records', { record_type: 'events' }));
+    truthy('…metadata reads pass', gate('dhis2_query', { path: 'programs?fields=id' }) === null && gate('get_program_info', {}) === null);
+    truthy('…a write passes (the write gates decide)', gate('dhis2_query', { path: 'analytics', method: 'POST' }) === null);
+    const a = { visualization_id: 'x' };
+    truthy('…a chart can be read, without its values', gate('get_visualization_details', a) === null && a.include_analytics_preview === false);
+    d.metadataOnlyTurn = false;
+    truthy('off: nothing is refused', gate('dhis2_query', { path: 'analytics?dimension=dx:a' }) === null);
+    d.metadataOnlyTurn = was;
+  }
+
+  const idDim = ctx.analyticsRecordIdDimension;
+  truthy('a record id is refused as an analytics dimension', ['psi', 'event', 'eventId', 'EVENT_ID'].every(n => /not an analytics dimension/.test(idDim(`analytics/events/aggregate/abcdefghij1?dimension=${n}&stage=x`)?._error || '')));
+  truthy('…a real dimension passes', idDim('analytics/events/aggregate/abcdefghij1?dimension=ou:ImspTQPwCqd&dimension=hKZh1et5n7v') === null);
+  truthy('…other endpoints are not affected', idDim('analytics?dimension=event') === null);
+
+  const mapBuilt = (over) => ctx.buildMapObject({ name: 'M', data_item: 'piA00000000', org_unit_level: 4, thematic_map_type: 'BUBBLE', period: '2026', ...over }, typeMap).map.mapViews.find(v => v.layer === 'thematic');
+  truthy('600 facilities get small bubbles', mapBuilt({ _drawn_units: 601 }).radiusLow === 2 && mapBuilt({ _drawn_units: 601 }).radiusHigh === 10 && mapBuilt({ _drawn_units: 601 }).opacity === 0.75);
+  truthy('13 districts keep the usual sizes', mapBuilt({ _drawn_units: 13 }).radiusHigh === 30);
+  truthy('asked-for sizes win', mapBuilt({ _drawn_units: 601, radius_low: 4, radius_high: 20 }).radiusHigh === 20);
+  truthy('a choropleth has no radius', mapBuilt({ thematic_map_type: 'CHOROPLETH' }).radiusHigh === undefined);
+
+  const llCtx = { program: { name: 'P', programType: 'WITHOUT_REGISTRATION' }, stages: [], stagesById: new Map(), teas: new Map(), des: new Map([['deIdentif01', { id: 'deIdentif01', name: 'Case number', stageIds: ['stageOnly01'] }]]), pis: new Map(), teaByName: new Map(), deByName: new Map([['case number', 'deIdentif01']]), piByName: new Map() };
+  const idCol = await ctx.lineListResolveDimension('Event ID', llCtx, 'EVENT', new Map(), 'column');
+  truthy('a line list refuses an event id column and says what to do', idCol._scope === 'line_list_no_record_id' && /Changed from your request/.test(idCol._hint));
+  const psiCol = await ctx.lineListResolveDimension('psi', llCtx, 'EVENT', new Map(), 'column');
+  truthy('…and "psi"', psiCol._scope === 'line_list_no_record_id');
+  const realCol = await ctx.lineListResolveDimension('Case number', llCtx, 'EVENT', new Map(), 'column');
+  truthy('…but a real field named like one is the field', realCol._scope !== 'line_list_no_record_id');
+
+  {
+    const d = vm.runInContext('dhis2', ctx);
+    const was = d.turnLedger;
+    d.turnLedger = {};
+    const led = ctx.noteTurnLedger;
+    led('manage_program_indicators', { action: 'create' }, { success: true, program_indicator_ids: ['a', 'b', 'c'] });
+    led('manage_dashboards', { action: 'create_visualization' }, { success: true, visualization_id: 'v1' });
+    led('manage_dashboards', { action: 'create_visualization' }, { success: true, visualization_id: 'v2' });
+    led('manage_maps', { action: 'create' }, { success: true, map_id: 'm1' });
+    const afterDash = led('manage_dashboards', { action: 'create_dashboard' }, { success: true, dashboard_id: 'd1', new_visualizations: [{ id: 'v3' }] });
+    truthy('the ledger counts what was saved', afterDash === '3 program indicators, 3 visualizations, 1 map, 1 dashboard');
+    truthy('…a deleted object leaves it', led('manage_metadata', { action: 'delete', object_type: 'visualizations', object_id: 'v2' }, { success: true }) === '3 program indicators, 2 visualizations, 1 map, 1 dashboard');
+    truthy('…a failure or a dry run changes nothing', led('manage_maps', { action: 'create' }, { _error: 'x' }) === null && led('manage_maps', { action: 'create' }, { dry_run: true, map_id: 'zz' }) === null);
+    d.turnLedger = was;
+  }
+
+  const held = (over, type = 'WITH_REGISTRATION') => { const pi = { name: 'P', analyticsType: 'EVENT', aggregationType: 'AVERAGE', expression: 'd2:condition("#{sssssssssss.ddddddddddd} < 2500", 100, 0)', filter: "V{program_stage_id} == 'sssssssssss'", ...over }; return { note: ctx.piOnlyHeldEvents(pi, type), filter: pi.filter }; };
+  truthy('a tracker percentage leaves scheduled visits out, like V{event_count}', /event_status/.test(held({}).filter) && /scheduled visits/.test(held({}).note));
+  truthy('…and a sum of a data element', /event_status/.test(held({ aggregationType: 'SUM' }).filter));
+  truthy('…with no filter, the filter is the status', held({ filter: '' }).filter === "(V{event_status} == 'ACTIVE' || V{event_status} == 'COMPLETED')");
+  truthy('…an OR filter is bracketed first, so the status applies to all of it', held({ filter: "#{sssssssssss.ddddddddddd} > 1 || #{sssssssssss.eeeeeeeeeee} > 1" }).filter.startsWith('(#{'));
+  truthy('…an event program, a plain count, an enrollment indicator and a filter already on status are left alone',
+    held({}, 'WITHOUT_REGISTRATION').note === null && held({ aggregationType: 'COUNT', expression: 'V{event_count}' }).note === null
+    && held({ analyticsType: 'ENROLLMENT' }).note === null && held({ filter: "V{event_status} == 'SCHEDULE'" }).note === null);
+  const axes2 = ctx.collectionReadEmptyAxesNote;
+  truthy('a collection read of line lists or maps asking for their layout is told the empties mean nothing',
+    /mean nothing/.test(axes2('eventVisualizations?fields=id,columns&filter=id:in:[a,b]') || '') && /manage_maps/.test(axes2('maps?fields=mapViews%5Bcolumns%5D') || '') && /mean nothing/.test(axes2('eventVisualizations.json?fields=:all') || ''));
+  truthy('…one object, other fields and other resources get no note',
+    axes2('eventVisualizations/abcdefghij1?fields=columns') === null && axes2('maps?fields=id,name') === null && axes2('visualizations?fields=columns') === null);
+  const agg = ctx.healEventAggregationValue;
+  const av = agg('analytics/events/aggregate/abcdefghij1?dimension=ou:ImspTQPwCqd&dimension=Zj7UnCAulEk.qrur9Dvnyt5&stage=Zj7UnCAulEk&aggregationType=AVERAGE');
+  truthy('an event average names its item in value=', av.healed && /value=qrur9Dvnyt5/.test(av.path) && !/dimension=Zj7UnCAulEk/.test(av.path));
+  truthy('…a count drops the aggregation type', !/aggregationType/.test(agg('analytics/events/aggregate/abcdefghij1?dimension=ou:x&aggregationType=COUNT').path));
+  truthy('…also when split by a field', (() => { const r = agg('analytics/events/aggregate/abcdefghij1?dimension=ou:x&stage=s&dimension=UXz7xuGCEhU&aggregationType=COUNT'); return r.healed && !/aggregationType/.test(r.path) && /dimension=UXz7xuGCEhU/.test(r.path); })());
+  truthy('…value= already there, two items, or another endpoint: untouched',
+    !agg('analytics/events/aggregate/abcdefghij1?value=qrur9Dvnyt5&aggregationType=AVERAGE').healed
+    && !agg('analytics/events/aggregate/abcdefghij1?dimension=qrur9Dvnyt5&dimension=oZg33kd9taw&aggregationType=AVERAGE').healed
+    && !agg('analytics?dimension=dx:a&aggregationType=AVERAGE').healed);
+  const heal = ctx.healBareInFilter;
+  truthy('filter=id:in:a,b gets its brackets', heal('visualizations?fields=id&filter=id:in:aaa,bbb&pageSize=5') === 'visualizations?fields=id&filter=id:in:[aaa,bbb]&pageSize=5');
+  truthy('…also percent-encoded, and !in', heal('visualizations?filter=id%3Ain%3Aaaa%2Cbbb') === 'visualizations?filter=id:in:[aaa,bbb]' && heal('x?filter=level:!in:1,2') === 'x?filter=level:!in:[1,2]');
+  truthy('…a correct or other filter is left alone', heal('x?filter=id:in:[a,b]') === 'x?filter=id:in:[a,b]' && heal('x?filter=name:ilike:in:a') === 'x?filter=name:ilike:in:a' && heal('x?fields=id') === 'x?fields=id');
+  truthy('a long multi-part request gets more look-ups than a short one', (() => { const f = vm.runInContext('discoveryStreakLimit', ctx); vm.runInContext('lastUserText = "short"', ctx); const a = f(); vm.runInContext(`lastUserText = ${JSON.stringify('x'.repeat(900))}`, ctx); const b = f(); vm.runInContext('lastUserText = ""', ctx); return a === 12 && b === 20; })());
+  truthy('a dashboard description over 255 characters is shortened, not refused', (() => { const t = ctx.dashboardTextMarkup; const out = ctx.clampDashboardDescription('Measures describe recorded events. '.repeat(12)); return out.length <= 255 && out.endsWith('…') && ctx.clampDashboardDescription('short') === 'short'; })());
+  {
+    const saved = ctx.safeDhis2Fetch; const d = vm.runInContext('dhis2', ctx);
+    ctx.safeDhis2Fetch = async (p) => (/^organisationUnitLevels/.test(p) ? { organisationUnitLevels: [{ level: 2, displayName: 'District' }, { level: 3, displayName: 'Chiefdom' }, { level: 4, displayName: 'Facility' }] } : {});
+    d.orgLevelNames = null;
+    try {
+      const w = ctx.orgLevelNameWarning;
+      truthy('a title saying district on level 3 (Chiefdom) is flagged', /level 2 on this server/.test(await w('Stockout % by district, 2026', ['ImspTQPwCqd'], 3) || ''));
+      truthy('…the same through LEVEL-3', /Chiefdom/.test(await w('Testing by District', ['LEVEL-3']) || ''));
+      truthy('…a plural name is matched', /level 4 on this server/.test(await w('Events by facilities', ['LEVEL-2']) || ''));
+      truthy('…the right level is not', await w('Stockout % by district', [], 2) === null);
+      truthy('…a facility map with district outlines in its title is not', await w('Facility events with district outlines', [], 4) === null);
+      truthy('…no level or no level name is not', await w('Stockout by district', ['ImspTQPwCqd']) === null && await w('Stockout map', [], 3) === null);
+    } finally { ctx.safeDhis2Fetch = saved; d.orgLevelNames = null; }
+    const fine = ctx.buildMapObject({ name: 'M', data_item: 'piA00000000', org_unit_level: 2, boundary_level: 3, period: '2026' }, typeMap);
+    truthy('finer outlines on a shaded map are left out and reported', fine.map.mapViews.length === 1 && /left out/.test(fine.boundaryNote || ''));
+    const coarse = ctx.buildMapObject({ name: 'M', data_item: 'piA00000000', org_unit_level: 4, boundary_level: 2, thematic_map_type: 'BUBBLE', period: '2026' }, typeMap);
+    truthy('district outlines under a facility bubble map stay', coarse.map.mapViews.length === 2 && !coarse.boundaryNote);
+  }
+  {
+    const saved = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (/^visualizations\?filter=dataDimensionItems\.programIndicator/.test(p) ? { visualizations: [{ id: 'v1', name: 'Chart' }] } : /^maps\?/.test(p) ? { maps: [{ id: 'm1', name: 'Map' }] } : {});
+    try {
+      const used = await ctx.savedOutputsUsingDataItem('programIndicator', 'pi1');
+      truthy('the charts and maps plotting an indicator are found', used.length === 2 && used[0].type === 'chart' && used[1].type === 'map');
+      truthy('…deleting it is refused with their names', /Chart/.test(ctx.dataItemInUseRefusal('x', used)._error));
+      const r = await ctx.checkMetadataReferences('programIndicators', 'pi1');
+      truthy('…manage_metadata sees them as references too', r.has_references === true);
+    } finally { ctx.safeDhis2Fetch = saved; }
+  }
+
+  truthy('a refusal\'s redirect goes on the wire', (() => { const s = vm.runInContext('_runAgenticLoopInner.toString()', ctx); return /toolResult\._redirect/.test(s) && /wireTools\.push\(\.\.\.toWireTools\(\[offered\]\)\)/.test(s); })());
+  const refs = ctx.safeDhis2Fetch;
+  ctx.safeDhis2Fetch = async (p) => (/^dashboards\?filter=dashboardItems\.visualization\.id/.test(p) ? { dashboards: [{ id: 'd1', name: 'Dash' }] } : {});
+  try {
+    const r = await ctx.checkMetadataReferences('visualizations', 'v1');
+    truthy('a chart on a dashboard has a reference, so manage_metadata will not silently remove its tile', r.has_references === true && /remove that tile/.test(ctx.buildDeletionHint('visualizations', 'v1', r.references)));
+  } finally { ctx.safeDhis2Fetch = refs; }
+}
+
+// ── ANC Follow-up Explorer thread (2026-11-03, play 2.42.7) ───────────────────
+// An app sent orgUnit= to tracker/enrollments (400) and enrollment= to tracker/events
+// (ignored: other registrations' events). This assistant's own prompt taught the first.
+// The model could not see the app run, called a wrong theory "verified", and shipped
+// two fixes that changed nothing. Installing took three extra rounds, a wrong URL and
+// a token limit the user had to raise by hand.
+async function runAncAppThreadChecks() {
+  console.log('\nANC app thread (tracker parameter names, install check, install intent, own-app repair, token budget):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const n = (s, v = 42) => ctx.normalizeTrackerQuery(s, v);
+  truthy('enrollments: orgUnit → orgUnits', n('tracker/enrollments?program=p&orgUnit=a&orgUnitMode=DESCENDANTS') === 'tracker/enrollments?program=p&orgUnits=a&orgUnitMode=DESCENDANTS');
+  truthy('trackedEntities: orgUnit → orgUnits', /orgUnits=a/.test(n('tracker/trackedEntities?orgUnit=a&orgUnitMode=DESCENDANTS')));
+  truthy('events: orgUnits → orgUnit', n('tracker/events?orgUnits=a&orgUnitMode=DESCENDANTS') === 'tracker/events?orgUnit=a&orgUnitMode=DESCENDANTS');
+  truthy('events: enrollment → enrollments (the name that leaked other registrations)', n('tracker/events?program=p&enrollment=e') === 'tracker/events?program=p&enrollments=e');
+  truthy('ouMode → orgUnitMode everywhere', ['enrollments', 'events', 'trackedEntities'].every(k => /orgUnitMode=DESCENDANTS/.test(n(`tracker/${k}?ouMode=DESCENDANTS&${k === 'events' ? 'orgUnit' : 'orgUnits'}=a`))));
+  truthy('enrollments: programStartDate/EndDate → enrolledAfter/Before', n('tracker/enrollments?programStartDate=2026-01-01&programEndDate=2026-12-31') === 'tracker/enrollments?enrolledAfter=2026-01-01&enrolledBefore=2026-12-31');
+  truthy('trackedEntities: programStartDate → enrollmentEnrolledAfter, trackedEntity → trackedEntities', n('tracker/trackedEntities?programStartDate=2026-01-01&trackedEntity=t') === 'tracker/trackedEntities?enrollmentEnrolledAfter=2026-01-01&trackedEntities=t');
+  truthy('events: startDate, eventStatus, stage', n('tracker/events?startDate=a&endDate=b&eventStatus=COMPLETED&stage=s') === 'tracker/events?occurredAfter=a&occurredBefore=b&status=COMPLETED&programStage=s');
+  truthy('orgUnits a;b → a,b', n('tracker/enrollments?orgUnits=a;b&orgUnitMode=DESCENDANTS') === 'tracker/enrollments?orgUnits=a,b&orgUnitMode=DESCENDANTS');
+  truthy('USER_ORGUNIT is not an id: it becomes the capture mode', n('tracker/enrollments?orgUnit=USER_ORGUNIT&orgUnitMode=DESCENDANTS') === 'tracker/enrollments?orgUnitMode=CAPTURE');
+  truthy('a mode that needs an org unit, with none: every record the viewer can reach', n('tracker/events?orgUnitMode=DESCENDANTS&program=p') === 'tracker/events?orgUnitMode=ACCESSIBLE&program=p');
+  truthy('an empty org unit counts as none', n('tracker/enrollments?orgUnit=&orgUnitMode=SELECTED') === 'tracker/enrollments?orgUnitMode=ACCESSIBLE');
+  truthy('the right name beats a wrong one sent with it', n('tracker/enrollments?orgUnit=a&orgUnits=b&orgUnitMode=DESCENDANTS') === 'tracker/enrollments?orgUnits=b&orgUnitMode=DESCENDANTS');
+  truthy('correct requests come back unchanged', ['tracker/enrollments?program=p&orgUnits=a&orgUnitMode=DESCENDANTS&enrolledAfter=2026-01-01&page=2', 'tracker/events?program=p&enrollments=e&paging=false', 'tracker/events?program=p&orgUnit=a&orgUnitMode=DESCENDANTS'].every(s => n(s) === s));
+  truthy('a full URL works, and other paths are left alone', n('https://x.org/api/42/tracker/enrollments?orgUnit=a&orgUnitMode=ALL') === 'https://x.org/api/42/tracker/enrollments?orgUnits=a&orgUnitMode=ALL' && n('programs?orgUnit=a') === 'programs?orgUnit=a' && n('tracker/enrollments/abc?orgUnit=a') === 'tracker/enrollments/abc?orgUnit=a');
+  truthy('2.40 keeps its own names', n('tracker/enrollments?orgUnit=a&ouMode=DESCENDANTS', 40) === 'tracker/enrollments?orgUnit=a&ouMode=DESCENDANTS');
+
+  const closed = ctx.customAppRecordsClosed;
+  truthy('install check: a tracker list asks for an empty window', ['enrollments', 'events', 'trackedEntities'].every(k => /updatedAfter=2099-01-01$/.test(closed(`/api/42/tracker/${k}?program=p`))));
+  truthy('…one record, SQL-view rows and old record endpoints are not sent', closed('/api/tracker/enrollments/abcdefghijk?fields=x') === null && closed('/api/sqlViews/abcdefghijk/data') === null && closed('/api/42/events?program=p') === null);
+  truthy('…row-level analytics adds skipData; metadata and aggregates pass', /skipData=true/.test(closed('/api/analytics/events/query/p?x=1')) && closed('/api/programs/p?fields=id') === '/api/programs/p?fields=id' && closed('/api/analytics?dimension=dx:a') === '/api/analytics?dimension=dx:a');
+
+  {
+    const dv = vm.runInContext('dhis2', ctx);
+    const savedVersion = dv.apiVersion;
+    dv.apiVersion = 42;
+    const guardSrc = ctx.buildCustomAppGuardJs({ needsWriteAccess: false });
+    dv.apiVersion = savedVersion;
+    const calls = [];
+    const win = { location: { origin: 'https://d.org', href: 'https://d.org/api/apps/x/index.html', search: '' }, fetch: (u) => { calls.push(String(u)); return Promise.resolve({ ok: true, status: 200 }); } };
+    win.XMLHttpRequest = function () {}; win.XMLHttpRequest.prototype.open = function (m, u) { calls.push(`xhr ${u}`); };
+    vm.runInNewContext(guardSrc, { window: win, navigator: {}, console: { error() {} }, URL, Promise, Error, String, Object, Number, Array, RegExp, Math, JSON });
+    await win.fetch('/api/42/tracker/enrollments?program=p&orgUnit=a&orgUnitMode=DESCENDANTS');
+    new win.XMLHttpRequest().open('GET', '/api/tracker/events?enrollment=e');
+    truthy('a generated app\'s guard corrects the names, on fetch and on XHR', /orgUnits=a/.test(calls[0]) && /enrollments=e/.test(calls[1]));
+    truthy('…and an ordinary open is not in check mode', !win.__aiAppCheck && !/updatedAfter=2099/.test(calls[0]));
+    const checkCalls = [];
+    const listeners = [];
+    const cw = { location: { origin: 'https://d.org', href: 'https://d.org/api/apps/x/index.html?__ai_check=1', search: '?redirect=false&__ai_check=1' }, addEventListener: (t, f) => listeners.push([t, f]), fetch: (u) => { checkCalls.push(String(u)); return Promise.resolve({ ok: false, status: 400, clone() { return { text: () => Promise.resolve('{"message":"At least one org unit"}') }; } }); } };
+    cw.XMLHttpRequest = function () {}; cw.XMLHttpRequest.prototype.open = function () {};
+    class FakeResponse { constructor(b, o) { this.status = o.status; this.ok = false; } }
+    const cons = { error() {} };
+    vm.runInNewContext(guardSrc.replace('var READ_ONLY = true', 'var READ_ONLY = false'), { window: cw, navigator: {}, console: cons, URL, Promise, Error, String, Object, Number, Array, RegExp, Math, JSON, Response: FakeResponse, Request: function () {} });
+    await cw.fetch('/api/42/tracker/enrollments?program=p&orgUnits=a&orgUnitMode=DESCENDANTS');
+    await new Promise(r => setImmediate(r));
+    const one = await cw.fetch('/api/42/tracker/enrollments/abcdefghijk');
+    const blocked = await cw.fetch('/api/dataStore/x/y', { method: 'POST' }).then(() => 'sent', () => 'blocked');
+    const L = cw.__aiAppCheck;
+    truthy('check mode: the list goes out with the empty window, and its status and DHIS2 message are logged', checkCalls.length === 1 && /updatedAfter=2099-01-01/.test(checkCalls[0]) && L.requests[0].status === 400 && /org unit/.test(L.requests[0].message));
+    truthy('…a single record is not sent, a write is refused', one.status === 404 && L.notOpened.length === 1 && blocked === 'blocked' && L.blockedWrites.length === 1 && checkCalls.length === 1);
+    cons.error('boom');
+    truthy('…script errors are logged', L.errors.some(e => /boom/.test(e)));
+  }
+
+  const asked = ctx.userAskedToInstall;
+  truthy('"Give me the finished app URL" asks for an installed app', asked('Create an app called X. Give me the finished app URL and explain what needs testing.'));
+  truthy('…"the link to the app", "install it"', asked('send me the link to the app') && asked('install it'));
+  truthy('…a plain "create an app", or "preview first", does not', !asked('Create an app called X') && !asked('Show me a preview first, then the finished app') && !asked('do not install it'));
+  {
+    const savedHist = vm.runInContext('conversationHistory', ctx);
+    vm.runInContext(`conversationHistory = [{ role: 'user', content: 'Create an app called X for Y with many parts. Give me the finished app URL when done.' }, { role: 'assistant', content: 'ok' }]; lastUserText = 'I increased the max tokens, continue';`, ctx);
+    truthy('"…, continue" keeps the install intent of the request it continues', asked(ctx.installIntentText()));
+    vm.runInContext(`lastUserText = 'getting this error'`, ctx);
+    truthy('…an unrelated short message does not inherit it', !asked(ctx.installIntentText()));
+    vm.runInContext('lastUserText = ""', ctx);
+    vm.runInContext(`conversationHistory = ${JSON.stringify(savedHist || [])}`, ctx);
+  }
+
+  const repair = ctx.ownAppRepairAllowed;
+  const own = { own_app_same_access: true };
+  truthy('repairing its own app: allowed on an error report, in a turn that approved something else, and in a broad turn',
+    repair('manage_custom_app', 'update', own, { scope: 'read_only', reason: 'user reported a problem — diagnose first' }) && repair('manage_custom_app', 'update', own, { scope: 'scoped' }) && repair('manage_custom_app', 'update', own, { scope: 'broad' }));
+  truthy('…not when the user said to change nothing, not on a plain question',
+    !repair('manage_custom_app', 'update', own, { scope: 'read_only', reason: 'the user asked for no changes (explain / read-only)' }) && !repair('manage_custom_app', 'update', own, { scope: 'read_only', reason: 'no explicit write authorization detected' }));
+  truthy('…not another app, a change of write access, another action or another tool',
+    !repair('manage_custom_app', 'update', { own_app_same_access: false }, { scope: 'scoped' }) && !repair('manage_custom_app', 'delete', own, { scope: 'scoped' }) && !repair('manage_maps', 'update', own, { scope: 'scoped' }));
+
+  {
+    const d = vm.runInContext('dhis2', ctx);
+    const was = d.raisedMaxTokens;
+    d.raisedMaxTokens = 0;
+    const effective = vm.runInContext('effectiveMaxTokens', ctx);
+    const raise = vm.runInContext('raiseMaxTokensAfterCut', ctx);
+    const refused = vm.runInContext('providerRefusedMaxTokens', ctx);
+    truthy('a cut doubles the budget, up to a ceiling, and stops raising there', effective({ maxTokens: 16384 }) === 16384 && raise({ maxTokens: 16384 }) === 32768 && effective({ maxTokens: 16384 }) === 32768 && raise({ maxTokens: 16384 }) === 64000 && raise({ maxTokens: 16384 }) === 0);
+    d.raisedMaxTokens = 0;
+    truthy('…a user setting above it stands', effective({ maxTokens: 100000 }) === 100000 && raise({ maxTokens: 100000 }) === 0);
+    truthy('…a provider refusing the number is recognised', refused(400, { error: { message: 'max_tokens is too large' } }) && !refused(400, { error: { message: 'bad model' } }) && !refused(500, { message: 'max_tokens' }));
+    d.raisedMaxTokens = was;
+  }
+
+  const prompt = vm.runInContext('TOOLS', ctx);
+  {
+    const applyEdits = ctx.applyCustomAppEdits;
+    const src = { 'app.jsx': 'const a = 1;\nconst b = 2;\nconst c = 1;' };
+    truthy('update edits: an exact, unique find is replaced', applyEdits(src, [{ file: 'src/app.jsx', find: 'const b = 2;', replace: 'const b = 3;' }]).ok && /const b = 3;/.test(src['app.jsx']));
+    const copy = { 'app.jsx': 'x y x' };
+    const miss = applyEdits(copy, [{ file: 'app.jsx', find: 'y', replace: 'z' }, { file: 'app.jsx', find: 'x', replace: 'w' }]);
+    truthy('…a find that matches twice refuses, and nothing is changed (all or nothing)', /occurs 2 times/.test(miss._error || '') && copy['app.jsx'] === 'x y x');
+    truthy('…no match, an unknown file and a malformed edit are refused', /occurs 0 times/.test(applyEdits(copy, [{ file: 'app.jsx', find: 'q', replace: 'r' }])._error || '') && /no file/.test(applyEdits(copy, [{ file: 'nope.jsx', find: 'x', replace: 'r' }])._error || '') && /needs file/.test(applyEdits(copy, [{ file: 'app.jsx' }])._error || ''));
+    truthy('…no edits at all is fine', applyEdits(copy, undefined).ok === true);
+    const d2 = vm.runInContext('dhis2', ctx);
+    const wasR = d2.raisedMaxTokens; const wasF = d2.maxTokensRefused;
+    d2.raisedMaxTokens = 0; d2.maxTokensRefused = true;
+    truthy('a provider that refused a higher budget is not asked again (no endless cut and refusal)', vm.runInContext('raiseMaxTokensAfterCut', ctx)({ maxTokens: 16384 }) === 0);
+    d2.raisedMaxTokens = wasR; d2.maxTokensRefused = wasF;
+  }
+  const uids = ctx.extractCustomAppUids;
+  truthy('a variable named like an id is not an id, even after a regex with a quote', uids({ 'app.js': `const facilitiesQ = { a: 1 }; const r = /"/g; useDataQuery(facilitiesQ); const s = 'x'; const t = "y";` }).length === 0);
+  truthy('…a real id in a string still is', uids({ 'app.js': `const PROGRAM = 'WSGAb5XwJ3Y';` }).includes('WSGAb5XwJ3Y'));
+  const allDocs = JSON.stringify(prompt) + vm.runInContext('KB_CUSTOM_APPS_DETAILS', ctx);
+  truthy('the prompt no longer teaches orgUnit on tracker/enrollments or tracker/trackedEntities', !/tracker\/(?:enrollments|trackedEntities)\?program=\{id\}&orgUnit=/.test(vm.runInContext('buildSystemPrompt.toString()', ctx) + allDocs));
+  truthy('the app manual gives the parameter table, the timeline recipe and the install check', /enrollments \(PLURAL\)/.test(allDocs) && /ONE REGISTRATION'S WHOLE TIMELINE/.test(allDocs) && /D2_SELF_TEST/.test(allDocs) && /Install check/.test(allDocs));
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -4044,6 +4341,8 @@ setImmediate(async () => {
   if (loaded) await runAppRequestRoutingChecks().catch((e) => bad(`app request routing checks threw: ${e && e.stack || e}`));
   if (loaded) await runAppScannerAndAnalyticsCacheChecks().catch((e) => bad(`app scanner / analytics cache checks threw: ${e && e.stack || e}`));
   if (loaded) await runStressThreadChecks().catch((e) => bad(`stress thread checks threw: ${e && e.stack || e}`));
+  if (loaded) await runMalariaThreadChecks().catch((e) => bad(`Malaria thread checks threw: ${e && e.stack || e}`));
+  if (loaded) await runAncAppThreadChecks().catch((e) => bad(`ANC app thread checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

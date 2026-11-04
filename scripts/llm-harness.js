@@ -15,6 +15,8 @@
  *   LLM_MODEL        e.g. accounts/fireworks/models/minimax-m3
  *   LLM_THINK        "1" if the model streams <think>…</think> blocks
  *   LLM_MAX_TOKENS   optional, default 16384
+ *   LLM_BROWSER      "1" runs manage_custom_app's install check in real Chrome
+ *                    (needs playwright-core and CHROME_PATH or /usr/bin/google-chrome)
  *   DHIS2_BASE / DHIS2_AUTH / DHIS2_APIVER as in live-harness.js
  *
  * Exposes loadLLM() → { ctx, API, summarize, events } where ctx.runAgenticLoop
@@ -76,6 +78,27 @@ async function shimFetch(url, opts = {}) {
   return resp;
 }
 
+// The install check runs in the user's DHIS2 tab: LLM_BROWSER gives it a real page.
+// Only that function runs there. Everything else keeps the logged direct fetch, so
+// a failed API call is still counted (an empty result = no tab, as for fetchViaTab).
+const browserState = { page: null, browser: null };
+async function browserPage() {
+  if (browserState.page) return browserState.page;
+  const npx = path.join(require('os').homedir(), '.npm', '_npx');
+  let pw = null;
+  for (const t of [process.env.PLAYWRIGHT_CORE_PATH, 'playwright-core'].filter(Boolean)) { try { pw = require(t); break; } catch { /* next */ } }
+  if (!pw && fs.existsSync(npx)) for (const d of fs.readdirSync(npx)) { const p = path.join(npx, d, 'node_modules', 'playwright-core'); if (fs.existsSync(path.join(p, 'package.json'))) { try { pw = require(p); break; } catch { /* next */ } } }
+  if (!pw) throw new Error('LLM_BROWSER needs playwright-core');
+  browserState.browser = await pw.chromium.launch({ executablePath: process.env.CHROME_PATH || '/usr/bin/google-chrome', headless: true });
+  const c = await browserState.browser.newContext({ viewport: { width: 1400, height: 900 } });
+  const [user, password] = (process.env.DHIS2_AUTH || 'admin:district').split(':');
+  await c.request.post(`${BASE}/api/auth/login`, { data: { username: user, password }, headers: { 'Content-Type': 'application/json' } });
+  browserState.page = await c.newPage();
+  await browserState.page.goto(`${BASE}/api/system/info.json`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  return browserState.page;
+}
+async function closeBrowser() { if (browserState.browser) await browserState.browser.close().catch(() => {}); browserState.browser = null; browserState.page = null; }
+
 const noop = () => {};
 const evt = () => ({ addListener: noop, removeListener: noop, hasListener: () => false });
 // chrome.storage.local must serve the provider config so core.js's startup
@@ -119,13 +142,20 @@ const chrome = {
              getURL: (p) => EXT_ORIGIN + String(p).replace(/^\//, ''), getPlatformInfo: () => Promise.resolve({ os: 'linux' }),
              sendMessage: () => Promise.resolve() },
   storage: { local: localStore, session: sessionStore, onChanged: evt() },
-  tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve([]), sendMessage: () => Promise.resolve() },
+  tabs: { onUpdated: evt(), onActivated: evt(), query: () => Promise.resolve(process.env.LLM_BROWSER === '1' ? [{ id: 1, url: `${BASE}/`, active: true }] : []), sendMessage: () => Promise.resolve() },
   action: { onClicked: evt() },
   // `contains: true`: the harness stands in for a user who granted host access.
   // Without it initializeFromUrlNow refuses silently and a page-bound prompt
   // ("this form") runs with no page context at all.
   permissions: { onAdded: evt(), onRemoved: evt(), getAll: () => Promise.resolve({ origins: [] }), contains: () => Promise.resolve(true) },
-  scripting: { getRegisteredContentScripts: () => Promise.resolve([]), executeScript: () => Promise.resolve([]) },
+  scripting: {
+    getRegisteredContentScripts: () => Promise.resolve([]),
+    executeScript: async ({ func, args }) => {
+      if (process.env.LLM_BROWSER !== '1' || !func || func.name !== 'customAppCheckInPage') return [];
+      const page = await browserPage();
+      return [{ result: await page.evaluate(`(${func.toString()})(...${JSON.stringify(args || [])})`) }];
+    },
+  },
   sidePanel: { setOptions: noop, open: () => Promise.resolve() },
 };
 
@@ -177,4 +207,4 @@ function summarize(sinceIndex = 0, untilIndex = API.length) {
   return { total: slice.length, failed };
 }
 
-module.exports = { loadLLM, API, LLMLOG, events, summarize, BASE, APIVER };
+module.exports = { loadLLM, API, LLMLOG, events, summarize, BASE, APIVER, browserPage, closeBrowser };

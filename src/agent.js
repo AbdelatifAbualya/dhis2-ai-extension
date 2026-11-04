@@ -321,6 +321,14 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   const routingText = buildRoutingText(userText);
   const contextualTools = getContextualTools(ctx, routingText, browseWeb, userText);
   const contextualToolNames = new Set(contextualTools.map(t => t.function.name));
+  dhis2.metadataOnlyTurn = userAskedMetadataOnly(routingText);
+  // A whole app is a long reply: start with room for it, instead of losing two full
+  // replies to the default limit first (a provider that refuses this drops back).
+  if (detectCustomAppIntent(String(routingText || '').toLowerCase()) && !dhis2.maxTokensRefused) {
+    dhis2.raisedMaxTokens = Math.max(Number(dhis2.raisedMaxTokens) || 0, MAX_TOKENS_CEILING);
+  }
+  dhis2.turnLedger = {};
+  dhis2.orgLevelNames = null;
   // Learning memory: start observing this turn (privacy taint is decided here
   // for patient-record pages and save-error diagnosis).
   memoryBeginTurn(userText, ctx, contextualToolNames);
@@ -903,6 +911,22 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           // of burning 3 doomed resends. Transport glitches (no 'length')
           // still get one "resend the same call" pass before split advice.
           const hitTokenLimit = argsCorrupted.finishReason === 'length';
+          // A whole app cannot be split into smaller calls: give the same call room.
+          const raisedTo = hitTokenLimit ? raiseMaxTokensAfterCut(getProviderConfig()) : 0;
+          if (raisedTo) {
+            const feedback = {
+              _error: `The arguments for ${toolName} were cut off by the response token limit after ${argsCorrupted.rawLength} characters, so nothing was executed.`,
+              _hint: `The limit has been raised to ${raisedTo} tokens. Send the same ${toolName} call again, complete.`,
+              _scope: 'incomplete_call',
+              _no_disable: true,
+            };
+            broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args: {} });
+            // Nothing failed: nothing ran, and the same call is on its way again.
+            broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: true, summary: `Long reply: raised the limit to ${raisedTo} tokens and sending it again`, details: { scope: 'incomplete_call' } });
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
+            lastToolName = toolName;
+            continue;
+          }
           const persistent = hitTokenLimit || dhis2.corruptedCallCount >= 3;
           const splitHint = smallerCallHint(toolName);
           const feedback = {
@@ -1007,6 +1031,22 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             // Record this dispatch so the no-progress guard can refuse a model
             // that keeps re-issuing the SAME call and getting the same result.
             noteExecutedCall(tc.function.name, args);
+            // A refusal that says "use <tool>, it is available now" must be true:
+            // put that tool on the wire for the next iteration. Malaria thread,
+            // 2026-11-03: three refusals named manage_line_lists, it was not
+            // offered, and the model told the user the tool did not exist.
+            {
+              const redirect = toolResult && typeof toolResult._redirect === 'string' ? toolResult._redirect : null;
+              if (redirect && TOOL_ROUTER[redirect] && !contextualToolNames.has(redirect)
+                && !(saveDiagnosisReadOnly && WRITE_CAPABLE_TOOL_NAMES.has(redirect))) {
+                const offered = TOOLS.find(t => t.function.name === redirect);
+                if (offered) {
+                  console.log(`[AgenticLoop] Surfacing "${redirect}": a refusal sent the model to it`);
+                  contextualToolNames.add(redirect);
+                  wireTools.push(...toWireTools([offered]));
+                }
+              }
+            }
             // Remember the tool for the rest of the CONVERSATION, so a
             // follow-up turn that names no feature ("now put it back the way it
             // was") still has it on the wire. See noteToolUsedThisThread.
@@ -1033,7 +1073,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             const failNote = noteToolFailure(tc.function.name, args, toolResult);
             if (failNote && failNote.famCount >= 2) {
               toolResult._failure_streak = failNote.famCount;
-              toolResult._hint = `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of ${tc.function.name} with the same error this turn. Identical retries are BLOCKED. Change the failing part based on the exact error above (e.g. simplify the expression to the supported grammar, or test with dry_run). If you cannot fix it now, STOP calling ${tc.function.name}: give the user a final answer listing what succeeded (names + IDs), what failed with this exact error, and your recommended next step.`;
+              toolResult._hint = toolResult._redirect && contextualToolNames.has(toolResult._redirect)
+                ? `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of the same refusal. Your next call must be ${toolResult._redirect}: it is in your tool list now.`
+                : `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of ${tc.function.name} with the same error this turn. Identical retries are BLOCKED. Change the failing part based on the exact error above (e.g. simplify the expression to the supported grammar, or test with dry_run). If you cannot fix it now, STOP calling ${tc.function.name}: give the user a final answer listing what succeeded (names + IDs), what failed with this exact error, and your recommended next step.`;
             }
             // Learning memory: a failure gets the stored fix for it attached; a
             // success that resolves an earlier failure this turn gets a nudge
@@ -1042,6 +1084,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
               const mem = memoryObserveCall(tc.function.name, args, toolResult);
               if (mem.lessons) { toolResult._memory_lessons = mem.lessons; toolResult._memory_rule = MEMORY_TOOL_RULE; }
               if (mem.note) toolResult._memory_note = mem.note;
+            }
+            if (!failNote && WRITE_CAPABLE_TOOL_NAMES.has(tc.function.name) && toolResult && typeof toolResult === 'object' && !Array.isArray(toolResult)) {
+              const savedSoFar = noteTurnLedger(tc.function.name, args, toolResult);
+              if (savedSoFar) toolResult._saved_this_turn = savedSoFar;
             }
             if (!failNote) {
               // Success — unlocks ONE identical retry for previously failed
@@ -1281,6 +1327,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
         // one small concrete step now and build the rest incrementally.
         if (finishReason === 'length') {
           console.warn(`[AgenticLoop] Empty response cut by token limit (finish_reason=length), nudge ${emptyResponseCount}/3`);
+          // The cut is the budget's fault as much as the plan's: raise it, which
+          // gives the same request room to finish, and this attempt does not count.
+          if (raiseMaxTokensAfterCut(getProviderConfig())) { emptyResponseCount = Math.max(0, emptyResponseCount - 1); continue; }
           if (emptyResponseCount < 3) {
             messages.push({
               role: 'system',
