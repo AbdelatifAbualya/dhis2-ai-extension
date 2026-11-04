@@ -2628,6 +2628,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
           ]),
       };
       if (piSharing) { obj.sharing = piSharing; obj.publicAccess = piSharing.public; }
+      piOnlyHeldEvents(obj, programType);
       return obj;
     });
 
@@ -3500,6 +3501,30 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
     backup: backup.block,
     added_elements: addedElements,
     total_elements: updatedPsdes.length,
+  };
+}
+
+// Charts, maps and line lists that plot an indicator. Deleting it strips it from
+// them with a plain 200, leaving a chart with no data items and a broken tile
+// (verified 2.42.7, 2026-11-03). kind: 'programIndicator' | 'indicator'.
+async function savedOutputsUsingDataItem(kind, id) {
+  const [viz, maps, lists] = await Promise.all([
+    safeDhis2Fetch(`visualizations?filter=dataDimensionItems.${kind}.id:eq:${id}&fields=id,name&paging=false`),
+    safeDhis2Fetch(`maps?filter=mapViews.dataDimensionItems.${kind}.id:eq:${id}&fields=id,name&paging=false`),
+    kind === 'programIndicator' ? safeDhis2Fetch(`eventVisualizations?filter=programIndicatorDimensions.programIndicator.id:eq:${id}&fields=id,name&paging=false`) : Promise.resolve({}),
+  ]);
+  return [
+    ...(viz?.visualizations || []).map(o => ({ type: 'chart', id: o.id, name: o.name })),
+    ...(maps?.maps || []).map(o => ({ type: 'map', id: o.id, name: o.name })),
+    ...(lists?.eventVisualizations || []).map(o => ({ type: 'line list', id: o.id, name: o.name })),
+  ];
+}
+function dataItemInUseRefusal(label, used) {
+  return {
+    _error: `Cannot delete ${label}: ${used.length} saved output(s) plot it: ${used.slice(0, 8).map(o => `${o.type} "${o.name}" (${o.id})`).join(', ')}. DHIS2 would silently strip it from them and leave broken tiles.`,
+    _hint: 'Delete or rebuild those first (a tile: manage_dashboards add_items replace_item_id, or remove_item, then manage_metadata delete), or tell the user they use it.',
+    used_by: used,
+    _scope: 'data_item_in_use',
   };
 }
 
@@ -4557,6 +4582,19 @@ async function checkMetadataReferences(objectType, objectId) {
   const refs = {};
   const id = objectId;
 
+  // A saved chart, map or line list on a dashboard: DHIS2 deletes its tiles with
+  // it and reports plain success (verified 2.42.7).
+  const dashboardField = { visualizations: 'visualization', maps: 'map', eventVisualizations: 'eventVisualization' }[objectType];
+  if (dashboardField) {
+    const onDash = await safeDhis2Fetch(`dashboards?filter=dashboardItems.${dashboardField}.id:eq:${id}&fields=id,name&paging=false`);
+    if (!onDash._error && onDash.dashboards?.length) refs.dashboards_showing_this = onDash.dashboards.map(d => ({ id: d.id, name: d.name }));
+  }
+  const dataItemKind = { programIndicators: 'programIndicator', indicators: 'indicator' }[objectType];
+  if (dataItemKind) {
+    const used = await savedOutputsUsingDataItem(dataItemKind, id);
+    if (used.length) refs.saved_outputs_plotting_this = used;
+  }
+
   if (objectType === 'dataElements') {
     // Check program stages containing this DE
     const stagesResp = await safeDhis2Fetch(
@@ -4667,6 +4705,12 @@ async function checkMetadataReferences(objectType, objectId) {
 // Helper: build human-readable hint for resolving references before deletion
 function buildDeletionHint(objectType, objectId, refs) {
   const hints = [];
+  if (refs.saved_outputs_plotting_this?.length) {
+    hints.push(`Saved outputs plot it: ${refs.saved_outputs_plotting_this.slice(0, 8).map(o => `${o.type} "${o.name}" (${o.id})`).join(', ')}. DHIS2 would silently strip it from them and leave broken tiles: delete or rebuild those first.`);
+  }
+  if (refs.dashboards_showing_this?.length) {
+    hints.push(`It is a tile on ${refs.dashboards_showing_this.map(d => `"${d.name}" (${d.id})`).join(', ')}, and deleting it would silently remove that tile. To replace it use manage_dashboards(action="add_items", replace_item_id=<tile id>, items=[…]); to drop it use remove_item; then delete it.`);
+  }
   if (refs.program_stages?.length) {
     for (const s of refs.program_stages) {
       hints.push(`Remove from stage "${s.stage_name}" (${s.stage_id}) using manage_metadata(action=remove_from_stage, stage_id="${s.stage_id}", data_element_ids=["${objectId}"])`);
@@ -7326,6 +7370,26 @@ const PI_NUMERIC_VALUE_TYPES = new Set([
 // programStageDataElements:[{ dataElement:{ id, displayName, valueType } }] }
 // or null when the structure is unknown (the DE-type checks are then skipped).
 // Returns { corrections:[…], advisories:[…] } or { error, hint }.
+// V{event_count} counts ACTIVE and COMPLETED events only, but an AVERAGE or SUM over
+// a data element counts every event in the table, SCHEDULE included. On a tracker
+// program a count and its percentage then disagree (Child Programme, verified on
+// 2.42.7 and 2.43.2, 2026-11-03: 1 low birth weight birth but 2 in the percentage;
+// a month with 0 showed 0.11%), and a scheduled visit with no value drags
+// "% of visits with X" down. This filter matches V{event_count} exactly: 202511 = 0,
+// 202608 unchanged, both versions. Tracker programs only; a filter that already
+// talks about status or due dates is left alone. Mutates pi; returns a note or null.
+const PI_HELD_EVENTS_FILTER = "(V{event_status} == 'ACTIVE' || V{event_status} == 'COMPLETED')";
+function piOnlyHeldEvents(pi, programType) {
+  if (programType !== 'WITH_REGISTRATION' || pi.analyticsType !== 'EVENT') return null;
+  const agg = String(pi.aggregationType || '').toUpperCase();
+  if (agg !== 'AVERAGE' && agg !== 'SUM') return null;
+  const expr = String(pi.expression || '');
+  const filter = String(pi.filter || '').trim();
+  if (!/#\{/.test(expr) || /V\{(?:event_count|event_status|due_date|scheduled_date)\}/.test(`${expr} ${filter}`)) return null;
+  pi.filter = !filter ? PI_HELD_EVENTS_FILTER : `${/\|\|/.test(filter) ? `(${filter})` : filter} && ${PI_HELD_EVENTS_FILTER}`;
+  return `"${pi.name}": scheduled visits were left out (filter ${PI_HELD_EVENTS_FILTER}), to match V{event_count}. An average or sum otherwise counts events that have not happened.`;
+}
+
 function piAnalyticsRuntimeTraps(pi, stageById, apiMinor) {
   const expr = String(pi.expression || '').trim();
   const filter = String(pi.filter || '');
@@ -8608,7 +8672,7 @@ async function validateProgramIndicatorExpression(kind, text, programId) {
   const endpoint = kind === 'filter' ? 'filter/description' : 'expression/description';
   const url = `${dhis2.baseUrl}/api/${dhis2.apiVersion}/programIndicators/${endpoint}?programId=${encodeURIComponent(programId)}`;
   try {
-    const resp = await fetch(url, {
+    const request = () => fetch(url, {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -8619,6 +8683,10 @@ async function validateProgramIndicatorExpression(kind, text, programId) {
       body: text || '',
       redirect: 'manual',
     });
+    // Reads nothing and changes nothing, so a dropped connection is simply asked
+    // again: one lost validation failed one indicator of a batch (Malaria replay,
+    // 2026-11-03).
+    const resp = await request().catch(async () => { await new Promise(r => setTimeout(r, 500)); return request(); });
     if (resp.type === 'opaqueredirect' || resp.status === 0) {
       return { _error: DHIS2_NOT_SIGNED_IN_MSG, _status: 401, _not_signed_in: true };
     }
@@ -9609,6 +9677,8 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     // Verify the indicator exists BEFORE deleting. 404 → STOP.
     const _verify = await verifyTargetExists('programIndicators', args.indicator_id, 'manage_program_indicators', 'delete');
     if (!_verify.exists) return _verify.refusal;
+    const _used = await savedOutputsUsingDataItem('programIndicator', args.indicator_id);
+    if (_used.length) return dataItemInUseRefusal(`program indicator ${args.indicator_id}`, _used);
 
     const backup = await ensureBackupOrBail(
       { operation: 'delete', tool: 'manage_program_indicators', action: 'delete', reason: `Deleting program indicator ${args.indicator_id}` },
@@ -9761,6 +9831,15 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
   // Combinations the server accepts but analytics cannot run (see
   // piAnalyticsRuntimeTraps). Heals a bare count variable's aggregation.
   const traps = piAnalyticsRuntimeTraps(pi, stageById, Number(dhis2.apiVersion) || 0);
+  if (!traps.error && programId && pi.analyticsType === 'EVENT' && /^(?:AVERAGE|SUM)$/i.test(String(pi.aggregationType || ''))) {
+    let programType = opts.programType;
+    if (!programType) {
+      const pt = await safeDhis2Fetch(`programs/${programId}?fields=programType`);
+      programType = pt?._error ? null : pt?.programType;
+    }
+    const heldNote = piOnlyHeldEvents(pi, programType);
+    if (heldNote) traps.corrections.push(heldNote);
+  }
   if (traps.error) {
     return {
       _error: `Program indicator ${indicatorId ? 'update' : 'create'} blocked: ${traps.error} Nothing was saved.`,
@@ -9909,11 +9988,11 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
 async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun) {
   const catComboId = (await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1'))?.categoryCombos?.[0]?.id || 'bjDvmb4bfuf';
   let progStagesById = null;
-  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programType,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
   if (!progResp?._error && Array.isArray(progResp?.programStages)) {
     progStagesById = new Map(progResp.programStages.map(st => [st.id, st]));
   }
-  const opts = { catComboId, progStagesById };
+  const opts = { catComboId, progStagesById, programType: progResp?._error ? null : progResp?.programType };
 
   // Validate/build every indicator with bounded concurrency (a 40-PI batch would
   // otherwise fire 80 description POSTs at once). Preserve input order for reporting.

@@ -78,6 +78,30 @@ function filterPatientDataForProvider(messages, cfg = getProviderConfig()) {
 // max 8s); the adapter supplies how a final failure is worded.
 //   opts: { url, headers, bodyStr, retryable:Set, iteration, logTag,
 //           networkError(e, isAbort) → Error, httpError(resp, errBody) → Error }
+// A reply cut at max_tokens is deterministic: the same request is cut at the same
+// place. ANC Follow-up Explorer thread: a 60 KB app does not fit in the default
+// 16,384 tokens, the reply died three times, and the user was told to change a
+// setting. So a cut raises the budget for the rest of the conversation, up to
+// MAX_TOKENS_CEILING, and a provider that refuses the higher number drops back.
+const MAX_TOKENS_CEILING = 64000;
+function effectiveMaxTokens(cfg) {
+  const base = Number(cfg && cfg.maxTokens) || 16384;
+  const raised = Number(typeof dhis2 === 'object' && dhis2 && dhis2.raisedMaxTokens) || 0;
+  return Math.max(base, raised);
+}
+// → the new budget, or 0 when it is already at the ceiling.
+function raiseMaxTokensAfterCut(cfg) {
+  const now = effectiveMaxTokens(cfg);
+  if (dhis2.maxTokensRefused || now >= MAX_TOKENS_CEILING) return 0;
+  const next = Math.min(MAX_TOKENS_CEILING, now * 2);
+  dhis2.raisedMaxTokens = next;
+  console.warn(`[AgenticLoop] Reply cut at ${now} tokens: raising the budget to ${next}`);
+  return next;
+}
+function providerRefusedMaxTokens(status, err) {
+  return (status === 400 || status === 422) && /max[_\s-]?tokens|max[_\s-]?output|output\s+tokens/i.test(JSON.stringify(err || {}));
+}
+
 async function postProviderRequest(opts) {
   const MAX_RETRIES = 3;
   const CONNECT_TIMEOUT_MS = 60_000;
@@ -109,6 +133,21 @@ async function postProviderRequest(opts) {
     }
     if (resp.ok) return resp;
     const err = await resp.json().catch(() => ({}));
+    // A budget raised after a cut, which this provider or model refuses: back to
+    // the user's own setting, and the same request again.
+    if (dhis2.raisedMaxTokens && providerRefusedMaxTokens(resp.status, err) && attempt < MAX_RETRIES) {
+      try {
+        const body = JSON.parse(opts.bodyStr);
+        dhis2.raisedMaxTokens = 0;
+        dhis2.maxTokensRefused = true; // this provider: no more raising, or a cut and a refusal would alternate for ever
+        if (body && body.max_tokens != null) {
+          body.max_tokens = effectiveMaxTokens(getProviderConfig());
+          opts.bodyStr = JSON.stringify(body);
+          console.warn(`[${opts.logTag}] Provider refused the raised max_tokens, back to ${body.max_tokens}`);
+          continue;
+        }
+      } catch { /* fall through to the error */ }
+    }
     if (opts.retryable.has(resp.status) && attempt < MAX_RETRIES) {
       const delay = backoffDelay(attempt, String(resp.status));
       broadcast({ type: 'AI_THINKING', iteration: opts.iteration, label: `API busy, retrying (${attempt + 1}/${MAX_RETRIES})` });
@@ -184,7 +223,7 @@ async function callFireworksStreaming(messages, useTools, onTextChunk, tools = T
     model: cfg.modelId,
     messages: sanitizedMessages,
     temperature: cfg.temperature,
-    max_tokens: cfg.maxTokens,
+    max_tokens: effectiveMaxTokens(cfg),
     stream: true,
   };
   // Google doesn't allow top_p alongside temperature
@@ -570,7 +609,7 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
   const body = {
     model: cfg.modelId,
     messages: anthropicMessages,
-    max_tokens: cfg.maxTokens || 16384,
+    max_tokens: effectiveMaxTokens(cfg),
     temperature: cfg.temperature,
     stream: true,
   };
@@ -1981,6 +2020,36 @@ function guessedLogEndpointRefusal(canonicalPath) {
     _hint: DHIS2_LOG_SOURCES_HINT,
     _scope: 'known_endpoint_guidance',
   };
+}
+
+// ── "Use metadata only" ──────────────────────────────────────────────────────
+// A request can rule out reading data at all. Malaria thread, 2026-11-03: "Use
+// metadata only during development … I will verify the finished results
+// separately", and the model ran 13 analytics queries and reported the numbers as
+// verified. Applies to this request only (and a "continue" of it). Checks inside
+// the tools still run: they prove an indicator or list can be computed, and return
+// no values. Worded to miss "metadata only sharing" and "export metadata only".
+function userAskedMetadataOnly(text) {
+  const t = String(text || '').toLowerCase();
+  if (/\bmetadata[-\s]only\s+(?:sharing|access|import|export|package|shar)|\b(?:export|import|share|sharing|download)\b.{0,30}\bmetadata[-\s]only\b/.test(t)) return false;
+  return /\b(?:use|using|rely\s+on|work\s+from|stick\s+to|stay\s+with|limit\s+(?:yourself|it)\s+to)\s+(?:only\s+|just\s+)?(?:the\s+)?metadata(?:\s+only)?\b/.test(t)
+    || /\bmetadata[-\s]only\s+(?:during|while|for|in|at|until)\b/.test(t)
+    || /\bonly\s+(?:use|read|look\s+at|check)\s+(?:the\s+)?metadata\b/.test(t)
+    || /\b(?:do\s+not|don'?t|never)\s+(?:read|fetch|query|retrieve|look\s+at)\s+(?:any\s+|the\s+|actual\s+)*data\b/.test(t);
+}
+const DATA_READING_TOOLS = new Set(['count_records', 'get_event_analytics', 'cross_stage_entity_intersection', 'detect_enrollment_abnormalities']);
+function metadataOnlyGate(name, args) {
+  if (!dhis2.metadataOnlyTurn) return null;
+  const refuse = (what) => ({
+    _error: `Not read: the user asked for metadata only in this request, so ${what} is off limits.`,
+    _hint: 'Keep building from metadata. The tools run their own checks (program indicators compute, line lists run) without returning values. In your answer list the numbers under what still needs live testing; do not state any value.',
+    _scope: 'metadata_only_request',
+  });
+  if (DATA_READING_TOOLS.has(name)) return refuse(`${name}`);
+  if (name === 'get_visualization_details' || name === 'get_map_details') { args.include_analytics_preview = false; return null; }
+  if (name !== 'dhis2_query' || String(args?.method || 'GET').toUpperCase() !== 'GET') return null;
+  const p = canonicalApiPath(args?.path);
+  return /^(?:analytics|dataValueSets|dataValues|tracker|events|enrollments|trackedEntityInstances)(?:[/.?]|$)/i.test(p) ? refuse(`data from ${p.split('?')[0]}`) : null;
 }
 
 // Returns a refusal object if the call must be blocked, else null.

@@ -814,7 +814,20 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     if (/['"`]tracker\/(?:events|enrollments|trackedEntities)\b/.test(allCode)
         && (/\borgUnits?\s*:/.test(allBare) || /[?&]orgUnits?=/.test(allCode))
         && !/\b(?:orgUnitMode|ouMode)\b/.test(allCode)) {
-      errors.push({ message: 'tracker/events | enrollments | trackedEntities with orgUnit and no orgUnitMode return only the records entered AT that exact org unit (DHIS2 defaults to SELECTED). Records are entered at facilities, so a country or district — including "All locations" — shows 0 records. Send orgUnitMode: \'DESCENDANTS\' next to orgUnit for "this place and everything under it" (or orgUnitMode: \'SELECTED\' only when the picker lists the units where records are entered).' });
+      errors.push({ message: 'tracker/events | enrollments | trackedEntities with an org unit and no orgUnitMode return only the records entered AT that exact org unit (DHIS2 defaults to SELECTED). Records are entered at facilities, so a country or district — including "All locations" — shows 0 records. Send orgUnitMode: \'DESCENDANTS\' next to the org unit (orgUnits on enrollments and trackedEntities, orgUnit on events) for "this place and everything under it", or orgUnitMode: \'SELECTED\' only when the picker lists the units where records are entered.' });
+    }
+    // The app's guard corrects these at run time, but the code should say what it
+    // sends, and a correction hides nothing from whoever reads it next.
+    const wrongParams = [
+      [/tracker\/(?:enrollments|trackedEntities)\b[^;]{0,300}?[{,\s&?]orgUnit\s*[:=]/, 'tracker/enrollments and tracker/trackedEntities take orgUnits, not orgUnit (a 400 otherwise).'],
+      [/tracker\/events\b[^;]{0,300}?[{,\s&?]orgUnits\s*[:=]/, 'tracker/events takes orgUnit, not orgUnits (a 400 otherwise).'],
+      [/tracker\/events\b[^;]{0,300}?[{,\s&?]enrollment\s*[:=]/, 'tracker/events takes enrollments (plural): DHIS2 ignores enrollment and answers with other registrations\' events.'],
+      [/\bouMode\b/, 'ouMode is ignored on this DHIS2 version: use orgUnitMode.'],
+      [/\bprogramStartDate\b|\bprogramEndDate\b/, 'programStartDate and programEndDate are ignored without an error: use enrolledAfter / enrolledBefore on tracker/enrollments.'],
+      [/\borgUnitMode\s*[:=]\s*['"`]ALL\b/, 'orgUnitMode ALL needs a special authority most users do not have. To reach every record the viewer may see, send no org unit (or orgUnitMode ACCESSIBLE).'],
+    ];
+    if (Number(dhis2.apiVersion) >= 41) {
+      for (const [re, msg] of wrongParams) if (re.test(allCode)) warnings.push({ message: msg });
     }
     const nested = allCode.match(/fields\s*:\s*['"`][^'"`]*\b(orgUnit|trackedEntity|enrollment|program|programStage)\[/);
     if (nested) {
@@ -899,10 +912,14 @@ function customAppPatientDataSource(code, file, pluginType) {
 function extractCustomAppUids(compiled) {
   const out = new Set();
   for (const js of Object.values(compiled)) {
-    const { code } = customAppSourceViews(js);
+    const { code, bare } = customAppSourceViews(js);
     for (const lit of code.match(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g) || []) {
       for (const tok of lit.match(/(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]{10}(?![A-Za-z0-9])/g) || []) {
         if (!isLikelyDhisUid(tok) || RESERVED_UID_SHAPED_WORDS.has(tok)) continue;
+        // A name the code itself uses outside any string is a variable. A quote in
+        // a regex (the CSV /"/g) can pair up across code here, and a query variable
+        // called facilitiesQ was refused as an id that does not exist (2026-11-03).
+        if (new RegExp(`(?<![\\w$])${tok}(?![\\w$])`).test(bare)) continue;
         // camelCase words: indicatorId, dataElement, and with an acronym inside, toISOString.
         if (/^[A-Za-z][a-z]+(?:[A-Z]+[a-z]+)+$/.test(tok)) continue;
         out.add(tok);
@@ -1041,6 +1058,25 @@ const CAPTURE_PLUGIN_CSS = '#root { display: flow-root; }\n';
 //     any request but GET/HEAD (fetch, XMLHttpRequest, sendBeacon) and
 //     double-checks the origin. The viewer's own DHIS2 authorities remain the
 //     final limit on what any request can do.
+// During the install check no record is fetched: a list asks for an empty window
+// (updatedAfter=2099-01-01 answers 0 on all three endpoints and the server still
+// validates the request, verified 2.42.7), row-level analytics adds skipData, and one
+// record, SQL-view rows and old record endpoints are not sent: null. Pure and
+// self-contained: its source is written into every generated app's app-guard.js.
+function customAppRecordsClosed(url) {
+  var u = String(url);
+  var q = u.indexOf('?');
+  var path = q === -1 ? u : u.slice(0, q);
+  if (/\/tracker\/(?:events|enrollments|trackedEntities)\/[A-Za-z0-9]{11}(?:\/|$)/.test(path)) return null;
+  if (/\/sqlViews\/[A-Za-z0-9]{11}\/data\b|\/api\/(?:\d+\/)?(?:events|enrollments|trackedEntityInstances|audits)\b/.test(path)) return null;
+  if (/\/tracker\/(?:events|enrollments|trackedEntities)\/?$/.test(path)) {
+    var query = q === -1 ? [] : u.slice(q + 1).split('&').filter(function (p) { return !/^updatedAfter=/.test(p); });
+    return path + '?' + query.concat('updatedAfter=2099-01-01').join('&');
+  }
+  if (/\/analytics\/(?:events|enrollments|trackedEntities)\/query\b/.test(path)) return u + (q === -1 ? '?' : '&') + 'skipData=true';
+  return u;
+}
+
 const CUSTOM_APP_CSP = "connect-src 'self'; form-action 'none'; object-src 'none'; base-uri 'self'";
 function buildCustomAppGuardJs(spec) {
   const readOnly = !spec.needsWriteAccess;
@@ -1054,6 +1090,59 @@ function buildCustomAppGuardJs(spec) {
   // Without this an app with a program picker silently shows the first program's
   // event counts for every program it opens (see withEventAggregateCacheKey).
   ${withEventAggregateCacheKey.toString().replace(/\n/g, '\n  ')}
+  // Each tracker endpoint names its parameters differently, and a wrong name can
+  // answer another person's records with no error (see normalizeTrackerQuery).
+  var API_VERSION = ${Number(typeof dhis2 === 'object' && dhis2 && dhis2.apiVersion) || 0};
+  ${normalizeTrackerQuery.toString().replace(/\n/g, '\n  ')}
+  // The install check (manage_custom_app) opens the app with ?__ai_check=1: records
+  // stay closed, requests are logged by path, status and DHIS2's own message.
+  var CHECK = /[?&]__ai_check=1(?:&|$)/.test(String(window.location && window.location.search));
+  var LOG = null;
+  ${customAppRecordsClosed.toString().replace(/\n/g, '\n  ')}
+  if (CHECK) {
+    LOG = { requests: [], notOpened: [], blockedWrites: [], errors: [], inflight: 0 };
+    window.__aiAppCheck = LOG;
+    var noteError = function (m) { if (LOG.errors.length < 20) LOG.errors.push(String(m).slice(0, 400)); };
+    window.addEventListener('error', function (e) { noteError(e.message || 'script error'); });
+    window.addEventListener('unhandledrejection', function (e) { var r = e.reason; noteError('Unhandled rejection: ' + ((r && r.message) || r)); });
+    var nativeConsoleError = console.error;
+    console.error = function () {
+      try { noteError(Array.prototype.map.call(arguments, function (a) { return (a && a.message) || String(a); }).join(' ')); } catch (e) { /* the log never breaks the app */ }
+      return nativeConsoleError.apply(console, arguments);
+    };
+    LOG.selfTest = function () {
+      if (typeof window.D2_SELF_TEST !== 'function') return Promise.resolve(null);
+      return Promise.resolve().then(function () { return window.D2_SELF_TEST(); }).then(function (rows) {
+        return (Array.isArray(rows) ? rows : []).map(function (r) { return { name: String(r && r.name).slice(0, 160), pass: !!(r && r.pass), detail: r && r.pass ? undefined : String(r && r.detail !== undefined ? r.detail : '').slice(0, 200) }; });
+      }).catch(function (e) { return [{ name: 'D2_SELF_TEST threw', pass: false, detail: String(e && e.message).slice(0, 200) }]; });
+    };
+  }
+  function checkedFetch(self, url, input, init) {
+    var shown = String(url).replace(ORIGIN, '');
+    var sent = customAppRecordsClosed(url);
+    if (sent === null) {
+      LOG.notOpened.push(shown.split('?')[0]);
+      return Promise.resolve(new Response(JSON.stringify({ httpStatusCode: 404, status: 'ERROR', message: 'Not opened during the install check.' }), { status: 404, headers: { 'Content-Type': 'application/json' } }));
+    }
+    LOG.inflight++;
+    return nativeFetch.call(self, typeof input === 'object' && input.url ? new Request(sent, input) : sent, init).then(function (r) {
+      LOG.inflight--;
+      var entry = { path: shown, status: r.status };
+      LOG.requests.push(entry);
+      if (!r.ok && r.status !== 304) {
+        LOG.inflight++;
+        r.clone().text().then(function (t) {
+          try { entry.message = String(JSON.parse(t).message || '').slice(0, 300); } catch (e) { entry.message = String(t).slice(0, 120); }
+          LOG.inflight--;
+        }, function () { LOG.inflight--; });
+      }
+      return r;
+    }, function (e) {
+      LOG.inflight--;
+      LOG.requests.push({ path: shown, status: 0, message: String(e && e.message) });
+      throw e;
+    });
+  }
   var nativeFetch = window.fetch;
   if (nativeFetch) {
     var guardedFetch = function (input, init) {
@@ -1061,8 +1150,13 @@ function buildCustomAppGuardJs(spec) {
       var method = String((init && init.method) || (input && typeof input === 'object' && input.method) || 'GET').toUpperCase();
       if (!sameOrigin(url)) return Promise.reject(refuse('requests may only go to this DHIS2 server'));
       if (READ_ONLY && method !== 'GET' && method !== 'HEAD') return Promise.reject(refuse('this app is read-only (' + method + ')'));
+      if (CHECK && method !== 'GET' && method !== 'HEAD') {
+        LOG.blockedWrites.push(method + ' ' + String(url).replace(ORIGIN, '').split('?')[0]);
+        return Promise.reject(new Error('Not sent: writes are closed during the install check.'));
+      }
       if (method === 'GET') {
-        var keyed = withEventAggregateCacheKey(url);
+        var keyed = withEventAggregateCacheKey(normalizeTrackerQuery(url, API_VERSION));
+        if (CHECK) return checkedFetch(this, keyed, input, init);
         if (keyed !== url) return nativeFetch.call(this, typeof input === 'object' && input.url ? new Request(keyed, input) : keyed, init);
       }
       return nativeFetch.apply(this, arguments);
@@ -1075,6 +1169,11 @@ function buildCustomAppGuardJs(spec) {
     var guardedOpen = function (method, url) {
       if (!sameOrigin(url)) throw refuse('requests may only go to this DHIS2 server');
       if (READ_ONLY && !/^(GET|HEAD)$/i.test(String(method))) throw refuse('this app is read-only (' + method + ')');
+      if (/^GET$/i.test(String(method))) {
+        var fixedUrl = normalizeTrackerQuery(url, API_VERSION);
+        if (CHECK) fixedUrl = customAppRecordsClosed(fixedUrl) || (window.location.href.split('?')[0] + '?not-opened');
+        if (fixedUrl !== url) { var xhrArgs = Array.prototype.slice.call(arguments); xhrArgs[1] = fixedUrl; return nativeOpen.apply(this, xhrArgs); }
+      }
       return nativeOpen.apply(this, arguments);
     };
     try { Object.defineProperty(XHR.prototype, 'open', { value: guardedOpen, writable: false, configurable: false }); } catch (e) { XHR.prototype.open = guardedOpen; }
@@ -1311,7 +1410,16 @@ function customAppConflicts(spec, apps, mode) {
 }
 
 async function installCustomAppZip(zip, key) {
-  const up = await uploadAppZip(zip, `${key}.zip`);
+  let up = await uploadAppZip(zip, `${key}.zip`);
+  // A 5xx here is the server's trouble, not the app's: the same zip went in on the
+  // next try (2.43.2, "Unexpected end of file from server"), and the model had
+  // already written itself a false lesson about file sizes. The same zip is safe to
+  // send twice: it replaces this app and nothing else.
+  if (up._error && up._status >= 500) {
+    console.warn(`[manage_custom_app] upload answered ${up._status}, trying once more`);
+    await new Promise((r) => setTimeout(r, 2000));
+    up = await uploadAppZip(zip, `${key}.zip`);
+  }
   if (up._error) return up;
   const installedKey = (up.app && up.app.key) || key;
   return { installedKey, response: up.app || null };
@@ -1656,7 +1764,20 @@ async function recallCustomAppPreview(token) {
 function userAskedToInstall(text) {
   const t = String(text || '').toLowerCase();
   if (/\bpreview\b[^.?!]*\bfirst\b|\b(?:don'?t|do\s+not|not|never|without|before)\s+(?:\w+\s+){0,2}install/.test(t)) return false;
-  return /\b(?:install|deploy|publish)/.test(t);
+  // "Give me the finished app URL" cannot be met by a preview (ANC Follow-up
+  // Explorer thread: the preview was refused an install, the user was given a URL
+  // that did not exist and got "Unable to find an app for this URL").
+  return /\b(?:install|deploy|publish)/.test(t)
+    || /\bfinished\s+(?:app|plugin)\b|\b(?:app|plugin)(?:'s)?\s+(?:url|link)\b|\b(?:url|link)\s+(?:of|to|for)\s+(?:the|my)\s+(?:finished\s+|new\s+)?(?:app|plugin)\b/.test(t);
+}
+// The request whose install intent counts: this message, and when it only says to
+// carry on ("I increased the max tokens, continue"), the request it carries on.
+function installIntentText() {
+  const said = String(lastUserText || '');
+  if (said.trim().split(/\s+/).length <= 15 && /\b(?:continue|resume|go\s+on|carry\s+on|keep\s+going|proceed|try\s+again|retry)\b/i.test(said) && typeof lastSubstantiveUserRequest === 'function') {
+    return `${said}\n${lastSubstantiveUserRequest()}`;
+  }
+  return said;
 }
 // Installing goes ahead when the user's message asks to install, or to put
 // the plugin somewhere (placing implies installing), or when they are
@@ -1665,8 +1786,9 @@ function userAskedToInstall(text) {
 // previewTurn: the turn of the newest preview of this key, or null.
 function customAppApprovalProblem(key, token, previewTurn) {
   const turn = dhis2.turnCounter || 0;
-  if (userAskedToInstall(lastUserText)) return null;
-  if (typeof userAskedToPlace === 'function' && userAskedToPlace([lastUserText])) return null;
+  const said = installIntentText();
+  if (userAskedToInstall(said)) return null;
+  if (typeof userAskedToPlace === 'function' && userAskedToPlace([said])) return null;
   if (previewTurn != null && previewTurn < turn) return null;
   return {
     _error: previewTurn === turn
@@ -1688,6 +1810,31 @@ async function latestPreviewTurn(key) {
   return best;
 }
 
+// A repair of a few lines used to mean sending the whole file again: 35 KB and over
+// ten thousand tokens per attempt on the ANC app. edits: [{ file, find, replace }],
+// each find exact and found once. All or nothing: a miss changes no file.
+function applyCustomAppEdits(sources, edits) {
+  if (edits == null) return { ok: true };
+  if (!Array.isArray(edits)) return { _error: 'edits must be a list of { file, find, replace }.' };
+  const out = { ...sources };
+  for (const [i, e] of edits.entries()) {
+    const file = String(e && e.file || '').replace(/^src\//, '');
+    const find = e && e.find;
+    if (!file || typeof find !== 'string' || !find || typeof e.replace !== 'string') return { _error: `edits[${i}] needs file, find and replace (strings; find not empty).` };
+    if (typeof out[file] !== 'string') return { _error: `edits[${i}]: this app has no file "${file}". It has: ${Object.keys(out).join(', ')}.` };
+    const count = out[file].split(find).length - 1;
+    if (count !== 1) {
+      return {
+        _error: `edits[${i}]: the text to find occurs ${count} times in ${file}; it must occur exactly once. Nothing was changed.`,
+        _hint: count ? 'Include more of the surrounding code in find so that it matches one place.' : 'Copy find exactly from the source (manage_custom_app get_source shows it), spaces and line breaks included.',
+      };
+    }
+    out[file] = out[file].split(find).join(e.replace);
+  }
+  Object.assign(sources, out);
+  return { ok: true };
+}
+
 function customAppFilesArg(args) {
   const files = args.files;
   if (files == null) return {};
@@ -1707,8 +1854,117 @@ async function buildAndInstallCustomApp(spec) {
   return { prep, inst, ver };
 }
 
+function noteAssistantBuiltApp(key) {
+  const list = Array.isArray(dhis2.assistantBuiltApps) ? dhis2.assistantBuiltApps : [];
+  if (!list.includes(key)) list.push(key);
+  dhis2.assistantBuiltApps = list.slice(-50);
+}
+
+// ── Install check ────────────────────────────────────────────────────────────
+// Until now the model could not see its app run, and a remote model may not read
+// records to find out. ANC Follow-up Explorer thread: the table never filled, the
+// 400 was explained with a theory called "verified, not guessed", and the fix went
+// out unproved with the same 400 behind it.
+// This opens the installed app in a hidden frame of the user's own DHIS2 tab, with
+// ?__ai_check=1 (see buildCustomAppGuardJs): a list asks for updatedAfter=2099-01-01,
+// so the server validates the whole request and returns no record; one record, SQL
+// view rows and writes are not sent at all; row-level analytics adds skipData. What
+// comes back is request paths, statuses and DHIS2's messages, script errors, and the
+// page's text, which holds no record because none was fetched.
+// Runs in the page, so it must be self-contained.
+async function customAppCheckInPage(url, timeoutMs, quietMs) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const f = document.createElement('iframe');
+  f.setAttribute('aria-hidden', 'true');
+  f.tabIndex = -1;
+  f.style.cssText = 'position:fixed;left:-20000px;top:0;width:1280px;height:900px;border:0;visibility:hidden';
+  f.src = url;
+  (document.body || document.documentElement).appendChild(f);
+  try {
+    const t0 = Date.now();
+    let c = null;
+    let loaded = false;
+    let seen = -1;
+    let quietFrom = t0;
+    while (Date.now() - t0 < timeoutMs) {
+      await sleep(250);
+      try { c = f.contentWindow && f.contentWindow.__aiAppCheck; } catch (e) { return { opened: false, reason: `the app page could not be read: ${e.message}` }; }
+      if (!c) continue;
+      // The guard runs first and the app's scripts after it: until the page has
+      // loaded, "nothing happening" only means they are still downloading.
+      if (f.contentWindow.document.readyState !== 'complete') { quietFrom = Date.now(); continue; }
+      loaded = true;
+      const n = c.requests.length + c.notOpened.length + c.errors.length;
+      if (n !== seen || c.inflight > 0) { seen = n; quietFrom = Date.now(); }
+      if (Date.now() - quietFrom > quietMs) break;
+    }
+    if (!c) return { opened: false, reason: 'the app page did not start (its guard script never ran)' };
+    if (!loaded) return { opened: false, reason: `the app page had not finished loading after ${Math.round(timeoutMs / 1000)} s` };
+    const selfTest = c.selfTest ? await Promise.race([c.selfTest(), sleep(4000).then(() => [{ name: 'D2_SELF_TEST', pass: false, detail: 'did not finish in 4 s' }])]) : null;
+    const doc = f.contentWindow.document;
+    const root = doc.getElementById('root');
+    return {
+      opened: true,
+      timed_out: c.inflight > 0,
+      requests: c.requests.slice(0, 80),
+      not_opened: c.notOpened.slice(0, 20),
+      blocked_writes: c.blockedWrites.slice(0, 20),
+      errors: c.errors.slice(0, 12),
+      self_test: selfTest,
+      rendered: !!(root && root.childElementCount),
+      text: String((doc.body && doc.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 1200),
+    };
+  } finally {
+    f.remove();
+  }
+}
+
+async function customAppRuntimeCheck(key, spec) {
+  const hasApp = customAppHasApp(spec.kind);
+  let tabId = null;
+  try {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find(t => t.url && (t.url === dhis2.baseUrl || t.url.startsWith(`${dhis2.baseUrl}/`)));
+    tabId = tab ? tab.id : null;
+  } catch { /* reported below */ }
+  if (tabId == null) return { ran: false, reason: 'no DHIS2 tab of this server is open, so the app could not be opened' };
+  let r = null;
+  try {
+    const url = `${dhis2.baseUrl}/api/apps/${encodeURIComponent(key)}/${hasApp ? 'index' : 'plugin'}.html?redirect=false&__ai_check=1`;
+    // A plugin waits for its host's answer first, which never comes here, and goes on after a timeout.
+    const results = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: customAppCheckInPage, args: [url, 25000, hasApp ? 2000 : 4000] });
+    r = results && results[0] && results[0].result;
+  } catch (e) {
+    return { ran: false, reason: `the app could not be opened: ${e.message}` };
+  }
+  if (!r) return { ran: false, reason: 'the check returned nothing' };
+  if (!r.opened) return { ran: true, verdict: 'failed', opened: false, reason: r.reason };
+  const noise = /\/staticContent\/|\/api\/(?:\d+\/)?files\/style\b/;
+  const failed = (r.requests || []).filter(x => (x.status >= 400 || x.status === 0) && !noise.test(x.path));
+  const selfFails = (r.self_test || []).filter(t => !t.pass);
+  const out = {
+    ran: true,
+    records_fetched: false,
+    opened: true,
+    requests_ok: (r.requests || []).length - (r.requests || []).filter(x => x.status >= 400 || x.status === 0).length,
+    failed_requests: failed.map(x => ({ path: x.path, status: x.status, dhis2_message: x.message })),
+    ...(r.not_opened.length ? { not_opened: r.not_opened } : {}),
+    ...(r.blocked_writes.length ? { writes_at_startup: r.blocked_writes } : {}),
+    ...(r.errors.length ? { page_errors: r.errors } : {}),
+    ...(r.self_test ? { self_test: { total: r.self_test.length, passed: r.self_test.length - selfFails.length, failed: selfFails } } : {}),
+    rendered: r.rendered,
+    ...(r.timed_out ? { still_loading_after_25s: true } : {}),
+    page_text: r.text,
+  };
+  // A plugin without its host may rightly show nothing: not a failure in itself.
+  out.verdict = failed.length || r.errors.length || selfFails.length || (hasApp && !r.rendered) ? 'problems' : 'clean';
+  if (!hasApp) out.plugin_note = 'Opened outside its host page, so it had no dashboard or Capture props.';
+  return out;
+}
+
 function customAppResult(action, spec, built, extra) {
   const s = built.ver.summary;
+  const check = built.check || null;
   return {
     success: built.ver.problems.length === 0,
     action,
@@ -1731,7 +1987,12 @@ function customAppResult(action, spec, built, extra) {
     where_to_find: customAppWhereToFind(s, spec.kind, spec.pluginType),
     // Live 2026-11-02: an app whose form could never be saved was reported as
     // "installed and live" with every requirement ticked. Nothing here clicks.
-    _not_run: 'This confirms the code compiled, its names exist and the app installed. Nothing has opened the app or clicked anything. Do not say it works, is live or is tested: say it is installed and not yet exercised, and give the user the 2 or 3 clicks that prove its main flow.',
+    runtime_check: check || undefined,
+    ...(check && check.ran && check.verdict !== 'clean' ? { _must_fix: `The app is installed, but it FAILS when opened (runtime_check). Fix it now, in this turn: read each dhis2_message, correct the code, and call manage_custom_app(action="update", key="${s.key}", files=…), which runs this check again. Do not ask the user first and do not hand them the link as working. If it still fails after two repairs, report the exact messages.` } : {}),
+    ...(check && !check.ran ? { _check_not_run: `The install check did not run: ${check.reason}. Say so, and that the app has not been opened.` } : {}),
+    _not_run: check && check.ran && check.verdict === 'clean'
+      ? 'The install check opened the app with records closed: it started and DHIS2 accepted its requests. It has shown no real record and nothing was clicked, so do not say it works or is tested. Say exactly that, and give the user the 2 or 3 clicks that prove its main flow.'
+      : 'This confirms the code compiled, its names exist and the app installed. Nothing has opened the app or clicked anything. Do not say it works, is live or is tested: say it is installed and not yet exercised, and give the user the 2 or 3 clicks that prove its main flow.',
     ...extra,
   };
 }
@@ -1930,6 +2191,8 @@ async function executeManageCustomApp(args) {
         if (src == null || src === '') delete spec.sources[f];
         else spec.sources[f] = src;
       }
+      const edited = applyCustomAppEdits(spec.sources, args.edits);
+      if (edited._error) return edited;
       spec.version = args.version || bumpCustomAppVersion(base.version, args.version_bump);
     } else {
       spec.sources = { ...files };
@@ -1964,7 +2227,10 @@ async function executeManageCustomApp(args) {
       files: prep.pkg.files,
       zip_bytes: prep.pkg.zip.length,
       source: spec.sources,
-      next_step: existing && isAssistantBuiltApp(existing)
+      ...(customAppHasApp(spec.kind) ? { url_once_installed: `${dhis2.baseUrl}/apps/${key}`, _url_note: 'That address opens nothing until create has installed the app: do not give it to the user as a working link before then, and never build an app address yourself.' } : {}),
+      next_step: !existing && userAskedToInstall(installIntentText())
+        ? `The user's request already asks for the finished app: call manage_custom_app(action="create", key="${key}", preview_token="${token}") now, in this turn, without asking.`
+        : existing && isAssistantBuiltApp(existing)
         ? `Summarise what the change does, ask the user to approve, then manage_custom_app(action="update", key="${key}", files=…).`
         : `Summarise for the user (what it shows, which data it reads${spec.needsWriteAccess ? ', what it WRITES' : ''}, where it will appear) and ask for approval. After "yes": manage_custom_app(action="create", key="${key}", preview_token="${token}").`,
     };
@@ -1987,13 +2253,15 @@ async function executeManageCustomApp(args) {
     if (inst._error) return inst;
     const ver = await verifyCustomAppInstalled(inst.installedKey, spec.version);
     if (ver._error) return ver;
-    return customAppResult('create', spec, { prep, inst, ver });
+    noteAssistantBuiltApp(inst.installedKey);
+    const check = await customAppRuntimeCheck(inst.installedKey, spec);
+    return customAppResult('create', spec, { prep, inst, ver, check });
   }
 
   // update
   const prep = await prepareCustomAppBuild(spec);
   if (prep._error) return prep;
-  const gate = requireWriteAuth('manage_custom_app', 'update', { key, version: spec.version });
+  const gate = requireWriteAuth('manage_custom_app', 'update', { key, version: spec.version, own_app_same_access: (dhis2.assistantBuiltApps || []).includes(key) && !!spec.needsWriteAccess === !!base.needsWriteAccess });
   if (gate) return gate;
   const conflicts = customAppConflicts(spec, apps, 'replace');
   if (conflicts.length) return { _error: conflicts.map((c) => c.message).join(' '), conflicts };
@@ -2006,7 +2274,9 @@ async function executeManageCustomApp(args) {
   if (inst._error) return { ...inst, backup };
   const ver = await verifyCustomAppInstalled(inst.installedKey, spec.version);
   if (ver._error) return ver;
-  return customAppResult('update', spec, { prep, inst, ver }, {
+  noteAssistantBuiltApp(inst.installedKey);
+  const check = await customAppRuntimeCheck(inst.installedKey, spec);
+  return customAppResult('update', spec, { prep, inst, ver, check }, {
     previous_version: base.version,
     changed_files: Object.keys(files),
     backup: backup ? { key: backup.backup_key, version: backup.version, rollback_hint: `manage_custom_app(action="rollback", key="${key}")` } : { skipped: true },

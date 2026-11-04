@@ -6,7 +6,7 @@
  * Each file is one user turn; the conversation persists across turns.
  * PASS = every turn returns a non-error answer AND zero failed DHIS2 calls. */
 const fs = require('fs');
-const { loadLLM, API, LLMLOG, summarize } = require('./llm-harness');
+const { loadLLM, API, LLMLOG, summarize, closeBrowser } = require('./llm-harness');
 
 const promptFiles = process.argv.slice(2);
 if (!promptFiles.length) { console.error('usage: llm-run.js <prompt-file> …'); process.exit(2); }
@@ -48,5 +48,6 @@ if (!promptFiles.length) { console.error('usage: llm-run.js <prompt-file> …');
   const { total, failed } = summarize();
   console.log(`\n══════ OVERALL: ${total} DHIS2 calls, ${failed.length} failed, ${LLMLOG.length} provider calls ══════`);
   console.log(anyFail ? 'RESULT: FAIL' : 'RESULT: PASS');
+  await closeBrowser();
   process.exit(anyFail ? 1 : 0);
 })();

@@ -315,7 +315,9 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
   const timeDims = LINE_LIST_TIME_DIMENSIONS[outputType] || {};
   for (const [canonical, aliases] of Object.entries(timeDims)) {
     if (canonical === dimToken || aliases.includes(lower)) {
-      const periods = (raw.periods || raw.items || []).map(v => String(typeof v === 'object' ? v.id : v).trim()).filter(Boolean);
+      let periods = (raw.periods || raw.items || []).map(v => String(typeof v === 'object' ? v.id : v).trim()).filter(Boolean);
+      const yearFix = periods.length ? namedYearPeriods(periods) : null;
+      if (yearFix) periods = yearFix.periods;
       if (!periods.length) return { _error: `The ${canonical} ${axis} needs periods[] — relative keywords (e.g. LAST_12_MONTHS, THIS_YEAR) and/or fixed ISO periods (e.g. 202601, 2026Q1).` };
       const norm = [];
       for (const p of periods) {
@@ -378,6 +380,16 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
     else if (deId) target = { kind: 'de', ...ctx.des.get(deId) };
     else if (deId === null) return { _error: `Data element name "${dimToken}" is ambiguous in this program (several DEs share it). Pass its UID instead.` };
     else if (piId) target = { kind: 'pi', ...ctx.pis.get(piId) };
+  }
+  // No record-ID column exists in a line list. POST eventVisualizations accepts one
+  // (201), and from then on every GET answers 400 "Not a valid dimension: psi" and
+  // the app shows that error (verified 2.42.7, 2026-11-03: psi, event, eventId).
+  if (!target && /^(?:psi|pi|tei|uid|id|event|enrollment|enrolment|tracked[\s_-]?entity|(?:event|enrol?lment|record|tracked[\s_-]?entity|tei|patient|case)[\s_-]?(?:id|uid|identifier|number|no\.?))$/.test(lower)) {
+    return {
+      _error: `A line list has no "${dimToken}" column: DHIS2 Line Listing offers data elements, attributes, program indicators, org unit, dates, statuses and user columns, but no record identifier. A list saved with one fails with "Not a valid dimension", so it was not saved.`,
+      _hint: 'Send the same call without this column. In your answer say under "Changed from your request" that the identifier could not be included in a line list, and offer a dashboard plugin (manage_custom_app) if they want identifiers shown.',
+      _scope: 'line_list_no_record_id',
+    };
   }
   // 4b. Near-name fallback. An exact-name lookup is brittle against DHIS2's own
   // renames: create_program appends a qualifier when a name collides with an
@@ -1049,6 +1061,9 @@ async function executeManageLineLists(args) {
         line_list: summary,
       };
     }
+    if (dhis2.metadataOnlyTurn) {
+      return { success: true, line_list_id: llId, name: summary.name, query_check: 'The list\'s query ran without error. Row counts are not reported: this request is metadata only.', headers: probeRes.headers };
+    }
     return {
       success: true,
       line_list_id: llId,
@@ -1091,8 +1106,11 @@ async function executeManageLineLists(args) {
       }
     }
 
-    // Pre-flight probe: prove the layout runs BEFORE saving anything.
-    const dataCheck = String(args.data_check || 'warn_empty');
+    // Pre-flight probe: prove the layout runs BEFORE saving anything. It returns
+    // no values, so a metadata-only request keeps it (a model read "metadata only"
+    // as skip, and two lists were saved unproven, Malaria replay 2026-11-03) and
+    // only the row count is held back.
+    const dataCheck = dhis2.metadataOnlyTurn && args.data_check === 'skip' ? 'warn_empty' : String(args.data_check || 'warn_empty');
     let probeRes = null;
     let staleAnalyticsWarning = null;
     if (dataCheck !== 'skip') {
@@ -1142,8 +1160,12 @@ async function executeManageLineLists(args) {
       filters: built.resolved.filters,
       sorting: built.payload.sorting || [],
       legend: built.payload.legend || null,
-      row_count: probeRes ? probeRes.row_count : null,
-      ...(probeRes?.row_count_is_lower_bound ? { row_count_is_lower_bound: true, row_count_note: probeRes.row_count_note } : {}),
+      ...(dhis2.metadataOnlyTurn
+        ? { query_check: probeRes ? 'The list\'s query ran without error. Row counts are not reported: this request is metadata only.' : 'not run' }
+        : {
+          row_count: probeRes ? probeRes.row_count : null,
+          ...(probeRes?.row_count_is_lower_bound ? { row_count_is_lower_bound: true, row_count_note: probeRes.row_count_note } : {}),
+        }),
       open_url: `${dhis2.baseUrl}/dhis-web-line-listing/index.html#/${newId}`,
       warnings: warnings.length ? warnings : undefined,
       _next_step: 'Place it on a dashboard with manage_dashboards(action="add_items", items:[{ type:"EVENT_VISUALIZATION", event_visualization_id:"' + newId + '" }]) or create_dashboard with the same item type.',

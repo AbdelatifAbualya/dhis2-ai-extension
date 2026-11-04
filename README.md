@@ -353,6 +353,75 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.37 — Dashboard and app threads: "Malaria Testing and Treatment Review", "ANC Follow-up Explorer" (2026-11-03)
+
+A real thread on play 2.42.7: two charts showed "There was an error loading data", both detailed tables were missing, a facility map was one solid blob, and a "metadata only" request read data through 13 analytics queries. Its summary numbers and district table were correct. Each fix below was checked against the live server and in real Chrome.
+
+**Tiles that saved but could not draw:**
+- **A chart with no category.** The builder accepted `rows: []`. DHIS2 answers 201, and the Dashboard then shows the error. Bar, column, line, area and radar charts now always get a category and series, and the tool reports the correction. Several data items with one period and one place become one bar each, labelled on the axis. A long-labelled chart takes the full width, and a horizontal bar chart gets a line per bar.
+- **Existing broken charts are now reported.** `manage_dashboards get` adds `will_not_render` and `_broken_tiles`, and `get_visualization_details` adds `_will_not_render`.
+- **A dimension sent on two axes** is saved on one.
+
+**Tools the model could not reach:**
+- **"A detailed table of events" did not offer the line-list tool.** Only "line list" and "register" wording did. Plain wording now routes to it, and every dashboard request offers line lists, maps and legend sets.
+- **"That tool is available now" was not always true.** A refusal that names a tool now puts that tool on the wire for the next iteration, and a repeat refusal says to call it instead of "give a final answer". In the thread the model told the user the tool did not exist.
+
+**Honouring the request:**
+- **"Use metadata only".** `userAskedMetadataOnly` / `metadataOnlyGate`: on such a request analytics, record counts and previews are refused, and the prompt says so. The tools' own checks still run and return no values. A line-list probe still runs when the model asks to skip it, and its row count is held back.
+- **A named year stays that year.** MONTHS_THIS_YEAR under "start with 2026" would move to 2027 while the 2026 tiles stay. When the request names one year and does not say "this year", charts, maps and line lists save fixed periods.
+- **Event identifier.** A saved line list cannot show a record id. DHIS2 accepts a `psi` or `event` column (201), and then every read answers "Not a valid dimension" (verified 2.42.7). The tool refuses it and tells the model to say so under "Changed from your request". Analytics record-id dimensions are refused before the 409.
+- **Missing answers, two-field comparisons, legends:** the prompt and manuals now say how to compare two fields of the same events (one count indicator per combination, data items on the axis), to give both fields a "not recorded" item, and to leave out fixed legend bands unless the user gave thresholds. A 0–100 scale in steps of 20 painted a map of 18–30% values one colour.
+- **Accurate counts in the answer.** Each write returns `_saved_this_turn`. The thread reported five visualizations where there were eight.
+
+**Maps and text:**
+- **Bubble sizes.** Unset, the 5–30 px default made 600 facilities one blob. Now sized from the places drawn (2–10 px above 200, 3–16 up to 200, 5–30 up to 40), with `radius_low` / `radius_high` to override. `location_coverage` reports how many units can be drawn.
+- **Text tiles.** `**bold**` showed literal stars. DHIS2 uses `*bold*` and `_italic_`, so the tool converts it.
+- **Wrong level.** A title saying "district" on level 3 (Chiefdom) now gets a warning naming the right level. Outlines finer than a shaded map's level are left out and reported.
+
+**A wrong number on tracker programs:**
+- **Scheduled visits in percentages.** `V{event_count}` counts ACTIVE and COMPLETED events, but an AVERAGE or SUM over a data element counts SCHEDULE events too. On Child Programme a count said 1 and its percentage implied 2, and a month with 0 showed 0.11%. For EVENT indicators on tracker programs the tool now adds `(V{event_status} == 'ACTIVE' || V{event_status} == 'COMPLETED')`, and reports it under `auto_corrected`. Verified on 2.42.7 and 2.43.2. Existing indicators change only when re-saved.
+
+**Silent loss when deleting:**
+- A chart, map or line list on a dashboard: DHIS2 removes the tile with a plain 200. `manage_metadata` and `manage_maps` now refuse and say how to swap it.
+- A program indicator or indicator in use: DHIS2 strips it from charts and maps with a plain 200, leaving a broken tile (verified 2.42.7). `manage_program_indicators`, `manage_indicators` and `manage_metadata` now refuse and name them.
+
+**A false repair:**
+- A raw read of several line lists or maps (`/eventVisualizations?filter=…`) answers `columns: []`, `rows: []` and `filters: []` whatever they hold; only a read of one object fills them (verified 2.42.7 and 2.43.2). A real model reported two healthy lists as "saved with no columns and no period" and rewrote them. Such reads now carry a note saying the empties mean nothing.
+
+**Fewer failed calls:**
+- A dashboard description over 255 characters (refused on 2.43) is shortened.
+- `filter=id:in:a,b` gets its brackets (400 otherwise).
+- `aggregationType` on event analytics: an average moves its item to `value=`, and a count drops the parameter (409 otherwise).
+- A lookup of named ids no longer trips the `paging=false` refusal.
+- `get_program_info(indicators)` includes analytics and aggregation types, so the model need not read each indicator.
+- A long multi-part request gets 20 look-ups instead of 12 before the discovery stop.
+- A dropped connection during indicator validation is retried once.
+
+**Verified:** `npm run verify` (new block "Malaria thread"). Scenarios: line lists 128 calls, MNCH 129, dashboard edits 69, all 0 failed. Real model `deepseek-v4p1-flash-1017`: the thread's prompt, an inpatient dashboard, a tracker dashboard, an aggregate dashboard, a repair request and a follow-up edit on play 2.42.7 and 2.43.2. Dashboards were opened in real Chrome and their numbers compared with separate analytics queries. Not rendered: how legends read on every map, and anything on a phone-width screen. `npm run apps` was not run (it deletes every `ai-test-*` app on the target server).
+
+**"ANC Follow-up Explorer" app thread (same version):** the app never worked. Its table stayed empty after three rounds, and the model called a wrong theory "verified, not guessed".
+
+*The cause, and the same bug elsewhere:*
+- **Tracker parameter names differ per endpoint, and a wrong name is mostly silent** (verified on 2.42.5, 2.42.7, 2.43.2 by comparing totals). `orgUnit` on `tracker/enrollments` or `trackedEntities` is a 400 (the name is `orgUnits`); `orgUnits` on `tracker/events` is a 400 (the name is `orgUnit`). `tracker/events?enrollment=<id>` is ignored and returned 992 rows of other registrations out of 1000 (the name is `enrollments`). `programStartDate`, `ouMode`, `eventStatus`, `startDate`, `stage` and `trackedEntity` on `trackedEntities` do nothing.
+- **This assistant's own prompt taught the wrong form**, and `count_records`' tracker fallback and the enrollment helpers sent it too. Corrected. `normalizeTrackerQuery` now fixes these names in `safeDhis2Fetch` and, through `app-guard.js`, in every generated app. 2.41 follows its documentation: no such server was available to test.
+- **Reinstalling is enough.** The same v1.1.0 code that showed the 400, installed under a test key with the new guard, filled its table and opened its panels.
+
+*The model can now see its app run:*
+- **Install check** (`runtime_check` on create and update, in `tools-apps.js`). The tool opens the installed app in a hidden frame of the user's DHIS2 tab with `?__ai_check=1`. A tracker list asks for `updatedAfter=2099-01-01`, so DHIS2 validates the whole request and returns no record. One record, SQL-view rows and writes are not sent, and row-level analytics adds `skipData`. It returns request paths, statuses, DHIS2's messages, script errors, whether anything rendered, and the page's text. Failures tell the model to fix and re-check in the same turn. Plugins are opened on their own too.
+- **`window.D2_SELF_TEST`.** Calculation checks the app defines are run by the check and reported. Before, the model described assertions nobody had run. In the replay this caught a real miscount in the first build.
+- **It cannot show real records or clicks.** The manual says to list those under what still needs live testing, and not to call anything verified that the check did not show.
+
+*The workflow:*
+- **"Give me the finished app URL" counts as asking to install**, including through "…, continue". The preview now gives the real address and says not to hand it out before install. The thread's invented `/dhis-web-…` address led to "Unable to find an app for this URL".
+- **Repairing its own app no longer needs a separate "yes"** when the user reports an error in it or the check finds one: backed up first, same write access only. Never when the user said to change nothing, and not on a plain question.
+- **Token budget.** A reply cut at `max_tokens` raises the budget (doubling, up to 64,000) and sends the same request again. App-building turns start at the ceiling. A provider that refuses a higher number drops back to the user's setting and is not asked again. Before, the user was told to change a setting.
+- **`edits: [{ file, find, replace }]` on update**, all or nothing, so a small fix need not resend a 35 KB file.
+- **A 5xx on app upload is retried once.** The model had recorded a false lesson about file sizes from one.
+- **The UID scanner no longer refuses a variable** such as `facilitiesQ` as an id that does not exist.
+- **Manual additions**, from a finished app that passed every check and was still wrong: a section named after a stage counts only that stage, a details panel must be visible when opened, labels must say what the filter does, and download file names carry an id and not a person's name.
+
+*Verified:* `npm run verify`, `npm run appcheck` (new: real tools and real Chrome, on 2.42.7 and 2.43.2), and the install check from the real extension service worker over the CDP pipe. Real model `deepseek-v4p1-flash-1017`: the thread's prompt on 2.42.7 and 2.43.2, then used in Chrome: totals match the server, panels open, the event link opens that event in Capture, and the CSV matches the server row by row on event, date and hemoglobin. Line lists, MNCH, dashboard edits and SQL views scenarios pass. `npm run apps` was not run.
+
 ### 2.8.36 — Fixes from stress-testing a real model on dashboards, plugins and apps (2026-11-02)
 
 Sixteen multi-step threads ran through the real agent loop on `deepseek-v4p1-flash-1017` against localhost:8081, and the results were then opened and used in the real Dashboard and Capture apps. Most API calls succeeded, and that hid the worst problems: an app that could not save, a KPI showing 0 where the server had 23, a tile the model said would fill in but which showed an error. Each fix below comes from a failure seen on the live server, and each DHIS2 behaviour was confirmed there before it went into a tool.
