@@ -328,6 +328,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     dhis2.raisedMaxTokens = Math.max(Number(dhis2.raisedMaxTokens) || 0, MAX_TOKENS_CEILING);
   }
   dhis2.turnLedger = {};
+  dhis2.turnDataCheck = null;
   dhis2.orgLevelNames = null;
   // Learning memory: start observing this turn (privacy taint is decided here
   // for patient-record pages and save-error diagnosis).
@@ -1088,6 +1089,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             if (!failNote && WRITE_CAPABLE_TOOL_NAMES.has(tc.function.name) && toolResult && typeof toolResult === 'object' && !Array.isArray(toolResult)) {
               const savedSoFar = noteTurnLedger(tc.function.name, args, toolResult);
               if (savedSoFar) toolResult._saved_this_turn = savedSoFar;
+              noteDataCheckTarget(tc.function.name, args, toolResult);
             }
             if (!failNote) {
               // Success — unlocks ONE identical retry for previously failed
@@ -1292,7 +1294,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
       }
     } else {
       // Final text response (already streamed to UI if streaming was active)
-      const text = msg.content || '';
+      let text = msg.content || '';
 
       // A model under stress can emit its tool call as PLAIN TEXT (XML-ish
       // <tool_call>/<invoke> markup, sometimes with leaked provider separator
@@ -1395,6 +1397,15 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
         continue;
       }
 
+      // What the saved work really shows, measured now that it is finished. It does
+      // not depend on the model having read or repeated a tool's warning.
+      const closing = await finishTurnDataCheck(text).catch(() => '');
+      if (closing && text.trim()) {
+        text += closing;
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg && lastMsg.role === 'assistant') lastMsg.content = text;
+        if (streamStartBroadcast) broadcast({ type: 'AI_STREAM_CHUNK', text: closing });
+      }
       if (streamStartBroadcast) {
         broadcast({ type: 'AI_STREAM_END', text });
       }
@@ -1452,8 +1463,13 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     }, [], 49);
     if (finalTimer) { clearTimeout(finalTimer); finalTimer = null; }
     if (finalBuf) { broadcast({ type: 'AI_STREAM_CHUNK', text: finalBuf }); finalBuf = ''; }
-    const finalText = finalResult?.choices?.[0]?.message?.content || '';
+    let finalText = finalResult?.choices?.[0]?.message?.content || '';
     if (finalText.trim()) {
+      const closingCheck = await finishTurnDataCheck(finalText).catch(() => '');
+      if (closingCheck) {
+        finalText += closingCheck;
+        if (finalStreamStarted) broadcast({ type: 'AI_STREAM_CHUNK', text: closingCheck });
+      }
       messages.push({ role: 'assistant', content: finalText });
       if (finalStreamStarted) broadcast({ type: 'AI_STREAM_END', text: finalText });
       const turnHist = buildTurnHistory(messages, turnStartIdx, historyText);

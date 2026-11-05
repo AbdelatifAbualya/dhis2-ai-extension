@@ -5604,6 +5604,7 @@ function mapColorScale(scale, classes) {
   const all = ramp.split(',');
   return { colors: Array.from({ length: n }, (_, i) => all[Math.round(i * (all.length - 1) / (n - 1))]).join(','), classes: n };
 }
+const MAP_DEFAULT_NO_DATA_COLOR = '#D9D9D9';
 function buildMapObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
   const name = String(spec.name || '').trim();
@@ -5678,12 +5679,24 @@ function buildMapObject(spec, typeMap) {
     mapView.radiusHigh = Number.isFinite(high) && high > mapView.radiusLow ? Math.round(high) : Math.max(auto[1], mapView.radiusLow + 1);
     if (spec.opacity == null && pts > 40) mapView.opacity = 0.75;
   }
-  // Places without data get their own colour (Maps app "no data" style);
-  // without it they are simply not drawn.
-  if (spec.no_data_color != null && spec.no_data_color !== '') {
+  // Places without data get their own colour (Maps app "no data" style); without
+  // it they are not drawn, and a shaded map with no data at all opens on an empty
+  // view of a continent (Maternity thread 2026-11-04). So a shaded map always has
+  // one; no_data_color:"" asks for none. A facility map would fill with empty
+  // markers instead, so it gets outlines below.
+  const noDataGiven = spec.no_data_color !== undefined && spec.no_data_color !== null;
+  if (noDataGiven && spec.no_data_color !== '') {
     const c = String(spec.no_data_color).trim();
     if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(c)) return { _error: `no_data_color "${c}" is not a hex colour like "#CCCCCC".` };
     mapView.noDataColor = c;
+  } else if (!noDataGiven && thematicMapType === 'CHOROPLETH') {
+    mapView.noDataColor = MAP_DEFAULT_NO_DATA_COLOR;
+  }
+  // A bubble layer with nothing to draw has the same empty view, so it gets the
+  // outlines of its parent areas unless boundary_level says otherwise (0 = none).
+  if (thematicMapType === 'BUBBLE' && (spec.boundary_level === undefined || spec.boundary_level === null || spec.boundary_level === '')) {
+    const finest = organisationUnitLevels.length ? Math.max(...organisationUnitLevels) : null;
+    if (finest) spec = { ...spec, boundary_level: finest > 2 ? 2 : finest };
   }
 
   // boundary_level: an outline layer of that level (e.g. 2 = district
@@ -5696,7 +5709,7 @@ function buildMapObject(spec, typeMap) {
   // map with every chiefdom outlined, Malaria replay 2026-11-03).
   const boundaryTooFine = thematicMapType === 'CHOROPLETH' && Number.isFinite(level) && Number(spec.boundary_level) > level;
   const boundaryNote = boundaryTooFine ? `boundary_level ${spec.boundary_level} is finer than the shaded level ${level}, so it was left out: an outline layer is for a coarser level.` : null;
-  if (spec.boundary_level != null && spec.boundary_level !== '' && !boundaryTooFine) {
+  if (spec.boundary_level != null && spec.boundary_level !== '' && Number(spec.boundary_level) !== 0 && !boundaryTooFine) {
     const bl = Number(spec.boundary_level);
     if (!Number.isInteger(bl) || bl < 1) return { _error: `boundary_level must be an org-unit level number (e.g. 2 for districts), not "${spec.boundary_level}".` };
     const parents = organisationUnits.length ? organisationUnits : [];
@@ -5959,7 +5972,9 @@ async function executeManageDashboards(args) {
     });
     const small = items.filter(it => it.too_small);
     const unrenderable = items.filter(it => it.will_not_render);
+    const dataCheck = await dataCheckForResult({ dashboards: [resp.id] });
     return {
+      ...(dataCheck ? { data_check: dataCheck } : {}),
       success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length,
       _items_note: 'items are in reading order (position 1 = top left). id is the TILE id (for arrange order / insert_after_item_id / remove_item); a tile\'s numbers come from its data_items, never from the visualization or map id.',
       items,
@@ -6134,10 +6149,12 @@ async function executeManageDashboards(args) {
         if (w) periodWarnings.push(`${g.names.map(n => `"${n}"`).join(', ')}: ${w}`);
       }
     }
+    const dataCheck = await dataCheckForResult({ dashboards: [dashId] });
     return {
       success: true,
       action: 'create_dashboard',
       ...(periodWarnings.length ? { _warning: periodWarnings.join(' | ') } : {}),
+      ...(dataCheck ? { data_check: dataCheck } : {}),
       // Top-level dashboard_id mirrors the *_id convention so the final sharing
       // step (manage_metadata update_sharing) can chain it directly. The nested
       // `dashboard` object is preserved for any existing reader.
@@ -6300,9 +6317,11 @@ async function executeManageDashboards(args) {
 
     const verify = await safeDhis2Fetch(`dashboards/${dId}?fields=dashboardItems~size`);
     const after = verify && !verify._error ? (verify.dashboardItems ?? null) : null;
+    const dataCheck = await dataCheckForResult({ dashboards: [dId] });
     return {
       success: true,
       action: 'add_items',
+      ...(dataCheck ? { data_check: dataCheck } : {}),
       dashboard_id: dId,
       dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dId}`,
       dashboard_name: dashName,

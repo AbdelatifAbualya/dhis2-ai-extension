@@ -298,6 +298,7 @@ dhis2-AI/
 │   ├── tools-sqlviews.js      manage_sql_views (SQL views · real DB columns)
 │   ├── tools-apps.js          manage_custom_app (AI-built apps & dashboard plugins)
 │   ├── tools-apps-placement.js  manage_custom_app place / unplace / placements
+│   ├── data-check.js          what saved items will show: tile, field and analytics-table counts
 │   └── agent.js               agentic loop · feedback · keepalive · screenshot · message router
 ├── scripts/
 │   ├── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
@@ -352,6 +353,46 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 ## Changelog
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
+
+### 2.8.38 — Dashboard thread: "Maternity Care and Birth Outcomes" (2026-11-04)
+
+A real thread on play 2.43.2. The dashboard looked broken: a Caesarean % of 0, a chart saying "No data", a map opening on an empty view of Africa, blank table columns. Every saved object was correct and no call had failed. The causes were on the server, and the assistant had no way to find them and could not say so.
+
+**What the server held (measured on 2.43.2 and 2.42.7):**
+- Delivery method and Pregnancy outcome have no value on any of the 1,982 birth-care events. Unique ID is on 10 of 4,009 people.
+- On 2.43.2 another playground user's analytics jobs left the event analytics tables empty for a time: every event query, for every program, answered 0 until a run finished at 13:54. The thread built its dashboard at 13:47.
+- Both playgrounds use `CACHE_TWO_WEEKS`: analytics answers carry `Cache-Control: max-age=1209600, public`, and Chrome reuses them without asking the server (0 bytes, 3 ms). A tile first opened while the tables were empty can keep showing it for two weeks.
+
+**New: a data check of everything saved (`src/data-check.js`).** The answer used to say "all numbers must be confirmed by opening the tiles". Now each build is measured, whatever the model does:
+- **Tile by tile:** the tile's own aggregate query, reporting empty and partly empty tiles and which field is behind them.
+- **Field by field:** how many records hold a value, from live tracker totals: no values at all, or rarely filled (under 5%, so a column reads as blank).
+- **Program by program:** whether the analytics tables hold its records, compared with the live total. `system/info` cannot tell: it reported a run minutes old while the tables were empty.
+- **Where it appears:** `data_check` in `manage_dashboards` create_dashboard / add_items / get and `manage_line_lists` create / update / validate; `why_no_data` in the program-indicator check. One final check of the finished work is printed under the answer as a "Data check" block, which reaches the panel, the returned text and the history.
+- **Privacy:** counts only. A tracker total asks for one id and drops it; a line-list probe asks for one row holding only the facility name (`headers=ouname`). No patient value reaches the extension, so it also runs in a metadata-only request, where the numbers are held back and only the state is given ("no record has a value"). A metadata-only turn's own list probes now ask the same way: bad columns and failing indicators still answer 409, verified on both versions.
+- It costs about 40 calls for 15 tiles, stops after 25 seconds, and leaves out whatever cannot be measured.
+- A single-value tile with nothing to count shows 0 (DHIS2 answers 0.0 for a filter-only query), so such a tile is named and the 0 explained: a field that holds nothing, or the analytics tables, or the saved period and places.
+- The model is told these are live counts. Without that, a real run spent 20 extra analytics queries re-checking an empty field and looking for its values elsewhere.
+
+**Fixed:**
+- **The extension's own reads could be two weeks old.** Reads now use `cache: 'no-store'`, so a check after an analytics run sees the new answer.
+- **A map with no data opened on an empty continent.** A shaded map now draws places without data in grey (`no_data_color`, `""` = none). A bubble map gets level 2 outlines (`boundary_level`, `0` = none). Checked in real Chrome.
+- **`relativeKeyToPeriodToken` wrote `LAST12_MONTHS`.** Analytics answers 409 for it, so `get_visualization_details` previews of a chart on "last 12 months" failed. It now uses the exact keyword list.
+- **`skipMeta=true` on `analytics/events/aggregate` answers 500 on 2.43.2** ("org.hisp.dhis.common.Pager"; 2.42.7 is fine). It is taken off the query, in the worker and in every generated app's guard.
+- **A 0-row line list told the model to go and read `system/info`,** and it then told the user it could be either cause. The warning now states the measured cause.
+- **`manage_line_lists` update dropped the build notes and sent a row count in a metadata-only request.** Both are fixed.
+- **The dashboard link:** a thread's answer gave a made-up link and corrected itself in brackets. The right link is added under the answer when the answer does not carry it.
+
+**Line lists: told to the model and now in the manual:**
+- A column from a repeatable stage in an enrollment list shows only the most recent visit, unless `repeated_events` is passed (`{ oldest:1 }` is the first). The thread reported "haemoglobin at the second antenatal visit" without saying so.
+- The app names the stage in a header only for a data element used from several stages, and a saved list cannot rename a column. Asked to "label each stage clearly", the model must say which columns carry no stage.
+- Columns are saved in the order passed, so the model must keep the order the user listed. The thread put the facility first and then described another order.
+- A line list on a dashboard uses the same org units as the charts beside it. USER_ORGUNIT follows each viewer's unit, so a district user would see another scope.
+- Bare date and org-unit columns with their period or org units on the filters axis are now merged, not refused. A real model sent it that way twice in a row.
+- An identifier column that is rarely filled is reported. Names and birth dates are personal data: the model may offer them, not add them.
+
+**Checks:** `npm run verify` adds the Maternity thread block. New `npm run datacheck` (`scripts/scenario-data-check.js`) builds such a dashboard through the real tools and compares every finding with separate queries: all green on 2.43.2.1 and 2.42.7.1, 0 failed calls, server left as found. `npm run dashboards`, `npm run mnch` and the line-list scenario were re-run. `npm run apps` was not run. The user's dashboard was not changed.
+
+**Real model (Fireworks deepseek-v4p1-flash-1017, 2026-11-05):** the user's prompt through the real agent loop, 5 runs, 0 failed DHIS2 calls in each: the exact prompt on 2.43.2 (130 s, 217 calls); without "metadata only" on 2.42.7, twice (310 s, then 204 s after the model was told the counts are live); and twice with event analytics simulated as empty, the state the original thread met. The 3 builds on real analytics were compared with the tracker: 23 of 23 figures matched in each (6 summary numbers, 13 districts, 12 months of the 4 stages), and the program and its records were unchanged. On the exact-prompt build the flagged list held exactly the 779 raw records and the registration table exactly 2,002 rows, and its maps and tables were checked in real Chrome. No answer called an empty tile working, but two used wording looser than the block under them ("display the existing data", "built and verified"), and in the runs allowed to read counts the model still made 12 to 22 exploratory analytics queries before building (one hit the 20-call research stop). The merge of bare date and org-unit columns came after these runs: it is covered by verify and `npm run datacheck`, not by a further model run.
 
 ### 2.8.37 — Dashboard and app threads: "Malaria Testing and Treatment Review", "ANC Follow-up Explorer" (2026-11-03)
 

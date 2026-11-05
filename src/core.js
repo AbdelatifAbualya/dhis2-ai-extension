@@ -3373,7 +3373,11 @@ function normalizeTrackerQuery(pathOrUrl, apiVersion) {
 function withEventAggregateCacheKey(pathOrUrl) {
   var s = String(pathOrUrl);
   var at = s.indexOf('analytics/events/aggregate/');
-  if (at < 0 || /[?&]limit=/.test(s)) return s;
+  if (at < 0) return s;
+  // skipMeta=true on this endpoint answers 500 "org.hisp.dhis.common.Pager" on 2.43.2
+  // (fine on 2.42.7, and without it on both; verified 2026-11-04).
+  s = s.replace(/([?&])skipMeta=true(&|$)/, function (m, before, after) { return after ? before : ''; });
+  if (/[?&]limit=/.test(s)) return s;
   var key = s.slice(at), h = 0;
   for (var i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) | 0;
   return s + (s.indexOf('?') < 0 ? '?' : '&') + 'limit=' + (10000 + (Math.abs(h) % 40000));
@@ -3480,6 +3484,11 @@ async function safeDhis2Fetch(path, options = {}) {
         // into. Turned into a clean auth error below.
         redirect: 'manual',
       };
+      // With keyCacheStrategy on (CACHE_TWO_WEEKS on both playgrounds) analytics answers
+      // carry Cache-Control: max-age=1209600, public, and the browser reuses them without
+      // asking the server (verified in Chrome 2026-11-04: 0 bytes, 3 ms). A check run
+      // after an analytics rebuild would read the answer from before it.
+      if (!isWrite) fetchOpts.cache = 'no-store';
       if (bodyStr) fetchOpts.body = bodyStr;
 
       const resp = await fetch(fullUrl, fetchOpts);
@@ -4722,10 +4731,16 @@ async function resolveFacilityScopedOu(ouId) {
   return { ouId: base.id, ouName: base.displayName || base.id, source: 'fallback_current_ou' };
 }
 
+// A saved chart's relativePeriods flag → the keyword analytics takes. Exact names first,
+// because the keywords are not regular (thisDay = TODAY, last2SixMonths = LAST_2_SIXMONTHS).
+// The old pattern gave LAST12_MONTHS, which analytics answers with 409, so a preview or
+// check of any chart on "last 12 months" failed (found by the data check, 2026-11-04).
 function relativeKeyToPeriodToken(key) {
-  return String(key || '')
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toUpperCase();
+  const k = String(key || '');
+  if (typeof VIZ_REL_PERIOD_FLAG !== 'undefined') {
+    for (const [token, flag] of Object.entries(VIZ_REL_PERIOD_FLAG)) if (flag === k) return token;
+  }
+  return k.replace(/([a-z])([0-9])/g, '$1_$2').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase();
 }
 
 function getRelativePeriodKeys(relativePeriods) {

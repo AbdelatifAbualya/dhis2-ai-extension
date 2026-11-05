@@ -38,7 +38,7 @@ const runtimeFiles = [
   'background.js', 'content.js', 'generate-icons.js',
   'src/core.js', 'src/memory.js', 'src/registry.js', 'src/providers.js',
   'src/tools-metadata.js', 'src/tools-programs.js', 'src/tools-linelists.js',
-  'src/tools-admin.js', 'src/tools-sqlviews.js', 'src/tools-apps.js', 'src/tools-apps-placement.js', 'src/agent.js',
+  'src/tools-admin.js', 'src/tools-sqlviews.js', 'src/tools-apps.js', 'src/tools-apps-placement.js', 'src/data-check.js', 'src/agent.js',
   'sidepanel/panel.js',
 ];
 for (const rel of runtimeFiles) {
@@ -4320,6 +4320,194 @@ async function runAncAppThreadChecks() {
   truthy('the app manual gives the parameter table, the timeline recipe and the install check', /enrollments \(PLURAL\)/.test(allDocs) && /ONE REGISTRATION'S WHOLE TIMELINE/.test(allDocs) && /D2_SELF_TEST/.test(allDocs) && /Install check/.test(allDocs));
 }
 
+// ── Maternity thread (src/data-check.js): what saved items will really show ───
+async function runMaternityThreadChecks() {
+  console.log('\nMaternity thread (data check, fresh reads, maps that never open empty, list notes):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = vm.runInContext('dhis2', ctx);
+  const saved = { sdf: ctx.safeDhis2Fetch, fetch: ctx.fetch, broadcast: ctx.broadcast, exec: ctx.executeTool, base: d.baseUrl, connected: d.connected, apiVersion: d.apiVersion, pageContext: d.pageContext, metaOnly: d.metadataOnlyTurn, turn: d.turnDataCheck, hist: JSON.parse(JSON.stringify(vm.runInContext('conversationHistory', ctx))) };
+  Object.assign(d, { baseUrl: 'https://dhis.invalid', connected: true, apiVersion: 43, pageContext: { appType: 'Dashboard' }, metadataOnlyTurn: false });
+  vm.runInContext('_dataCheckCache.clear();', ctx);
+
+  // Fresh reads and the aggregate endpoint's 500.
+  const key = ctx.withEventAggregateCacheKey;
+  truthy('skipMeta=true is taken off an event aggregate (500 on 2.43.2)', !/skipMeta/.test(key('analytics/events/aggregate/P?dimension=pe:2026&skipMeta=true&stage=S')) && /stage=S/.test(key('analytics/events/aggregate/P?dimension=pe:2026&skipMeta=true&stage=S')));
+  truthy('…at the end of the query too, leaving no stray separator', !/[?&]$/.test(key('analytics/events/aggregate/P?limit=5&skipMeta=true')));
+  truthy('…and left alone on other endpoints', /skipMeta=true/.test(key('analytics?dimension=dx:a&skipMeta=true')));
+  truthy('a stable limit is still added', /limit=\d+/.test(key('analytics/events/aggregate/P?dimension=pe:2026')));
+  const seen = [];
+  ctx.fetch = async (u, o) => { seen.push(o || {}); return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } }); };
+  await ctx.__realSafeDhis2Fetch('analytics?dimension=dx:aaaaaaaaaaa&dimension=pe:2026&dimension=ou:USER_ORGUNIT');
+  truthy('reads skip the browser cache (a server can tell it to keep analytics answers for two weeks)', seen[0] && seen[0].cache === 'no-store');
+  seen.length = 0;
+  await ctx.__realSafeDhis2Fetch('dataStore/x/y', { method: 'POST', body: { a: 1 } });
+  truthy('…writes are not touched', !seen.some(o => o.cache === 'no-store'));
+  ctx.fetch = saved.fetch;
+
+  // Maps never open on an empty continent.
+  const typeMap = { piAAAAAAAAA: 'PROGRAM_INDICATOR' };
+  const map = (over) => ctx.buildMapObject({ name: 'T', data_item: 'piAAAAAAAAA', org_unit_level: 2, org_units: ['ImspTQPwCqd'], period: '2026', ...over }, typeMap).map;
+  const thematic = (m) => m.mapViews.find(v => v.layer === 'thematic');
+  const boundary = (m) => m.mapViews.find(v => v.layer === 'boundary');
+  truthy('a shaded map draws places without data in grey', thematic(map({})).noDataColor === '#D9D9D9');
+  truthy('…no_data_color:"" asks for none', !thematic(map({ no_data_color: '' })).noDataColor);
+  truthy('…a given colour is kept', thematic(map({ no_data_color: '#123456' })).noDataColor === '#123456');
+  truthy('a bubble map gets district outlines, not grey markers on every facility', boundary(map({ thematic_map_type: 'BUBBLE', org_unit_level: 4 })).organisationUnitLevels[0] === 2 && !thematic(map({ thematic_map_type: 'BUBBLE', org_unit_level: 4 })).noDataColor);
+  truthy('…boundary_level:0 asks for none', !boundary(map({ thematic_map_type: 'BUBBLE', org_unit_level: 4, boundary_level: 0 })));
+  truthy('…an asked-for level is kept', boundary(map({ thematic_map_type: 'BUBBLE', org_unit_level: 4, boundary_level: 3 })).organisationUnitLevels[0] === 3);
+
+  // Bare date and place columns with their scope on the filters axis.
+  const scoped = ctx.lineListMergeScopeFilters(
+    ['uniqueId', { dimension: 'enrollment_date' }, { dimension: 'ou' }, { dimension: 'program_status' }],
+    [{ dimension: 'ou', org_units: ['ouAAAAAAAAA'] }, { dimension: 'enrollmentDate', periods: ['2026'] }, { dimension: 'deAAAAAAAAA', filter: { operator: 'EQ', value: 1 } }]);
+  truthy('a period on the filters axis moves onto its bare date column', JSON.stringify(scoped.columns[1].periods) === '["2026"]');
+  truthy('…an org unit onto its bare org-unit column, in place', JSON.stringify(scoped.columns[2].org_units) === '["ouAAAAAAAAA"]' && scoped.columns.length === 4);
+  truthy('…a real filter stays a filter', scoped.filters.length === 1 && scoped.filters[0].dimension === 'deAAAAAAAAA');
+  const keptScope = ctx.lineListMergeScopeFilters([{ dimension: 'ou', org_units: ['ouBBBBBBBBB'] }], [{ dimension: 'ou', org_units: ['ouAAAAAAAAA'] }]);
+  truthy('…a column with its own org units is not overwritten', keptScope.columns[0].org_units[0] === 'ouBBBBBBBBB' && keptScope.filters.length === 1);
+  const noColumn = ctx.lineListMergeScopeFilters(['deAAAAAAAAA'], [{ dimension: 'ou', org_units: ['ouAAAAAAAAA'] }]);
+  truthy('…org units with no such column stay on the filters axis', noColumn.filters.length === 1 && noColumn.columns.length === 1);
+
+  // A probe that only asks "does it run, is it empty".
+  const noVal = ctx.lineListProbeWithoutValues;
+  truthy('an enrollment probe asks for one row with the facility name alone', noVal('analytics/enrollments/query/P?dimension=ou:X&pageSize=100') === 'analytics/enrollments/query/P?dimension=ou:X&pageSize=1&headers=ouname');
+  truthy('…an event probe keeps its total', noVal('analytics/events/query/P?pageSize=1&totalPages=true') === 'analytics/events/query/P?pageSize=1&totalPages=true&headers=ouname');
+  truthy('…asking twice changes nothing', noVal(noVal('analytics/events/query/P?pageSize=1')) === noVal('analytics/events/query/P?pageSize=1'));
+  truthy('…other paths are left alone', noVal('programs/abc?fields=id') === 'programs/abc?fields=id');
+  const probeSeen = [];
+  ctx.safeDhis2Fetch = async (p) => { probeSeen.push(p); return { headers: [{ name: 'ouname' }], rows: [['x']] }; };
+  d.metadataOnlyTurn = true;
+  await ctx.lineListRunProbe('analytics/enrollments/query/P?dimension=ou:X&pageSize=100');
+  d.metadataOnlyTurn = false;
+  await ctx.lineListRunProbe('analytics/enrollments/query/P?dimension=ou:X&pageSize=100');
+  truthy('a metadata-only request reads no values through a list probe', /headers=ouname/.test(probeSeen[0]) && /pageSize=1\b/.test(probeSeen[0]));
+  truthy('…an ordinary one still counts its rows', !/headers=/.test(probeSeen[1]) && /pageSize=100/.test(probeSeen[1]));
+
+  // Reading a saved object.
+  const refs = ctx.dataCheckIndicatorFields({ program: { id: 'progAAAAAAA' }, expression: "d2:condition(\"#{stageAAAAAA.deAAAAAAAAA} == 'x'\", 100, 0)", filter: "V{program_stage_id} == 'stageAAAAAA' && d2:hasValue(#{stageAAAAAA.deBBBBBBBBB}) && A{teaAAAAAAAA} == 'y'" });
+  truthy('an indicator\'s fields are read from its expression and filter', refs.length === 3 && refs[0].id === 'deAAAAAAAAA' && refs[2].kind === 'tea');
+  truthy('a level and a user org unit are both asked for', ctx.dataCheckOuDimension({ organisationUnits: [{ id: 'ouAAAAAAAAA' }], organisationUnitLevels: [2], userOrganisationUnit: true }) === 'ouAAAAAAAAA;USER_ORGUNIT;LEVEL-2');
+  truthy('fixed and relative periods are both asked for', ctx.dataCheckPeDimension({ periods: [{ id: '2026' }], relativePeriods: { lastYear: true, thisYear: false } }) === '2026;LAST_YEAR');
+  const token = ctx.relativeKeyToPeriodToken;
+  truthy('a saved "last 12 months" becomes a keyword analytics accepts', token('last12Months') === 'LAST_12_MONTHS');
+  truthy('…the irregular ones too', token('thisDay') === 'TODAY' && token('last2SixMonths') === 'LAST_2_SIXMONTHS' && token('last6BiMonths') === 'LAST_6_BIMONTHS' && token('biMonthsThisYear') === 'BIMONTHS_THIS_YEAR');
+  truthy('…every known flag comes back as its own keyword', Object.entries(vm.runInContext('VIZ_REL_PERIOD_FLAG', ctx)).every(([kw, flag]) => token(flag) === kw));
+
+  // The check itself, on a fixture server.
+  const PI = (id, name, expr, filter) => ({ dataDimensionItemType: 'PROGRAM_INDICATOR', programIndicator: { id, displayName: name, expression: expr, filter, program: { id: 'progAAAAAAA' } } });
+  const fixture = (over = {}) => async (p) => {
+    const path = String(p);
+    if (path.startsWith('dashboards/')) return { dashboardItems: [{ visualization: { id: 'vizSVAAAAAA' } }, { visualization: { id: 'vizCHAAAAAA' } }] };
+    if (path.startsWith('visualizations?')) return { visualizations: [
+      { id: 'vizSVAAAAAA', displayName: 'Caesarean %', type: 'SINGLE_VALUE', periods: [{ id: '2026' }], organisationUnits: [{ id: 'ouAAAAAAAAA' }], dataDimensionItems: [PI('piEMPTYAAAA', 'Caesarean rate', "d2:condition(\"#{stageAAAAAA.deMETHODAAA} == 'C'\", 100, 0)", 'd2:hasValue(#{stageAAAAAA.deMETHODAAA})')] },
+      { id: 'vizKPAAAAAA', displayName: 'Visits KPI', type: 'SINGLE_VALUE', periods: [{ id: '2026' }], organisationUnits: [{ id: 'ouAAAAAAAAA' }], dataDimensionItems: [PI('piFULLAAAAA', 'Visits', 'V{event_count}', "V{program_stage_id} == 'stageAAAAAA'")] },
+      { id: 'vizCHAAAAAA', displayName: 'Activity', type: 'COLUMN', periods: [{ id: '2026' }], organisationUnits: [{ id: 'ouAAAAAAAAA' }], dataDimensionItems: [PI('piFULLAAAAA', 'Visits', 'V{event_count}', "V{program_stage_id} == 'stageAAAAAA'"), PI('piNEARAAAAA', 'Near miss', 'V{event_count}', '#{stageAAAAAA.deNEARAAAAA} == 1')] },
+    ] };
+    if (path.startsWith('analytics?')) {
+      if (over.tables === 'empty') return { headers: [{ name: 'dx' }, { name: 'ou' }, { name: 'pe' }, { name: 'value' }], rows: [] };
+      const rows = /piFULLAAAAA/.test(path) ? [['piFULLAAAAA', 'ouAAAAAAAAA', '2026', '1026'], ['piNEARAAAAA', 'ouAAAAAAAAA', '2026', '523']] : [];
+      return { headers: [{ name: 'dx' }, { name: 'ou' }, { name: 'pe' }, { name: 'value' }], rows };
+    }
+    if (path.startsWith('tracker/events')) {
+      if (over.noRecords) return { pager: { total: 0 } };
+      if (/filter=deMETHODAAA/.test(path)) return { pager: { total: 0 } };
+      if (/filter=deNEARAAAAA/.test(path)) return { pager: { total: 1982 } };
+      return { pager: { total: 1982 } };
+    }
+    if (path.startsWith('analytics/events/aggregate/')) {
+      if (over.tables === 'missing') return { _error: 'Query failed because a referenced table does not exist (E7144)' };
+      const held = over.tables === 'empty' ? 0 : over.tables === 'behind' ? 100 : 1982;
+      return { headers: [{ name: 'pe' }, { name: 'value' }], rows: [['2026', String(held)]] };
+    }
+    if (path.startsWith('system/info')) return { lastAnalyticsTableSuccess: '2026-11-04T13:00:00.000' };
+    if (path.startsWith('systemSettings/keyCacheStrategy')) return { keyCacheStrategy: 'CACHE_TWO_WEEKS' };
+    if (path.startsWith('programs/progAAAAAAA')) return { id: 'progAAAAAAA', displayName: 'RMNCH', programStages: [{ id: 'stageAAAAAA', displayName: 'Care at birth', programStageDataElements: [{ dataElement: { id: 'deMETHODAAA', displayName: 'Delivery method' } }, { dataElement: { id: 'deNEARAAAAA', displayName: 'Near-miss' } }] }], programTrackedEntityAttributes: [] };
+    if (path.startsWith('programIndicators?')) return { programIndicators: [] };
+    return {};
+  };
+  const run = async (over = {}, metaOnly = false) => {
+    vm.runInContext('_dataCheckCache.clear();', ctx);
+    d.metadataOnlyTurn = metaOnly;
+    ctx.safeDhis2Fetch = fixture(over);
+    const c = await ctx.runDataCheck({ dashboards: ['dashAAAAAAA'] });
+    d.metadataOnlyTurn = false;
+    return c;
+  };
+  const c = await run();
+  truthy('an empty tile is named, with the field behind it', c.empty_tiles?.[0]?.tile === 'Caesarean %' && /Delivery method \(Care at birth\)/.test(c.empty_tiles[0].because_no_values_in[0]));
+  truthy('a tile with values is counted as having them', c.tiles.with_data === 2 && c.tiles.total === 3);
+  truthy('a field with no values is reported with its count', c.fields_without_values?.[0]?.records === 1982);
+  truthy('a field with values is not', !c.fields_without_values.some(f => /Near-miss/.test(f.field)));
+  truthy('a single value showing 0 for nothing recorded is called out', c.single_values_showing_0_for_nothing_recorded?.[0] === 'Caesarean %' && c.report_lines.some(l => /not as a real zero/.test(l)));
+  truthy('healthy analytics tables are not mentioned', !c.analytics_tables && !c.report_lines.some(l => /Analytics tables/.test(l)));
+  const e = await run({ tables: 'empty' });
+  truthy('empty analytics tables are reported as the server\'s state, not the items\' fault', e.analytics_tables?.[0]?.state === 'empty' && e.report_lines.some(l => /hold none of this program's records/.test(l) && /not at fault/.test(l)));
+  truthy('…with the browser\'s two-week cache explained', e.report_lines.some(l => /CACHE_TWO_WEEKS/.test(l) && /private window/.test(l)));
+  truthy('…a zero caused by the tables is not called "nothing recorded"', e.single_values_showing_0_for_no_data?.[0] === 'Visits KPI' && e.report_lines.some(l => /"Visits KPI" shows 0 only because of the analytics tables/.test(l)) && !e.report_lines.some(l => /"Visits KPI"[^.]*nothing is recorded/.test(l)));
+  truthy('…a zero caused by an empty field still is', e.single_values_showing_0_for_nothing_recorded?.[0] === 'Caesarean %');
+  truthy('the model is told not to re-check live counts', /do not re-check/.test(c._note || '') && /do not re-check/.test(vm.runInContext('KB_DASHBOARDS_DETAILS', ctx)));
+  const b = await run({ tables: 'behind' });
+  truthy('tables holding only part of the records are reported', b.analytics_tables?.[0]?.state === 'behind' && b.report_lines.some(l => /100 of 1982/.test(l)));
+  const m = await run({ tables: 'missing' });
+  truthy('missing tables are reported', m.analytics_tables?.[0]?.state === 'missing');
+  const fresh = await run({ noRecords: true });
+  truthy('a stage with no records at all gets one line, not one per field', fresh.report_lines.filter(l => /No records yet/.test(l)).length === 1 && !fresh.report_lines.some(l => /no record on this server has a value/.test(l)) && fresh.report_lines.some(l => /Care at birth/.test(l)));
+  const hidden = await run({ tables: 'behind' }, true);
+  truthy('a metadata-only request still gets the findings', hidden.fields_without_values?.length === 1 && hidden.report_lines.length > 0);
+  truthy('…with every number held back', !/\b(?:1982|100)\b/.test(JSON.stringify({ f: hidden.fields_without_values, r: hidden.report_lines, a: hidden.analytics_tables })));
+  ctx.safeDhis2Fetch = async () => ({ _error: 'HTTP 403' });
+  vm.runInContext('_dataCheckCache.clear();', ctx);
+  const denied = await ctx.dataCheckForResult({ dashboards: ['dashAAAAAAA'] });
+  truthy('a server that refuses every read costs nothing', denied === null);
+  let slow = null;
+  await Promise.race([(async () => { slow = await ctx.dataCheckWithin(new Promise(() => {}), 20); })(), new Promise(r => setTimeout(r, 400))]);
+  truthy('a check that hangs is given up on', slow === null);
+
+  // A turn: the finished work is measured, the block lands in the stream, the
+  // answer and the history, whatever the model wrote.
+  const enc = new TextEncoder();
+  const sse = (obj) => `data: ${JSON.stringify({ choices: [{ index: 0, ...obj }] })}\n\n`;
+  const turn = async (script, userText) => {
+    vm.runInContext('conversationHistory = []; _dataCheckCache.clear();', ctx);
+    const events = []; let n = 0;
+    ctx.broadcast = (x) => events.push(x);
+    ctx.safeDhis2Fetch = fixture();
+    ctx.executeTool = async (name) => (name === 'manage_dashboards' ? { success: true, dashboard_id: 'dashAAAAAAA', dashboard_url: 'https://dhis.invalid/dhis-web-dashboard/#/dashAAAAAAA' } : { success: true });
+    ctx.fetch = async (url) => {
+      if (!String(url).startsWith('https://llm.invalid')) return new Response('{"version":"2.43"}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      const step = script[Math.min(n++, script.length - 1)];
+      const payload = step.call
+        ? sse({ delta: { tool_calls: [{ index: 0, id: `c${n}`, type: 'function', function: { name: step.call, arguments: JSON.stringify(step.args) } }] }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'tool_calls' })
+        : sse({ delta: { content: step.text }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'stop' });
+      return new Response(new ReadableStream({ start(cc) { cc.enqueue(enc.encode(`${payload}data: [DONE]\n\n`)); cc.close(); } }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    const res = await ctx.runAgenticLoop(userText, null, false);
+    return { res, events, history: JSON.parse(JSON.stringify(vm.runInContext('conversationHistory', ctx))) };
+  };
+  vm.runInContext(`_cachedApiKey = 'verify-key'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+  const CREATE = { call: 'manage_dashboards', args: { action: 'create_dashboard', dashboard: { name: 'T' }, items: [] } };
+  const built = await turn([CREATE, CREATE, { text: 'The dashboard is built.' }], 'Create a dashboard called T');
+  const lastAssistant = [...built.history].reverse().find(x => x.role === 'assistant' && !x.tool_calls);
+  truthy('the answer ends with the data check', /\*\*Data check\*\*/.test(built.res?.text || '') && /Delivery method \(Care at birth\)/.test(built.res?.text || ''));
+  truthy('…the dashboard link is added when the answer lacks it', /Dashboard link:\*\* https:\/\/dhis\.invalid\/dhis-web-dashboard\/#\/dashAAAAAAA/.test(built.res?.text || ''));
+  truthy('…the panel gets it in the stream and at the end', built.events.some(x => x.type === 'AI_STREAM_CHUNK' && /Data check/.test(x.text)) && built.events.some(x => x.type === 'AI_STREAM_END' && /Data check/.test(x.text)));
+  truthy('…and the next turn remembers it', /Data check/.test(lastAssistant?.content || ''));
+  const linked = await turn([CREATE, CREATE, { text: 'Open it: https://dhis.invalid/dhis-web-dashboard/#/dashAAAAAAA' }], 'Create a dashboard called T');
+  truthy('a right link in the answer is not repeated', !/Dashboard link:/.test(linked.res?.text || ''));
+  const readOnly = await turn([{ text: 'This server has several dashboards.' }], 'What dashboards are there?');
+  truthy('a turn that saved nothing gets no block', !/Data check/.test(readOnly.res?.text || ''));
+
+  // Line-list notes.
+  truthy('the manual explains repeatable stages, header labels and column order', ['MOST RECENT', 'Column order', 'names the stage in the header', 'Identifier column'].every(w => vm.runInContext('KB_LINE_LISTS_DETAILS', ctx).includes(w)));
+  truthy('the dashboard manual explains data_check and forbids swapping a field', /data_check/.test(vm.runInContext('KB_DASHBOARDS_DETAILS', ctx)) && /never swap in another field/.test(vm.runInContext('KB_DASHBOARDS_DETAILS', ctx)));
+  truthy('the metadata-only prompt tells the model the check still runs', /data_check/.test(ctx.buildSystemPrompt.toString()));
+
+  vm.runInContext('_dataCheckCache.clear();', ctx);
+  ctx.safeDhis2Fetch = saved.sdf; ctx.fetch = saved.fetch; ctx.broadcast = saved.broadcast; ctx.executeTool = saved.exec;
+  Object.assign(d, { baseUrl: saved.base, connected: saved.connected, apiVersion: saved.apiVersion, pageContext: saved.pageContext, metadataOnlyTurn: saved.metaOnly, turnDataCheck: saved.turn });
+  vm.runInContext(`conversationHistory = ${JSON.stringify(saved.hist)};`, ctx);
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -4343,6 +4531,7 @@ setImmediate(async () => {
   if (loaded) await runStressThreadChecks().catch((e) => bad(`stress thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runMalariaThreadChecks().catch((e) => bad(`Malaria thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runAncAppThreadChecks().catch((e) => bad(`ANC app thread checks threw: ${e && e.stack || e}`));
+  if (loaded) await runMaternityThreadChecks().catch((e) => bad(`Maternity thread checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

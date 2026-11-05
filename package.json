@@ -14,6 +14,7 @@
     "sqlviews": "node scripts/scenario-sql-views.js",
     "mnch": "node scripts/scenario-mnch-dashboard.js",
     "dashboards": "node scripts/scenario-dashboard-edits.js",
+    "datacheck": "node scripts/scenario-data-check.js",
     "appcheck": "node scripts/scenario-app-install-check.js",
     "restore": "node scripts/scenario-restore-fidelity.js",
     "build-kit": "node scripts/build-runtime-kit.js"

@@ -37,6 +37,7 @@ background.js  (loader)
      src/tools-sqlviews.js   manage_sql_views — SQL views (data no endpoint has, real DB columns)
      src/tools-apps.js       manage_custom_app — AI-built DHIS2 apps & dashboard plugins
      src/tools-apps-placement.js  manage_custom_app place / unplace / placements
+     src/data-check.js       what saved items will show: tile, field and analytics-table counts
      src/agent.js            agent loop · feedback · keepalive · message router
    )
 ```
