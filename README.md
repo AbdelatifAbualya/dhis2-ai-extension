@@ -354,6 +354,45 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.40 — A refreshed side panel: capability suggestions, tabbed settings, a cleaner theme (2026-11-08)
+
+The panel still opened with suggestions from a much less capable version ("How many patients are enrolled?", "Monthly trend of events"), kept every setting on one long page, and had several places that were unreadable in dark mode. Each change below was checked in real Chrome with the extension loaded (CDP `Extensions.loadUnpacked`), against localhost:8081 and a real model.
+
+**Welcome screen:**
+- Six capability cards replace the four question chips: build a complex dashboard, create and install a custom app, add a dashboard plugin, add a form-field plugin, design a tracker program, and audit and fix configuration.
+- A card puts its prompt in the message box to edit, instead of sending it. The prompts name programs and dashboards the user will want to adapt to their own server.
+- The composer reads "Ask or describe a task…". The longer wording was cut off at the panel's minimum width of 320 px.
+
+**Settings in three tabs:**
+- **General** holds the theme, the model provider and the advanced model settings. **Web browsing** holds the Tavily key. **Memory** holds learning memory.
+- The tabs work with the arrow, Home and End keys. A validation error brings back the tab with the field. The Memory tab has no Save button and no empty footer, because its changes apply at once.
+- The theme is stored as soon as it changes.
+- Clearing the Tavily field and saving now removes the key; before, a saved key could never be removed.
+- A status message no longer hides a newer one early (each message started its own 3-second timer). Errors stay for 6 seconds.
+
+**Conversation:**
+- **Tool steps are grouped.** The steps of one run share a collapsible group. It shows the step running now, and folds into "Done in N steps" when the reply starts. A group with a failed step stays open. API paths are shown decoded and cut to two lines, with the full path on hover. A 14-step answer used to fill several screens with wrapped, URL-encoded paths.
+- **A cursor kept blinking after the turn ended.** When the model writes a sentence and then calls tools, the worker sends no stream end for that sentence, so its bubble was never settled. It is now settled when a tool call or the next reply starts. A bubble that received no words is removed.
+- **Tables** have thin lines, a quiet header and tabular numbers. Words wrap only between words: "Palestine" was shown as "Palestin-e" in a narrow cell, and the table now scrolls sideways instead.
+- **Charts** already on screen are redrawn when the theme changes; before, they kept light gridlines and labels on a dark panel. The value-axis title is no longer cut off at the top.
+
+**Theme:** this builds on a new light and dark palette, a light header with the version, a single composer box and focus rings. Dark mode had components with light-only colours, and they now use theme tokens: the save and error messages (dark green text on a dark green background), the error bubble, the chart header (a bright band with white text), zebra rows in data tables, the web-browsing indicator, the grant banner, and the tool icons.
+
+**Worker fixes found while testing the panel and the new real-model cases:**
+- **An app request changed a live program.** Asked for an "NCD follow-up worklist" app with a "Mark as called" note, the model added a "Follow-up Call Log" stage and a data element to the NCD program without asking. `create_metadata` add_stage / add_data_elements_to_stage / add_program_rules are now refused during an app or plugin request (`program_change_not_requested`), and the model is told to propose the change and ask. A request that names the change, a yes after the proposal, or a program built in this conversation still goes through. The stage and field the test run added were removed again.
+- **Patient notes:** the app manual now gives DHIS2's own enrollment and event notes: `POST tracker/enrollments/<id>/note`, read through `fields=notes[…]`. `dhis2_query` answers the guessed `tracker/notes` (404) and `GET …/note` (405) itself instead of sending them (verified 2.42.5).
+- **`value=<program indicator>` on an event aggregate** returned 409 ("Value does not refer to a data element or attribute which are numeric"). It is now read from `/analytics` as `dx`, with the indicator's own aggregation.
+
+**New real-model cases** (`scripts/llm-apps-acceptance.js`, deepseek-v4p1-flash-1017, 8081):
+- **J**, Malaria facility scorecard dashboard plugin: all checks passed, and its 69.0% supervised matches the records.
+- **K**, NCD Follow-up form-field plugin: all checks passed. It shows the previous visit (143/80, HbA1c 9.9) with arrows, sets "BP controlled" to No at 150/95 and Yes at 120/80, and shows the crisis alert at 185/125.
+- **I**, NCD follow-up worklist app: its list and summary match the records (22 overdue, 1 due in the next 7 days, 2 due in 8–14 days, active enrollments). The guard stopped the program change. The test's "Mark as called" step still needs a re-run with the corrected checks (one run: click timeout).
+
+**Checks:**
+- `npm run verify` adds side-panel checks: the three tabs and their fields, the capability cards filling the input, the settled stream, grouped steps, the chart redraw, and theme tokens.
+- Settings UI in real Chrome: 20 checks all pass, covering tabs and keys, validation, saving, Tavily key removal, the memory toggle and viewer, the theme surviving a reload, and the cards filling the input. No page errors.
+- A real model turn through the panel against 8081 drew its chart, table and grouped steps correctly in both themes, at 420 px and 320 px.
+
 ### 2.8.39 — Fixes from complex real-model builds: maps, analytics queries, data check, apps (2026-11-08)
 
 The real model (Fireworks deepseek-v4p1-flash-1017) built two complex dashboards, one each on the NCD and Malaria programs, and eight apps and plugins on localhost:8081 (2.42.5). Each result was checked in real Chrome and against the raw tracker records. Every problem below came from those runs, or from a code review done alongside them, and each fix was checked on the live server.

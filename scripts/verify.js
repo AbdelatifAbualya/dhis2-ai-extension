@@ -1182,6 +1182,23 @@ if (loaded) {
       if (detailGaps.length) bad(`panel detail formatter has no branch for: ${detailGaps.join(', ')}`);
       else ok(`panel detail formatter covers all ${names.length} routable tools`);
     }
+    // 2.8.40 panel refresh (checked in real Chrome; these keep the pieces in place).
+    const html = fs.readFileSync(path.join(ROOT, 'sidepanel/panel.html'), 'utf8');
+    const css = fs.readFileSync(path.join(ROOT, 'sidepanel/panel.css'), 'utf8');
+    const t = (label, cond) => (cond ? ok(label) : bad(label));
+    t('settings are split into General / Web browsing / Memory tabs, each with its panel',
+      ['general', 'web', 'memory'].every((n) => html.includes(`data-tab="${n}"`) && html.includes(`id="settings-panel-${n}"`))
+      && /id="settings-panel-general"[\s\S]*id="theme-select"[\s\S]*id="provider-select"[\s\S]*advanced-toggle[\s\S]*id="settings-panel-web"[\s\S]*id="tavily-api-key-input"[\s\S]*id="settings-panel-memory"[\s\S]*id="memory-enabled-toggle"/.test(html));
+    t('the welcome screen suggests dashboards, apps, dashboard plugins and form-field plugins (filled into the input, not sent)',
+      ['dashboard', 'app', 'plugin', 'form-plugin'].every((k) => html.includes(`data-kind="${k}"`)) && !/How many patients are enrolled\?/.test(html)
+      && /example-btn[\s\S]{0,400}chatInput\.value = btn\.dataset\.prompt/.test(panelSrc) && !/example-btn[\s\S]{0,600}sendMessage\(\)/.test(panelSrc.slice(panelSrc.indexOf('// Example prompts'), panelSrc.indexOf('// Example prompts') + 700)));
+    t('a reply that streams words and then calls tools is settled (no cursor left blinking)',
+      /function showToolCall\([^)]*\) \{\s*removeThinking\(\);\s*settleStreamingBubble\(\);/.test(panelSrc) && /function handleStreamStart\(\) \{[\s\S]{0,120}settleStreamingBubble\(\);/.test(panelSrc));
+    t('tool steps of one run share a collapsible group, closed when the reply starts',
+      /currentToolGroup\(\)/.test(panelSrc) && /function markAllToolsDone\(\) \{[\s\S]*?closeToolGroups\(\);\s*\}/.test(panelSrc) && /\.tool-group\s*\{/.test(css));
+    t('charts on screen are redrawn when the theme changes', /function applyTheme\([\s\S]{0,700}buildChartOption\(c\._spec\)/.test(panelSrc) && /chart\._spec = normalizedSpec/.test(panelSrc));
+    t('save and error colours, tables and charts use theme tokens (readable in dark mode)',
+      /\.key-status\.key-saved \{[^}]*var\(--success-text\)/.test(css) && /\.chart-header \{[^}]*var\(--surface-2\)/.test(css) && /\.md-table td \{[^}]*overflow-wrap: normal/.test(css) && !/border: 2px solid #64748b/.test(css));
   }
 
   const missingTarget = need('actionMissingFieldTarget');
@@ -1915,6 +1932,34 @@ async function runCustomAppChecks() {
   d.writeAuth = { scope: 'read_only', reason: 'verify: no authorization' };
   const gated = (r) => r && r._scope === 'requires_user_confirmation' && /manage_custom_app/.test(r._error);
   truthy('create is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'create', key: 'ai-verify-new', name: 'New', files: { 'app.jsx': appSrc } })));
+  {
+    // NCD worklist app (deepseek, 2026-11-08): an app request added a stage and a data
+    // element to the live program to hold its notes, without asking.
+    const savedWa = d.writeAuth, savedTurn = d.turnCounter, savedRef = d.lastRefusedWrite, savedMine = d.assistantCreatedIds;
+    const ask = (text, opts = {}) => {
+      vm.runInContext(`lastUserText = ${JSON.stringify(text)};`, ctx);
+      d.writeAuth = { scope: 'broad', reason: 'verify', verbs: { create: true, update: true } };
+      return ctx.requireWriteAuth('create_metadata', opts.action || 'add_stage', { program_id: opts.program || 'progLive001' });
+    };
+    try {
+      d.turnCounter = 10; d.lastRefusedWrite = null; d.assistantCreatedIds = ['progMine001'];
+      const appAsk = 'Build and install an app called "NCD follow-up worklist" with a "Mark as called" button that saves a short note on the server.';
+      const r = ask(appAsk);
+      truthy('an app request does not let create_metadata add a stage to an existing program: refused, asking the user, nothing saved',
+        r && r._scope === 'program_change_not_requested' && /tracker data, not the dataStore/.test(r._hint) && /Ask/.test(r._hint));
+      truthy('…nor add data elements to a stage or add program rules', ask(appAsk, { action: 'add_data_elements_to_stage' })?._scope === 'program_change_not_requested' && ask(appAsk, { action: 'add_program_rules' })?._scope === 'program_change_not_requested');
+      truthy('…while a program request still adds stages', ask('Add a repeatable follow-up call stage to the NCD program') === null && ask('Create a tracker program for TB follow-up') === null);
+      truthy('…an app request that names the change is allowed ("add a stage for the call notes")', ask('Build an app that logs calls, and add a new stage to the NCD program for the call notes.') === null);
+      truthy('…a program built in this conversation is the assistant\'s own work', ask(appAsk, { program: 'progMine001' }) === null);
+      ask(appAsk);
+      d.turnCounter = 11;
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: ${JSON.stringify(appAsk)} }];`, ctx);
+      truthy('…and the user agreeing next turn ("yes, go ahead") lets the proposed change through', ask('Yes, go ahead.') === null);
+    } finally {
+      d.writeAuth = savedWa; d.turnCounter = savedTurn; d.lastRefusedWrite = savedRef; d.assistantCreatedIds = savedMine;
+      vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx);
+    }
+  }
   truthy('delete is refused on a read-only turn', gated(await ctx.executeManageCustomApp({ action: 'delete', key: 'ai-verify-app' })));
   const aiManifest = { key: 'ai-verify-app', name: 'Verify app', kind: 'app', version: '1.0.0', created_by: 'dhis2-ai-assistant', files: ['app.jsx'] };
   ctx.fetch = ((inner) => (url, o) => {
@@ -3071,6 +3116,11 @@ async function runRuleScopeAndTetSharingChecks() {
       eq('program indicators asked for on an enrollment AGGREGATE endpoint are routed to /analytics (no 409 E7224)', await ctx.routeProgramIndicatorAnalytics('analytics/enrollments/aggregate/progNcd0001?dimension=ou%3AUSER_ORGUNIT&dimension=pe%3ALAST_12_MONTHS&dimension=dx%3Api000000001%3Bpi000000002&pageSize=50&stage=stageFollow1'), { path: 'analytics?dimension=dx%3Api000000001%3Bpi000000002&dimension=ou%3AUSER_ORGUNIT&dimension=pe%3ALAST_12_MONTHS', routed: true });
       eq('…also bare / single program-indicator dimensions (no dx:), which otherwise group by the indicator value', (await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&dimension=pe:THIS_YEAR&dimension=pi000000001&dimension=pi000000002;pi000000003&stage=stageFollow1')).path, 'analytics?dimension=dx%3Api000000001%3Bpi000000002%3Bpi000000003&dimension=ou:USER_ORGUNIT&dimension=pe:THIS_YEAR');
       eq('…keeping startDate / endDate when the query has no pe dimension', (await ctx.routeProgramIndicatorAnalytics('analytics/enrollments/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT;LEVEL-4&dimension=pi000000001&startDate=2025-11-01&endDate=2026-10-31')).path, 'analytics?dimension=dx%3Api000000001&dimension=ou:USER_ORGUNIT;LEVEL-4&startDate=2025-11-01&endDate=2026-10-31');
+      // TB dashboard through the panel (2026-11-08): value=<program indicator> → 409.
+      const viaValue = await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT&value=pi000000001&aggregationType=AVERAGE');
+      const deValue = await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=pe:LAST_12_MONTHS&value=deAge000001&aggregationType=AVERAGE&stage=stageFollow1');
+      truthy('a program indicator given as value= on an event aggregate is read from /analytics with its own aggregation (no aggregationType); a data element value= is left alone',
+        viaValue.routed && viaValue.path === 'analytics?dimension=dx%3Api000000001&dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT' && /not an event-analytics value/.test(viaValue.note || '') && !deValue.routed);
       eq('…data elements are not routed (they stay event/enrollment dimensions)', (await ctx.routeProgramIndicatorAnalytics('analytics/events/aggregate/progNcd0001?dimension=dx:deSystolic1&dimension=pe:LAST_12_MONTHS')).routed, false);
     } finally { ctx.safeDhis2Fetch = saved7; }
     eq('…dimension=stage:<uid> becomes the stage parameter', ctx.healEventAnalyticsDxDimension('analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&dimension=stage:stageFoll01&startDate=2025-01-01').path, 'analytics/events/aggregate/progNcd0001?dimension=ou:USER_ORGUNIT&stage=stageFoll01&startDate=2025-01-01');

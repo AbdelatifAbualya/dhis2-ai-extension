@@ -445,6 +445,187 @@ const CASES = [
     },
   },
   {
+    id: 'I',
+    title: 'Very complex app — NCD follow-up worklist: due/overdue list, summary, facility tree, "called" notes on the server, CSV',
+    pageContext: { appType: 'Dashboard' },
+    prompt: 'Build and install an app called "NCD follow-up worklist" for the NCD Hypertension and Diabetes Care program. It should list every patient whose next appointment date (from their latest Follow-up Visit) is overdue or falls in the next 14 days, most overdue first, with their name, national ID, facility, next appointment date, days overdue and their last blood pressure (shown in red when it is 140/90 or higher). Add a facility filter with an org unit tree, a summary at the top (patients overdue, due in the next 7 days, due in 8 to 14 days), a "Mark as called" button that saves a short note on the server so the whole team sees who was called, by whom and when, and a CSV download of the list.',
+    // The model may add a stage for the call notes (after asking): note the stages
+    // before, so the ones it adds can be removed afterwards.
+    async before() { this.stagesBefore = new Set(((await api(`programs/KggjM4VSwLS?${qs({ fields: 'programStages[id]' })}`)).programStages || []).map((s) => s.id)); this.startedAt = new Date().toISOString().slice(0, 19); },
+    async verify(browser, app) {
+      // Expected from the raw records: each ACTIVE enrollment's latest non-scheduled
+      // Follow-up Visit and its Next appointment date (a worklist leaves out
+      // completed enrollments).
+      const active = new Set(((await api(`tracker/enrollments?${qs({ program: 'KggjM4VSwLS', orgUnitMode: 'ACCESSIBLE', status: 'ACTIVE', pageSize: 1000, fields: 'enrollment' })}`)).enrollments || []).map((e) => e.enrollment));
+      const ev = ((await api(`tracker/events?${qs({ program: 'KggjM4VSwLS', programStage: 'lNntUL4fzxd', orgUnitMode: 'ACCESSIBLE', pageSize: 1000, fields: 'enrollment,trackedEntity,orgUnit,occurredAt,status,dataValues[dataElement,value]' })}`)).events || []).filter((e) => e.status !== 'SCHEDULE');
+      const last = {};
+      for (const e of ev) if (active.has(e.enrollment) && (!last[e.enrollment] || e.occurredAt > last[e.enrollment].occurredAt)) last[e.enrollment] = e;
+      const today = new Date().toISOString().slice(0, 10);
+      const due = Object.values(last).map((e) => ({ e, next: ((e.dataValues.find((d) => d.dataElement === 'thzKCHsBVeI') || {}).value || '').slice(0, 10) }))
+        .filter((x) => x.next && x.next <= new Date(Date.now() + 14 * 864e5).toISOString().slice(0, 10)).sort((a, b) => a.next.localeCompare(b.next));
+      const overdue = due.filter((x) => x.next < today);
+      const first = due[0];
+      const te = first ? await api(`tracker/trackedEntities/${first.e.trackedEntity}?${qs({ program: 'KggjM4VSwLS', fields: 'attributes[attribute,value]' })}`) : null;
+      const attr = (id) => ((te && te.attributes) || []).find((a) => a.attribute === id)?.value || '';
+      const natId = attr('Tan1suUUC3s');
+      const name = `${attr('VLWPWNwBNaW')} ${attr('xoi3V1rzkEt')}`.trim();
+      const ns = app.activities && app.activities.dhis && app.activities.dhis.namespace;
+      const stagesNow = ((await api(`programs/KggjM4VSwLS?${qs({ fields: 'programStages[id,name]' })}`)).programStages || []);
+      const added = stagesNow.filter((s) => !this.stagesBefore.has(s.id));
+      cur.logs.push(`stages added to the NCD program: ${JSON.stringify(added)}; app namespace: ${ns || 'none'}`);
+      const page = await (await browser.newContext({ viewport: { width: 1440, height: 1000 }, storageState: STATE, acceptDownloads: true })).newPage();
+      const log = collect(page, app.key);
+      await page.goto(`${BASE}/api/apps/${app.key}/index.html?redirect=false`);
+      await settled(page.mainFrame());
+      await page.waitForTimeout(5000);
+      const text = (await page.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+      check(`the most overdue patient is listed (${name}, ${natId}; ${overdue.length} overdue, ${due.length} in all)`, first && (text.includes(natId) || text.includes(name)), text.slice(0, 300));
+      check('…with a summary that counts the overdue patients', new RegExp(`\\b${overdue.length}\\b`).test(text), text.slice(0, 200));
+      check('there is an org unit tree to filter by facility', await page.locator('[data-test*="org-unit"], [data-test*="orgunit"], [class*="OrganisationUnitTree"], [role="tree"]').count() > 0);
+      await shot(page, 'worklist');
+      // Mark the first row as called with a note, then look for it on the server.
+      const mark = page.locator('button').filter({ hasText: /called/i }).first();
+      check('there is a "Mark as called" button', await mark.count());
+      if (await mark.count()) {
+        await mark.click();
+        await page.waitForTimeout(800);
+        const note = page.locator('[role="dialog"] textarea, [role="dialog"] input[type="text"], [role="dialog"] input:not([type]), .modal textarea, textarea').first();
+        if (await note.count()) await note.fill('ai-test called note');
+        const confirm = page.locator('[role="dialog"] button, [data-test*="modal"] button').filter({ hasText: /save|mark|confirm|called/i }).last();
+        if (await confirm.count()) await confirm.click();
+        await page.waitForTimeout(3000);
+        // Patient notes belong in tracker data (the manual's rule); app-level data in
+        // the app's namespace. Either way the note must be on the server.
+        const inNs = ns ? JSON.stringify(await api(`dataStore/${ns}?${qs({ fields: '.', paging: 'false' })}`)) : '';
+        const written = ((await api(`tracker/events?${qs({ program: 'KggjM4VSwLS', orgUnitMode: 'ACCESSIBLE', updatedAfter: this.startedAt, pageSize: 50, fields: 'event,programStage,storedBy,createdBy[username],dataValues[value]' })}`)).events || [])
+          .filter((e) => JSON.stringify(e.dataValues).includes('ai-test called note'));
+        this.writtenEvents = written.map((e) => e.event);
+        check('the call is saved on the server with the note and who made it (tracker data or the app\'s namespace)', (/ai-test called note/.test(inNs) && /admin/i.test(inNs)) || (written.length > 0 && /admin/i.test(JSON.stringify(written))), (inNs || JSON.stringify(written)).slice(0, 300));
+        await shot(page, 'worklist after a call');
+      }
+      const csv = page.locator('button, a').filter({ hasText: /csv|download|export/i }).first();
+      if (await csv.count()) {
+        const dl = await Promise.all([page.waitForEvent('download', { timeout: 8000 }).catch(() => null), csv.click()]).then(([d]) => d);
+        const body = dl ? fs.readFileSync(await dl.path(), 'utf8') : '';
+        check('the CSV download holds the list', dl && (body.includes(natId) || body.includes(name)) && body.split('\n').length >= Math.min(due.length, 10), dl ? `${body.split('\n').length} lines` : 'no download');
+      } else check('there is a CSV download button', false);
+      check('no console errors / failed requests from the app', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
+      await page.context().close();
+      // Leave the program as found: the call events, the stages the model added and
+      // their data elements.
+      if (!KEEP) {
+        for (const id of this.writtenEvents || []) await fetch(`${BASE}/api/tracker?async=false&importStrategy=DELETE`, { method: 'POST', headers: { Authorization: AUTHH, 'Content-Type': 'application/json' }, body: JSON.stringify({ events: [{ event: id }] }) });
+        for (const s of added) {
+          const st = await api(`programStages/${s.id}?${qs({ fields: 'programStageDataElements[dataElement[id,created]]' })}`);
+          const left = (await api(`tracker/events?${qs({ program: 'KggjM4VSwLS', programStage: s.id, orgUnitMode: 'ACCESSIBLE', pageSize: 1, totalPages: true, fields: 'event' })}`)).pager?.total || 0;
+          if (left) { cur.logs.push(`stage ${s.id} kept: ${left} event(s) in it`); continue; }
+          const del = await apiDelete(`programStages/${s.id}`);
+          // Only fields made during this run: an existing field reused in the stage stays.
+          for (const p of st.programStageDataElements || []) if (String(p.dataElement.created || '') >= this.startedAt) await apiDelete(`dataElements/${p.dataElement.id}`);
+          check(`the stage the model added (${s.name}) and its fields are removed`, del < 300, `HTTP ${del}`);
+        }
+      }
+    },
+  },
+  {
+    id: 'J',
+    title: 'Very complex dashboard plugin — Malaria facility scorecard: KPIs, stacked chart, colour-coded ranking, district/facility switch',
+    pageContext: { appType: 'Dashboard' },
+    placement: true,
+    prompt: 'Create a dashboard plugin called "Malaria facility scorecard" for the Malaria Case Surveillance and Response program that follows the dashboard\'s org unit and period filters (default: last 12 months, all my org units). Show four headline numbers (cases, % RDT positive, % of treatments fully supervised, Day 28 cure rate), a stacked monthly column chart of cases by RDT result, and a table ranking the facilities by cases with positivity % and cure rate %, coloured green, amber or red (cure rate 90% or more green, 75 to 90% amber, under 75% red). Add a switch to show the table by district or by facility. Put it on a new dashboard called "ai-test LLM malaria scorecard".',
+    async placed(key) {
+      const d = await api(`dashboards?${qs({ filter: `dashboardItems.appKey:eq:${key}`, fields: 'id,displayName', paging: 'false' })}`);
+      return (d.dashboards || []).length > 0;
+    },
+    async verify(browser, app) {
+      const d = (await api(`dashboards?${qs({ filter: `dashboardItems.appKey:eq:${app.key}`, fields: 'id,displayName', paging: 'false' })}`)).dashboards || [];
+      check('the plugin was placed on a dashboard named "ai-test LLM malaria scorecard"', d.some((x) => /malaria scorecard/i.test(x.displayName)), JSON.stringify(d));
+      for (const x of d) createdDashboards.push(x.id);
+      if (!d.length) return;
+      const ous = [...new Set(((await api(`tracker/enrollments?${qs({ program: 'l0NXObayGhi', orgUnitMode: 'ACCESSIBLE', pageSize: 1000, fields: 'orgUnit' })}`)).enrollments || []).map((e) => e.orgUnit))];
+      const ouNames = ((await api(`organisationUnits?${qs({ filter: `id:in:[${ous.join(',')}]`, fields: 'displayName', paging: 'false' })}`)).organisationUnits || []).map((o) => o.displayName);
+      const page = await (await browser.newContext({ viewport: { width: 1440, height: 1000 }, storageState: STATE })).newPage();
+      const log = collect(page, app.key);
+      await page.goto('about:blank');
+      await page.goto(`${BASE}/dhis-web-dashboard/#/${d[0].id}`);
+      const f = await waitFrame(page, app.key, 'plugin.html');
+      check('the plugin renders on the dashboard', !!f);
+      if (f) {
+        await settled(f);
+        await page.waitForTimeout(5000);
+        const text = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+        check('it draws the stacked chart', await f.evaluate(() => !!document.querySelector('canvas, svg')), text.slice(0, 160));
+        check('…shows percentages and no error notice', /\d+(\.\d+)?\s*%/.test(text) && !/error|failed|could not/i.test(text), text.slice(0, 240));
+        check('…and ranks facilities from the program\'s records', ouNames.some((n) => text.includes(n)), `${ouNames.slice(0, 4).join(', ')} — ${text.slice(0, 200)}`);
+        const sw = f.locator('button, [role="tab"], [role="radio"], label, option, select').filter({ hasText: /district/i });
+        check('there is a district / facility switch', await sw.count() > 0);
+        if (await sw.count()) {
+          await sw.first().click().catch(() => {});
+          await page.waitForTimeout(3000);
+          const after = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+          check('…and switching to districts changes the table without an error', after !== text && !/error|failed|could not/i.test(after), after.slice(0, 200));
+        }
+        await shot(page, 'malaria scorecard on its dashboard');
+      }
+      check('no console errors / failed requests from the plugin', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
+      await page.context().close();
+    },
+  },
+  {
+    id: 'K',
+    title: 'Very complex form-field plugin — NCD Follow-up: compare with the previous visit, crisis alert, sets "BP controlled" itself',
+    url: `${BASE}/apps/capture#/enrollmentEventNew?enrollmentId=JxWy9RxojCX&orgUnitId=BW4n4Em2zBm&programId=KggjM4VSwLS&stageId=lNntUL4fzxd&teiId=vtsJDjnOoIT`,
+    pageContext: { programId: 'KggjM4VSwLS', orgUnitId: 'BW4n4Em2zBm', teiId: 'vtsJDjnOoIT', enrollmentId: 'JxWy9RxojCX', stageId: 'lNntUL4fzxd', route: 'enrollmentEventNew', appType: 'Capture' },
+    placement: true,
+    prompt: 'Add a plugin to this Follow-up Visit form that reads the systolic and diastolic blood pressure, fasting blood glucose and HbA1c as they are typed and compares each with this patient\'s previous follow-up visit (fetched from the server), showing the previous value and an up or down arrow. Show a red "hypertensive crisis" alert when systolic is 180 or more or diastolic 120 or more, and set the BP controlled field automatically: Yes when systolic is under 140 and diastolic under 90, otherwise No.',
+    async placed(key) { const f = await captureKey('dataEntryForms'); return !!(f && f.lNntUL4fzxd && JSON.stringify(f.lNntUL4fzxd).includes(`/api/apps/${key}/`)); },
+    async verify(browser, app) {
+      const form = ((await captureKey('dataEntryForms')) || {}).lNntUL4fzxd || [];
+      const plug = form.flatMap((s) => s.elements).find((e) => e.type === 'plugin' && e.pluginSource.includes(`/api/apps/${app.key}/`));
+      const mapped = new Set(((plug && plug.fieldMap) || []).map((m) => m.IdFromApp));
+      check('placed in the Follow-up Visit form with both BP fields, glucose, HbA1c and BP controlled mapped', plug && ['V49fVKzuuZG', 'gutNnuOOCGP', 'V5Ug9j2uxfY', 'ez91Ow9ScGf', 'dFfGvLJNYta'].every((id) => mapped.has(id)), JSON.stringify(plug && plug.fieldMap));
+      if (!plug) return;
+      // The previous visit, from the records.
+      const prev = ((await api(`tracker/events?${qs({ enrollments: 'JxWy9RxojCX', programStage: 'lNntUL4fzxd', fields: 'occurredAt,status,dataValues[dataElement,value]', pageSize: 100 })}`)).events || [])
+        .filter((e) => e.status !== 'SCHEDULE').sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))[0];
+      const pv = (id) => (prev.dataValues.find((x) => x.dataElement === id) || {}).value;
+      const eventsBefore = ((await api(`tracker/events?${qs({ enrollments: 'JxWy9RxojCX', programStage: 'lNntUL4fzxd', fields: 'event', pageSize: 100 })}`)).events || []).length;
+      const page = await (await browser.newContext({ viewport: { width: 1440, height: 1200 }, storageState: STATE })).newPage();
+      const log = collect(page, app.key);
+      await page.goto(this.url);
+      const f = await waitFrame(page, app.key, 'plugin.html');
+      check('the plugin is inside the real Capture form', !!f);
+      if (f) {
+        const capture = f.parentFrame();
+        const field = (id) => capture.locator(`[data-test="form-field-${id}"]`).locator('input, textarea').first();
+        const bpControlled = () => capture.$eval('[data-test="form-field-dFfGvLJNYta"]', (el) => { const c = el.querySelector('input:checked'); return c ? c.value : null; }).catch(() => null);
+        const typeIn = async (pairs) => { for (const [id, v] of pairs) { await field(id).fill(v); await field(id).press('Tab'); } await page.waitForTimeout(3000); };
+        await settled(f);
+        await page.waitForTimeout(3000);
+        await typeIn([['V49fVKzuuZG', '150'], ['gutNnuOOCGP', '95'], ['V5Ug9j2uxfY', '7.2'], ['ez91Ow9ScGf', '8.1']]);
+        const t1 = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+        check(`it shows the previous visit's values (${pv('V49fVKzuuZG')}/${pv('gutNnuOOCGP')}, HbA1c ${pv('ez91Ow9ScGf')})`, t1.includes(pv('V49fVKzuuZG')) && t1.includes(pv('gutNnuOOCGP')) && t1.includes(pv('ez91Ow9ScGf')), t1.slice(0, 300));
+        check('…with up / down arrows', /[↑↓▲▼⬆⬇]|\bup\b|\bdown\b/i.test(t1), t1.slice(0, 200));
+        check('150/95 sets BP controlled to No', (await bpControlled()) === 'false', String(await bpControlled()));
+        await (await f.frameElement()).scrollIntoViewIfNeeded();
+        await shot(page, 'follow-up form plugin, uncontrolled');
+        await typeIn([['V49fVKzuuZG', '120'], ['gutNnuOOCGP', '80']]);
+        check('120/80 sets BP controlled to Yes', (await bpControlled()) === 'true', String(await bpControlled()));
+        await typeIn([['V49fVKzuuZG', '185'], ['gutNnuOOCGP', '125']]);
+        const t3 = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+        check('185/125 shows the hypertensive crisis alert (and BP controlled No)', /crisis/i.test(t3) && (await bpControlled()) === 'false', t3.slice(0, 200));
+        await shot(page, 'follow-up form plugin, crisis');
+        const el = await f.frameElement();
+        const box = await el.boundingBox();
+        const docH = await f.evaluate(() => document.documentElement.scrollHeight);
+        check('Capture sized the plugin to its content', box.height + 2 >= docH, `frame ${Math.round(box.height)} / content ${docH}`);
+      }
+      check('no console errors / failed requests from the plugin', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
+      await page.context().close(); // leave the form without saving
+      check('no event was saved', ((await api(`tracker/events?${qs({ enrollments: 'JxWy9RxojCX', programStage: 'lNntUL4fzxd', fields: 'event', pageSize: 100 })}`)).events || []).length === eventsBefore);
+    },
+  },
+  {
     id: 'F',
     title: 'Transfer-history dashboard plugin (the reported thread, verbatim) — SQL view + plugin + dashboard',
     pageContext: { appType: 'Dashboard' },
@@ -531,6 +712,7 @@ async function main() {
     R.cases.push(cur);
     console.log(`\n── ${c.id}. ${c.title}`);
     try {
+      if (c.before) await c.before();
       const conv = await converse(c);
       cur.transcript = conv.transcript;
       cur.api = conv.api;

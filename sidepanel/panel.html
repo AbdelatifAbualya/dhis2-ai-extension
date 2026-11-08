@@ -11,11 +11,11 @@
     <!-- Header -->
     <header class="header">
       <div class="header-left">
-        <svg class="header-logo" width="22" height="22" viewBox="0 0 24 24" fill="none">
-          <rect width="24" height="24" rx="6" fill="rgba(255,255,255,0.15)"/>
-          <path d="M6 16V11M10 16V8M14 16V13M18 16V6" stroke="white" stroke-width="2" stroke-linecap="round"/>
-        </svg>
+        <span class="header-logo" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 17V12M10 17V8M14 17V13M18 17V6" stroke="white" stroke-width="2.4" stroke-linecap="round"/></svg>
+        </span>
         <span class="header-title">DHIS2 AI</span>
+        <span id="header-version" class="header-version"></span>
       </div>
       <div class="header-right">
         <div class="chat-download-menu-container">
@@ -67,20 +67,47 @@
     <div id="messages-area" class="messages-area">
       <!-- Welcome Screen -->
       <div id="welcome" class="welcome">
-        <div class="welcome-icon">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none">
-            <rect width="24" height="24" rx="6" fill="#e0e7ff"/>
-            <path d="M6 16V11M10 16V8M14 16V13M18 16V6" stroke="#4f46e5" stroke-width="2" stroke-linecap="round"/>
-          </svg>
+        <div class="welcome-hero">
+          <div class="welcome-icon" aria-hidden="true">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M6 17V12M10 17V8M14 17V13M18 17V6" stroke="white" stroke-width="2.2" stroke-linecap="round"/></svg>
+          </div>
+          <h2 class="welcome-title">What should we build in DHIS2?</h2>
+          <p class="welcome-desc">I work inside your logged-in DHIS2 session and do the work end to end: I find the metadata, build the items, save them and check the result.</p>
         </div>
-        <h2 class="welcome-title">DHIS2 AI Assistant</h2>
-        <p class="welcome-desc">Navigate to a DHIS2 page and I'll extract the context automatically. Then ask me anything about the data.<br><span class="welcome-subdesc">Defaults to a local <strong>Ollama</strong> model — switch to a cloud provider in settings if you prefer.</span></p>
+        <div class="welcome-section-label">Try one of these</div>
         <div class="welcome-examples" id="example-prompts">
-          <button class="example-btn" data-prompt="How many patients are enrolled in this program?">How many patients are enrolled?</button>
-          <button class="example-btn" data-prompt="Show me the trend of events by month for the last 12 months">Monthly trend of events</button>
-          <button class="example-btn" data-prompt="Compare data across org units for this program">Compare across org units</button>
-          <button class="example-btn" data-prompt="What data elements and stages does this program have?">Explain program structure</button>
+          <button type="button" class="example-btn" data-kind="dashboard"
+            data-prompt="Create a dashboard called &quot;Malaria Testing and Treatment Review&quot; for the Malaria testing and surveillance program. Find the fields and choices yourself and start with this year across all locations. Include summary numbers, a monthly chart of test results, a chart of treatment choices, a district table, a line listing of positive cases and a district map of the positivity rate. Add period and location filters where supported, explain the calculations on the dashboard, and give me the link.">
+            <span class="example-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>
+            <span class="example-text"><span class="example-title">Build a complex dashboard</span><span class="example-sub">Charts, tables, line lists and maps, saved and checked</span></span>
+          </button>
+          <button type="button" class="example-btn" data-kind="app"
+            data-prompt="Build and install a DHIS2 app called &quot;Reporting Completeness Explorer&quot; that lets supervisors pick a data set and a period, then shows reporting completeness and timeliness by district in a sortable table with a 12-month trend chart. Use the real data sets on this server, show me a short summary before installing, and give me the app link.">
+            <span class="example-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 14l2 2-2 2M13 18h3"/></svg></span>
+            <span class="example-text"><span class="example-title">Create and install a custom app</span><span class="example-sub">A full React app on @dhis2/ui, no build tools needed</span></span>
+          </button>
+          <button type="button" class="example-btn" data-kind="plugin"
+            data-prompt="Create a dashboard plugin that shows ANC 1st visit coverage by district for the period and location selected in the dashboard filters, with a ranked bar chart and the national figure on top. Add it to the &quot;Antenatal Care&quot; dashboard.">
+            <span class="example-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4"/><circle cx="12" cy="12" r="4"/></svg></span>
+            <span class="example-text"><span class="example-title">Add a dashboard plugin</span><span class="example-sub">An interactive widget that follows dashboard filters</span></span>
+          </button>
+          <button type="button" class="example-btn" data-kind="form-plugin"
+            data-prompt="Add a form-field plugin to this tracker program's event form that calculates BMI from the weight and height fields, shows the BMI category with a colour, and saves the BMI value into the BMI data element. Show me the field mapping before you place it.">
+            <span class="example-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6a2 2 0 0 1 2 2v1H7V5a2 2 0 0 1 2-2z"/><rect x="5" y="5" width="14" height="16" rx="2"/><path d="M9 12h6M9 16h4"/></svg></span>
+            <span class="example-text"><span class="example-title">Add a form-field plugin</span><span class="example-sub">Calculations and checks inside Capture forms</span></span>
+          </button>
+          <button type="button" class="example-btn" data-kind="program"
+            data-prompt="Design and create a tracker program for TB case follow-up: registration attributes, a diagnosis stage and a repeatable monthly follow-up stage, option sets for treatment outcome, program rules that warn about missed follow-ups, and program indicators for treatment success. Show me the plan before creating anything.">
+            <span class="example-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8.5 6h7M7.3 8.2l3.4 7.6M16.7 8.2l-3.4 7.6"/></svg></span>
+            <span class="example-text"><span class="example-title">Design a tracker program</span><span class="example-sub">Stages, option sets, rules and indicators in one go</span></span>
+          </button>
+          <button type="button" class="example-btn" data-kind="audit"
+            data-prompt="Review this program's configuration for problems: program rules with broken conditions, data elements that are not used in any stage, missing option sets, sharing that blocks data entry, and indicators that cannot be calculated. List what you find and propose fixes, but do not change anything yet.">
+            <span class="example-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg></span>
+            <span class="example-text"><span class="example-title">Audit and fix configuration</span><span class="example-sub">Find broken rules, unused fields and sharing gaps</span></span>
+          </button>
         </div>
+        <p class="welcome-footnote">The suggestion goes into the message box so you can edit it before sending. Runs on a local <strong>Ollama</strong> model by default; switch to a cloud provider in Settings.</p>
       </div>
 
       <!-- Chat Messages -->
@@ -127,7 +154,7 @@
             </button>
           </div>
         </div>
-        <textarea id="chat-input" placeholder="Ask about your DHIS2 data..." rows="1"></textarea>
+        <textarea id="chat-input" placeholder="Ask or describe a task…" rows="1"></textarea>
         <button id="btn-send" class="send-btn" disabled title="Send message">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
@@ -155,96 +182,111 @@
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
+        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button type="button" class="settings-tab active" role="tab" id="settings-tab-general" aria-controls="settings-panel-general" aria-selected="true" data-tab="general">General</button>
+          <button type="button" class="settings-tab" role="tab" id="settings-tab-web" aria-controls="settings-panel-web" aria-selected="false" tabindex="-1" data-tab="web">Web browsing</button>
+          <button type="button" class="settings-tab" role="tab" id="settings-tab-memory" aria-controls="settings-panel-memory" aria-selected="false" tabindex="-1" data-tab="memory">Memory</button>
+        </div>
         <div class="settings-body">
-          <div class="form-group">
-            <label for="theme-select">Theme</label>
-            <select id="theme-select" class="settings-select">
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
-            </select>
-            <p class="form-hint">Choose how the assistant panel looks.</p>
-          </div>
-          <div class="form-group">
-            <label for="provider-select">Provider</label>
-            <select id="provider-select" class="settings-select">
-              <option value="ollama" selected>Ollama (local — default, no key)</option>
-              <option value="fireworks">Fireworks AI</option>
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic Claude</option>
-              <option value="google">Google Gemini</option>
-              <option value="openrouter">OpenRouter (any model)</option>
-              <option value="together">Together AI</option>
-              <option value="groq">Groq</option>
-              <option value="grok">xAI Grok</option>
-              <option value="custom">Custom / Other (OpenAI-compatible)</option>
-            </select>
-            <p class="form-hint">Select your AI provider. URL and model will be pre-filled. Ollama runs fully locally and needs no API key.</p>
-          </div>
-          <div class="form-group">
-            <label for="api-base-url-input">API Base URL</label>
-            <input type="text" id="api-base-url-input" class="settings-input" placeholder="http://localhost:11434/v1" autocomplete="off" spellcheck="false">
-            <p class="form-hint">Auto-filled from provider. Override if needed. Must start with http:// or https://.</p>
-          </div>
-          <div class="form-group">
-            <label for="model-id-input">Model ID</label>
-            <input type="text" id="model-id-input" class="settings-input" placeholder="llama3.2" autocomplete="off" spellcheck="false">
-            <p class="form-hint">The model identifier your provider uses. For Ollama, run <code>ollama pull llama3.2</code> first.</p>
-          </div>
-          <div class="form-group" id="api-key-group">
-            <label for="api-key-input">API Key <span id="api-key-optional-badge" class="form-optional-badge">optional for local providers</span></label>
-            <div class="input-with-toggle">
-              <input type="password" id="api-key-input" placeholder="Leave blank for Ollama" autocomplete="off" spellcheck="false">
-              <button id="btn-toggle-key" class="toggle-key-btn" type="button">Show</button>
+          <section class="settings-panel" id="settings-panel-general" role="tabpanel" aria-labelledby="settings-tab-general" data-panel="general">
+            <h4 class="settings-section-title">Appearance</h4>
+            <div class="form-group">
+              <label for="theme-select">Theme</label>
+              <select id="theme-select" class="settings-select">
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+              <p class="form-hint">Choose how the assistant panel looks.</p>
             </div>
-            <p class="form-hint">Required for cloud providers (OpenAI, Anthropic, etc.). Not needed when using a local Ollama instance.</p>
-          </div>
-          <details class="form-group advanced-toggle">
-            <summary class="advanced-summary">Advanced Model Settings</summary>
-            <div class="advanced-body">
-              <div class="form-group">
-                <label for="max-tokens-input">Max Tokens</label>
-                <input type="number" id="max-tokens-input" class="settings-input" placeholder="16384" min="256" max="131072" autocomplete="off">
-              </div>
-              <div class="form-group">
-                <label for="temperature-input">Temperature</label>
-                <input type="number" id="temperature-input" class="settings-input" placeholder="0.2" min="0" max="2" step="0.1" autocomplete="off">
-              </div>
-              <div class="form-group form-checkbox">
-                <input type="checkbox" id="think-block-checkbox">
-                <label for="think-block-checkbox">Strip &lt;think&gt; blocks (for reasoning models like DeepSeek, Kimi, QwQ)</label>
-              </div>
-              <div class="form-group">
-                <label for="vision-model-id-input">Vision Model ID (optional)</label>
-                <input type="text" id="vision-model-id-input" class="settings-input" placeholder="accounts/fireworks/models/llama-v3p2-11b-vision-instruct" autocomplete="off">
-                <p class="form-hint">Separate model for image analysis. Leave empty to pass images directly to the main model.</p>
-              </div>
-              <div class="form-group">
-                <label for="vision-api-base-url-input">Vision API Base URL (optional)</label>
-                <input type="text" id="vision-api-base-url-input" class="settings-input" placeholder="Same as main API if empty" autocomplete="off">
-              </div>
+            <h4 class="settings-section-title">Model provider</h4>
+            <div class="form-group">
+              <label for="provider-select">Provider</label>
+              <select id="provider-select" class="settings-select">
+                <option value="ollama" selected>Ollama (local — default, no key)</option>
+                <option value="fireworks">Fireworks AI</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic Claude</option>
+                <option value="google">Google Gemini</option>
+                <option value="openrouter">OpenRouter (any model)</option>
+                <option value="together">Together AI</option>
+                <option value="groq">Groq</option>
+                <option value="grok">xAI Grok</option>
+                <option value="custom">Custom / Other (OpenAI-compatible)</option>
+              </select>
+              <p class="form-hint">Select your AI provider. URL and model will be pre-filled. Ollama runs fully locally and needs no API key.</p>
             </div>
-          </details>
-          <div class="form-group">
-            <label for="tavily-api-key-input">Tavily API Key (Web Browsing)</label>
-            <input type="password" id="tavily-api-key-input" class="settings-input" placeholder="tvly-..." autocomplete="off">
-            <p class="form-hint">Used by the Browse Web tool. Get your key at <a href="https://app.tavily.com/" target="_blank" rel="noopener">app.tavily.com</a>.</p>
-          </div>
-          <div class="form-group memory-settings">
-            <label for="memory-enabled-toggle">Learning memory</label>
-            <div class="memory-toggle-row">
-              <label class="memory-switch">
-                <input type="checkbox" id="memory-enabled-toggle" checked>
-                <span class="memory-slider" aria-hidden="true"></span>
-              </label>
-              <span id="memory-status-text" class="memory-status-text">On</span>
-              <button id="btn-view-memory" class="btn btn-secondary btn-small" type="button">View memories</button>
+            <div class="form-group">
+              <label for="api-base-url-input">API Base URL</label>
+              <input type="text" id="api-base-url-input" class="settings-input" placeholder="http://localhost:11434/v1" autocomplete="off" spellcheck="false">
+              <p class="form-hint">Auto-filled from provider. Override if needed. Must start with http:// or https://.</p>
             </div>
-            <p class="form-hint">When on, the assistant remembers how it solved DHIS2 problems (endpoints, parameters, configuration rules) and reuses those lessons on related tasks so it never repeats a mistake. Stored only in this browser. Patient data is never stored.</p>
-          </div>
-          <div id="key-status" class="key-status hidden"></div>
+            <div class="form-group">
+              <label for="model-id-input">Model ID</label>
+              <input type="text" id="model-id-input" class="settings-input" placeholder="llama3.2" autocomplete="off" spellcheck="false">
+              <p class="form-hint">The model identifier your provider uses. For Ollama, run <code>ollama pull llama3.2</code> first.</p>
+            </div>
+            <div class="form-group" id="api-key-group">
+              <label for="api-key-input">API Key <span id="api-key-optional-badge" class="form-optional-badge">optional for local providers</span></label>
+              <div class="input-with-toggle">
+                <input type="password" id="api-key-input" placeholder="Leave blank for Ollama" autocomplete="off" spellcheck="false">
+                <button id="btn-toggle-key" class="toggle-key-btn" type="button">Show</button>
+              </div>
+              <p class="form-hint">Required for cloud providers (OpenAI, Anthropic, etc.). Not needed when using a local Ollama instance.</p>
+            </div>
+            <details class="form-group advanced-toggle">
+              <summary class="advanced-summary">Advanced Model Settings</summary>
+              <div class="advanced-body">
+                <div class="form-group">
+                  <label for="max-tokens-input">Max Tokens</label>
+                  <input type="number" id="max-tokens-input" class="settings-input" placeholder="16384" min="256" max="131072" autocomplete="off">
+                </div>
+                <div class="form-group">
+                  <label for="temperature-input">Temperature</label>
+                  <input type="number" id="temperature-input" class="settings-input" placeholder="0.2" min="0" max="2" step="0.1" autocomplete="off">
+                </div>
+                <div class="form-group form-checkbox">
+                  <input type="checkbox" id="think-block-checkbox">
+                  <label for="think-block-checkbox">Strip &lt;think&gt; blocks (for reasoning models like DeepSeek, Kimi, QwQ)</label>
+                </div>
+                <div class="form-group">
+                  <label for="vision-model-id-input">Vision Model ID (optional)</label>
+                  <input type="text" id="vision-model-id-input" class="settings-input" placeholder="accounts/fireworks/models/llama-v3p2-11b-vision-instruct" autocomplete="off">
+                  <p class="form-hint">Separate model for image analysis. Leave empty to pass images directly to the main model.</p>
+                </div>
+                <div class="form-group">
+                  <label for="vision-api-base-url-input">Vision API Base URL (optional)</label>
+                  <input type="text" id="vision-api-base-url-input" class="settings-input" placeholder="Same as main API if empty" autocomplete="off">
+                </div>
+              </div>
+            </details>
+          </section>
+          <section class="settings-panel hidden" id="settings-panel-web" role="tabpanel" aria-labelledby="settings-tab-web" data-panel="web">
+            <p class="settings-panel-intro">Let the assistant search the web for DHIS2 documentation, release notes and guidance when you ask it to.</p>
+            <div class="form-group">
+              <label for="tavily-api-key-input">Tavily API key</label>
+              <input type="password" id="tavily-api-key-input" class="settings-input" placeholder="tvly-..." autocomplete="off">
+              <p class="form-hint">Used when you pick <strong>Browse Web</strong> from the + menu. Get a key at <a href="https://app.tavily.com/" target="_blank" rel="noopener">app.tavily.com</a>. To remove a saved key, clear the field and save.</p>
+            </div>
+          </section>
+          <section class="settings-panel hidden" id="settings-panel-memory" role="tabpanel" aria-labelledby="settings-tab-memory" data-panel="memory">
+            <p class="settings-panel-intro">Changes on this tab apply immediately.</p>
+            <div class="form-group memory-settings">
+              <label for="memory-enabled-toggle">Learning memory</label>
+              <div class="memory-toggle-row">
+                <label class="memory-switch">
+                  <input type="checkbox" id="memory-enabled-toggle" checked>
+                  <span class="memory-slider" aria-hidden="true"></span>
+                </label>
+                <span id="memory-status-text" class="memory-status-text">On</span>
+                <button id="btn-view-memory" class="btn btn-secondary btn-small" type="button">View memories</button>
+              </div>
+              <p class="form-hint">When on, the assistant remembers how it solved DHIS2 problems (endpoints, parameters, configuration rules) and reuses those lessons on related tasks so it never repeats a mistake. Stored only in this browser. Patient data is never stored.</p>
+            </div>
+          </section>
         </div>
         <div class="settings-footer">
-          <button id="btn-save-settings" class="btn btn-primary">Save Settings</button>
+          <div id="key-status" class="key-status hidden" role="status" aria-live="polite"></div>
+          <button id="btn-save-settings" class="btn btn-primary">Save settings</button>
         </div>
       </div>
     </div>

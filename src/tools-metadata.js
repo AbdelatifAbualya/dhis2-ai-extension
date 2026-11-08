@@ -266,6 +266,15 @@ async function executeToolCall(name, args) {
           _scope: 'known_endpoint_guidance',
         };
       }
+      // NCD worklist app (2026-11-08): GET tracker/notes → 404. Notes hang off the
+      // enrollment or event (verified 2.42.5: GET …/note is a 405).
+      if (/^tracker\/(?:notes?\/?$|(?:enrollments|events)\/[A-Za-z][A-Za-z0-9]{10}\/notes?\/?$)/i.test(_gp)) {
+        return {
+          _error: `Not sent: GET ${_gp} does not exist (tracker/notes is a 404, GET …/note a 405).`,
+          _hint: 'Read notes as a field of the record: tracker/enrollments/<id>?fields=enrollment,notes[note,value,storedAt,storedBy,createdBy[username]] (or tracker/events/<id>). Write one with POST tracker/enrollments/<id>/note (or tracker/events/<id>/note), body { "value": "…" }. Reading a patient\'s notes is patient-level data.',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
       if (isGuessedLogEndpoint(_gp)) return guessedLogEndpointRefusal(_gp);
       // Sharing exists per dataStore ENTRY, by its UID; a namespace has none, so
       // this is always a 404 (live 2026-11-02, two in a row while sizing an app).
@@ -1004,6 +1013,11 @@ async function executeToolCall(name, args) {
       if (piRoute.routed) {
         console.log(`[dhis2_query] Program indicators → /analytics: ${piRoute.path}`);
         safePath = piRoute.path;
+        if (piRoute.note) {
+          // The earlier "moved to value=" note no longer describes what was sent.
+          if (aggHeal.healed) { const at = queryNotes.indexOf(aggHeal.note); if (at >= 0) queryNotes.splice(at, 1); }
+          queryNotes.push(piRoute.note);
+        }
       }
       const periodRefusal = analyticsUnknownPeriodRefusal(safePath);
       if (periodRefusal) return periodRefusal;
@@ -7409,7 +7423,7 @@ async function executeCreateMetadata(args, contextOrgUnitId) {
   if (!action) return { _error: 'Missing required parameter: action' };
 
   // create_metadata is ALWAYS destructive (POSTs new objects). Gate on write auth.
-  const _gate = requireWriteAuth('create_metadata', action);
+  const _gate = requireWriteAuth('create_metadata', action, (args.program_id || args.stage_id) ? { program_id: args.program_id, stage_id: args.stage_id } : undefined);
   if (_gate) return _gate;
 
   try {

@@ -122,10 +122,16 @@
   let pendingImageBase64 = null; // base64 data URL of attached image
   let pendingWebBrowse = false; // one-shot toggle for next message
   let pendingGrantInfo = null; // { origin, originPattern } awaiting host-permission grant
+  let savedTavilyKey = ''; // the Tavily key as stored, so clearing the field can remove it
   const toolTimers = new Map();
 
   // ── Init ─────────────────────────────────────────────────────────────────
   async function init() {
+    try {
+      const v = chrome.runtime.getManifest?.()?.version;
+      const vEl = $('header-version');
+      if (v && vEl) vEl.textContent = 'v' + v;
+    } catch {}
     setupListeners();
     setupMemoryUi();
     updateWebBrowseIndicator();
@@ -164,7 +170,10 @@
       if (resp?.key) apiKeyInput.value = resp.key;
     });
     chrome.runtime.sendMessage({ type: 'GET_TAVILY_API_KEY' }, (resp) => {
-      if (resp?.key && tavilyApiKeyInput) tavilyApiKeyInput.value = resp.key;
+      if (resp?.key && tavilyApiKeyInput) {
+        tavilyApiKeyInput.value = resp.key;
+        savedTavilyKey = resp.key;
+      }
     });
     // Load provider configuration
     chrome.runtime.sendMessage({ type: 'GET_PROVIDER_CONFIG' }, (resp) => {
@@ -278,7 +287,12 @@
       chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
     });
 
-    btnSettings.addEventListener('click', () => settingsOverlay.classList.remove('hidden'));
+    btnSettings.addEventListener('click', () => {
+      showSettingsTab('general');
+      keyStatus.classList.add('hidden');
+      settingsOverlay.classList.remove('hidden');
+    });
+    setupSettingsTabs();
     btnCloseSettings.addEventListener('click', () => settingsOverlay.classList.add('hidden'));
     settingsOverlay.addEventListener('click', (e) => {
       if (e.target === settingsOverlay) settingsOverlay.classList.add('hidden');
@@ -324,11 +338,17 @@
     }
 
     // Example prompts
+    // Capability examples go into the input for editing rather than being sent
+    // straight away: they name programs and dashboards the user will want to
+    // adapt to their own server.
     document.querySelectorAll('.example-btn').forEach(btn => {
       btn.addEventListener('click', () => {
-        chatInput.value = btn.dataset.prompt;
-        btnSend.disabled = false;
-        sendMessage();
+        if (isSending) return;
+        chatInput.value = btn.dataset.prompt || '';
+        chatInput.dispatchEvent(new Event('input'));
+        chatInput.focus();
+        chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
+        chatInput.scrollTop = chatInput.scrollHeight;
       });
     });
 
@@ -507,9 +527,30 @@
   }
 
   // ── Streaming Handlers ──────────────────────────────────────────────────
+  // A reply that streams some words and then calls tools gets no STREAM_END, so
+  // its cursor blinked on forever (seen on "I'll start by locating the program…",
+  // 2026-11-08). Settle it when a tool call or the next reply starts; a bubble
+  // that received no words at all is removed.
+  function settleStreamingBubble() {
+    if (!streamingBubble) return;
+    if (streamingRafId) { cancelAnimationFrame(streamingRafId); streamingRafId = null; }
+    streamingDirty = false;
+    const msgEl = streamingBubble.closest('.msg');
+    if (!streamingRawText.trim()) {
+      if (msgEl) msgEl.remove();
+    } else {
+      streamingBubble.classList.remove('streaming');
+      streamingBubble.innerHTML = renderMarkdown(streamingRawText);
+    }
+    streamingBubble = null;
+    streamingRawText = '';
+    streamingLastHtml = '';
+  }
+
   function handleStreamStart() {
     removeThinking();
     markAllToolsDone();
+    settleStreamingBubble();
 
     // Create the assistant message bubble for streaming
     const el = document.createElement('div');
@@ -828,13 +869,66 @@
     applyTheme(stored.uiTheme || 'light');
     if (themeSelect) {
       themeSelect.value = stored.uiTheme || 'light';
-      themeSelect.addEventListener('change', () => applyTheme(themeSelect.value));
+      // Theme is a display preference: apply and keep it as soon as it changes,
+      // so closing Settings without saving does not leave an unsaved theme on screen.
+      themeSelect.addEventListener('change', () => {
+        const theme = themeSelect.value === 'dark' ? 'dark' : 'light';
+        applyTheme(theme);
+        chrome.storage.local.set({ uiTheme: theme }).catch(() => {});
+      });
     }
   }
 
+  // ── Settings tabs (General / Web browsing / Memory) ──
+  function showSettingsTab(name) {
+    document.querySelectorAll('.settings-tab').forEach(tab => {
+      const on = tab.dataset.tab === name;
+      tab.classList.toggle('active', on);
+      tab.setAttribute('aria-selected', on ? 'true' : 'false');
+      tab.tabIndex = on ? 0 : -1;
+    });
+    document.querySelectorAll('.settings-panel').forEach(panel => {
+      panel.classList.toggle('hidden', panel.dataset.panel !== name);
+    });
+    const body = document.querySelector('.settings-body');
+    if (body) body.scrollTop = 0;
+    // Memory changes apply immediately, so its tab has no Save button (and no
+    // empty footer bar).
+    btnSaveSettings?.classList.toggle('hidden', name === 'memory');
+    document.querySelector('#settings-overlay .settings-footer')?.classList.toggle('hidden', name === 'memory');
+  }
+
+  function setupSettingsTabs() {
+    const tabs = [...document.querySelectorAll('.settings-tab')];
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => showSettingsTab(tab.dataset.tab));
+      tab.addEventListener('keydown', (e) => {
+        let next = null;
+        if (e.key === 'ArrowRight') next = tabs[(i + 1) % tabs.length];
+        else if (e.key === 'ArrowLeft') next = tabs[(i - 1 + tabs.length) % tabs.length];
+        else if (e.key === 'Home') next = tabs[0];
+        else if (e.key === 'End') next = tabs[tabs.length - 1];
+        if (!next) return;
+        e.preventDefault();
+        showSettingsTab(next.dataset.tab);
+        next.focus();
+      });
+    });
+  }
+
   function applyTheme(theme) {
+    const next = theme === 'dark' ? 'theme-dark' : 'theme-light';
+    const changed = !document.body.classList.contains(next);
     document.body.classList.remove('theme-light', 'theme-dark');
-    document.body.classList.add(theme === 'dark' ? 'theme-dark' : 'theme-light');
+    document.body.classList.add(next);
+    // Chart colours are chosen when a chart is drawn: charts already on screen kept
+    // light gridlines and labels on a dark panel until redrawn.
+    if (changed) {
+      chartInstances.forEach(c => {
+        if (!c._spec || c.isDisposed?.()) return;
+        try { c.setOption(buildChartOption(c._spec), true); } catch { /* a chart that cannot redraw keeps its colours */ }
+      });
+    }
   }
 
   function saveSettings() {
@@ -857,16 +951,21 @@
     // Client-side URL validation. Background revalidates and is the source of truth.
     const URL_RE = /^https?:\/\//i;
     if (baseUrl && !URL_RE.test(baseUrl)) {
+      showSettingsTab('general');
       showKeyStatus('API Base URL must start with http:// or https://', true);
       return;
     }
     if (visionBase && !URL_RE.test(visionBase)) {
+      showSettingsTab('general');
+      const adv = document.querySelector('.advanced-toggle');
+      if (adv) adv.open = true;
       showKeyStatus('Vision API Base URL must start with http:// or https://', true);
       return;
     }
     // Cloud providers need a key. Local providers don't.
     const isLocal = isLocalProviderSelection(providerType, baseUrl);
     if (!isLocal && !key) {
+      showSettingsTab('general');
       showKeyStatus('This provider requires an API key. Paste it above, or pick "Ollama (local)".', true);
       return;
     }
@@ -897,9 +996,14 @@
     tasks.push(new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'SAVE_API_KEY', payload: { key } }, (resp) => resolve(resp));
     }));
-    if (tavilyKey) {
+    // Save the Tavily key when it was typed, and also when a stored key was
+    // cleared from the field — otherwise a saved key could never be removed.
+    if (tavilyKey || savedTavilyKey) {
       tasks.push(new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: 'SAVE_TAVILY_API_KEY', payload: { key: tavilyKey } }, (resp) => resolve(resp));
+        chrome.runtime.sendMessage({ type: 'SAVE_TAVILY_API_KEY', payload: { key: tavilyKey } }, (resp) => {
+          if (resp?.success) savedTavilyKey = tavilyKey;
+          resolve(resp);
+        });
       }));
     }
 
@@ -933,11 +1037,15 @@
     });
   }
 
+  // One timer at a time: an earlier message's timer used to hide a newer one
+  // early (an error, then "Settings saved" a moment later).
+  let keyStatusTimer = null;
   function showKeyStatus(text, isError) {
     keyStatus.textContent = text;
     keyStatus.className = `key-status ${isError ? 'key-error' : 'key-saved'}`;
     keyStatus.classList.remove('hidden');
-    setTimeout(() => keyStatus.classList.add('hidden'), 3000);
+    clearTimeout(keyStatusTimer);
+    keyStatusTimer = setTimeout(() => keyStatus.classList.add('hidden'), isError ? 6000 : 3000);
   }
 
   // ── Chat ─────────────────────────────────────────────────────────────────
@@ -1624,6 +1732,7 @@ ${turnXml}
 
   function showToolCall(tool, args) {
     removeThinking();
+    settleStreamingBubble();
     const el = document.createElement('div');
     el.className = 'tool-card';
     const toolId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -2066,12 +2175,60 @@ ${turnXml}
           <div class="tool-name">${esc(label)}</div>
           <span class="tool-state">Running</span>
         </div>
-        <div class="tool-detail">${esc(detail)}</div>
+        <div class="tool-detail" title="${esc(displayToolDetail(detail))}">${esc(displayToolDetail(detail))}</div>
       </div>
       <div class="tool-spinner"></div>
     `;
-    messagesDiv.appendChild(el);
+    const group = currentToolGroup();
+    group.querySelector('.tool-group-body').appendChild(el);
+    el.dataset.label = label;
+    refreshToolGroup(group);
     scrollToBottom();
+  }
+
+  // API paths arrive URL-encoded (fields%5Bid%5D…): show them as written.
+  function displayToolDetail(text) {
+    const t = String(text || '');
+    try { return decodeURIComponent(t); } catch { return t; }
+  }
+
+  // ── Tool steps, grouped per run ──
+  // Consecutive steps share one collapsible group: open while they run, folded to
+  // "N steps" once the reply starts, left open when a step failed.
+  function currentToolGroup() {
+    const last = messagesDiv.lastElementChild;
+    if (last && last.classList.contains('tool-group') && !last.classList.contains('tool-group-done')) return last;
+    const group = document.createElement('details');
+    group.className = 'tool-group';
+    group.open = true;
+    group.innerHTML = '<summary><svg class="tool-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg><span class="tool-group-live" aria-hidden="true"></span><span class="tool-group-label"></span><span class="tool-group-count"></span></summary><div class="tool-group-body"></div>';
+    messagesDiv.appendChild(group);
+    return group;
+  }
+
+  function refreshToolGroup(group) {
+    if (!group) return;
+    const cards = [...group.querySelectorAll('.tool-card')];
+    const failed = cards.filter(c => c.querySelector('.tool-fail')).length;
+    const running = cards.filter(c => !c.classList.contains('tool-done'));
+    const label = group.querySelector('.tool-group-label');
+    const count = group.querySelector('.tool-group-count');
+    const steps = `${cards.length} step${cards.length === 1 ? '' : 's'}`;
+    if (running.length && !group.classList.contains('tool-group-done')) {
+      label.textContent = `Working: ${running[running.length - 1].dataset.label || 'running a step'}`;
+    } else {
+      label.textContent = failed ? `${steps}, ${failed} failed` : `Done in ${steps}`;
+    }
+    count.textContent = failed ? `${failed} failed` : steps;
+    count.classList.toggle('has-fail', failed > 0);
+  }
+
+  function closeToolGroups() {
+    messagesDiv.querySelectorAll('.tool-group:not(.tool-group-done)').forEach(group => {
+      group.classList.add('tool-group-done');
+      refreshToolGroup(group);
+      if (!group.querySelector('.tool-fail')) group.open = false;
+    });
   }
 
   function markToolDone(tool, success, summary, apiPath, details) {
@@ -2098,11 +2255,12 @@ ${turnXml}
     // Show actual API path if available
     if (apiPath && tool !== 'browse_web') {
       const detail = card.querySelector('.tool-detail');
-      if (detail) detail.textContent = apiPath;
+      if (detail) { detail.textContent = displayToolDetail(apiPath); detail.title = detail.textContent; }
     } else if (apiPath && tool === 'browse_web') {
       const detail = card.querySelector('.tool-detail');
       if (detail) detail.textContent += ` | source=${apiPath}`;
     }
+    refreshToolGroup(card.closest('.tool-group'));
     const state = card.querySelector('.tool-state');
     if (state) {
       const statusText = success ? 'Done' : 'Failed';
@@ -2174,6 +2332,7 @@ ${turnXml}
       const state = card.querySelector('.tool-state');
       if (state) state.textContent = 'Done';
     });
+    closeToolGroups();
   }
 
   // ── Chart Rendering ──────────────────────────────────────────────────────
@@ -2223,6 +2382,7 @@ ${turnXml}
       const chart = echarts.init(canvas);
       const option = buildChartOption(normalizedSpec);
       chart.setOption(option);
+      chart._spec = normalizedSpec; // redrawn with the new colours when the theme changes
       // Track observer alongside chart for proper cleanup
       const ro = new ResizeObserver(() => chart.resize());
       ro.observe(canvas);
@@ -2396,6 +2556,8 @@ ${turnXml}
       option.xAxis = isHorizontal ? valAxis : catAxis;
       option.yAxis = isHorizontal ? catAxis : valAxis;
       if (isHorizontal) option.grid.left = 90;
+      // The value-axis title sits above the plot: give it room, or its top is cut off.
+      else if (valAxis.name) option.grid.top += 14;
     }
 
     // ── Heatmap ──

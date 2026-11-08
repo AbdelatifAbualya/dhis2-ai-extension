@@ -607,6 +607,34 @@ function ownAppRepairAllowed(toolName, action, descriptor, wa) {
   return wa.scope !== 'read_only' || /reported a problem/.test(String(wa.reason || ''));
 }
 
+// A request for an app or plugin is not permission to change an existing program's
+// structure. Building an "NCD follow-up worklist" app, a model added a "Follow-up
+// Call Log" stage and a new data element to the live NCD program to hold the app's
+// call notes, without a word (deepseek, 2026-11-08). Patient notes do belong in
+// tracker data, not the dataStore — so the change may be right, but it is the
+// user's to approve. Let through: a request that names the change ("add a stage
+// for …"), or the user agreeing to it after it was proposed and refused.
+const PROGRAM_STRUCTURE_ACTIONS = new Set(['add_stage', 'add_data_elements_to_stage', 'add_program_rules']);
+const PROGRAM_CHANGE_ASKED_RE = /\b(?:add|create|insert|include|make)\s+(?:(?:a|an|the|one|two|new|another|extra|separate)\s+){0,3}(?:(?:program|repeatable|tracker)\s+)?(?:stages?|data\s*elements?|fields?|program\s*rules?|rules?)\b/;
+function programChangeNotRequested(toolName, action, descriptor) {
+  if (toolName !== 'create_metadata' || !PROGRAM_STRUCTURE_ACTIONS.has(String(action || ''))) return null;
+  // A program (or stage) built in this conversation is the assistant's own work.
+  const mine = new Set(Array.isArray(dhis2.assistantCreatedIds) ? dhis2.assistantCreatedIds : []);
+  if (writeTargetsOf(descriptor).some(id => mine.has(id))) return null;
+  const said = String(typeof lastUserText === 'string' ? lastUserText : '').toLowerCase();
+  const earlier = typeof lastSubstantiveUserRequest === 'function' ? String(lastSubstantiveUserRequest() || '').toLowerCase() : '';
+  if (typeof detectCustomAppIntent !== 'function' || !detectCustomAppIntent(`${said}\n${earlier}`)) return null;
+  if (PROGRAM_CHANGE_ASKED_RE.test(said) || PROGRAM_CHANGE_ASKED_RE.test(earlier)) return null;
+  const prev = dhis2.lastRefusedWrite;
+  if (prev && prev.tool === toolName && prev.action === action && prev.turn < (dhis2.turnCounter || 0)) return null;
+  return {
+    _error: `Refused: create_metadata(action=${action}) changes an existing program's structure, but the user asked for an app or plugin, not for program changes. Nothing was saved.`,
+    _hint: 'If the app needs a place for patient-level data (notes, flags about a person), that belongs in tracker data, not the dataStore, so a new stage or field may be right. Propose it to the user: which program, the stage or field name, its type, and why. Ask, and continue with the parts that need no program change. After a yes, retry this same call. Settings and app-level data (not about a person) go in the app\'s own dataStore namespace instead, with no program change.',
+    _refused: { tool: toolName, action },
+    _scope: 'program_change_not_requested',
+  };
+}
+
 function requireWriteAuth(toolName, action, descriptor) {
   const wa = dhis2.writeAuth || {};
   const scope = wa.scope || 'read_only';
@@ -628,6 +656,11 @@ function requireWriteAuth(toolName, action, descriptor) {
         _refused: { tool: toolName, action, target: descriptor || null },
         _scope: 'delete_not_requested',
       };
+    }
+    const programChange = programChangeNotRequested(toolName, action, descriptor);
+    if (programChange) {
+      rememberRefusedWrite(toolName, action, descriptor);
+      return programChange;
     }
     if (dhis2.lastRefusedWrite && dhis2.lastRefusedWrite.tool === toolName) dhis2.lastRefusedWrite = null;
     return null;
@@ -5168,6 +5201,16 @@ async function routeProgramIndicatorAnalytics(path) {
   const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
   const items = [];
   const itemParts = new Set();
+  // value=<program indicator> on an event aggregate is a 409 "Value does not refer to
+  // a data element or attribute which are numeric" (TB dashboard through the panel,
+  // 2026-11-08; an AVERAGE given with the indicator as its only dimension is moved
+  // there by healEventAggregationValue). It is routed with the dimensions, and the
+  // aggregation type is dropped: an indicator brings its own.
+  let fromValue = false;
+  for (const part of parts) {
+    const vm = part.match(/^value=([A-Za-z][A-Za-z0-9]{10})$/i);
+    if (vm && /^analytics\/events\//.test(p)) { items.push(vm[1]); itemParts.add(part); fromValue = true; }
+  }
   for (const part of parts) {
     const kv = part.match(/^dimension=(.*)$/i);
     if (!kv) continue;
@@ -5213,8 +5256,9 @@ async function routeProgramIndicatorAnalytics(path) {
     }
     return { path: p, routed: false };
   }
-  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x));
-  return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true };
+  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x)
+    && !(fromValue && /^aggregationType=/i.test(x)));
+  return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true, ...(fromValue ? { note: 'Query corrected: a program indicator is not an event-analytics value (409); it was read from /analytics as a data item, with its own aggregation.' } : {}) };
 }
 
 // An average or sum on event analytics names its item in value=; aggregationType
