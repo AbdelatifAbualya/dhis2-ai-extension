@@ -111,7 +111,7 @@ function dataCheckAnalyticsState(programId) {
 }
 
 // ── Reading what a saved object asks for ─────────────────────────────────────
-const DATA_CHECK_DX_FIELDS = 'dataDimensionItemType,programIndicator[id,displayName,expression,filter,program[id]],indicator[id,displayName],dataElement[id,displayName]';
+const DATA_CHECK_DX_FIELDS = 'dataDimensionItemType,programIndicator[id,displayName,expression,filter,aggregationType,program[id]],indicator[id,displayName],dataElement[id,displayName]';
 const DATA_CHECK_SAVED_FIELDS = `periods[id],relativePeriods,organisationUnits[id],organisationUnitLevels,userOrganisationUnit,userOrganisationUnitChildren,userOrganisationUnitGrandChildren,dataDimensionItems[${DATA_CHECK_DX_FIELDS}]`;
 
 function dataCheckOuDimension(saved) {
@@ -140,6 +140,11 @@ function dataCheckIndicatorFields(pi) {
 }
 
 const dataCheckFieldKey = (f) => `${f.programId}:${f.stageId || ''}:${f.id}`;
+
+// A record count: its 0 is a real zero once the analytics tables hold the program.
+// "Pregnant women with malaria" showed 0 because no case had Pregnant = Yes, and the
+// check told the user to read it as "no data, not a real zero" (2026-11-08).
+const dataCheckIsCount = (pi) => /^\s*V\{(?:event|enrollment|tei)_count\}\s*$/.test(String(pi?.expression || ''));
 
 function dataCheckItems(dims) {
   return (dims || []).map((d) => {
@@ -290,7 +295,10 @@ function dataCheckAssemble(tiles, fieldList, analytics) {
   const failed = tiles.filter(t => t.state === 'failed');
   const zeroTiles = emptyTiles.filter(t => t.type === 'SINGLE_VALUE');
   const zeroUnrecorded = zeroTiles.filter(t => causeOf(t).length).map(t => t.tile);
-  const zeroOther = zeroTiles.filter(t => !causeOf(t).length).map(t => t.tile);
+  const tablesOk = new Set(analytics.filter(a => a.state === 'ok').map(a => a.programId));
+  const trueZero = (t) => (t.items || []).length > 0 && t.items.every(i => i.indicator && dataCheckIsCount(i.indicator) && tablesOk.has(i.indicator.program?.id));
+  const zeroCounted = zeroTiles.filter(t => !causeOf(t).length && trueZero(t)).map(t => t.tile);
+  const zeroOther = zeroTiles.filter(t => !causeOf(t).length && !trueZero(t)).map(t => t.tile);
 
   const check = {
     what_was_read: 'Counts only: no patient values were read.',
@@ -300,6 +308,7 @@ function dataCheckAssemble(tiles, fieldList, analytics) {
     ...(failed.length ? { failed_tiles: failed.map(t => ({ tile: t.tile, type: t.type, error: t.error })) } : {}),
     ...(zeroUnrecorded.length ? { single_values_showing_0_for_nothing_recorded: zeroUnrecorded } : {}),
     ...(zeroOther.length ? { single_values_showing_0_for_no_data: zeroOther } : {}),
+    ...(zeroCounted.length ? { single_values_true_zero: zeroCounted } : {}),
     ...(noValue.length ? { fields_without_values: noValue.map(f => ({ field: fieldLabel(f), used_by: usedBy(f), ...(f.coverage.state === 'no_records' ? { stage_has_no_records: true, stage: f.stage || null } : {}), ...(hideNumbers ? {} : { records: f.coverage.total }) })) } : {}),
     ...(few.length ? { fields_rarely_filled: few.map(f => ({ field: fieldLabel(f), used_by: usedBy(f), ...(hideNumbers ? {} : { with_values: f.coverage.with_values, records: f.coverage.total }) })) } : {}),
   };
@@ -354,9 +363,14 @@ function dataCheckReportLines(check, analyticsNotOk = []) {
     const why = analyticsNotOk.length ? 'only because of the analytics tables above, not because the records are missing' : 'because nothing matches their saved period and places';
     lines.push(`${quoted(list)} ${verb(list)} 0 ${why}. DHIS2 draws "no data" as 0 on a single-value tile, so read it as "no data", not as a real zero.`);
   }
+  if ((check.single_values_true_zero || []).length) {
+    const list = check.single_values_true_zero;
+    lines.push(`${quoted(list)} ${verb(list)} 0: no record in ${list.length === 1 ? 'its' : 'their'} saved period and places matches. The analytics tables hold this program's records, so this is a real count of zero.`);
+  }
   for (const t of check.failed_tiles || []) lines.push(`"${t.tile}" did not load in this check: ${t.error}`);
   const explained = (check.fields_without_values || []).length > 0 || analyticsNotOk.length > 0;
-  const unexplained = (check.empty_tiles || []).filter(t => !t.because_no_values_in && !explained);
+  const saidAbove = new Set([...(check.single_values_showing_0_for_no_data || []), ...(check.single_values_true_zero || [])]);
+  const unexplained = (check.empty_tiles || []).filter(t => !t.because_no_values_in && !explained && !saidAbove.has(t.tile));
   if (unexplained.length) lines.push(`${quoted(unexplained.map(t => t.tile))}: no values for the saved periods and places.`);
   return lines;
 }

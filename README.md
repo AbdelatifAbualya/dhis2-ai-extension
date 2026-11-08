@@ -354,6 +354,52 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.39 — Fixes from complex real-model builds: maps, analytics queries, data check, apps (2026-11-08)
+
+The real model (Fireworks deepseek-v4p1-flash-1017) built two complex dashboards, one each on the NCD and Malaria programs, and eight apps and plugins on localhost:8081 (2.42.5). Each result was checked in real Chrome and against the raw tracker records. Every problem below came from those runs, or from a code review done alongside them, and each fix was checked on the live server.
+
+**Maps:**
+- **Every map the assistant saved was covered with "API KEY REQUIRED".** The Maps app's own default basemap, OSM Light (`osmLight`), loads CartoDB tiles, and these now come back as that picture. `manage_maps` always saved it. The basemap is now the server's default when an admin set one (`keyDefaultBaseMap`). Otherwise it is OSM Detailed (`openStreetMap`, no key needed) on an https server.
+- **OSM Detailed cannot load over plain http.** The Maps app asks for `//a.tile.openstreetmap.org`. Over http that is a 301 to https without a CORS header, so the map library gets nothing (`net::ERR_FAILED` in Chrome on localhost:8081) and the map has no background. On an http server OSM Light is therefore kept, and the result says why (`_basemap_note`).
+- `osmDetailed` / "OSM Detailed" are now read as `openStreetMap`. The tool description had suggested `osmDetailed`, an id the Maps app does not know.
+- The map manual told the model to count places without coordinates itself. A real run then made seven `organisationUnits` geometry queries, which pull every boundary's coordinates. The result's `location_coverage` already has the count, and the manual now says to use it.
+
+**Analytics queries (`dhis2_query`):**
+- **A query parameter inside a dimension** (`dimension: ["ou:…", "stage=<uid>"]`) was sent as is and answered 409, twice. It is now sent as its own parameter. A parameter the query already has keeps its value.
+- **A bare stage UID moved to `stage=` was not reported.** The model saw the query work and saved the bare form as a lesson in its learning memory. The correction is now in the result (`_query_corrected`).
+- **An item filter without an operator** (`filter=<de>:CURED`, or `<de>:<option id>`) is a 409 "Query item or filter is invalid". It now gets `EQ` (`IN` for several values), and an option id is sent as its code. Verified on 2.42.5: `:EQ:CURED`, `:IN:CURED` and `:eq:CURED` each answer 49 events, the true count. `<groupSet>:<group>` and `<category>:<option>` are real dimensions, so an id value is rewritten only when it is an option-set option. The lookup is a list query, so a group id gets an empty answer, not a 404.
+- **A Yes/No filter written as `true`/`false`** (`filter=<stage>.<de>:EQ:true`) is a 409 with a misleading message: "Expression violation. Maybe an indicator caused division by zero?". Analytics stores Yes/No as 1 and 0, and `:EQ:1` answers 40, the true count of supervised treatments. EQ, NE and IN on event and enrollment analytics are now sent as 1/0. This applies in `dhis2_query` and in every generated app's request guard (fetch and XHR), where a model-written Facilities tab hit it.
+
+**Data check:**
+- **A record count of 0 was called "no data, not a real zero".** "Pregnant women with malaria" showed 0 because no case on the server has Pregnant = Yes. When the item is a count (`V{event_count}`, `V{enrollment_count}`, `V{tei_count}`) and the analytics tables hold the program's records, the 0 is now reported as a real count of zero (`single_values_true_zero`). Averages and percentages keep the old wording, and so do counts while the tables are empty or behind.
+- An empty single-value tile was also repeated in the closing "no values for the saved periods and places" line. It is now said once.
+
+**Apps:**
+- **A search box and paging that did nothing.** A model-written program explorer passed its own `useState` values (search text, page) as `useDataQuery` variables. app-runtime reads those only at mount, so neither the search nor the paging ever fetched again. The manual says so and the model still wrote it. A new lint makes this an error at preview time, unless the app calls `refetch` or the query sits in a component remounted by a key. It flags that app and none of the other 31 model-written or scenario sources.
+- **The install check opened only the first tab.** It now opens each `role="tab"` in turn, so each tab's queries are checked too (`tabs_opened`). Writes and records stay closed during the check. The Yes/No 409 above was in a tab the check never opened.
+- **`create` with only a `preview_token` was refused** with "Pass name or key", although the token already names the app. The key now comes from the preview, and an unknown token alone says it has expired.
+
+**Capture:**
+- **Deleting an analytics-only program indicator raised its program's version**, once per indicator: cleaning up six dashboard indicators sent six `PATCH programs/<id>`. All six were 409s on play 2.43.2, whose program now references an org unit that no longer validates. Capture does not show such indicators, and creating one already wrote nothing to the program, so deleting one no longer does either. One shown in Capture (`displayInForm`) still raises the version.
+
+**Housekeeping:** `package.json` said 2.8.37 while `manifest.json` said 2.8.38. Both are 2.8.39 now, and verify checks that they match.
+
+**Tests:**
+- `scripts/llm-apps-acceptance.js` adds two real-model cases. G is a Malaria follow-up board app with three tabs, an org-unit tree, a chart and a CSV download; its overdue list is compared with the raw tracker records (30 overdue cases, oldest first). H is a Capture enrollment widget showing a patient's blood-pressure trend, latest HbA1c and a two-visit alert, checked against the patient's six follow-up visits.
+- Case A's "the search filters the list" check now looks for a program that was on screen before the search. The old check looked for one that was never on page 1, so a search that did nothing passed.
+- `scenario-line-lists.js` now removes the backup its update step makes. Every run used to leave one behind.
+
+**Checks:**
+- `npm run verify`: new assertions for every fix above.
+- **Real model on 8081 (deepseek-v4p1-flash-1017):**
+  - All eight app and plugin cases (A–H): 85 checks, 82 passed. The 3 failures were the program explorer's dead search box and the Malaria board's Facilities tab (a Yes/No filter answering 409). After the lint, the Yes/No repair and the tab visits, A and G were re-run: 26 of 26 passed, every chatbot DHIS2 call succeeded, and the server was left as found.
+  - The complex NCD dashboard (9 tiles: 4 KPIs, line chart, stacked chart, district table, map with a legend set, filtered line list): 131 calls, 0 failed.
+  - The complex Malaria dashboard (10 tiles: stacked columns, positivity line, pie, 4 KPIs, district and facility maps, severe-case line list): 114 calls, 0 failed.
+  - Both dashboards were drawn tile by tile in real Chrome, and every figure was compared with the raw tracker records. They all match: 34 enrolled, 118 visits, 25.4% BP controlled, 48.3% good adherence, 77 uncontrolled visits; 9 severe cases, 0 pregnant (true), 44/51 = 86.3% cured, 40/58 = 69.0% supervised.
+- Live scenarios on 8081: dashboard edits, line lists, sticky context and restore fidelity all passed with 0 failed calls.
+- The MNCH scenario cannot pass on either playground right now. On 2.42.7, countIfValue on a text field is valid (the scenario expects 2.43). On 2.43.2, the root org unit `ImspTQPwCqd` is rejected as an invalid reference on every write. Neither is caused by the extension.
+- `npm run apps` was not run: it deletes every `ai-test-*` app, dashboard and namespace on the server, and 8081 holds earlier test objects still awaiting a decision.
+
 ### 2.8.38 — Dashboard thread: "Maternity Care and Birth Outcomes" (2026-11-04)
 
 A real thread on play 2.43.2. The dashboard looked broken: a Caesarean % of 0, a chart saying "No data", a map opening on an empty view of Africa, blank table columns. Every saved object was correct and no call had failed. The causes were on the server, and the assistant had no way to find them and could not say so.

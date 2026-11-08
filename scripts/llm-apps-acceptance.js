@@ -170,7 +170,10 @@ const CASES = [
       const nums = (row.match(/\d[\d,.\u00a0\u202f]*/g) || []).map((x) => Number(x.replace(/[,.\u00a0\u202f]/g, ''))); // "1,274" is one number
       check(`search finds "Pharmacy" and its row shows ${stages} stages and ${total} (or ${unique} unique) data elements`, nums.includes(stages) && (nums.includes(total) || nums.includes(unique)), row.replace(/\s+/g, ' '));
       const after = await page.evaluate(() => document.body.innerText);
-      check('the search filters the list', !/\bW4W Clinic\b/.test(after) || !all.includes('W4W Clinic'), after.slice(0, 160).replace(/\s+/g, ' '));
+      // A program shown before the search that is not Pharmacy must be gone (the
+      // old check looked for one not on page 1 at all, so a dead search passed).
+      const shownBefore = progs.map((p) => p.displayName).filter((n) => !/pharmacy/i.test(n) && all.includes(n));
+      check('the search filters the list', shownBefore.length > 0 && shownBefore.every((n) => !after.includes(n)), `still shown: ${shownBefore.filter((n) => after.includes(n)).slice(0, 3).join(', ')} — ${after.slice(0, 120).replace(/\s+/g, ' ')}`);
       await shot(page, 'program explorer');
       check('no console errors / failed requests from the app', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
       await page.context().close();
@@ -337,6 +340,107 @@ const CASES = [
         } else check('there is a delete button', false);
       }
       check('no console errors / failed requests from the app', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
+      await page.context().close();
+    },
+  },
+  {
+    id: 'G',
+    title: 'Complex app — Malaria follow-up board: three tabs, org-unit picker, chart, CSV',
+    pageContext: { appType: 'Dashboard' },
+    prompt: 'Build and install an app called "Malaria follow-up board" for the Malaria Case Surveillance and Response program with three tabs: (1) "Overdue Day 28" — every case whose case detection visit was more than 28 days ago and that has no Day 28 outcome yet, with the facility, case ID, detection date and days since detection, oldest first; (2) "Trend" — a monthly chart of the last 12 months with cases detected, cases treated and cases cured; (3) "Facilities" — a table per facility with the number of cases, the % of treatments fully supervised and the Day 28 cure rate. Add an org unit picker that filters all three tabs, and a button that downloads the table on screen as CSV.',
+    async verify(browser, app) {
+      // Expected from the raw tracker records: a case is overdue when its first
+      // non-scheduled Case Detection event is > 28 days old and no Day 28 Outcome
+      // event exists.
+      const j = await api(`tracker/enrollments?${qs({ program: 'l0NXObayGhi', orgUnitMode: 'ACCESSIBLE', pageSize: 1000, fields: 'enrollment,orgUnit,attributes[attribute,value],events[programStage,status,occurredAt]' })}`);
+      const today = Date.now();
+      const overdue = [];
+      for (const e of j.enrollments || j.instances || []) {
+        const det = (e.events || []).filter((x) => x.programStage === 'I4NJMVxEaZN' && x.status !== 'SCHEDULE' && x.occurredAt).sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))[0];
+        if (!det || (e.events || []).some((x) => x.programStage === 'ILSztnThbiV' && x.status !== 'SCHEDULE')) continue;
+        if ((today - new Date(det.occurredAt)) / 864e5 > 28) overdue.push({ at: det.occurredAt, id: ((e.attributes || []).find((a) => a.attribute === 'ex34nfZnhnF') || {}).value, ou: e.orgUnit });
+      }
+      overdue.sort((a, b) => a.at.localeCompare(b.at));
+      const ouNames = Object.fromEntries(((await api(`organisationUnits?${qs({ filter: `id:in:[${[...new Set(overdue.map((o) => o.ou))].join(',')}]`, fields: 'id,displayName', paging: 'false' })}`)).organisationUnits || []).map((o) => [o.id, o.displayName]));
+      const page = await (await browser.newContext({ viewport: { width: 1440, height: 1000 }, storageState: STATE, acceptDownloads: true })).newPage();
+      const log = collect(page, app.key);
+      await page.goto(`${BASE}/api/apps/${app.key}/index.html?redirect=false`);
+      await settled(page.mainFrame());
+      await page.waitForTimeout(4000);
+      // The tab itself, never the tab bar around it (its text holds every tab name).
+      const tab = (re) => page.getByRole('tab', { name: re }).or(page.getByRole('button', { name: re })).first();
+      const hasTabs = (await tab(/overdue/i).count()) && (await tab(/trend/i).count()) && (await tab(/facilit/i).count());
+      check('it has the three tabs (Overdue Day 28, Trend, Facilities)', hasTabs);
+      if (await tab(/overdue/i).count()) { await tab(/overdue/i).click(); await page.waitForTimeout(3000); }
+      const od = (await page.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+      check(`the overdue tab lists the oldest overdue case first page (${overdue[0] && overdue[0].id}, of ${overdue.length} overdue)`, overdue.length && od.includes(overdue[0].id) && od.includes(overdue[1].id), od.slice(0, 300));
+      check('…with its facility name', overdue.length && od.includes(ouNames[overdue[0].ou] || '¤'), ouNames[overdue[0] && overdue[0].ou]);
+      check('…and no case that already has a Day 28 outcome (MCSR-DEMO-0001 and -0002 have one)', !/MCSR-DEMO-000[12]\b/.test(od) || overdue.some((o) => /MCSR-DEMO-000[12]$/.test(o.id)), od.match(/MCSR-DEMO-000[12]\b/g));
+      await shot(page, 'overdue tab');
+      const csv = page.locator('button, a').filter({ hasText: /csv|download|export/i }).first();
+      check('there is a CSV download button', await csv.count());
+      if (await csv.count()) {
+        const dl = await Promise.all([page.waitForEvent('download', { timeout: 8000 }).catch(() => null), csv.click()]).then(([d]) => d);
+        const body = dl ? fs.readFileSync(await dl.path(), 'utf8') : '';
+        check('…and it downloads the overdue table as CSV', dl && body.includes(overdue[0].id) && body.split('\n').length >= Math.min(overdue.length, 10), dl ? `${dl.suggestedFilename()} · ${body.split('\n').length} lines` : 'no download');
+      }
+      if (await tab(/trend/i).count()) {
+        await tab(/trend/i).click();
+        await page.waitForTimeout(4000);
+        check('the trend tab draws a chart', await page.evaluate(() => !!document.querySelector('canvas, svg[class*="echarts"], div[_echarts_instance_] svg, div[_echarts_instance_] canvas')));
+        await shot(page, 'trend tab');
+      }
+      if (await tab(/facilit/i).count()) {
+        await tab(/facilit/i).click();
+        await page.waitForTimeout(4000);
+        const ft = (await page.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+        check('the facilities tab shows a row per facility with a percentage', Object.values(ouNames).some((n) => ft.includes(n)) && /\d+(\.\d+)?\s*%/.test(ft), ft.slice(0, 300));
+        await shot(page, 'facilities tab');
+      }
+      check('there is an org unit picker', await page.locator('[data-test*="org-unit"], [data-test*="orgunit"], [class*="OrganisationUnitTree"], [role="tree"], select, input[placeholder*="org" i]').count() > 0);
+      check('no console errors / failed requests from the app', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
+      await page.context().close();
+    },
+  },
+  {
+    id: 'H',
+    title: 'Complex Capture widget — a patient\'s blood-pressure trend, latest HbA1c and a two-visit alert',
+    url: `${BASE}/apps/capture#/enrollment?enrollmentId=JxWy9RxojCX&orgUnitId=BW4n4Em2zBm&programId=KggjM4VSwLS&teiId=vtsJDjnOoIT`,
+    pageContext: { programId: 'KggjM4VSwLS', orgUnitId: 'BW4n4Em2zBm', teiId: 'vtsJDjnOoIT', enrollmentId: 'JxWy9RxojCX', route: 'enrollment', appType: 'Capture' },
+    placement: true,
+    prompt: 'Add a widget to this NCD enrollment dashboard that shows the patient\'s blood pressure across all their follow-up visits as a line chart (systolic and diastolic, with dashed lines at 140 and 90), their latest HbA1c with the date of that visit, and a red alert when the last two follow-up visits were both uncontrolled (systolic 140 or more, or diastolic 90 or more).',
+    async placed(key) { const l = await captureKey('enrollmentOverviewLayout'); return !!(l && l.KggjM4VSwLS && JSON.stringify(l.KggjM4VSwLS).includes(`/api/apps/${key}/`)); },
+    async verify(browser, app) {
+      check('placed on the NCD enrollment dashboard', await this.placed(app.key));
+      // From the records: the last two follow-ups (126/90, 143/80) are both
+      // uncontrolled; the latest HbA1c is 9.9 on 2026-08-06.
+      const ev = ((await api(`tracker/events?${qs({ enrollments: 'JxWy9RxojCX', programStage: 'lNntUL4fzxd', fields: 'occurredAt,status,dataValues[dataElement,value]', pageSize: 100 })}`)).events || [])
+        .filter((e) => e.status !== 'SCHEDULE').sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
+      const v = (e, id) => (e.dataValues.find((x) => x.dataElement === id) || {}).value;
+      const withHb = ev.filter((e) => v(e, 'ez91Ow9ScGf'));
+      const lastHb = withHb[withHb.length - 1];
+      const unc = (e) => Number(v(e, 'V49fVKzuuZG')) >= 140 || Number(v(e, 'gutNnuOOCGP')) >= 90;
+      const alert = ev.length >= 2 && unc(ev[ev.length - 1]) && unc(ev[ev.length - 2]);
+      const page = await (await browser.newContext({ viewport: { width: 1440, height: 1000 }, storageState: STATE })).newPage();
+      const log = collect(page, app.key);
+      await page.goto(this.url);
+      const f = await waitFrame(page, app.key, 'plugin.html');
+      check('the widget is on the real Capture enrollment dashboard', !!f);
+      if (f) {
+        await settled(f);
+        await page.waitForTimeout(4000);
+        const text = (await f.evaluate(() => document.body.innerText)).replace(/\s+/g, ' ');
+        check('it draws the blood-pressure line chart', await f.evaluate(() => !!document.querySelector('canvas, svg')), text.slice(0, 160));
+        check(`it shows the latest HbA1c (${lastHb && v(lastHb, 'ez91Ow9ScGf')}) with its visit date`, lastHb && text.includes(v(lastHb, 'ez91Ow9ScGf')) && (text.includes(lastHb.occurredAt.slice(0, 10)) || /aug(ust)?\s*0?6|0?6\s*aug|06\/08|08\/06/i.test(text)), text.slice(0, 300));
+        check(`the two-visit alert is ${alert ? 'shown' : 'not shown'} (the last two visits are ${alert ? 'both' : 'not both'} uncontrolled)`, alert === /uncontrolled|alert/i.test(text) && (!alert || !/not\s+(both\s+)?uncontrolled|no alert/i.test(text)), text.slice(0, 300));
+        const el = await f.frameElement();
+        await el.scrollIntoViewIfNeeded();
+        const box = await el.boundingBox();
+        const docH = await f.evaluate(() => document.documentElement.scrollHeight);
+        check('Capture sized it to its content (nothing cut off)', box.height + 2 >= docH, `frame ${Math.round(box.height)} / content ${docH}`);
+        await shot(el, 'BP trend widget in Capture');
+      }
+      check('no console errors / failed requests from the widget', !log.console.length && !log.failed.length, [...log.console, ...log.failed].join(' | '));
       await page.context().close();
     },
   },

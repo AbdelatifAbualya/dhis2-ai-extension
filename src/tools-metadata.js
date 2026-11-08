@@ -943,11 +943,32 @@ async function executeToolCall(name, args) {
         console.log(`[dhis2_query] Split packed analytics dimensions → ${packHeal.path}`);
         safePath = packHeal.path;
       }
+      const paramHeal = healParamInsideDimension(safePath);
+      if (paramHeal.healed) {
+        console.log(`[dhis2_query] Query parameter moved out of dimension= → ${paramHeal.path}`);
+        safePath = paramHeal.path;
+        queryNotes.push(paramHeal.note);
+      }
       const stageHeal = await healBareStageDimension(safePath);
       if (stageHeal.refusal) return stageHeal.refusal;
       if (stageHeal.healed) {
         console.log(`[dhis2_query] Stage UID moved from dimension= to stage= → ${stageHeal.path}`);
         safePath = stageHeal.path;
+        // Said in the result: a model whose bare stage dimension "worked" saved that
+        // as a lesson (Malaria dashboard run, 2026-11-08).
+        queryNotes.push(`Query corrected: a program stage is not a dimension (DHIS2 answers 409); it was sent as its own parameter, ${(stageHeal.path.match(/[?&](stage=[^&]+)/) || [])[1] || 'stage=<stageUid>'}. Use that form.`);
+      }
+      const opHeal = await healItemFilterOperator(safePath);
+      if (opHeal.healed) {
+        console.log(`[dhis2_query] Item filter given an operator → ${opHeal.path}`);
+        safePath = opHeal.path;
+        queryNotes.push(opHeal.note);
+      }
+      const boolPath = healAnalyticsBooleanFilter(safePath);
+      if (boolPath !== safePath) {
+        console.log(`[dhis2_query] Yes/No filter sent as 1/0 → ${boolPath}`);
+        safePath = boolPath;
+        queryNotes.push('Query corrected: Yes/No values are 1 and 0 in analytics (true/false is a 409 "Expression violation"), so the filter was sent with 1/0. Use <de>:EQ:1 in any app or plugin code too.');
       }
       const emptyAxes = collectionReadEmptyAxesNote(safePath);
       if (emptyAxes) queryNotes.push(emptyAxes);
@@ -5605,6 +5626,35 @@ function mapColorScale(scale, classes) {
   return { colors: Array.from({ length: n }, (_, i) => all[Math.round(i * (all.length - 1) / (n - 1))]).join(','), classes: n };
 }
 const MAP_DEFAULT_NO_DATA_COLOR = '#D9D9D9';
+// The Maps app's own default, "OSM Light" (osmLight), draws CartoDB tiles that now
+// come back as an "API KEY REQUIRED" picture: every saved map was covered with it
+// (maps app 101.11, 2026-11-08). "OSM Detailed" (openStreetMap) needs no key, but
+// the app asks for it as //a.tile.openstreetmap.org: over https that answers 200 with
+// a CORS header; over plain http it is a 301 to https WITHOUT one, so the map library
+// gets nothing (net::ERR_FAILED in Chrome on localhost:8081) and the map has no
+// background at all. So: the server's own default when an admin set one
+// (keyDefaultBaseMap), else OSM Detailed on an https server and OSM Light on http.
+const MAP_DEFAULT_BASEMAP = 'openStreetMap';
+const MAP_BASEMAP_ALIASES = { osmdetailed: 'openStreetMap', openstreetmap: 'openStreetMap', osm: 'openStreetMap', osmlight: 'osmLight' };
+function normalizeMapBasemap(v) {
+  const s = String(v || '').trim();
+  return MAP_BASEMAP_ALIASES[s.toLowerCase().replace(/[\s_-]+/g, '')] || s;
+}
+const mapServerIsPlainHttp = () => /^http:/i.test(String(dhis2.baseUrl || ''));
+async function defaultMapBasemap() {
+  const r = await safeDhis2Fetch('systemSettings/keyDefaultBaseMap');
+  const set = typeof r === 'string' ? r : (r && !r._error ? r.keyDefaultBaseMap : '');
+  return String(set || '').trim() || (mapServerIsPlainHttp() ? 'osmLight' : MAP_DEFAULT_BASEMAP);
+}
+// What the user will see behind the map, when it is not a working basemap.
+function mapBasemapNote(basemap) {
+  const http = mapServerIsPlainHttp();
+  if (basemap === 'openStreetMap' && http) return 'The basemap "openStreetMap" (OSM Detailed) cannot load on this server, which is reached over plain http: the tile server redirects to https without a CORS header, so the map has no background. It loads on an https server.';
+  if (basemap !== 'osmLight') return null;
+  return `The basemap "osmLight" (OSM Light, the Maps app's default) draws CartoDB tiles that now show "API KEY REQUIRED" across the map. ${http
+    ? 'On this server (plain http) no keyless basemap loads, because OSM Detailed is blocked by its redirect to https: tell the user the background will show that text until an admin adds a basemap with a key (Maintenance, external map layers) and makes it the default.'
+    : 'Unless the user asked for OSM Light by name, use "openStreetMap" (OSM Detailed), which needs no key.'}`;
+}
 function buildMapObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
   const name = String(spec.name || '').trim();
@@ -5732,7 +5782,7 @@ function buildMapObject(spec, typeMap) {
   const map = {
     id: spec.id || generateDhis2Uid(),
     name,
-    basemap: spec.basemap || 'osmLight',
+    basemap: normalizeMapBasemap(spec.basemap) || MAP_DEFAULT_BASEMAP,
     latitude: spec.latitude != null ? Number(spec.latitude) : 0,
     longitude: spec.longitude != null ? Number(spec.longitude) : 0,
     zoom: spec.zoom != null ? Number(spec.zoom) : 3,
@@ -5827,6 +5877,7 @@ async function executeManageMaps(args) {
         spec._drawn_units = withGeo.pager.total;
       }
     }
+    if (!String(spec.basemap || '').trim()) spec.basemap = await defaultMapBasemap();
     const built = buildMapObject(spec, typeMap);
     if (built._error) return built;
     const rootScope = await singleRootScopeRefusal(spec.org_units, `Map "${built.map.name}"`);
@@ -5839,6 +5890,7 @@ async function executeManageMaps(args) {
     const periodWarning = await periodsMissThisYearWarning([itemId], [thematic.filters[0].items[0].id]);
     const boundaryWarning = await mapNoBoundariesWarning(itemId, thematic);
     const levelNameWarning = await orgLevelNameWarning(built.map.name, spec.org_units, spec.org_unit_level);
+    const basemapNote = mapBasemapNote(built.map.basemap);
     const mapWarning = [periodWarning, boundaryWarning, levelNameWarning, built.boundaryNote].filter(Boolean).join(' ');
     return {
       success: true,
@@ -5846,6 +5898,8 @@ async function executeManageMaps(args) {
       map_id: newId,
       name: built.map.name,
       layer: 'thematic',
+      basemap: built.map.basemap,
+      ...(basemapNote ? { _basemap_note: basemapNote } : {}),
       thematic_map_type: thematic.thematicMapType,
       data_item: itemId,
       org_unit_levels: thematic.organisationUnitLevels,

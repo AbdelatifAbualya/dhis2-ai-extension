@@ -3838,8 +3838,16 @@ async function captureResolvePrograms(type, ids) {
   const out = new Set();
   const opts = { noTruncate: true, _captureBump: true };
   if (CAPTURE_PROGRAM_REF_FIELDS[type]) {
-    const r = await safeDhis2Fetch(`${type}?filter=id:in:${inList}&fields=id,${CAPTURE_PROGRAM_REF_FIELDS[type]}&paging=false`, opts);
-    for (const o of (r && r[type]) || []) { const p = captureProgramIdOf(type, o); if (p) out.add(p); }
+    // An analytics-only indicator is not in Capture: deleting one must not write to
+    // its program, as creating one does not (cleanup of 6 dashboard indicators sent
+    // 6 PATCH programs/<id> on play 2.43.2, 2026-11-08).
+    const pi = type === 'programIndicators';
+    const r = await safeDhis2Fetch(`${type}?filter=id:in:${inList}&fields=id,${pi ? 'displayInForm,' : ''}${CAPTURE_PROGRAM_REF_FIELDS[type]}&paging=false`, opts);
+    for (const o of (r && r[type]) || []) {
+      if (pi && o.displayInForm !== true) continue;
+      const p = captureProgramIdOf(type, o);
+      if (p) out.add(p);
+    }
   } else if (type === 'dataElements' || type === 'dataEntryForms') {
     const f = type === 'dataElements' ? 'programStageDataElements.dataElement.id' : 'dataEntryForm.id';
     const r = await safeDhis2Fetch(`programStages?filter=${f}:in:${inList}&fields=program[id]&paging=false`, opts);
@@ -4924,6 +4932,104 @@ function healPackedAnalyticsDimensions(path) {
     for (const g of groups) out.push(`${key}=${g.join(';')}`);
   }
   return { path: healed ? `${p.slice(0, qIdx)}?${out.join('&')}` : p, healed };
+}
+
+// A query parameter written inside a dimension or filter — `dimension=stage=<uid>`,
+// sent as one item of a dimension list — is a 409 ("Item identifier does not
+// reference any data element…", Malaria dashboard run, 2026-11-08). "=" is never
+// part of a dimension, so it becomes its own parameter. A parameter already given
+// keeps its own value.
+function healParamInsideDimension(path) {
+  const p = String(path || '');
+  if (!/^analytics(\.|\/|\?)/.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const parts = p.slice(qIdx + 1).split('&').filter(Boolean);
+  const has = (name) => parts.some(x => x.slice(0, x.indexOf('=')).toLowerCase() === name.toLowerCase());
+  const moved = [];
+  const dropped = [];
+  const out = [];
+  for (const part of parts) {
+    const m = part.match(/^(dimension|filter)=(.*)$/i);
+    const kv = m && dec(m[2]).match(/^([A-Za-z][A-Za-z0-9_]*)=(.+)$/);
+    if (!kv) { out.push(part); continue; }
+    if (has(kv[1]) || out.some(x => x.toLowerCase().startsWith(`${kv[1].toLowerCase()}=`))) { dropped.push(`${kv[1]}=${kv[2]}`); continue; }
+    moved.push(`${kv[1]}=${kv[2]}`);
+    out.push(`${kv[1]}=${encodeURIComponent(kv[2])}`);
+  }
+  if (!moved.length && !dropped.length) return { path: p, healed: false };
+  const said = [
+    moved.length ? `${moved.join(', ')} ${moved.length > 1 ? 'were' : 'was'} written inside a dimension (a 409) and sent as ${moved.length > 1 ? 'their own query parameters' : 'its own query parameter'}, e.g. &${moved[0]}` : '',
+    dropped.length ? `${dropped.join(', ')} inside a dimension was left out: the query already has that parameter` : '',
+  ].filter(Boolean).join('; ');
+  return { path: `${p.slice(0, qIdx)}?${out.join('&')}`, healed: true, note: `Query corrected: ${said}.` };
+}
+
+// An item filter needs an operator: `filter=<de>:CURED` and `filter=<de>:<option
+// id>` are 409 "Query item or filter is invalid" (Malaria follow-up board app,
+// 2026-11-08); `<de>:EQ:CURED` and `<de>:IN:A;B` answer (verified on 2.42.5:
+// 49 events either way, operator in any case). An option id is sent as its code,
+// the value analytics compares. Two segments only: anything already holding an
+// operator, or a legend set, is left alone.
+const ANALYTICS_ITEM_OPERATORS = /^(?:EQ|NE|NEQ|IEQ|GT|GE|LT|LE|LIKE|ILIKE|NLIKE|NILIKE|IN|NIN|SW|EW|NULL|NNULL|!NULL)$/i;
+async function healItemFilterOperator(path) {
+  const p = String(path || '');
+  if (!/^analytics\/(?:events|enrollments)\/(?:aggregate|query)\//.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const fixed = [];
+  const out = [];
+  for (const part of p.slice(qIdx + 1).split('&')) {
+    const m = part.match(/^(dimension|filter)=(.*)$/i);
+    const item = m && dec(m[2]).match(/^((?:[A-Za-z][A-Za-z0-9]{10}\.)?[A-Za-z][A-Za-z0-9]{10}):([^:]+)$/);
+    if (!item || ANALYTICS_ITEM_OPERATORS.test(item[2].trim())) { out.push(part); continue; }
+    const values = item[2].split(';').map(v => v.trim()).filter(Boolean);
+    // `<groupSet>:<group>;<group>` and `<category>:<option>` are real dimensions:
+    // an id value is rewritten only when it is an option of an option set. Asked as
+    // a list, so a group id is an empty answer, not a 404.
+    const ids = values.filter(v => /^[A-Za-z][A-Za-z0-9]{10}$/.test(v));
+    let codeOf = new Map();
+    if (ids.length) {
+      const r = await safeDhis2Fetch(`options?filter=id:in:[${ids.join(',')}]&fields=id,code&paging=false`);
+      codeOf = new Map(((r && !r._error && r.options) || []).filter(o => o.code).map(o => [o.id, o.code]));
+    }
+    if (ids.some(id => !codeOf.has(id)) || !values.length) { out.push(part); continue; }
+    const codes = values.map(v => codeOf.get(v) || v);
+    const healedItem = `${item[1]}:${codes.length > 1 ? 'IN' : 'EQ'}:${codes.join(';')}`;
+    fixed.push(`${item[1]}:${item[2]} → ${healedItem}`);
+    out.push(`${m[1]}=${encodeURIComponent(healedItem)}`);
+  }
+  if (!fixed.length) return { path: p, healed: false };
+  return {
+    path: `${p.slice(0, qIdx)}?${out.join('&')}`,
+    healed: true,
+    note: `Query corrected: an item filter needs an operator, and an option is compared by its code (DHIS2 answers 409 otherwise): ${fixed.join(', ')}. Use <item>:EQ:<code> (or IN:<code>;<code>) in any app or plugin code too.`,
+  };
+}
+
+// Yes/No values are 1 and 0 in analytics: `<de>:EQ:true` is a 409 "Expression
+// violation. Maybe an indicator caused division by zero?" (Malaria follow-up board
+// app, 2.42.5, 2026-11-08); `<de>:EQ:1` answers the true count (40 supervised
+// treatments). ES5, because the generated apps' request guard carries it too.
+function healAnalyticsBooleanFilter(pathOrUrl) {
+  var s = String(pathOrUrl || '');
+  var q = s.indexOf('?');
+  if (q === -1 || !/analytics\/(?:events|enrollments)\//.test(s.slice(0, q))) return s;
+  var parts = s.slice(q + 1).split('&');
+  var changed = false;
+  for (var i = 0; i < parts.length; i++) {
+    var m = parts[i].match(/^(dimension|filter)=(.*)$/i);
+    if (!m) continue;
+    var val;
+    try { val = decodeURIComponent(m[2]); } catch (e) { val = m[2]; }
+    var fixed = val.replace(/:(EQ|NE|NEQ|IEQ|IN):((?:true|false)(?:;(?:true|false))*)(?=[:,]|$)/gi, function (all, op, list) {
+      return ':' + op + ':' + list.split(';').map(function (b) { return /^true$/i.test(b) ? '1' : '0'; }).join(';');
+    });
+    if (fixed !== val) { parts[i] = m[1] + '=' + encodeURIComponent(fixed); changed = true; }
+  }
+  return changed ? s.slice(0, q + 1) + parts.join('&') : s;
 }
 
 // Status on analytics/events|enrollments is its own query parameter, never a

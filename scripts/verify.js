@@ -114,6 +114,11 @@ if (loaded) {
   const truthy = (label, got) => (got ? ok(`${label} => truthy`) : bad(`${label} => ${JSON.stringify(got)} (expected truthy)`));
   const need = (n) => { const f = fn(n); if (!f) bad(`${n} — missing (safety function vanished!)`); return f; };
 
+  // package.json said 2.8.37 while manifest.json said 2.8.38 (found 2026-11-08).
+  eq('package.json and manifest.json carry the same version',
+    JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version,
+    JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8')).version);
+
   // write authorization: writes need explicit intent; problem reports do not authorize
   const cwa = need('classifyWriteAuthorization');
   if (cwa) {
@@ -1744,6 +1749,14 @@ async function runCustomAppChecks() {
   truthy('inline useDataQuery({…}) is an error (static-input trap)', lint('const { useDataQuery, DataProvider } = D2Runtime;\nconst A = () => { useDataQuery({ a: { resource: "me" } }); return null; };' + root).errors.some((e) => /inline object/.test(e.message)));
   truthy('HeaderBar is refused (Global Shell draws it)', lint('const { HeaderBar } = D2UI;\nconst A = () => <HeaderBar />;' + root).errors.some((e) => /HeaderBar/.test(e.message)));
   {
+    // A program explorer's search and paging did nothing (deepseek, 2026-11-08).
+    const once = (src) => lint("const { useState, useEffect } = React;\nconst { useDataQuery } = D2Runtime;\nconst Q = { list: { resource: 'programs', params: ({ page, q }) => ({ page, filter: 'displayName:ilike:' + q }) } };\n" + src + root).errors.some((e) => /fetches only once/.test(e.message));
+    truthy('useDataQuery with variables from this component\'s useState and no refetch is an error (search and paging would do nothing)',
+      once("function A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); const { data } = useDataQuery(Q, { variables: { page, q } }); return null; }"));
+    truthy('…a refetch on those values is fine', !once("function A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); const { data, refetch } = useDataQuery(Q, { variables: { page, q } }); useEffect(() => { refetch({ page, q }); }, [page, q]); return null; }"));
+    truthy('…and so is a child keyed by the values (props, not its own state)', !once("function List({ page, q }) { const { data } = useDataQuery(Q, { variables: { page, q } }); return null; }\nfunction A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); return <List key={q + page} page={page} q={q} />; }"));
+  }
+  {
     // dataStore key reads: a 404 until the key exists (live 2026-10-22).
     const ds = (src) => lint(src + root).errors.some((e) => /is read directly, which is a 404/.test(e.message));
     truthy('reading dataStore/<ns>/<key> directly is an error (404 until the first save)', ds("const { useDataEngine, DataProvider } = D2Runtime;\nconst KEY = `dataStore/${D2_APP_CONFIG.namespace}/notes`;\nconst A = () => { const engine = useDataEngine(); engine.query({ n: { resource: KEY } }); return null; };"));
@@ -1936,6 +1949,11 @@ async function runCustomAppChecks() {
     vm.runInContext('lastUserText = "";', ctx);
     const pvTurn = await ctx.recallCustomAppPreview(pv.preview_token);
     truthy('the preview remembers the turn it was made in', pvTurn && pvTurn.spec && pvTurn.turn === turn);
+    // deepseek sent create with the token alone and was told to pass a name or key.
+    const byToken = await ctx.executeManageCustomApp({ action: 'create', preview_token: pv.preview_token });
+    truthy('create with only a preview_token takes the app from the preview (reaches the write gate as ai-verify-app-2, not "Pass name or key")',
+      gated(byToken) && /ai-verify-app-2/.test(JSON.stringify(byToken)) && !/Pass "name"/.test(byToken._error || ''));
+    truthy('…and an unknown token alone says it has expired', /has expired/.test((await ctx.executeManageCustomApp({ action: 'create', preview_token: 'pv-ffffffffffffffff' }))._error || ''));
   }
   truthy('preview / list / get_source are discovery actions; create is not',
     ctx.isDiscoveryCall('manage_custom_app', { action: 'preview' }) && ctx.isDiscoveryCall('manage_custom_app', { action: 'list' }) && !ctx.isDiscoveryCall('manage_custom_app', { action: 'create' }));
@@ -2743,6 +2761,8 @@ async function runCaptureRefreshChecks() {
     if (p.startsWith('programStages?filter=id:in:[stageA00001]')) return { programStages: [{ id: 'stageA00001', program: { id: 'progA000001' } }] };
     if (p.startsWith('programStages?filter=programStageDataElements.dataElement.id:in:[deStore0001]')) return { programStages: [{ program: { id: 'progA000001' } }, { program: { id: 'progB000001' } }] };
     if (p.startsWith('programRules?filter=id:in:[ruleGone001]')) return { programRules: [{ id: 'ruleGone001', program: { id: 'progB000001' } }] };
+    if (p.startsWith('programIndicators?filter=id:in:[piAnalyt001]')) return /displayInForm/.test(p) ? { programIndicators: [{ id: 'piAnalyt001', displayInForm: false, program: { id: 'progA000001' } }] } : { _error: 'displayInForm not asked for' };
+    if (p.startsWith('programIndicators?filter=id:in:[piInForm001]')) return /displayInForm/.test(p) ? { programIndicators: [{ id: 'piInForm001', displayInForm: true, program: { id: 'progA000001' } }] } : { _error: 'displayInForm not asked for' };
     if (p.startsWith('system/info')) return { version: '2.42.5.1' };
     return { _error: `unexpected ${method} ${p}` };
   };
@@ -2766,6 +2786,13 @@ async function runCaptureRefreshChecks() {
     ctx.noteCaptureMetadataWrite('DELETE', 'programRules/ruleGone001', null, pre);
     r = await ctx.flushCaptureProgramVersionBumps();
     truthy('a deleted rule\'s program is resolved BEFORE the delete and bumped after', JSON.stringify(pre) === '["progB000001"]' && r && r.bumped[0].program_id === 'progB000001');
+    // Cleanup of 6 dashboard indicators sent 6 PATCH programs/<id> (play 2.43.2, 2026-11-08).
+    const preAnalytics = await ctx.captureProgramsOfDeletedObjects('DELETE', 'programIndicators/piAnalyt001', null);
+    ctx.noteCaptureMetadataWrite('DELETE', 'programIndicators/piAnalyt001', null, preAnalytics);
+    const afterAnalytics = await ctx.flushCaptureProgramVersionBumps();
+    const preInForm = await ctx.captureProgramsOfDeletedObjects('DELETE', 'programIndicators/piInForm001', null);
+    truthy('deleting an analytics-only program indicator writes nothing to its program; one shown in Capture still bumps it',
+      Array.isArray(preAnalytics) && preAnalytics.length === 0 && afterAnalytics === null && JSON.stringify(preInForm) === '["progA000001"]');
     ctx.noteCaptureMetadataWrite('PUT', 'dataStore/capture/dataEntryForms', JSON.stringify({ x: [] }));
     ctx.noteCaptureMetadataWrite('POST', 'tracker?async=false', JSON.stringify({ events: [{ event: 'e', programStage: 'stageA00001' }] }));
     truthy('dataStore and tracker DATA writes never bump a program', (await ctx.flushCaptureProgramVersionBumps()) === null);
@@ -3372,6 +3399,38 @@ async function runDashboardThreadChecks() {
       const de = await ctx.healBareStageDimension('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AImspTQPwCqd&dimension=vANAXwtLwcT&stage=WZbXY0S00lP');
       truthy('a stage UID sent as dimension= (409 E7224) becomes stage= on event analytics, is refused on enrollment analytics, and a data element is left alone',
         ev.healed && /stage=WZbXY0S00lP$/.test(ev.path) && !/dimension=WZbXY0S00lP/.test(ev.path) && en.refusal && en.refusal._scope === 'stage_as_dimension' && !de.healed && !de.refusal);
+      // Malaria dashboard run (2026-11-08): dimension:["ou:…","stage=<uid>"] → two 409s.
+      const inDim = ctx.healParamInsideDimension('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AUSER_ORGUNIT%3BLEVEL-3&dimension=stage%3DWZbXY0S00lP&startDate=2025-11-01');
+      const kept = ctx.healParamInsideDimension('analytics/events/aggregate/WSGAb5XwJ3Y?dimension=stage=edqlbukwRfQ&stage=WZbXY0S00lP');
+      const filterOk = ctx.healParamInsideDimension('analytics/events/query/WSGAb5XwJ3Y?dimension=vANAXwtLwcT:EQ:a=b&filter=ou:LEVEL-2');
+      truthy('a query parameter written inside dimension= (stage=<uid>) is moved to its own parameter and said in the result; one already given keeps its value; a filter value holding "=" is left alone',
+        inDim.healed && inDim.path === 'analytics/events/aggregate/WSGAb5XwJ3Y?dimension=ou%3AUSER_ORGUNIT%3BLEVEL-3&stage=WZbXY0S00lP&startDate=2025-11-01' && /stage=WZbXY0S00lP was written inside a dimension/.test(inDim.note)
+        && kept.healed && kept.path === 'analytics/events/aggregate/WSGAb5XwJ3Y?stage=WZbXY0S00lP' && /already has that parameter/.test(kept.note) && !filterOk.healed);
+      {
+    const b = ctx.healAnalyticsBooleanFilter;
+    truthy('Yes/No analytics filters become 1/0 (EQ, NE, IN; any case; dimension or filter; comma-joined dimensions), other values and other endpoints are left alone',
+      b('analytics/events/aggregate/p?filter=s.d:EQ:true&dimension=pe:2026') === 'analytics/events/aggregate/p?filter=s.d%3AEQ%3A1&dimension=pe:2026'
+      && /dimension=ou%3AX%2Cd%3Ane%3A0%2Cpe%3AY/.test(b('analytics/events/query/p?dimension=ou:X,d:ne:FALSE,pe:Y'))
+      && b('analytics/events/query/p?filter=d:EQ:trueish') === 'analytics/events/query/p?filter=d:EQ:trueish'
+      && b('analytics?dimension=dx:a&filter=d:EQ:true') === 'analytics?dimension=dx:a&filter=d:EQ:true');
+  }
+  // Malaria follow-up board (2026-11-08): filter=<de>:CURED and <de>:<option id> → 409s.
+      const opSeen = [];
+      ctx.safeDhis2Fetch = async (p) => { opSeen.push(p); return p.startsWith('options?filter=id:in:[') ? { options: /IN4Rqe6lyoJ/.test(p) ? [{ id: 'IN4Rqe6lyoJ', code: 'CURED' }] : [] } : { _error: 'Not found', _status: 404 }; };
+      const op1 = await ctx.healItemFilterOperator('analytics/events/aggregate/l0NXObayGhi?dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT&filter=VWwjl5N3CYJ:CURED&stage=ILSztnThbiV');
+      const op2 = await ctx.healItemFilterOperator('analytics/events/aggregate/l0NXObayGhi?filter=ILSztnThbiV.VWwjl5N3CYJ:IN4Rqe6lyoJ&dimension=VWwjl5N3CYJ:CURED;FAILED');
+      const op3 = await ctx.healItemFilterOperator('analytics/events/aggregate/l0NXObayGhi?dimension=J5jldMd8OHv:uIuxlbV1vRT;EYbopBOJWsW&filter=VWwjl5N3CYJ:eq:CURED&dimension=pe:2026');
+      truthy('an item filter without an operator gets EQ (several values IN), an option id is sent as its code, and a group-set dimension or a filter that has an operator is left alone',
+        op1.healed && /filter=VWwjl5N3CYJ%3AEQ%3ACURED/.test(op1.path) && /needs an operator/.test(op1.note)
+        && op2.healed && /filter=ILSztnThbiV.VWwjl5N3CYJ%3AEQ%3ACURED/.test(op2.path) && /dimension=VWwjl5N3CYJ%3AIN%3ACURED%3BFAILED/.test(op2.path)
+        && !op3.healed && opSeen.every(p => p.startsWith('options?filter=id:in:[')));
+      const savedFetch = ctx.safeDhis2Fetch;
+      const sent = [];
+      ctx.safeDhis2Fetch = async (p) => { sent.push(p); return p.startsWith('programs/WSGAb5XwJ3Y') ? { programStages: [{ id: 'WZbXY0S00lP' }] } : (p.startsWith('analytics/') ? { headers: [{ name: 'value' }], rows: [['5']] } : { _error: 'x' }); };
+      const viaTool = await ctx.executeTool('dhis2_query', { path: 'analytics/events/aggregate/WSGAb5XwJ3Y', query_params: { dimension: ['ou:USER_ORGUNIT', 'WZbXY0S00lP'], startDate: '2025-11-01', endDate: '2026-10-31' } });
+      ctx.safeDhis2Fetch = savedFetch;
+      truthy('…and a bare stage moved to stage= is said in the result too (a model saved the bare form as a lesson because it "worked")',
+        /a program stage is not a dimension/.test(viaTool?._query_corrected || '') && /stage=WZbXY0S00lP/.test(viaTool?._query_corrected || '') && sent.some(p => /^analytics\/events\/aggregate\/WSGAb5XwJ3Y\?.*stage=WZbXY0S00lP/.test(p)));
     } finally { ctx.safeDhis2Fetch = saved; }
   }
 
@@ -3734,6 +3793,28 @@ async function runDashboardMapsTurnChecks() {
     truthy('maps: a named scale in any case gives that many classes, a hex list is kept (4 classes), no_data_color is saved; an unknown scale or a non-hex no-data colour is refused',
       ch.map.mapViews.length === 1 && ch.map.mapViews[0].colorScale === '#f7fbff,#6baed6,#08306b' && ch.map.mapViews[0].noDataColor === '#D9D9D9'
       && own.map.mapViews[0].colorScale === '#fee5d9,#fcae91,#fb6a4a,#cb181d' && own.map.mapViews[0].classes === 4 && /Rainbow/.test(badScale._error || '') && /no_data_color/.test(badNoData._error || ''));
+    // OSM Light's CartoDB tiles now draw "API KEY REQUIRED" over every map (8081, 2026-11-08).
+    truthy('maps: the basemap defaults to openStreetMap (OSM Detailed), not osmLight; "osmDetailed" / "OSM Detailed" mean openStreetMap; an explicit osmLight is kept',
+      ch.map.basemap === 'openStreetMap'
+      && ctx.buildMapObject({ name: 'D', data_item: 'pfhawHn1Nss', org_unit_level: 2, basemap: 'osmDetailed' }, typeMap).map.basemap === 'openStreetMap'
+      && ctx.buildMapObject({ name: 'D', data_item: 'pfhawHn1Nss', org_unit_level: 2, basemap: 'OSM Detailed' }, typeMap).map.basemap === 'openStreetMap'
+      && ctx.buildMapObject({ name: 'D', data_item: 'pfhawHn1Nss', org_unit_level: 2, basemap: 'osmLight' }, typeMap).map.basemap === 'osmLight');
+    // OSM Detailed over plain http: a 301 to https without CORS → no background (Chrome, 8081).
+    const savedBase = d.baseUrl, savedSdf = ctx.safeDhis2Fetch;
+    try {
+      let setting = '';
+      ctx.safeDhis2Fetch = async (p) => (p.startsWith('systemSettings/keyDefaultBaseMap') ? { keyDefaultBaseMap: setting } : { _error: 'x' });
+      d.baseUrl = 'https://play.im.dhis2.org/stable-2-42-7-1';
+      const onHttps = await ctx.defaultMapBasemap();
+      d.baseUrl = 'http://localhost:8081';
+      const onHttp = await ctx.defaultMapBasemap();
+      setting = 'bingLight';
+      const adminSet = await ctx.defaultMapBasemap();
+      truthy('maps: the default basemap is the admin\'s keyDefaultBaseMap, else OSM Detailed over https and OSM Light over plain http (OSM Detailed cannot load there), each with a note on what the user will see',
+        onHttps === 'openStreetMap' && onHttp === 'osmLight' && adminSet === 'bingLight'
+        && /no keyless basemap loads/.test(ctx.mapBasemapNote('osmLight') || '') && /cannot load/.test(ctx.mapBasemapNote('openStreetMap') || '') && ctx.mapBasemapNote('bingLight') === null
+        && (d.baseUrl = 'https://x.org', /use "openStreetMap"/.test(ctx.mapBasemapNote('osmLight') || '') && ctx.mapBasemapNote('openStreetMap') === null));
+    } finally { d.baseUrl = savedBase; ctx.safeDhis2Fetch = savedSdf; }
   }
   truthy('the manage_dashboards schema offers insert_after_item_id / insert_before_item_id and arrange order',
     (() => { const t = vm.runInContext('TOOLS', ctx).find(x => x.function.name === 'manage_dashboards'); const p = t.function.parameters.properties; return p.insert_after_item_id && p.insert_before_item_id && p.order && /insert_after_item_id/.test(t.function.description); })());
@@ -4240,6 +4321,10 @@ async function runAncAppThreadChecks() {
     await win.fetch('/api/42/tracker/enrollments?program=p&orgUnit=a&orgUnitMode=DESCENDANTS');
     new win.XMLHttpRequest().open('GET', '/api/tracker/events?enrollment=e');
     truthy('a generated app\'s guard corrects the names, on fetch and on XHR', /orgUnits=a/.test(calls[0]) && /enrollments=e/.test(calls[1]));
+    // Malaria follow-up board (2026-11-08): filter=<stage>.<de>:EQ:true → 409 "Expression violation".
+    await win.fetch('/api/42/analytics/events/aggregate/p?dimension=ou%3AUSER_ORGUNIT%3BLEVEL-4,pe%3ALAST_12_MONTHS&filter=zxoz9E7n5pQ.wMlwu72FPuz%3AEQ%3Atrue&stage=zxoz9E7n5pQ');
+    new win.XMLHttpRequest().open('GET', '/api/analytics/enrollments/query/p?dimension=A.B:IN:true;false');
+    truthy('…and sends a Yes/No analytics filter as 1/0, on fetch and on XHR', /filter=zxoz9E7n5pQ\.wMlwu72FPuz%3AEQ%3A1(&|$)/.test(calls[2]) && /dimension=A\.B%3AIN%3A1%3B0/.test(calls[3]));
     truthy('…and an ordinary open is not in check mode', !win.__aiAppCheck && !/updatedAfter=2099/.test(calls[0]));
     const checkCalls = [];
     const listeners = [];
@@ -4401,6 +4486,7 @@ async function runMaternityThreadChecks() {
     if (path.startsWith('visualizations?')) return { visualizations: [
       { id: 'vizSVAAAAAA', displayName: 'Caesarean %', type: 'SINGLE_VALUE', periods: [{ id: '2026' }], organisationUnits: [{ id: 'ouAAAAAAAAA' }], dataDimensionItems: [PI('piEMPTYAAAA', 'Caesarean rate', "d2:condition(\"#{stageAAAAAA.deMETHODAAA} == 'C'\", 100, 0)", 'd2:hasValue(#{stageAAAAAA.deMETHODAAA})')] },
       { id: 'vizKPAAAAAA', displayName: 'Visits KPI', type: 'SINGLE_VALUE', periods: [{ id: '2026' }], organisationUnits: [{ id: 'ouAAAAAAAAA' }], dataDimensionItems: [PI('piFULLAAAAA', 'Visits', 'V{event_count}', "V{program_stage_id} == 'stageAAAAAA'")] },
+      { id: 'vizZEAAAAAA', displayName: 'Near-miss count', type: 'SINGLE_VALUE', periods: [{ id: '2026' }], organisationUnits: [{ id: 'ouAAAAAAAAA' }], dataDimensionItems: [PI('piZEROAAAAA', 'Near-miss cases', 'V{enrollment_count}', '#{stageAAAAAA.deNEARAAAAA} == 1')] },
       { id: 'vizCHAAAAAA', displayName: 'Activity', type: 'COLUMN', periods: [{ id: '2026' }], organisationUnits: [{ id: 'ouAAAAAAAAA' }], dataDimensionItems: [PI('piFULLAAAAA', 'Visits', 'V{event_count}', "V{program_stage_id} == 'stageAAAAAA'"), PI('piNEARAAAAA', 'Near miss', 'V{event_count}', '#{stageAAAAAA.deNEARAAAAA} == 1')] },
     ] };
     if (path.startsWith('analytics?')) {
@@ -4435,7 +4521,9 @@ async function runMaternityThreadChecks() {
   };
   const c = await run();
   truthy('an empty tile is named, with the field behind it', c.empty_tiles?.[0]?.tile === 'Caesarean %' && /Delivery method \(Care at birth\)/.test(c.empty_tiles[0].because_no_values_in[0]));
-  truthy('a tile with values is counted as having them', c.tiles.with_data === 2 && c.tiles.total === 3);
+  truthy('a tile with values is counted as having them', c.tiles.with_data === 2 && c.tiles.total === 4);
+  // Malaria run (2026-11-08): "Pregnant women with malaria" = 0 was told to be "no data, not a real zero".
+  truthy('a record count showing 0 while the tables hold the program is a real zero, said once', c.single_values_true_zero?.[0] === 'Near-miss count' && c.report_lines.filter(l => /"Near-miss count"/.test(l)).length === 1 && c.report_lines.some(l => /"Near-miss count" shows 0[^]*real count of zero/.test(l)) && !(c.single_values_showing_0_for_no_data || []).includes('Near-miss count'));
   truthy('a field with no values is reported with its count', c.fields_without_values?.[0]?.records === 1982);
   truthy('a field with values is not', !c.fields_without_values.some(f => /Near-miss/.test(f.field)));
   truthy('a single value showing 0 for nothing recorded is called out', c.single_values_showing_0_for_nothing_recorded?.[0] === 'Caesarean %' && c.report_lines.some(l => /not as a real zero/.test(l)));
@@ -4443,8 +4531,9 @@ async function runMaternityThreadChecks() {
   const e = await run({ tables: 'empty' });
   truthy('empty analytics tables are reported as the server\'s state, not the items\' fault', e.analytics_tables?.[0]?.state === 'empty' && e.report_lines.some(l => /hold none of this program's records/.test(l) && /not at fault/.test(l)));
   truthy('…with the browser\'s two-week cache explained', e.report_lines.some(l => /CACHE_TWO_WEEKS/.test(l) && /private window/.test(l)));
-  truthy('…a zero caused by the tables is not called "nothing recorded"', e.single_values_showing_0_for_no_data?.[0] === 'Visits KPI' && e.report_lines.some(l => /"Visits KPI" shows 0 only because of the analytics tables/.test(l)) && !e.report_lines.some(l => /"Visits KPI"[^.]*nothing is recorded/.test(l)));
+  truthy('…a zero caused by the tables is not called "nothing recorded"', e.single_values_showing_0_for_no_data?.[0] === 'Visits KPI' && e.report_lines.some(l => /"Visits KPI"[^.]* shows? 0 only because of the analytics tables/.test(l)) && !e.report_lines.some(l => /"Visits KPI"[^.]*nothing is recorded/.test(l)));
   truthy('…a zero caused by an empty field still is', e.single_values_showing_0_for_nothing_recorded?.[0] === 'Caesarean %');
+  truthy('…and a record count is not called a real zero while the tables are empty', e.single_values_showing_0_for_no_data?.includes('Near-miss count') && !e.single_values_true_zero);
   truthy('the model is told not to re-check live counts', /do not re-check/.test(c._note || '') && /do not re-check/.test(vm.runInContext('KB_DASHBOARDS_DETAILS', ctx)));
   const b = await run({ tables: 'behind' });
   truthy('tables holding only part of the records are reported', b.analytics_tables?.[0]?.state === 'behind' && b.report_lines.some(l => /100 of 1982/.test(l)));
