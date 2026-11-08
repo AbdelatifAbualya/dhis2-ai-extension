@@ -5834,6 +5834,47 @@ async function mapNoBoundariesWarning(itemId, thematic) {
   } catch { return null; }
 }
 
+// A dashboard save refused over tiles that were ALREADY on it, not the new item.
+// Antenatal Care on play 2.43.2 (2026-11-08): E4061/E5002 "Invalid reference
+// [<map>] (Map)" for its two map tiles although both maps open by id; the server's
+// list queries returned nothing for maps and org units, so its own validation could
+// not find them. Any save of that dashboard failed the same way (a plain POST of a
+// dashboard with such a map tile: 409), and there is no single-item endpoint on
+// 2.43 (POST dashboards/<id>/items/content → 400). The model spent ~15 calls
+// probing before saying so. Measured here once, and said plainly.
+async function diagnoseDashboardSaveRefusal(result, existingItems) {
+  try {
+    const text = JSON.stringify(result.errors || result._error || '');
+    const mine = new Set((existingItems || []).map(it => it && it.id).filter(Boolean));
+    const resourceOf = { Map: 'maps', Visualization: 'visualizations', EventVisualization: 'eventVisualizations', EventReport: 'eventReports', EventChart: 'eventCharts' };
+    const refs = [];
+    for (const m of text.matchAll(/Invalid reference \[([A-Za-z][A-Za-z0-9]{10})\] \((\w+)\) on object \[([A-Za-z][A-Za-z0-9]{10})\] \(DashboardItem\)/g)) {
+      if (mine.has(m[3]) && resourceOf[m[2]] && !refs.some(r => r.id === m[1])) refs.push({ id: m[1], type: m[2], tile: m[3] });
+    }
+    if (!refs.length) return {};
+    const checked = [];
+    for (const r of refs.slice(0, 10)) {
+      const o = await safeDhis2Fetch(`${resourceOf[r.type]}/${r.id}?fields=id,displayName`, { noTruncate: true });
+      checked.push({ ...r, exists: !!(o && !o._error && o.id), name: o && o.displayName });
+    }
+    const gone = checked.filter(c => !c.exists);
+    const list = checked.map(c => `${c.type.toLowerCase()} ${c.id}${c.name ? ` ("${c.name}")` : ''} on tile ${c.tile}`).join(', ');
+    if (gone.length) {
+      return {
+        _diagnosis: `The rejection is about tiles that were already on this dashboard, not the new item: ${gone.map(c => `tile ${c.tile} points at ${c.type.toLowerCase()} ${c.id}, which no longer exists`).join('; ')}. Nothing was changed.`,
+        _hint: 'Tell the user which tiles are broken. Removing them (manage_dashboards remove_item) lets the dashboard save again — ask first.',
+        _scope: 'dashboard_existing_tiles_missing',
+      };
+    }
+    const health = typeof serverListQueriesBroken === 'function' ? await serverListQueriesBroken() : { broken: false };
+    return {
+      _diagnosis: `The rejection is about tiles that were already on this dashboard, not the new item: ${list}. Each of them exists (read by its id), but DHIS2's own validation cannot find them${health.broken ? `: this server's list queries return nothing for objects that exist (${health.probe})` : ''}. Every save of this dashboard is refused the same way, in the Dashboard app too, until that is fixed on the server. Nothing was changed.`,
+      _hint: 'Do not probe further and do not try other write routes: DHIS2 has no single-item endpoint for this, and every route saves the whole dashboard. Tell the user exactly this, and offer: the item on a new dashboard that has no such tiles; removing those tiles from this dashboard (ask first: they disappear from it); or an admin looking at the server.',
+      _scope: 'dashboard_existing_tiles_unresolvable',
+    };
+  } catch { return {}; }
+}
+
 async function executeManageMaps(args) {
   const action = args.action;
   if (!action) return { _error: 'action required', _hint: 'One of: list, get, create, delete.' };
@@ -6381,7 +6422,10 @@ async function executeManageDashboards(args) {
     if (newVisualizations.length) payload.visualizations = newVisualizations;
     payload.dashboards = [owner];
     const result = await postMetadataPayload(payload, false);
-    if (!result.success) return { _error: result._error || 'add_items failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    if (!result.success) {
+      const diag = await diagnoseDashboardSaveRefusal(result, existingItems);
+      return { _error: result._error || 'add_items failed.', phase: result.phase, errors: result.errors, backup: backup.block, ...diag };
+    }
 
     const verify = await safeDhis2Fetch(`dashboards/${dId}?fields=dashboardItems~size`);
     const after = verify && !verify._error ? (verify.dashboardItems ?? null) : null;

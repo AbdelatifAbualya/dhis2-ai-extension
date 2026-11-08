@@ -1778,6 +1778,35 @@ async function runCustomAppChecks() {
       pagerLint("const { useDataQuery } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events', params: { pageSize: 100, totalPages: true } } };\nfunction A() { const { data, refetch } = useDataQuery(Q); const pc = (data && data.pager && data.pager.pageCount) || 1; return null; }")
       && pagerLint("const { useDataEngine } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events' } };\nfunction A() { const engine = useDataEngine(); const load = async () => { const res = await engine.query(Q); return res?.pager; }; return null; }")
       && !pagerLint("const { useDataQuery } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events' } };\nfunction A() { const { data } = useDataQuery(Q); const pc = data && data.ev.pager.pageCount; return null; }"));
+    {
+      // ANC plugin thread, play 2.43.2 (2026-11-08): list queries answered nothing for
+      // objects that exist, so a real indicator was "invented" and an untouched
+      // dashboard could not be saved over its two map tiles.
+      const dd = ctx.__dhis2(), savedSdf = ctx.safeDhis2Fetch, savedBase = dd.baseUrl;
+      dd.baseUrl = 'https://broken.invalid';
+      vm.runInContext('_listQueryHealth.clear();', ctx);
+      ctx.safeDhis2Fetch = async (p) => {
+        if (p.startsWith('metadata?')) return {};
+        if (p.startsWith('me?')) return { organisationUnits: [{ id: 'ouRoot00001' }] };
+        if (p.startsWith('organisationUnits?filter=id:eq:ouRoot00001')) return { organisationUnits: [] };
+        if (p.startsWith('identifiableObjects/indRealAAAA')) return { id: 'indRealAAAA', href: 'https://broken.invalid/api/indicators/indRealAAAA' };
+        if (p.startsWith('maps/mapRealAAAA')) return { id: 'mapRealAAAA', displayName: 'ANC map' };
+        if (p.startsWith('maps/mapGoneAAAA')) return { _error: 'not found', _status: 404 };
+        return { _error: 'Not found', _status: 404 };
+      };
+      try {
+        const u = await ctx.checkCustomAppUids(['indRealAAAA', 'madeUpAAAAA']);
+        truthy('on a server whose list queries miss existing objects, an id is confirmed by a direct read before it is called invented (a made-up one still is)',
+          u.found.indRealAAAA === 'indicators' && u.unknown.length === 1 && u.unknown[0] === 'madeUpAAAAA' && /ouRoot00001/.test(u.list_queries_broken || ''));
+        const err = (ids) => ({ success: false, errors: ids.map(([m, t]) => `Invalid reference [${m}] (Map) on object [${t}] (DashboardItem) for association \`map\``) });
+        const d1 = await ctx.diagnoseDashboardSaveRefusal(err([['mapRealAAAA', 'tileOld0001']]), [{ id: 'tileOld0001' }]);
+        const d2 = await ctx.diagnoseDashboardSaveRefusal(err([['mapGoneAAAA', 'tileOld0002']]), [{ id: 'tileOld0002' }]);
+        const d3 = await ctx.diagnoseDashboardSaveRefusal(err([['mapRealAAAA', 'tileNew0001']]), [{ id: 'tileOld0001' }]);
+        truthy('a dashboard save refused over tiles already on it is diagnosed once: existing objects the server cannot find (stop probing, offer the choices), or tiles pointing at deleted objects; a refusal about the new item gets no such note',
+          d1._scope === 'dashboard_existing_tiles_unresolvable' && /ANC map/.test(d1._diagnosis) && /list queries return nothing/.test(d1._diagnosis) && /Do not probe further/.test(d1._hint)
+          && d2._scope === 'dashboard_existing_tiles_missing' && /no longer exists/.test(d2._diagnosis) && !d3._scope);
+      } finally { ctx.safeDhis2Fetch = savedSdf; dd.baseUrl = savedBase; vm.runInContext('_listQueryHealth.clear();', ctx); }
+    }
     truthy('…and so is a child keyed by the values (props, not its own state)', !once("function List({ page, q }) { const { data } = useDataQuery(Q, { variables: { page, q } }); return null; }\nfunction A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); return <List key={q + page} page={page} q={q} />; }"));
   }
   {

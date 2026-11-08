@@ -3403,6 +3403,33 @@ function normalizeTrackerQuery(pathOrUrl, apiVersion) {
 // stage no longer gets its answer. Below the default keyAnalyticsMaxLimit of 100,000
 // (over it is 409 E7209). Pure and self-contained: its source is also written into
 // every generated app's app-guard.js. Works on a path or a full URL.
+// Some servers answer list queries with nothing for objects that exist. On play
+// 2.43.2 (2026-11-08) organisationUnits?filter=id:eq:<root>, maps (0 listed, 91 on
+// 2.42.7), indicators?filter=id:in:[…] and the metadata importer's own reference
+// check all found nothing, while organisationUnits/<id>, maps/<id> and
+// indicators/<id> answered. "Not found" from a list query is then no evidence. One
+// probe per server for 5 minutes: the user's own org unit (read from /me) looked up
+// through a list query.
+const _listQueryHealth = new Map();
+async function serverListQueriesBroken() {
+  const key = String(dhis2.baseUrl || '');
+  const hit = _listQueryHealth.get(key);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.value;
+  let value = { broken: false };
+  try {
+    const me = await safeDhis2Fetch('me?fields=organisationUnits[id]', { noTruncate: true });
+    const root = me && !me._error && ((me.organisationUnits || [])[0] || {}).id;
+    if (root) {
+      const r = await safeDhis2Fetch(`organisationUnits?filter=id:eq:${root}&fields=id&paging=false`, { noTruncate: true });
+      if (r && !r._error && Array.isArray(r.organisationUnits) && r.organisationUnits.length === 0) {
+        value = { broken: true, probe: `organisationUnits?filter=id:eq:${root} answered no rows although ${root} is the user's own org unit` };
+      }
+    }
+  } catch { /* cannot tell: treat as healthy */ }
+  _listQueryHealth.set(key, { at: Date.now(), value });
+  return value;
+}
+
 function withEventAggregateCacheKey(pathOrUrl) {
   var s = String(pathOrUrl);
   var at = s.indexOf('analytics/events/aggregate/');

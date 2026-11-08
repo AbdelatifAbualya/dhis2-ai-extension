@@ -997,9 +997,27 @@ async function checkCustomAppUids(uids) {
       for (const o of arr) if (o && o.id) found[o.id] = type;
     }
   }
+  // A server whose list queries miss existing objects called the real ANC 1
+  // Coverage indicator "does not exist" (play 2.43.2, 2026-11-08); the model then
+  // rewrote the plugin to look it up by name, which finds nothing there either.
+  // When the probe shows that, each unknown id is read on its own.
+  let unknown = uids.filter((u) => !found[u]);
+  let listQueriesBroken = null;
+  if (unknown.length && typeof serverListQueriesBroken === 'function') {
+    const health = await serverListQueriesBroken();
+    if (health.broken) {
+      listQueriesBroken = health.probe;
+      for (const id of unknown.slice(0, 15)) {
+        const r = await safeDhis2Fetch(`identifiableObjects/${id}?fields=id,href`, { noTruncate: true });
+        const type = r && !r._error && (String(r.href || '').match(/\/api\/(?:\d+\/)?([A-Za-z]+)\/[A-Za-z][A-Za-z0-9]{10}$/) || [])[1];
+        if (type) found[id] = type;
+      }
+      unknown = uids.filter((u) => !found[u]);
+    }
+  }
   // The server is named in the refusal: ids checked against another server
   // than the one the conversation used read as "invented" (2026-11-01).
-  return { checked: uids.length, found, unknown: uids.filter((u) => !found[u]), server: dhis2.baseUrl };
+  return { checked: uids.length, found, unknown, server: dhis2.baseUrl, ...(listQueriesBroken ? { list_queries_broken: listQueriesBroken } : {}) };
 }
 
 // A plugin reading a SQL view fails for its users when nobody has DATA read
@@ -1703,6 +1721,9 @@ async function prepareCustomAppBuild(spec, opts = {}) {
     };
   }
   lint.warnings.push(...sqlCheck.warnings);
+  if (uidCheck.list_queries_broken) {
+    lint.warnings.push(`This server's list queries return nothing for objects that exist (${uidCheck.list_queries_broken}); the ids in the code were confirmed one by one. Keep the verified ids: code that finds objects by name or filter (…?filter=…) finds nothing on this server until it is fixed. Tell the user the server has this problem.`);
+  }
 
   spec.usesEcharts = /(?<![\w$.])echarts\b/.test(Object.values(compiled).map((js) => customAppSourceViews(js).bare).join('\n'));
   let echartsBytes = null;
