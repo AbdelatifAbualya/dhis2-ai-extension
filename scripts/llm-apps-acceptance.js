@@ -486,7 +486,23 @@ const CASES = [
       // Mark the first row as called with a note, then look for it on the server.
       const mark = page.locator('button').filter({ hasText: /called/i }).first();
       check('there is a "Mark as called" button', await mark.count());
-      if (await mark.count()) {
+      // A disabled button means the app is waiting for a program change the user has
+      // not approved: say so instead of waiting 30 s on it.
+      const markEnabled = (await mark.count()) && await mark.isEnabled();
+      if (await mark.count() && !markEnabled) check('"Mark as called" works without a program change (it is disabled)', false, text.slice(0, 300));
+      // DHIS2 notes cannot be deleted through the API (verified 2.42.5: every
+      // …/note/<id> route is a 404), so a note request is answered here in the
+      // browser and checked, not sent: a test run must not leave notes on records.
+      const noteCalls = [];
+      await page.route(/\/api\/(?:\d+\/)?tracker\/(?:enrollments|events)\/[A-Za-z][A-Za-z0-9]{10}\/note(?:\?|$)/, async (route) => {
+        const req = route.request();
+        if (req.method() !== 'POST') return route.continue();
+        let body = {};
+        try { body = JSON.parse(req.postData() || '{}'); } catch { /* keep {} */ }
+        noteCalls.push({ url: req.url().replace(BASE, ''), value: body.value });
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ note: 'aiTestNote1', value: body.value, storedAt: new Date().toISOString(), storedBy: 'admin', createdBy: { username: 'admin' } }) });
+      });
+      if (markEnabled) {
         await mark.click();
         await page.waitForTimeout(800);
         const note = page.locator('[role="dialog"] textarea, [role="dialog"] input[type="text"], [role="dialog"] input:not([type]), .modal textarea, textarea').first();
@@ -500,7 +516,11 @@ const CASES = [
         const written = ((await api(`tracker/events?${qs({ program: 'KggjM4VSwLS', orgUnitMode: 'ACCESSIBLE', updatedAfter: this.startedAt, pageSize: 50, fields: 'event,programStage,storedBy,createdBy[username],dataValues[value]' })}`)).events || [])
           .filter((e) => JSON.stringify(e.dataValues).includes('ai-test called note'));
         this.writtenEvents = written.map((e) => e.event);
-        check('the call is saved on the server with the note and who made it (tracker data or the app\'s namespace)', (/ai-test called note/.test(inNs) && /admin/i.test(inNs)) || (written.length > 0 && /admin/i.test(JSON.stringify(written))), (inNs || JSON.stringify(written)).slice(0, 300));
+        // An enrollment or event note: DHIS2 records who wrote it and when itself.
+        const asNote = noteCalls.find((n) => String(n.value || '').includes('ai-test called note')); // apps may add a marker
+        check('the call is saved with the note and who made it (an enrollment/event note, tracker data or the app\'s namespace)',
+          !!asNote || (/ai-test called note/.test(inNs) && /admin/i.test(inNs)) || (written.length > 0 && /admin/i.test(JSON.stringify(written))),
+          asNote ? `POST ${asNote.url} "${asNote.value}" (answered in the browser, not stored)` : `notes sent: ${JSON.stringify(noteCalls)} · namespace: ${inNs} · events: ${JSON.stringify(written)}`.slice(0, 300));
         await shot(page, 'worklist after a call');
       }
       const csv = page.locator('button, a').filter({ hasText: /csv|download|export/i }).first();

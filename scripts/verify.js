@@ -1771,6 +1771,13 @@ async function runCustomAppChecks() {
     truthy('useDataQuery with variables from this component\'s useState and no refetch is an error (search and paging would do nothing)',
       once("function A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); const { data } = useDataQuery(Q, { variables: { page, q } }); return null; }"));
     truthy('…a refetch on those values is fine', !once("function A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); const { data, refetch } = useDataQuery(Q, { variables: { page, q } }); useEffect(() => { refetch({ page, q }); }, [page, q]); return null; }"));
+    // NCD worklist (deepseek, 2026-11-08): data.pager / data['events'] on a useDataQuery
+    // result → an empty first page, 0 patients shown, every request answering 200.
+    const pagerLint = (src) => lint(src + root).errors.some((e) => /\.pager is undefined/.test(e.message));
+    truthy('data.pager read on a useDataQuery / engine.query result is an error (the answer sits under the query key)',
+      pagerLint("const { useDataQuery } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events', params: { pageSize: 100, totalPages: true } } };\nfunction A() { const { data, refetch } = useDataQuery(Q); const pc = (data && data.pager && data.pager.pageCount) || 1; return null; }")
+      && pagerLint("const { useDataEngine } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events' } };\nfunction A() { const engine = useDataEngine(); const load = async () => { const res = await engine.query(Q); return res?.pager; }; return null; }")
+      && !pagerLint("const { useDataQuery } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events' } };\nfunction A() { const { data } = useDataQuery(Q); const pc = data && data.ev.pager.pageCount; return null; }"));
     truthy('…and so is a child keyed by the values (props, not its own state)', !once("function List({ page, q }) { const { data } = useDataQuery(Q, { variables: { page, q } }); return null; }\nfunction A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); return <List key={q + page} page={page} q={q} />; }"));
   }
   {

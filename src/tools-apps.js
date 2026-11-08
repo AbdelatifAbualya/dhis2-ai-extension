@@ -736,6 +736,30 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     }
   }
 
+  // A query's answer sits under the query's own key: useDataQuery({ ev: { resource:
+  // 'tracker/events' } }) gives data.ev.events and data.ev.pager. A model-written
+  // worklist read data.pager and data['events'] — undefined — so it stopped after an
+  // empty first page and showed 0 patients forever, every request answering 200
+  // (deepseek, 2026-11-08). The install check cannot see it (records are closed, so
+  // every list is empty anyway). data.pager is never right on such a result.
+  for (const [file, v] of Object.entries(views)) {
+    const holders = new Set();
+    for (const m of v.bare.matchAll(/\bconst\s*\{([^{}]*)\}\s*=\s*useDataQuery\s*\(/g)) {
+      for (const part of m[1].split(',')) {
+        const [k, alias] = part.split(':').map((x) => x.trim());
+        if (k === 'data') holders.add(alias || 'data');
+      }
+    }
+    for (const m of v.bare.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+engine\.query\s*\(/g)) holders.add(m[1]);
+    for (const name of holders) {
+      const n = name.replace(/\$/g, '\\$');
+      const hit = new RegExp(`(?<![\\w$.])${n}\\s*(?:\\?\\.|\\.)\\s*pager\\b`).exec(v.bare);
+      if (hit) {
+        errors.push({ file, line: lineAt(v.bare, hit.index), message: `${name}.pager is undefined: a query's answer sits under the query's own key, e.g. ${name}.<queryKey>.pager and ${name}.<queryKey>.events (useDataQuery and engine.query both). Read the list and the pager from ${name}.<queryKey>, or the app sees an empty first page and shows nothing while every request succeeds.` });
+      }
+    }
+  }
+
   // A read of dataStore/<ns>/<key> is a 404 until the key exists: a failed
   // request on every first visit (a model-written notes app did exactly that,
   // 2026-10-22). Key paths belong in mutation objects (with a type:); reads go
