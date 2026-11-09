@@ -7635,9 +7635,14 @@ async function piRuntimeAnalyticsCheck(programId, ids) {
   };
   await Promise.all(Array.from({ length: Math.min(4, recheck.length) }, one));
   const rebuildIds = new Set(needsRebuild.map(b => b.id));
+  // "no_data" alone leaves the model guessing. Say what is behind it: a field that
+  // nothing is recorded in, or analytics tables that hold none of the records.
+  const noDataIds = ids.filter(id => !withData.has(id) && !rebuildIds.has(id) && !broken.some(b => b.id === id));
+  const noDataCheck = noDataIds.length ? await dataCheckForResult({ indicators: noDataIds }) : null;
   return {
     ok: broken.length === 0,
     checked: ids.length,
+    ...(noDataCheck && (noDataCheck.report_lines || []).length ? { why_no_data: { fields_without_values: noDataCheck.fields_without_values, fields_rarely_filled: noDataCheck.fields_rarely_filled, analytics_tables: noDataCheck.analytics_tables, report_lines: noDataCheck.report_lines, _note: noDataCheck._note } } : {}),
     query: `aggregate analytics, org unit USER_ORGUNIT, periods ${PERIOD.replace(';', ' + ')}, and THIS_YEAR alone for any without a value`,
     with_data: ids.filter(id => withData.has(id)),
     no_data: ids.filter(id => !withData.has(id) && !rebuildIds.has(id) && !broken.some(b => b.id === id)),

@@ -298,6 +298,7 @@ dhis2-AI/
 │   ├── tools-sqlviews.js      manage_sql_views (SQL views · real DB columns)
 │   ├── tools-apps.js          manage_custom_app (AI-built apps & dashboard plugins)
 │   ├── tools-apps-placement.js  manage_custom_app place / unplace / placements
+│   ├── data-check.js          what saved items will show: tile, field and analytics-table counts
 │   └── agent.js               agentic loop · feedback · keepalive · screenshot · message router
 ├── scripts/
 │   ├── verify.js              node --check + shim-load + safety-gate assertions (npm run verify)
@@ -352,6 +353,148 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 ## Changelog
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
+
+### 2.8.41 — A server whose list queries miss existing objects: the "ANC 1st visit coverage" plugin thread (2026-11-08)
+
+A real thread on play 2.43.2 used one of the new suggestion cards: a dashboard plugin of ANC 1st visit coverage by district, added to the "Antenatal Care" dashboard. The plugin was built, installed and checked clean, but it could not be placed, and the model spent about 25 calls finding out why: four org-unit lookups that found nothing, a refusal of the real ANC 1 Coverage indicator as "invented", and 15 probes of the dashboard save.
+
+**What the server was doing (measured):** on `stable-2-43-2-1`, list queries answer nothing for objects that exist. `organisationUnits?filter=id:eq:ImspTQPwCqd` and `organisationUnits?filter=level:eq:1` return 0 rows, `maps` lists 0 maps (2.42.7 and dev list 91), and `indicators?filter=id:in:[Uvn6LCg7dVU]` returns 0. Meanwhile `organisationUnits/ImspTQPwCqd`, `maps/<id>` and `indicators/Uvn6LCg7dVU` read normally, and visualizations list fine. DHIS2's own import validation uses the same lookups, so every save of a dashboard holding a map tile is refused (E4061 / E5002 "Invalid reference … (Map)"). That includes the unchanged Antenatal Care dashboard, and a new dashboard with one such tile (409 on a plain `POST /dashboards`). There is no single-item route around it: `POST dashboards/<id>/items/content` is a 400 on 2.43 (read as an item id). It is a server problem; the extension did not cause it and the dashboard was not changed.
+
+**Fixed:**
+- **A real id called invented.** The app id check trusted `metadata?filter=id:in:[…]`. When an id comes back unknown, a single probe now tests whether the server's list queries work: the user's own org unit, looked up through one. If they don't, each unknown id is read directly (`identifiableObjects/<id>`). Real ids are confirmed, a made-up id is still refused, and the preview warns that lookups by name or filter find nothing on this server. A healthy server makes no extra calls. In the thread the false refusal made the model rewrite the plugin to look the indicator up by name, which also finds nothing on that server.
+- **A dashboard save refused over tiles that were already on it** is diagnosed in the tool result (`_diagnosis`). It names the tiles and their maps or charts and checks each by id. It then says one of two things: the objects exist but the server cannot find them, so every save is refused, in the Dashboard app too (with the list-query probe as evidence); or a tile points at an object that no longer exists. It tells the model to stop probing and offers the choices: the item on a new dashboard, removing those tiles (asking first), or an admin looking at the server. This covers `manage_dashboards add_items` and `manage_custom_app place`.
+- **Combined figures in dashboard plugins.** The thread's plugin averaged the percentages of several selected locations. The manual now says to ask analytics with them on the filter axis. Verified on 2.42.7 for ANC 1 Coverage in two districts: the filter axis answers 117.09, exactly the summed numerators over the summed denominators, while the mean of the two percentages is 115.11.
+
+**For the user:** the thread recorded a learning-memory lesson starting "Destructure every hook from D2Runtime; resolve ind…". Its first half is right. Any advice to resolve indicator ids by name came from the false refusal and should be deleted (Settings → Memory → View memories).
+
+**Checks:** `npm run verify` adds both cases: an id confirmed by direct read on a broken server while a made-up one is refused; and the dashboard diagnosis for existing-but-unfindable objects, for deleted objects, and for a refusal about the new item. Live on the broken 2.43.2 playground: the real indicator is confirmed and a made-up id refused, and `add_items` on Antenatal Care returns the diagnosis after one validate-only request (nothing changed). `npm run appcheck` passed on 2.42.7 (healthy server unaffected).
+
+### 2.8.40 — A refreshed side panel: capability suggestions, tabbed settings, a cleaner theme (2026-11-08)
+
+The panel still opened with suggestions from a much less capable version ("How many patients are enrolled?", "Monthly trend of events"), kept every setting on one long page, and had several places that were unreadable in dark mode. Each change below was checked in real Chrome with the extension loaded (CDP `Extensions.loadUnpacked`), against localhost:8081 and a real model.
+
+**Welcome screen:**
+- Six capability cards replace the four question chips: build a complex dashboard, create and install a custom app, add a dashboard plugin, add a form-field plugin, design a tracker program, and audit and fix configuration.
+- A card puts its prompt in the message box to edit, instead of sending it. The prompts name programs and dashboards the user will want to adapt to their own server.
+- The composer reads "Ask or describe a task…". The longer wording was cut off at the panel's minimum width of 320 px.
+
+**Settings in three tabs:**
+- **General** holds the theme, the model provider and the advanced model settings. **Web browsing** holds the Tavily key. **Memory** holds learning memory.
+- The tabs work with the arrow, Home and End keys. A validation error brings back the tab with the field. The Memory tab has no Save button and no empty footer, because its changes apply at once.
+- The theme is stored as soon as it changes.
+- Clearing the Tavily field and saving now removes the key; before, a saved key could never be removed.
+- A status message no longer hides a newer one early (each message started its own 3-second timer). Errors stay for 6 seconds.
+
+**Conversation:**
+- **Tool steps are grouped.** The steps of one run share a collapsible group. It shows the step running now, and folds into "Done in N steps" when the reply starts. A group with a failed step stays open. API paths are shown decoded and cut to two lines, with the full path on hover. A 14-step answer used to fill several screens with wrapped, URL-encoded paths.
+- **A cursor kept blinking after the turn ended.** When the model writes a sentence and then calls tools, the worker sends no stream end for that sentence, so its bubble was never settled. It is now settled when a tool call or the next reply starts. A bubble that received no words is removed.
+- **Tables** have thin lines, a quiet header and tabular numbers. Words wrap only between words: "Palestine" was shown as "Palestin-e" in a narrow cell, and the table now scrolls sideways instead.
+- **Charts** already on screen are redrawn when the theme changes; before, they kept light gridlines and labels on a dark panel. The value-axis title is no longer cut off at the top.
+
+**Theme:** this builds on a new light and dark palette, a light header with the version, a single composer box and focus rings. Dark mode had components with light-only colours, and they now use theme tokens: the save and error messages (dark green text on a dark green background), the error bubble, the chart header (a bright band with white text), zebra rows in data tables, the web-browsing indicator, the grant banner, and the tool icons.
+
+**Worker fixes found while testing the panel and the new real-model cases:**
+- **An app request changed a live program.** Asked for an "NCD follow-up worklist" app with a "Mark as called" note, the model added a "Follow-up Call Log" stage and a data element to the NCD program without asking. `create_metadata` add_stage / add_data_elements_to_stage / add_program_rules are now refused during an app or plugin request (`program_change_not_requested`), and the model is told to propose the change and ask. A request that names the change, a yes after the proposal, or a program built in this conversation still goes through. The stage and field the test run added were removed again.
+- **Patient notes:** the app manual now gives DHIS2's own enrollment and event notes: `POST tracker/enrollments/<id>/note`, read through `fields=notes[…]`. `dhis2_query` answers the guessed `tracker/notes` (404) and `GET …/note` (405) itself instead of sending them (verified 2.42.5).
+- **A paged list that showed nothing.** A model-written worklist read `data.pager` and `data['events']` on a `useDataQuery` result. The answer sits under the query's own key (`data.ev.events`, `data.ev.pager`), so the app stopped after an "empty" first page and showed 0 patients while every request answered 200. The install check cannot see this, because records are closed there and every list is empty anyway. A new lint makes `.pager` read on a `useDataQuery` or `engine.query` result an error at preview time. It flags that app and none of the other 36 saved app and plugin sources.
+- **`value=<program indicator>` on an event aggregate** returned 409 ("Value does not refer to a data element or attribute which are numeric"). It is now read from `/analytics` as `dx`, with the indicator's own aggregation.
+
+**New real-model cases** (`scripts/llm-apps-acceptance.js`, deepseek-v4p1-flash-1017, 8081):
+- **J**, Malaria facility scorecard dashboard plugin: all checks passed, and its 69.0% supervised matches the records.
+- **K**, NCD Follow-up form-field plugin: all checks passed. It shows the previous visit (143/80, HbA1c 9.9) with arrows, sets "BP controlled" to No at 150/95 and Yes at 120/80, and shows the crisis alert at 185/125.
+- **I**, NCD follow-up worklist app: list and summary match the records (22 overdue, 1 due in the next 7 days, 2 due in 8–14 days, active enrollments). The guard stopped the program change. With the notes guidance, the model saved calls as enrollment notes (`POST tracker/enrollments/<id>/note`), with no program change. One later run's app showed 0 patients, which is the paging bug the new lint now catches. Final run: 16 of 16 checks passed, with 0 failed calls and no program change.
+- **Notes are permanent.** DHIS2 notes cannot be deleted through the API (every `…/note/<id>` route is a 404 on 2.42.5), and adding one does not change the enrollment's `updatedAt`. Case I now answers the app's note request in the browser and checks it, so a run leaves no note behind. One earlier run left the note "ai-test called note" on an NCD enrollment on 8081.
+
+**Checks:**
+- `npm run verify` adds side-panel checks: the three tabs and their fields, the capability cards filling the input, the settled stream, grouped steps, the chart redraw, and theme tokens.
+- Settings UI in real Chrome: 20 checks all pass, covering tabs and keys, validation, saving, Tavily key removal, the memory toggle and viewer, the theme surviving a reload, and the cards filling the input. No page errors.
+- A real model turn through the panel against 8081 drew its chart, table and grouped steps correctly in both themes, at 420 px and 320 px.
+
+### 2.8.39 — Fixes from complex real-model builds: maps, analytics queries, data check, apps (2026-11-08)
+
+The real model (Fireworks deepseek-v4p1-flash-1017) built two complex dashboards, one each on the NCD and Malaria programs, and eight apps and plugins on localhost:8081 (2.42.5). Each result was checked in real Chrome and against the raw tracker records. Every problem below came from those runs, or from a code review done alongside them, and each fix was checked on the live server.
+
+**Maps:**
+- **Every map the assistant saved was covered with "API KEY REQUIRED".** The Maps app's own default basemap, OSM Light (`osmLight`), loads CartoDB tiles, and these now come back as that picture. `manage_maps` always saved it. The basemap is now the server's default when an admin set one (`keyDefaultBaseMap`). Otherwise it is OSM Detailed (`openStreetMap`, no key needed) on an https server.
+- **OSM Detailed cannot load over plain http.** The Maps app asks for `//a.tile.openstreetmap.org`. Over http that is a 301 to https without a CORS header, so the map library gets nothing (`net::ERR_FAILED` in Chrome on localhost:8081) and the map has no background. On an http server OSM Light is therefore kept, and the result says why (`_basemap_note`).
+- `osmDetailed` / "OSM Detailed" are now read as `openStreetMap`. The tool description had suggested `osmDetailed`, an id the Maps app does not know.
+- The map manual told the model to count places without coordinates itself. A real run then made seven `organisationUnits` geometry queries, which pull every boundary's coordinates. The result's `location_coverage` already has the count, and the manual now says to use it.
+
+**Analytics queries (`dhis2_query`):**
+- **A query parameter inside a dimension** (`dimension: ["ou:…", "stage=<uid>"]`) was sent as is and answered 409, twice. It is now sent as its own parameter. A parameter the query already has keeps its value.
+- **A bare stage UID moved to `stage=` was not reported.** The model saw the query work and saved the bare form as a lesson in its learning memory. The correction is now in the result (`_query_corrected`).
+- **An item filter without an operator** (`filter=<de>:CURED`, or `<de>:<option id>`) is a 409 "Query item or filter is invalid". It now gets `EQ` (`IN` for several values), and an option id is sent as its code. Verified on 2.42.5: `:EQ:CURED`, `:IN:CURED` and `:eq:CURED` each answer 49 events, the true count. `<groupSet>:<group>` and `<category>:<option>` are real dimensions, so an id value is rewritten only when it is an option-set option. The lookup is a list query, so a group id gets an empty answer, not a 404.
+- **A Yes/No filter written as `true`/`false`** (`filter=<stage>.<de>:EQ:true`) is a 409 with a misleading message: "Expression violation. Maybe an indicator caused division by zero?". Analytics stores Yes/No as 1 and 0, and `:EQ:1` answers 40, the true count of supervised treatments. EQ, NE and IN on event and enrollment analytics are now sent as 1/0. This applies in `dhis2_query` and in every generated app's request guard (fetch and XHR), where a model-written Facilities tab hit it.
+
+**Data check:**
+- **A record count of 0 was called "no data, not a real zero".** "Pregnant women with malaria" showed 0 because no case on the server has Pregnant = Yes. When the item is a count (`V{event_count}`, `V{enrollment_count}`, `V{tei_count}`) and the analytics tables hold the program's records, the 0 is now reported as a real count of zero (`single_values_true_zero`). Averages and percentages keep the old wording, and so do counts while the tables are empty or behind.
+- An empty single-value tile was also repeated in the closing "no values for the saved periods and places" line. It is now said once.
+
+**Apps:**
+- **A search box and paging that did nothing.** A model-written program explorer passed its own `useState` values (search text, page) as `useDataQuery` variables. app-runtime reads those only at mount, so neither the search nor the paging ever fetched again. The manual says so and the model still wrote it. A new lint makes this an error at preview time, unless the app calls `refetch` or the query sits in a component remounted by a key. It flags that app and none of the other 31 model-written or scenario sources.
+- **The install check opened only the first tab.** It now opens each `role="tab"` in turn, so each tab's queries are checked too (`tabs_opened`). Writes and records stay closed during the check. The Yes/No 409 above was in a tab the check never opened.
+- **`create` with only a `preview_token` was refused** with "Pass name or key", although the token already names the app. The key now comes from the preview, and an unknown token alone says it has expired.
+
+**Capture:**
+- **Deleting an analytics-only program indicator raised its program's version**, once per indicator: cleaning up six dashboard indicators sent six `PATCH programs/<id>`. All six were 409s on play 2.43.2, whose program now references an org unit that no longer validates. Capture does not show such indicators, and creating one already wrote nothing to the program, so deleting one no longer does either. One shown in Capture (`displayInForm`) still raises the version.
+
+**Housekeeping:** `package.json` said 2.8.37 while `manifest.json` said 2.8.38. Both are 2.8.39 now, and verify checks that they match.
+
+**Tests:**
+- `scripts/llm-apps-acceptance.js` adds two real-model cases. G is a Malaria follow-up board app with three tabs, an org-unit tree, a chart and a CSV download; its overdue list is compared with the raw tracker records (30 overdue cases, oldest first). H is a Capture enrollment widget showing a patient's blood-pressure trend, latest HbA1c and a two-visit alert, checked against the patient's six follow-up visits.
+- Case A's "the search filters the list" check now looks for a program that was on screen before the search. The old check looked for one that was never on page 1, so a search that did nothing passed.
+- `scenario-line-lists.js` now removes the backup its update step makes. Every run used to leave one behind.
+
+**Checks:**
+- `npm run verify`: new assertions for every fix above.
+- **Real model on 8081 (deepseek-v4p1-flash-1017):**
+  - All eight app and plugin cases (A–H): 85 checks, 82 passed. The 3 failures were the program explorer's dead search box and the Malaria board's Facilities tab (a Yes/No filter answering 409). After the lint, the Yes/No repair and the tab visits, A and G were re-run: 26 of 26 passed, every chatbot DHIS2 call succeeded, and the server was left as found.
+  - The complex NCD dashboard (9 tiles: 4 KPIs, line chart, stacked chart, district table, map with a legend set, filtered line list): 131 calls, 0 failed.
+  - The complex Malaria dashboard (10 tiles: stacked columns, positivity line, pie, 4 KPIs, district and facility maps, severe-case line list): 114 calls, 0 failed.
+  - Both dashboards were drawn tile by tile in real Chrome, and every figure was compared with the raw tracker records. They all match: 34 enrolled, 118 visits, 25.4% BP controlled, 48.3% good adherence, 77 uncontrolled visits; 9 severe cases, 0 pregnant (true), 44/51 = 86.3% cured, 40/58 = 69.0% supervised.
+- Live scenarios on 8081: dashboard edits, line lists, sticky context and restore fidelity all passed with 0 failed calls.
+- The MNCH scenario cannot pass on either playground right now. On 2.42.7, countIfValue on a text field is valid (the scenario expects 2.43). On 2.43.2, the root org unit `ImspTQPwCqd` is rejected as an invalid reference on every write. Neither is caused by the extension.
+- `npm run apps` was not run: it deletes every `ai-test-*` app, dashboard and namespace on the server, and 8081 holds earlier test objects still awaiting a decision.
+
+### 2.8.38 — Dashboard thread: "Maternity Care and Birth Outcomes" (2026-11-04)
+
+A real thread on play 2.43.2. The dashboard looked broken: a Caesarean % of 0, a chart saying "No data", a map opening on an empty view of Africa, blank table columns. Every saved object was correct and no call had failed. The causes were on the server, and the assistant had no way to find them and could not say so.
+
+**What the server held (measured on 2.43.2 and 2.42.7):**
+- Delivery method and Pregnancy outcome have no value on any of the 1,982 birth-care events. Unique ID is on 10 of 4,009 people.
+- On 2.43.2 another playground user's analytics jobs left the event analytics tables empty for a time: every event query, for every program, answered 0 until a run finished at 13:54. The thread built its dashboard at 13:47.
+- Both playgrounds use `CACHE_TWO_WEEKS`: analytics answers carry `Cache-Control: max-age=1209600, public`, and Chrome reuses them without asking the server (0 bytes, 3 ms). A tile first opened while the tables were empty can keep showing it for two weeks.
+
+**New: a data check of everything saved (`src/data-check.js`).** The answer used to say "all numbers must be confirmed by opening the tiles". Now each build is measured, whatever the model does:
+- **Tile by tile:** the tile's own aggregate query, reporting empty and partly empty tiles and which field is behind them.
+- **Field by field:** how many records hold a value, from live tracker totals: no values at all, or rarely filled (under 5%, so a column reads as blank).
+- **Program by program:** whether the analytics tables hold its records, compared with the live total. `system/info` cannot tell: it reported a run minutes old while the tables were empty.
+- **Where it appears:** `data_check` in `manage_dashboards` create_dashboard / add_items / get and `manage_line_lists` create / update / validate; `why_no_data` in the program-indicator check. One final check of the finished work is printed under the answer as a "Data check" block, which reaches the panel, the returned text and the history.
+- **Privacy:** counts only. A tracker total asks for one id and drops it; a line-list probe asks for one row holding only the facility name (`headers=ouname`). No patient value reaches the extension, so it also runs in a metadata-only request, where the numbers are held back and only the state is given ("no record has a value"). A metadata-only turn's own list probes now ask the same way: bad columns and failing indicators still answer 409, verified on both versions.
+- It costs about 40 calls for 15 tiles, stops after 25 seconds, and leaves out whatever cannot be measured.
+- A single-value tile with nothing to count shows 0 (DHIS2 answers 0.0 for a filter-only query), so such a tile is named and the 0 explained: a field that holds nothing, or the analytics tables, or the saved period and places.
+- The model is told these are live counts. Without that, a real run spent 20 extra analytics queries re-checking an empty field and looking for its values elsewhere.
+
+**Fixed:**
+- **The extension's own reads could be two weeks old.** Reads now use `cache: 'no-store'`, so a check after an analytics run sees the new answer.
+- **A map with no data opened on an empty continent.** A shaded map now draws places without data in grey (`no_data_color`, `""` = none). A bubble map gets level 2 outlines (`boundary_level`, `0` = none). Checked in real Chrome.
+- **`relativeKeyToPeriodToken` wrote `LAST12_MONTHS`.** Analytics answers 409 for it, so `get_visualization_details` previews of a chart on "last 12 months" failed. It now uses the exact keyword list.
+- **`skipMeta=true` on `analytics/events/aggregate` answers 500 on 2.43.2** ("org.hisp.dhis.common.Pager"; 2.42.7 is fine). It is taken off the query, in the worker and in every generated app's guard.
+- **A 0-row line list told the model to go and read `system/info`,** and it then told the user it could be either cause. The warning now states the measured cause.
+- **`manage_line_lists` update dropped the build notes and sent a row count in a metadata-only request.** Both are fixed.
+- **The dashboard link:** a thread's answer gave a made-up link and corrected itself in brackets. The right link is added under the answer when the answer does not carry it.
+
+**Line lists: told to the model and now in the manual:**
+- A column from a repeatable stage in an enrollment list shows only the most recent visit, unless `repeated_events` is passed (`{ oldest:1 }` is the first). The thread reported "haemoglobin at the second antenatal visit" without saying so.
+- The app names the stage in a header only for a data element used from several stages, and a saved list cannot rename a column. Asked to "label each stage clearly", the model must say which columns carry no stage.
+- Columns are saved in the order passed, so the model must keep the order the user listed. The thread put the facility first and then described another order.
+- A line list on a dashboard uses the same org units as the charts beside it. USER_ORGUNIT follows each viewer's unit, so a district user would see another scope.
+- Bare date and org-unit columns with their period or org units on the filters axis are now merged, not refused. A real model sent it that way twice in a row.
+- An identifier column that is rarely filled is reported. Names and birth dates are personal data: the model may offer them, not add them.
+
+**Checks:** `npm run verify` adds the Maternity thread block. New `npm run datacheck` (`scripts/scenario-data-check.js`) builds such a dashboard through the real tools and compares every finding with separate queries: all green on 2.43.2.1 and 2.42.7.1, 0 failed calls, server left as found. `npm run dashboards`, `npm run mnch` and the line-list scenario were re-run. `npm run apps` was not run. The user's dashboard was not changed.
+
+**Real model (Fireworks deepseek-v4p1-flash-1017, 2026-11-05):** the user's prompt through the real agent loop, 5 runs, 0 failed DHIS2 calls in each: the exact prompt on 2.43.2 (130 s, 217 calls); without "metadata only" on 2.42.7, twice (310 s, then 204 s after the model was told the counts are live); and twice with event analytics simulated as empty, the state the original thread met. The 3 builds on real analytics were compared with the tracker: 23 of 23 figures matched in each (6 summary numbers, 13 districts, 12 months of the 4 stages), and the program and its records were unchanged. On the exact-prompt build the flagged list held exactly the 779 raw records and the registration table exactly 2,002 rows, and its maps and tables were checked in real Chrome. No answer called an empty tile working, but two used wording looser than the block under them ("display the existing data", "built and verified"), and in the runs allowed to read counts the model still made 12 to 22 exploratory analytics queries before building (one hit the 20-call research stop). The merge of bare date and org-unit columns came after these runs: it is covered by verify and `npm run datacheck`, not by a further model run.
 
 ### 2.8.37 — Dashboard and app threads: "Malaria Testing and Treatment Review", "ANC Follow-up Explorer" (2026-11-03)
 

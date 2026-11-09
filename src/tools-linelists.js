@@ -664,10 +664,27 @@ async function lineListAnalyticsFresh(programId) {
 // was empty while the other two held 40 enrollments, and the model told the
 // user to run analytics). Re-probe the same query across all of the user's org
 // units before saying anything about analytics.
+// Whether the analytics tables hold the program's records at all, measured: "check
+// system/info" could not tell (it reported a run minutes old while every event query
+// answered 0, Maternity thread 2026-11-04, and the model told the user it might be either).
+async function lineListAnalyticsCause(probePath) {
+  const programId = (/analytics\/(?:events|enrollments)\/query\/([A-Za-z][A-Za-z0-9]{10})/.exec(String(probePath || '')) || [])[1];
+  if (!programId) return '';
+  const a = await dataCheckAnalyticsState(programId);
+  if (!a) return '';
+  if (a.state === 'empty') return ' Measured: the analytics tables hold none of this program\'s records although records exist, so the list stays empty until an Analytics Tables run finishes. The list is not at fault. Tell the user that; do not change the list.';
+  if (a.state === 'behind') return ' Measured: the analytics tables hold only part of this program\'s records, so an Analytics Tables run may fill it.';
+  if (a.state === 'missing') return ' Measured: the analytics tables for this program do not exist yet, so an Analytics Tables run is needed.';
+  if (a.state === 'ok') return ' Measured: the analytics tables hold this program\'s records, so nothing matches these periods and filters. Do not blame analytics.';
+  if (a.state === 'no_records') return ' Measured: this program has no records in this period range, so there is nothing to list yet.';
+  return '';
+}
+
 async function lineListEmptyWarning(probePath) {
   const base = 'The saved list currently shows 0 rows.';
+  const cause = await lineListAnalyticsCause(probePath);
   if (!probePath || /[?&](?:dimension|filter)=ou:USER_ORGUNIT(?:&|$)/.test(probePath)) {
-    return `${base} The query itself is valid; there is no matching data for these periods and filters across the user's org units (or analytics tables predate the data). Do not guess a cause — check system/info lastAnalyticsTableSuccess before mentioning analytics.`;
+    return `${base} The query itself is valid; there is no matching data for these periods and filters across the user's org units.${cause}`;
   }
   const wide = probePath.replace(/([?&](?:dimension|filter)=ou:)[^&]*/, '$1USER_ORGUNIT');
   if (wide === probePath) return base;
@@ -675,10 +692,21 @@ async function lineListEmptyWarning(probePath) {
   if (r.ok && r.row_count > 0) {
     return `${base} The SAME query across all of the user's org units (USER_ORGUNIT) returns ${r.row_count} row(s) — the data lives under OTHER org units than the ones this list is scoped to. Analytics tables are fine. If the user asked for the whole hierarchy, update the list's org units to ["USER_ORGUNIT"].`;
   }
-  return `${base} Across all of the user's org units it is empty too, so this is not an org-unit problem: either no data matches these periods/filters, or analytics tables predate the data — check system/info lastAnalyticsTableSuccess before saying which.`;
+  return `${base} Across all of the user's org units it is empty too, so this is not an org-unit problem.${cause}`;
 }
 
-async function lineListRunProbe(probePath) {
+// For a question that needs only "does it run, is it empty": one row with the facility
+// name alone, so no person's value reaches the extension at all. Bad columns and
+// indicators that fail at query time still answer 409, because the server runs the
+// whole query and trims the columns afterwards (verified 2.42.7 and 2.43.2, 2026-11-05).
+function lineListProbeWithoutValues(probePath) {
+  const s = String(probePath || '');
+  if (!/^analytics\/(?:events|enrollments|trackedEntities)\/query\//.test(s) || /[?&]headers=/.test(s)) return s;
+  return `${s.replace(/([?&])pageSize=\d+/, '$1pageSize=1')}&headers=ouname`;
+}
+
+async function lineListRunProbe(requestedPath) {
+  const probePath = dhis2.metadataOnlyTurn ? lineListProbeWithoutValues(requestedPath) : requestedPath;
   const resp = await safeDhis2Fetch(probePath);
   if (resp?._error) {
     return { ok: false, error: resp._error, status: resp._status || null };
@@ -801,6 +829,33 @@ function lineListDimsFromSaved(ev) {
   return { columns: toDims(summary.columns), filters: toDims(summary.filters), summary };
 }
 
+// "Show the date and the facility, for 2026 and this country" reads as bare columns plus
+// filters, and a real model sent it that way: two refusals in a row (Maternity replay,
+// 2026-11-05). It is one dimension either way, so the scope moves onto the column.
+function lineListMergeScopeFilters(columns, filters) {
+  const OU_NAMES = new Set(['ou', 'orgunit', 'orgunits', 'organisationunit', 'organisationunits']);
+  const nameOf = (s) => {
+    const n = lowercaseText(String((typeof s === 'string' ? s : s?.dimension) || '')).replace(/[\s_-]/g, '');
+    return OU_NAMES.has(n) ? 'ou' : n;
+  };
+  const SCOPE_KEYS = ['org_units', 'periods'];
+  const scopeOf = (s) => {
+    if (!s || typeof s !== 'object') return null;
+    const key = SCOPE_KEYS.find(k => Array.isArray(s[k]) && s[k].length);
+    return key ? { [key]: s[key] } : null;
+  };
+  const merged = (columns || []).map(c => c);
+  const left = [];
+  for (const f of filters || []) {
+    const scope = scopeOf(f);
+    const at = scope ? merged.findIndex(c => nameOf(c) === nameOf(f) && !scopeOf(c)) : -1;
+    if (at < 0) { left.push(f); continue; }
+    const col = merged[at];
+    merged[at] = { ...(typeof col === 'string' ? { dimension: col } : col), ...scope };
+  }
+  return { columns: merged, filters: left };
+}
+
 // ── Spec → payload assembly shared by create and update ─────────────────────
 async function lineListBuildFromSpec(args, { requireName }) {
   const outputTypeRaw = String(args.output_type || args.input_type || 'EVENT').trim().toUpperCase().replace(/\s+/g, '_');
@@ -864,9 +919,10 @@ async function lineListBuildFromSpec(args, { requireName }) {
     return { dims: out };
   };
 
-  const colRes = await resolveAxis(args.columns, 'column');
+  const axes = lineListMergeScopeFilters(args.columns, args.filters);
+  const colRes = await resolveAxis(axes.columns, 'column');
   if (colRes._error) return colRes;
-  const filtRes = await resolveAxis(args.filters, 'filter');
+  const filtRes = await resolveAxis(axes.filters, 'filter');
   if (filtRes._error) return filtRes;
   // The same data element from DIFFERENT stages is a different column
   // ("Hb at first ANC", "Hb at birth care"): DHIS2 stores one
@@ -983,6 +1039,28 @@ async function lineListBuildFromSpec(args, { requireName }) {
     warnings.push(`This line list has only org-unit/indicator columns, but it still lists ONE ROW PER ${rowNoun.toUpperCase()} (many rows per facility), not one row per org unit. If the user wanted org units with totals or percentages, that is a PIVOT TABLE (manage_dashboards create_visualization, vis_type PIVOT_TABLE, layout rows:["ou"] columns:["dx"]) — build that and tell them why.`);
   }
 
+  if (outputType === 'ENROLLMENT') {
+    // A repeatable stage in an enrollment list: without repetition indexes the column
+    // holds the LATEST event only, and the Maternity thread reported "haemoglobin at the
+    // second antenatal visit" that way without a word (that stage repeats, about five
+    // visits per woman). The app hatches the cell when the enrollment has no such event
+    // at all; a plain blank is an event with no value.
+    const latestOnly = columns.filter(d => d.kind === 'de' && d.stageId && !(d.repetitionIndexes || []).length && ctx.stagesById.get(d.stageId)?.repeatable);
+    if (latestOnly.length) {
+      const names = [...new Set(latestOnly.map(d => `"${d.label}" (${d.stageName})`))].join(', ');
+      warnings.push(`${names}: this stage is repeatable, so the column shows only the MOST RECENT visit of each enrollment. Tell the user. For a specific visit pass repeated_events on the column ({ oldest:1 } = the first visit of this stage, { most_recent:2 } = the last two). A hatched cell means the enrollment has no visit of this stage.`);
+    }
+    // The app names the stage in a header only for a data element used from several
+    // stages ("Hemoglobin value, First antenatal care visit"); others show their bare
+    // name, and nothing in a saved list can rename a column (verified 2.43.2).
+    const deColumns = columns.filter(d => d.kind === 'de' && d.stageId);
+    const stagesUsed = new Set(deColumns.map(d => d.stageId));
+    const bare = deColumns.filter(d => deColumns.filter(o => o.dimension === d.dimension).length === 1);
+    if (stagesUsed.size > 1 && bare.length) {
+      warnings.push(`Column headers name the stage only for a data element used from several stages; a saved list cannot rename a column. These show no stage in their header: ${bare.map(d => `"${d.label}" (${d.stageName})`).join(', ')}. If the user asked for stages to be labelled, say this.`);
+    }
+  }
+
   return {
     payload, outputType, programId, ctx, stageObj, columns, filters, probe, warnings,
     resolved: {
@@ -1061,18 +1139,20 @@ async function executeManageLineLists(args) {
         line_list: summary,
       };
     }
+    const dataCheck = await dataCheckForResult({ lineLists: [llId] });
     if (dhis2.metadataOnlyTurn) {
-      return { success: true, line_list_id: llId, name: summary.name, query_check: 'The list\'s query ran without error. Row counts are not reported: this request is metadata only.', headers: probeRes.headers };
+      return { success: true, line_list_id: llId, name: summary.name, query_check: 'The list\'s query ran without error. Row counts are not reported: this request is metadata only.', columns: summary.columns.map(c => c.name || c.dimension), ...(dataCheck ? { data_check: dataCheck } : {}) };
     }
     return {
       success: true,
       line_list_id: llId,
       name: summary.name,
+      ...(dataCheck ? { data_check: dataCheck } : {}),
       row_count: probeRes.row_count,
       ...(probeRes.row_count_is_lower_bound ? { row_count_is_lower_bound: true, row_count_note: probeRes.row_count_note } : {}),
       headers: probeRes.headers,
       empty: probeRes.row_count === 0,
-      _note: probeRes.row_count === 0 ? 'The query is VALID but returns 0 rows — check periods/org units/filters, and whether analytics tables have run since the data was entered.' : undefined,
+      _note: probeRes.row_count === 0 ? await lineListEmptyWarning(probe.path) : undefined,
     };
   }
 
@@ -1148,9 +1228,11 @@ async function executeManageLineLists(args) {
     if (probeRes && probeRes.row_count === 0) {
       warnings.push(await lineListEmptyWarning(built.probe.path));
     }
+    const savedCheck = await dataCheckForResult({ lineLists: [newId] });
     return {
       success: true,
       action: 'create',
+      ...(savedCheck ? { data_check: savedCheck } : {}),
       line_list_id: newId,
       name: built.payload.name,
       output_type: built.outputType,
@@ -1193,7 +1275,7 @@ async function executeManageLineLists(args) {
     if (!backup.ok) return backup.error;
 
     const relayouts = args.columns || args.filters;
-    let body, resolved = null, probePath = null, probeDims = null;
+    let body, resolved = null, probePath = null, probeDims = null, buildWarnings = [];
     if (relayouts) {
       // Full layout rebuild: same resolution pipeline as create, program fixed
       // to the existing one unless overridden.
@@ -1211,6 +1293,7 @@ async function executeManageLineLists(args) {
       body = { ...built.payload, id: llId };
       if (existing.sharing) body.sharing = existing.sharing;
       resolved = built.resolved;
+      buildWarnings = built.warnings || [];
       probePath = built.probe.path;
       probeDims = [...built.columns, ...built.filters];
       if (!args.description && existing.description) body.description = existing.description;
@@ -1263,6 +1346,9 @@ async function executeManageLineLists(args) {
         };
       }
     }
+    const updateWarnings = [...buildWarnings];
+    if (probeRes && probeRes.row_count === 0) updateWarnings.push(await lineListEmptyWarning(probePath));
+    const dataCheck = await dataCheckForResult({ lineLists: [llId] });
     return {
       success: true,
       action: 'update',
@@ -1270,7 +1356,11 @@ async function executeManageLineLists(args) {
       name: body.name,
       relayout: !!relayouts,
       resolved: resolved || undefined,
-      row_count: probeRes ? probeRes.row_count : undefined,
+      ...(dhis2.metadataOnlyTurn
+        ? (probeRes ? { query_check: 'The list\'s query ran without error. Row counts are not reported: this request is metadata only.' } : {})
+        : { row_count: probeRes ? probeRes.row_count : undefined }),
+      ...(dataCheck ? { data_check: dataCheck } : {}),
+      ...(updateWarnings.length ? { warnings: updateWarnings } : {}),
       backup: backup.block,
     };
   }

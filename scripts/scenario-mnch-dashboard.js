@@ -145,7 +145,9 @@ const show = (r) => JSON.stringify(r === undefined ? null : r).slice(0, 400);
     const pv = await t('dhis2_query', { path: `visualizations/${made.viz[0]}?fields=type,rows[dimension],columns[dimension],organisationUnitLevels,dataDimensionItems[programIndicator[id]]` });
     check('saved pivot: ou on rows, dx on columns, level 4, both indicators', pv.type === 'PIVOT_TABLE' && pv.rows?.[0]?.dimension === 'ou' && pv.columns?.[0]?.dimension === 'dx' && (pv.organisationUnitLevels || []).includes(4) && (pv.dataDimensionItems || []).length === 2, show(pv));
     const mv = await t('dhis2_query', { path: `maps/${made.map}?fields=mapViews[thematicMapType,organisationUnitLevels,dataDimensionItems[programIndicator[id]]]` });
-    check('saved map layer: BUBBLE, level 4, the % indicator as data', mv.mapViews?.[0]?.thematicMapType === 'BUBBLE' && (mv.mapViews[0].organisationUnitLevels || []).includes(4) && mv.mapViews[0].dataDimensionItems?.[0]?.programIndicator?.id === id('% attended ANC 1-4'), show(mv));
+    // A bubble map also has an outline layer beneath it: find the data layer, not the first.
+    const mvData = (mv.mapViews || []).find(v => v.thematicMapType);
+    check('saved map layer: BUBBLE, level 4, the % indicator as data', mvData?.thematicMapType === 'BUBBLE' && (mvData.organisationUnitLevels || []).includes(4) && mvData.dataDimensionItems?.[0]?.programIndicator?.id === id('% attended ANC 1-4'), show(mv));
     const an = await t('dhis2_query', { path: `analytics?dimension=dx:${id('% attended ANC 1st visit')};${id('% attended ANC visits 2-4')}&dimension=ou:${SL};LEVEL-4&filter=pe:THIS_YEAR` });
     check('the pivot\'s analytics query runs', !an._error && Array.isArray(an.rows), show(an));
     const llv = await t('manage_line_lists', { action: 'validate', line_list_id: made.lineList });

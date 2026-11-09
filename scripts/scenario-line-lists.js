@@ -29,6 +29,8 @@ const ST_SCREEN = 'LpLNpNLOpt9', ST_FU = 'AtNXKcDte6A';
 const PI_SUCCESS_RATE = 'QKvLpdBdGRg'; // division PI — must be refused as a column
 
 let failures = 0;
+// Backup keys carry their time (backup-20261108T084419Z-…): only this run's are looked at.
+const RUN_STARTED = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 function check(label, cond, detail) {
   if (cond) { console.log(`  ✓ ${label}`); }
   else { failures++; console.log(`  ✗ ${label}${detail ? ' — ' + detail : ''}`); }
@@ -357,6 +359,21 @@ function show(r) { return JSON.stringify(r === undefined ? null : r).slice(0, 30
       const r = await t('manage_legend_sets', { action: 'delete', legend_set_id: created.legendSet, skip_backup: true });
       check('legend set deleted', !r._error, show(r));
     }
+    // The update step backs its line list up; that backup named an object this
+    // run deleted and stayed behind after every run (found 2026-11-08).
+    const mine = new Set([...created.lineLists, ...created.pis, created.dashboard, created.legendSet].filter(Boolean));
+    const NS = 'dhis2-ai-extension-backups';
+    const keys = await ctx.safeDhis2Fetch(`dataStore/${NS}`);
+    const since = `backup-${RUN_STARTED}`;
+    let removed = 0;
+    for (const k of (Array.isArray(keys) ? keys : []).filter((x) => x >= since)) {
+      const e = await ctx.safeDhis2Fetch(`dataStore/${NS}/${encodeURIComponent(k)}`);
+      if (e && !e._error && (e.objects || []).some((o) => mine.has(o.object_id))) {
+        await ctx.safeDhis2Fetch(`dataStore/${NS}/${encodeURIComponent(k)}`, { method: 'DELETE' });
+        removed++;
+      }
+    }
+    console.log(`  backups made by this run removed: ${removed}`);
   } catch (e) {
     failures++;
     console.error('✗ cleanup threw:', e.stack || e.message);

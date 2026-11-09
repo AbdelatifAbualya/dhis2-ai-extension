@@ -704,6 +704,62 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     }
   }
 
+  // useDataQuery reads its variables once, at mount: a component that passes its
+  // own state (search text, page) as variables and never calls refetch fetches
+  // once and then ignores every change. A model-written program explorer's
+  // search box and paging did nothing (deepseek, 2026-11-08); the manual says
+  // so, and the model still wrote it. A component remounted by a key, or any
+  // refetch in the app, is left alone.
+  if (!/\brefetch\b/.test(allBare)) {
+    for (const [file, v] of Object.entries(views)) {
+      for (const m of v.bare.matchAll(/\buseDataQuery\s*\(/g)) {
+        let depth = 0;
+        let end = m.index + m[0].length;
+        for (; end < v.bare.length; end++) {
+          const ch = v.bare[end];
+          if (ch === '(' || ch === '{' || ch === '[') depth++;
+          else if (ch === ')' || ch === '}' || ch === ']') { if (!depth) break; depth--; }
+        }
+        const args = v.bare.slice(m.index + m[0].length, end);
+        const vm = /\bvariables\s*:\s*\{([^{}]*)\}/.exec(args);
+        if (!vm) continue;
+        const names = [...new Set(vm[1].split(',').map((p) => p.split(':').pop().trim()).filter((p) => /^[A-Za-z_$][\w$]*$/.test(p)))];
+        // The enclosing component: the last function declaration before the call.
+        const before = v.bare.slice(0, m.index);
+        const starts = [...before.matchAll(/\bfunction\s+[A-Z][\w$]*\s*\(|\b(?:const|let)\s+[A-Z][\w$]*\s*=\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)];
+        const from = starts.length ? starts[starts.length - 1].index : 0;
+        const own = before.slice(from);
+        const stateNames = names.filter((nm) => new RegExp(`\\[\\s*${nm.replace(/\$/g, '\\$')}\\s*,\\s*[A-Za-z_$][\\w$]*\\s*\\]\\s*=\\s*(?:React\\.)?useState\\b`).test(own));
+        if (!stateNames.length) continue;
+        errors.push({ file, line: lineAt(v.bare, m.index), message: `useDataQuery(…, { variables: { ${names.join(', ')} } }) fetches only once: app-runtime reads variables at mount, so when ${stateNames.join(' / ')} change (useState in this component) nothing is fetched again — the search, paging or filter does nothing. Keep the hook and call refetch({ ${names.join(', ')} }) in a useEffect on those values (const { data, refetch } = useDataQuery(…)), or move the query into a child component rendered with key={…} so a change remounts it.` });
+      }
+    }
+  }
+
+  // A query's answer sits under the query's own key: useDataQuery({ ev: { resource:
+  // 'tracker/events' } }) gives data.ev.events and data.ev.pager. A model-written
+  // worklist read data.pager and data['events'] — undefined — so it stopped after an
+  // empty first page and showed 0 patients forever, every request answering 200
+  // (deepseek, 2026-11-08). The install check cannot see it (records are closed, so
+  // every list is empty anyway). data.pager is never right on such a result.
+  for (const [file, v] of Object.entries(views)) {
+    const holders = new Set();
+    for (const m of v.bare.matchAll(/\bconst\s*\{([^{}]*)\}\s*=\s*useDataQuery\s*\(/g)) {
+      for (const part of m[1].split(',')) {
+        const [k, alias] = part.split(':').map((x) => x.trim());
+        if (k === 'data') holders.add(alias || 'data');
+      }
+    }
+    for (const m of v.bare.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+engine\.query\s*\(/g)) holders.add(m[1]);
+    for (const name of holders) {
+      const n = name.replace(/\$/g, '\\$');
+      const hit = new RegExp(`(?<![\\w$.])${n}\\s*(?:\\?\\.|\\.)\\s*pager\\b`).exec(v.bare);
+      if (hit) {
+        errors.push({ file, line: lineAt(v.bare, hit.index), message: `${name}.pager is undefined: a query's answer sits under the query's own key, e.g. ${name}.<queryKey>.pager and ${name}.<queryKey>.events (useDataQuery and engine.query both). Read the list and the pager from ${name}.<queryKey>, or the app sees an empty first page and shows nothing while every request succeeds.` });
+      }
+    }
+  }
+
   // A read of dataStore/<ns>/<key> is a 404 until the key exists: a failed
   // request on every first visit (a model-written notes app did exactly that,
   // 2026-10-22). Key paths belong in mutation objects (with a type:); reads go
@@ -941,9 +997,27 @@ async function checkCustomAppUids(uids) {
       for (const o of arr) if (o && o.id) found[o.id] = type;
     }
   }
+  // A server whose list queries miss existing objects called the real ANC 1
+  // Coverage indicator "does not exist" (play 2.43.2, 2026-11-08); the model then
+  // rewrote the plugin to look it up by name, which finds nothing there either.
+  // When the probe shows that, each unknown id is read on its own.
+  let unknown = uids.filter((u) => !found[u]);
+  let listQueriesBroken = null;
+  if (unknown.length && typeof serverListQueriesBroken === 'function') {
+    const health = await serverListQueriesBroken();
+    if (health.broken) {
+      listQueriesBroken = health.probe;
+      for (const id of unknown.slice(0, 15)) {
+        const r = await safeDhis2Fetch(`identifiableObjects/${id}?fields=id,href`, { noTruncate: true });
+        const type = r && !r._error && (String(r.href || '').match(/\/api\/(?:\d+\/)?([A-Za-z]+)\/[A-Za-z][A-Za-z0-9]{10}$/) || [])[1];
+        if (type) found[id] = type;
+      }
+      unknown = uids.filter((u) => !found[u]);
+    }
+  }
   // The server is named in the refusal: ids checked against another server
   // than the one the conversation used read as "invented" (2026-11-01).
-  return { checked: uids.length, found, unknown: uids.filter((u) => !found[u]), server: dhis2.baseUrl };
+  return { checked: uids.length, found, unknown, server: dhis2.baseUrl, ...(listQueriesBroken ? { list_queries_broken: listQueriesBroken } : {}) };
 }
 
 // A plugin reading a SQL view fails for its users when nobody has DATA read
@@ -1094,6 +1168,8 @@ function buildCustomAppGuardJs(spec) {
   // answer another person's records with no error (see normalizeTrackerQuery).
   var API_VERSION = ${Number(typeof dhis2 === 'object' && dhis2 && dhis2.apiVersion) || 0};
   ${normalizeTrackerQuery.toString().replace(/\n/g, '\n  ')}
+  // Yes/No values are 1/0 in analytics: EQ:true is a 409 (see healAnalyticsBooleanFilter).
+  ${healAnalyticsBooleanFilter.toString().replace(/\n/g, '\n  ')}
   // The install check (manage_custom_app) opens the app with ?__ai_check=1: records
   // stay closed, requests are logged by path, status and DHIS2's own message.
   var CHECK = /[?&]__ai_check=1(?:&|$)/.test(String(window.location && window.location.search));
@@ -1155,7 +1231,7 @@ function buildCustomAppGuardJs(spec) {
         return Promise.reject(new Error('Not sent: writes are closed during the install check.'));
       }
       if (method === 'GET') {
-        var keyed = withEventAggregateCacheKey(normalizeTrackerQuery(url, API_VERSION));
+        var keyed = withEventAggregateCacheKey(healAnalyticsBooleanFilter(normalizeTrackerQuery(url, API_VERSION)));
         if (CHECK) return checkedFetch(this, keyed, input, init);
         if (keyed !== url) return nativeFetch.call(this, typeof input === 'object' && input.url ? new Request(keyed, input) : keyed, init);
       }
@@ -1170,7 +1246,7 @@ function buildCustomAppGuardJs(spec) {
       if (!sameOrigin(url)) throw refuse('requests may only go to this DHIS2 server');
       if (READ_ONLY && !/^(GET|HEAD)$/i.test(String(method))) throw refuse('this app is read-only (' + method + ')');
       if (/^GET$/i.test(String(method))) {
-        var fixedUrl = normalizeTrackerQuery(url, API_VERSION);
+        var fixedUrl = healAnalyticsBooleanFilter(normalizeTrackerQuery(url, API_VERSION));
         if (CHECK) fixedUrl = customAppRecordsClosed(fixedUrl) || (window.location.href.split('?')[0] + '?not-opened');
         if (fixedUrl !== url) { var xhrArgs = Array.prototype.slice.call(arguments); xhrArgs[1] = fixedUrl; return nativeOpen.apply(this, xhrArgs); }
       }
@@ -1645,6 +1721,9 @@ async function prepareCustomAppBuild(spec, opts = {}) {
     };
   }
   lint.warnings.push(...sqlCheck.warnings);
+  if (uidCheck.list_queries_broken) {
+    lint.warnings.push(`This server's list queries return nothing for objects that exist (${uidCheck.list_queries_broken}); the ids in the code were confirmed one by one. Keep the verified ids: code that finds objects by name or filter (…?filter=…) finds nothing on this server until it is fixed. Tell the user the server has this problem.`);
+  }
 
   spec.usesEcharts = /(?<![\w$.])echarts\b/.test(Object.values(compiled).map((js) => customAppSourceViews(js).bare).join('\n'));
   let echartsBytes = null;
@@ -1900,8 +1979,29 @@ async function customAppCheckInPage(url, timeoutMs, quietMs) {
     }
     if (!c) return { opened: false, reason: 'the app page did not start (its guard script never ran)' };
     if (!loaded) return { opened: false, reason: `the app page had not finished loading after ${Math.round(timeoutMs / 1000)} s` };
-    const selfTest = c.selfTest ? await Promise.race([c.selfTest(), sleep(4000).then(() => [{ name: 'D2_SELF_TEST', pass: false, detail: 'did not finish in 4 s' }])]) : null;
     const doc = f.contentWindow.document;
+    const text = String((doc.body && doc.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 1200);
+    // Each tab, opened in turn: a tab's queries run only when it is shown. A
+    // Facilities tab answered 409 on a Yes/No filter the first tab never sent
+    // (Malaria follow-up board, 2026-11-08). Writes and records stay closed here.
+    const tabsOpened = [];
+    try {
+      for (const el of [...doc.querySelectorAll('[role="tab"]')].slice(0, 8)) {
+        if (Date.now() - t0 > timeoutMs || el.getAttribute('aria-selected') === 'true' || el.disabled) continue;
+        el.click();
+        tabsOpened.push(String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40));
+        const tTab = Date.now();
+        let seenTab = -1;
+        let quietTab = tTab;
+        while (Date.now() - tTab < 8000) {
+          await sleep(250);
+          const n = c.requests.length + c.notOpened.length + c.errors.length;
+          if (n !== seenTab || c.inflight > 0) { seenTab = n; quietTab = Date.now(); }
+          if (Date.now() - quietTab > quietMs) break;
+        }
+      }
+    } catch (e) { /* a tab that cannot be opened is left out */ }
+    const selfTest = c.selfTest ? await Promise.race([c.selfTest(), sleep(4000).then(() => [{ name: 'D2_SELF_TEST', pass: false, detail: 'did not finish in 4 s' }])]) : null;
     const root = doc.getElementById('root');
     return {
       opened: true,
@@ -1912,7 +2012,8 @@ async function customAppCheckInPage(url, timeoutMs, quietMs) {
       errors: c.errors.slice(0, 12),
       self_test: selfTest,
       rendered: !!(root && root.childElementCount),
-      text: String((doc.body && doc.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 1200),
+      text,
+      tabs_opened: tabsOpened,
     };
   } finally {
     f.remove();
@@ -1953,6 +2054,7 @@ async function customAppRuntimeCheck(key, spec) {
     ...(r.errors.length ? { page_errors: r.errors } : {}),
     ...(r.self_test ? { self_test: { total: r.self_test.length, passed: r.self_test.length - selfFails.length, failed: selfFails } } : {}),
     rendered: r.rendered,
+    ...(r.tabs_opened && r.tabs_opened.length ? { tabs_opened: r.tabs_opened } : {}),
     ...(r.timed_out ? { still_loading_after_25s: true } : {}),
     page_text: r.text,
   };
@@ -1991,7 +2093,7 @@ function customAppResult(action, spec, built, extra) {
     ...(check && check.ran && check.verdict !== 'clean' ? { _must_fix: `The app is installed, but it FAILS when opened (runtime_check). Fix it now, in this turn: read each dhis2_message, correct the code, and call manage_custom_app(action="update", key="${s.key}", files=…), which runs this check again. Do not ask the user first and do not hand them the link as working. If it still fails after two repairs, report the exact messages.` } : {}),
     ...(check && !check.ran ? { _check_not_run: `The install check did not run: ${check.reason}. Say so, and that the app has not been opened.` } : {}),
     _not_run: check && check.ran && check.verdict === 'clean'
-      ? 'The install check opened the app with records closed: it started and DHIS2 accepted its requests. It has shown no real record and nothing was clicked, so do not say it works or is tested. Say exactly that, and give the user the 2 or 3 clicks that prove its main flow.'
+      ? 'The install check opened the app with records closed: it started and DHIS2 accepted its requests. It has shown no real record and nothing was clicked apart from switching tabs, so do not say it works or is tested. Say exactly that, and give the user the 2 or 3 clicks that prove its main flow.'
       : 'This confirms the code compiled, its names exist and the app installed. Nothing has opened the app or clicked anything. Do not say it works, is live or is tested: say it is installed and not yet exercised, and give the user the 2 or 3 clicks that prove its main flow.',
     ...extra,
   };
@@ -2168,7 +2270,12 @@ async function executeManageCustomApp(args) {
     if (installedSource._error) return installedSource;
     base = installedSource.aiManifest;
   } else {
-    const r = resolveCustomAppKey(args);
+    // The preview token names its app: a model sent create with the token alone and
+    // was told to pass a name or key (deepseek, 2026-11-08).
+    const tokenOnly = action === 'create' && args.preview_token && !String(args.key || '').trim() && !args.name;
+    const fromToken = tokenOnly ? await recallCustomAppPreview(args.preview_token) : null;
+    if (tokenOnly && !fromToken) return { _error: `Preview ${args.preview_token} has expired.`, _hint: 'Send the same call again with files (and the other arguments) instead of preview_token.' };
+    const r = fromToken ? { key: fromToken.spec.key } : resolveCustomAppKey(args);
     if (r._error) return r;
     key = r.key;
   }

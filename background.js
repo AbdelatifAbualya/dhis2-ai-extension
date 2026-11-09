@@ -40,6 +40,9 @@
                             plugins (validate · safety-scan · package · install)
      src/tools-apps-placement.js  manage_custom_app place / unplace / placements
                             (dashboards · Capture pages · Capture form fields)
+     src/data-check.js      what saved dashboards, charts, maps and line lists will
+                            show: tile, field and analytics-table counts (no record
+                            is read), reported in tool results and under the answer
      src/agent.js           agentic loop · feedback · keepalive · message router
                             and every chrome.* event listener
 
@@ -62,5 +65,6 @@ importScripts(
   'src/tools-sqlviews.js',
   'src/tools-apps.js',
   'src/tools-apps-placement.js',
+  'src/data-check.js',
   'src/agent.js',
 );

@@ -266,6 +266,15 @@ async function executeToolCall(name, args) {
           _scope: 'known_endpoint_guidance',
         };
       }
+      // NCD worklist app (2026-11-08): GET tracker/notes → 404. Notes hang off the
+      // enrollment or event (verified 2.42.5: GET …/note is a 405).
+      if (/^tracker\/(?:notes?\/?$|(?:enrollments|events)\/[A-Za-z][A-Za-z0-9]{10}\/notes?\/?$)/i.test(_gp)) {
+        return {
+          _error: `Not sent: GET ${_gp} does not exist (tracker/notes is a 404, GET …/note a 405).`,
+          _hint: 'Read notes as a field of the record: tracker/enrollments/<id>?fields=enrollment,notes[note,value,storedAt,storedBy,createdBy[username]] (or tracker/events/<id>). Write one with POST tracker/enrollments/<id>/note (or tracker/events/<id>/note), body { "value": "…" }. Reading a patient\'s notes is patient-level data.',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
       if (isGuessedLogEndpoint(_gp)) return guessedLogEndpointRefusal(_gp);
       // Sharing exists per dataStore ENTRY, by its UID; a namespace has none, so
       // this is always a 404 (live 2026-11-02, two in a row while sizing an app).
@@ -943,11 +952,32 @@ async function executeToolCall(name, args) {
         console.log(`[dhis2_query] Split packed analytics dimensions → ${packHeal.path}`);
         safePath = packHeal.path;
       }
+      const paramHeal = healParamInsideDimension(safePath);
+      if (paramHeal.healed) {
+        console.log(`[dhis2_query] Query parameter moved out of dimension= → ${paramHeal.path}`);
+        safePath = paramHeal.path;
+        queryNotes.push(paramHeal.note);
+      }
       const stageHeal = await healBareStageDimension(safePath);
       if (stageHeal.refusal) return stageHeal.refusal;
       if (stageHeal.healed) {
         console.log(`[dhis2_query] Stage UID moved from dimension= to stage= → ${stageHeal.path}`);
         safePath = stageHeal.path;
+        // Said in the result: a model whose bare stage dimension "worked" saved that
+        // as a lesson (Malaria dashboard run, 2026-11-08).
+        queryNotes.push(`Query corrected: a program stage is not a dimension (DHIS2 answers 409); it was sent as its own parameter, ${(stageHeal.path.match(/[?&](stage=[^&]+)/) || [])[1] || 'stage=<stageUid>'}. Use that form.`);
+      }
+      const opHeal = await healItemFilterOperator(safePath);
+      if (opHeal.healed) {
+        console.log(`[dhis2_query] Item filter given an operator → ${opHeal.path}`);
+        safePath = opHeal.path;
+        queryNotes.push(opHeal.note);
+      }
+      const boolPath = healAnalyticsBooleanFilter(safePath);
+      if (boolPath !== safePath) {
+        console.log(`[dhis2_query] Yes/No filter sent as 1/0 → ${boolPath}`);
+        safePath = boolPath;
+        queryNotes.push('Query corrected: Yes/No values are 1 and 0 in analytics (true/false is a 409 "Expression violation"), so the filter was sent with 1/0. Use <de>:EQ:1 in any app or plugin code too.');
       }
       const emptyAxes = collectionReadEmptyAxesNote(safePath);
       if (emptyAxes) queryNotes.push(emptyAxes);
@@ -983,6 +1013,11 @@ async function executeToolCall(name, args) {
       if (piRoute.routed) {
         console.log(`[dhis2_query] Program indicators → /analytics: ${piRoute.path}`);
         safePath = piRoute.path;
+        if (piRoute.note) {
+          // The earlier "moved to value=" note no longer describes what was sent.
+          if (aggHeal.healed) { const at = queryNotes.indexOf(aggHeal.note); if (at >= 0) queryNotes.splice(at, 1); }
+          queryNotes.push(piRoute.note);
+        }
       }
       const periodRefusal = analyticsUnknownPeriodRefusal(safePath);
       if (periodRefusal) return periodRefusal;
@@ -5604,6 +5639,36 @@ function mapColorScale(scale, classes) {
   const all = ramp.split(',');
   return { colors: Array.from({ length: n }, (_, i) => all[Math.round(i * (all.length - 1) / (n - 1))]).join(','), classes: n };
 }
+const MAP_DEFAULT_NO_DATA_COLOR = '#D9D9D9';
+// The Maps app's own default, "OSM Light" (osmLight), draws CartoDB tiles that now
+// come back as an "API KEY REQUIRED" picture: every saved map was covered with it
+// (maps app 101.11, 2026-11-08). "OSM Detailed" (openStreetMap) needs no key, but
+// the app asks for it as //a.tile.openstreetmap.org: over https that answers 200 with
+// a CORS header; over plain http it is a 301 to https WITHOUT one, so the map library
+// gets nothing (net::ERR_FAILED in Chrome on localhost:8081) and the map has no
+// background at all. So: the server's own default when an admin set one
+// (keyDefaultBaseMap), else OSM Detailed on an https server and OSM Light on http.
+const MAP_DEFAULT_BASEMAP = 'openStreetMap';
+const MAP_BASEMAP_ALIASES = { osmdetailed: 'openStreetMap', openstreetmap: 'openStreetMap', osm: 'openStreetMap', osmlight: 'osmLight' };
+function normalizeMapBasemap(v) {
+  const s = String(v || '').trim();
+  return MAP_BASEMAP_ALIASES[s.toLowerCase().replace(/[\s_-]+/g, '')] || s;
+}
+const mapServerIsPlainHttp = () => /^http:/i.test(String(dhis2.baseUrl || ''));
+async function defaultMapBasemap() {
+  const r = await safeDhis2Fetch('systemSettings/keyDefaultBaseMap');
+  const set = typeof r === 'string' ? r : (r && !r._error ? r.keyDefaultBaseMap : '');
+  return String(set || '').trim() || (mapServerIsPlainHttp() ? 'osmLight' : MAP_DEFAULT_BASEMAP);
+}
+// What the user will see behind the map, when it is not a working basemap.
+function mapBasemapNote(basemap) {
+  const http = mapServerIsPlainHttp();
+  if (basemap === 'openStreetMap' && http) return 'The basemap "openStreetMap" (OSM Detailed) cannot load on this server, which is reached over plain http: the tile server redirects to https without a CORS header, so the map has no background. It loads on an https server.';
+  if (basemap !== 'osmLight') return null;
+  return `The basemap "osmLight" (OSM Light, the Maps app's default) draws CartoDB tiles that now show "API KEY REQUIRED" across the map. ${http
+    ? 'On this server (plain http) no keyless basemap loads, because OSM Detailed is blocked by its redirect to https: tell the user the background will show that text until an admin adds a basemap with a key (Maintenance, external map layers) and makes it the default.'
+    : 'Unless the user asked for OSM Light by name, use "openStreetMap" (OSM Detailed), which needs no key.'}`;
+}
 function buildMapObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
   const name = String(spec.name || '').trim();
@@ -5678,12 +5743,24 @@ function buildMapObject(spec, typeMap) {
     mapView.radiusHigh = Number.isFinite(high) && high > mapView.radiusLow ? Math.round(high) : Math.max(auto[1], mapView.radiusLow + 1);
     if (spec.opacity == null && pts > 40) mapView.opacity = 0.75;
   }
-  // Places without data get their own colour (Maps app "no data" style);
-  // without it they are simply not drawn.
-  if (spec.no_data_color != null && spec.no_data_color !== '') {
+  // Places without data get their own colour (Maps app "no data" style); without
+  // it they are not drawn, and a shaded map with no data at all opens on an empty
+  // view of a continent (Maternity thread 2026-11-04). So a shaded map always has
+  // one; no_data_color:"" asks for none. A facility map would fill with empty
+  // markers instead, so it gets outlines below.
+  const noDataGiven = spec.no_data_color !== undefined && spec.no_data_color !== null;
+  if (noDataGiven && spec.no_data_color !== '') {
     const c = String(spec.no_data_color).trim();
     if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(c)) return { _error: `no_data_color "${c}" is not a hex colour like "#CCCCCC".` };
     mapView.noDataColor = c;
+  } else if (!noDataGiven && thematicMapType === 'CHOROPLETH') {
+    mapView.noDataColor = MAP_DEFAULT_NO_DATA_COLOR;
+  }
+  // A bubble layer with nothing to draw has the same empty view, so it gets the
+  // outlines of its parent areas unless boundary_level says otherwise (0 = none).
+  if (thematicMapType === 'BUBBLE' && (spec.boundary_level === undefined || spec.boundary_level === null || spec.boundary_level === '')) {
+    const finest = organisationUnitLevels.length ? Math.max(...organisationUnitLevels) : null;
+    if (finest) spec = { ...spec, boundary_level: finest > 2 ? 2 : finest };
   }
 
   // boundary_level: an outline layer of that level (e.g. 2 = district
@@ -5696,7 +5773,7 @@ function buildMapObject(spec, typeMap) {
   // map with every chiefdom outlined, Malaria replay 2026-11-03).
   const boundaryTooFine = thematicMapType === 'CHOROPLETH' && Number.isFinite(level) && Number(spec.boundary_level) > level;
   const boundaryNote = boundaryTooFine ? `boundary_level ${spec.boundary_level} is finer than the shaded level ${level}, so it was left out: an outline layer is for a coarser level.` : null;
-  if (spec.boundary_level != null && spec.boundary_level !== '' && !boundaryTooFine) {
+  if (spec.boundary_level != null && spec.boundary_level !== '' && Number(spec.boundary_level) !== 0 && !boundaryTooFine) {
     const bl = Number(spec.boundary_level);
     if (!Number.isInteger(bl) || bl < 1) return { _error: `boundary_level must be an org-unit level number (e.g. 2 for districts), not "${spec.boundary_level}".` };
     const parents = organisationUnits.length ? organisationUnits : [];
@@ -5719,7 +5796,7 @@ function buildMapObject(spec, typeMap) {
   const map = {
     id: spec.id || generateDhis2Uid(),
     name,
-    basemap: spec.basemap || 'osmLight',
+    basemap: normalizeMapBasemap(spec.basemap) || MAP_DEFAULT_BASEMAP,
     latitude: spec.latitude != null ? Number(spec.latitude) : 0,
     longitude: spec.longitude != null ? Number(spec.longitude) : 0,
     zoom: spec.zoom != null ? Number(spec.zoom) : 3,
@@ -5755,6 +5832,47 @@ async function mapNoBoundariesWarning(itemId, thematic) {
     if (drawn?._error || (drawn.organisationUnits || []).length) return null;
     return `This map will look EMPTY: the ${withData.length} org unit(s) holding this data have no boundary (geometry) on this server, and a thematic layer only draws units with one. Tell the user and suggest a table or chart by org unit instead, or adding boundaries in Maintenance. Do not present the map as showing data.`;
   } catch { return null; }
+}
+
+// A dashboard save refused over tiles that were ALREADY on it, not the new item.
+// Antenatal Care on play 2.43.2 (2026-11-08): E4061/E5002 "Invalid reference
+// [<map>] (Map)" for its two map tiles although both maps open by id; the server's
+// list queries returned nothing for maps and org units, so its own validation could
+// not find them. Any save of that dashboard failed the same way (a plain POST of a
+// dashboard with such a map tile: 409), and there is no single-item endpoint on
+// 2.43 (POST dashboards/<id>/items/content → 400). The model spent ~15 calls
+// probing before saying so. Measured here once, and said plainly.
+async function diagnoseDashboardSaveRefusal(result, existingItems) {
+  try {
+    const text = JSON.stringify(result.errors || result._error || '');
+    const mine = new Set((existingItems || []).map(it => it && it.id).filter(Boolean));
+    const resourceOf = { Map: 'maps', Visualization: 'visualizations', EventVisualization: 'eventVisualizations', EventReport: 'eventReports', EventChart: 'eventCharts' };
+    const refs = [];
+    for (const m of text.matchAll(/Invalid reference \[([A-Za-z][A-Za-z0-9]{10})\] \((\w+)\) on object \[([A-Za-z][A-Za-z0-9]{10})\] \(DashboardItem\)/g)) {
+      if (mine.has(m[3]) && resourceOf[m[2]] && !refs.some(r => r.id === m[1])) refs.push({ id: m[1], type: m[2], tile: m[3] });
+    }
+    if (!refs.length) return {};
+    const checked = [];
+    for (const r of refs.slice(0, 10)) {
+      const o = await safeDhis2Fetch(`${resourceOf[r.type]}/${r.id}?fields=id,displayName`, { noTruncate: true });
+      checked.push({ ...r, exists: !!(o && !o._error && o.id), name: o && o.displayName });
+    }
+    const gone = checked.filter(c => !c.exists);
+    const list = checked.map(c => `${c.type.toLowerCase()} ${c.id}${c.name ? ` ("${c.name}")` : ''} on tile ${c.tile}`).join(', ');
+    if (gone.length) {
+      return {
+        _diagnosis: `The rejection is about tiles that were already on this dashboard, not the new item: ${gone.map(c => `tile ${c.tile} points at ${c.type.toLowerCase()} ${c.id}, which no longer exists`).join('; ')}. Nothing was changed.`,
+        _hint: 'Tell the user which tiles are broken. Removing them (manage_dashboards remove_item) lets the dashboard save again — ask first.',
+        _scope: 'dashboard_existing_tiles_missing',
+      };
+    }
+    const health = typeof serverListQueriesBroken === 'function' ? await serverListQueriesBroken() : { broken: false };
+    return {
+      _diagnosis: `The rejection is about tiles that were already on this dashboard, not the new item: ${list}. Each of them exists (read by its id), but DHIS2's own validation cannot find them${health.broken ? `: this server's list queries return nothing for objects that exist (${health.probe})` : ''}. Every save of this dashboard is refused the same way, in the Dashboard app too, until that is fixed on the server. Nothing was changed.`,
+      _hint: 'Do not probe further and do not try other write routes: DHIS2 has no single-item endpoint for this, and every route saves the whole dashboard. Tell the user exactly this, and offer: the item on a new dashboard that has no such tiles; removing those tiles from this dashboard (ask first: they disappear from it); or an admin looking at the server.',
+      _scope: 'dashboard_existing_tiles_unresolvable',
+    };
+  } catch { return {}; }
 }
 
 async function executeManageMaps(args) {
@@ -5814,6 +5932,7 @@ async function executeManageMaps(args) {
         spec._drawn_units = withGeo.pager.total;
       }
     }
+    if (!String(spec.basemap || '').trim()) spec.basemap = await defaultMapBasemap();
     const built = buildMapObject(spec, typeMap);
     if (built._error) return built;
     const rootScope = await singleRootScopeRefusal(spec.org_units, `Map "${built.map.name}"`);
@@ -5826,6 +5945,7 @@ async function executeManageMaps(args) {
     const periodWarning = await periodsMissThisYearWarning([itemId], [thematic.filters[0].items[0].id]);
     const boundaryWarning = await mapNoBoundariesWarning(itemId, thematic);
     const levelNameWarning = await orgLevelNameWarning(built.map.name, spec.org_units, spec.org_unit_level);
+    const basemapNote = mapBasemapNote(built.map.basemap);
     const mapWarning = [periodWarning, boundaryWarning, levelNameWarning, built.boundaryNote].filter(Boolean).join(' ');
     return {
       success: true,
@@ -5833,6 +5953,8 @@ async function executeManageMaps(args) {
       map_id: newId,
       name: built.map.name,
       layer: 'thematic',
+      basemap: built.map.basemap,
+      ...(basemapNote ? { _basemap_note: basemapNote } : {}),
       thematic_map_type: thematic.thematicMapType,
       data_item: itemId,
       org_unit_levels: thematic.organisationUnitLevels,
@@ -5959,7 +6081,9 @@ async function executeManageDashboards(args) {
     });
     const small = items.filter(it => it.too_small);
     const unrenderable = items.filter(it => it.will_not_render);
+    const dataCheck = await dataCheckForResult({ dashboards: [resp.id] });
     return {
+      ...(dataCheck ? { data_check: dataCheck } : {}),
       success: true, id: resp.id, name: resp.displayName, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${resp.id}`, description: resp.description || null, item_count: items.length,
       _items_note: 'items are in reading order (position 1 = top left). id is the TILE id (for arrange order / insert_after_item_id / remove_item); a tile\'s numbers come from its data_items, never from the visualization or map id.',
       items,
@@ -6134,10 +6258,12 @@ async function executeManageDashboards(args) {
         if (w) periodWarnings.push(`${g.names.map(n => `"${n}"`).join(', ')}: ${w}`);
       }
     }
+    const dataCheck = await dataCheckForResult({ dashboards: [dashId] });
     return {
       success: true,
       action: 'create_dashboard',
       ...(periodWarnings.length ? { _warning: periodWarnings.join(' | ') } : {}),
+      ...(dataCheck ? { data_check: dataCheck } : {}),
       // Top-level dashboard_id mirrors the *_id convention so the final sharing
       // step (manage_metadata update_sharing) can chain it directly. The nested
       // `dashboard` object is preserved for any existing reader.
@@ -6296,13 +6422,18 @@ async function executeManageDashboards(args) {
     if (newVisualizations.length) payload.visualizations = newVisualizations;
     payload.dashboards = [owner];
     const result = await postMetadataPayload(payload, false);
-    if (!result.success) return { _error: result._error || 'add_items failed.', phase: result.phase, errors: result.errors, backup: backup.block };
+    if (!result.success) {
+      const diag = await diagnoseDashboardSaveRefusal(result, existingItems);
+      return { _error: result._error || 'add_items failed.', phase: result.phase, errors: result.errors, backup: backup.block, ...diag };
+    }
 
     const verify = await safeDhis2Fetch(`dashboards/${dId}?fields=dashboardItems~size`);
     const after = verify && !verify._error ? (verify.dashboardItems ?? null) : null;
+    const dataCheck = await dataCheckForResult({ dashboards: [dId] });
     return {
       success: true,
       action: 'add_items',
+      ...(dataCheck ? { data_check: dataCheck } : {}),
       dashboard_id: dId,
       dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dId}`,
       dashboard_name: dashName,
@@ -7336,7 +7467,7 @@ async function executeCreateMetadata(args, contextOrgUnitId) {
   if (!action) return { _error: 'Missing required parameter: action' };
 
   // create_metadata is ALWAYS destructive (POSTs new objects). Gate on write auth.
-  const _gate = requireWriteAuth('create_metadata', action);
+  const _gate = requireWriteAuth('create_metadata', action, (args.program_id || args.stage_id) ? { program_id: args.program_id, stage_id: args.stage_id } : undefined);
   if (_gate) return _gate;
 
   try {

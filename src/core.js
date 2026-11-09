@@ -607,6 +607,34 @@ function ownAppRepairAllowed(toolName, action, descriptor, wa) {
   return wa.scope !== 'read_only' || /reported a problem/.test(String(wa.reason || ''));
 }
 
+// A request for an app or plugin is not permission to change an existing program's
+// structure. Building an "NCD follow-up worklist" app, a model added a "Follow-up
+// Call Log" stage and a new data element to the live NCD program to hold the app's
+// call notes, without a word (deepseek, 2026-11-08). Patient notes do belong in
+// tracker data, not the dataStore — so the change may be right, but it is the
+// user's to approve. Let through: a request that names the change ("add a stage
+// for …"), or the user agreeing to it after it was proposed and refused.
+const PROGRAM_STRUCTURE_ACTIONS = new Set(['add_stage', 'add_data_elements_to_stage', 'add_program_rules']);
+const PROGRAM_CHANGE_ASKED_RE = /\b(?:add|create|insert|include|make)\s+(?:(?:a|an|the|one|two|new|another|extra|separate)\s+){0,3}(?:(?:program|repeatable|tracker)\s+)?(?:stages?|data\s*elements?|fields?|program\s*rules?|rules?)\b/;
+function programChangeNotRequested(toolName, action, descriptor) {
+  if (toolName !== 'create_metadata' || !PROGRAM_STRUCTURE_ACTIONS.has(String(action || ''))) return null;
+  // A program (or stage) built in this conversation is the assistant's own work.
+  const mine = new Set(Array.isArray(dhis2.assistantCreatedIds) ? dhis2.assistantCreatedIds : []);
+  if (writeTargetsOf(descriptor).some(id => mine.has(id))) return null;
+  const said = String(typeof lastUserText === 'string' ? lastUserText : '').toLowerCase();
+  const earlier = typeof lastSubstantiveUserRequest === 'function' ? String(lastSubstantiveUserRequest() || '').toLowerCase() : '';
+  if (typeof detectCustomAppIntent !== 'function' || !detectCustomAppIntent(`${said}\n${earlier}`)) return null;
+  if (PROGRAM_CHANGE_ASKED_RE.test(said) || PROGRAM_CHANGE_ASKED_RE.test(earlier)) return null;
+  const prev = dhis2.lastRefusedWrite;
+  if (prev && prev.tool === toolName && prev.action === action && prev.turn < (dhis2.turnCounter || 0)) return null;
+  return {
+    _error: `Refused: create_metadata(action=${action}) changes an existing program's structure, but the user asked for an app or plugin, not for program changes. Nothing was saved.`,
+    _hint: 'If the app needs a place for patient-level data (notes, flags about a person), that belongs in tracker data, not the dataStore, so a new stage or field may be right. Propose it to the user: which program, the stage or field name, its type, and why. Ask, and continue with the parts that need no program change. After a yes, retry this same call. Settings and app-level data (not about a person) go in the app\'s own dataStore namespace instead, with no program change.',
+    _refused: { tool: toolName, action },
+    _scope: 'program_change_not_requested',
+  };
+}
+
 function requireWriteAuth(toolName, action, descriptor) {
   const wa = dhis2.writeAuth || {};
   const scope = wa.scope || 'read_only';
@@ -628,6 +656,11 @@ function requireWriteAuth(toolName, action, descriptor) {
         _refused: { tool: toolName, action, target: descriptor || null },
         _scope: 'delete_not_requested',
       };
+    }
+    const programChange = programChangeNotRequested(toolName, action, descriptor);
+    if (programChange) {
+      rememberRefusedWrite(toolName, action, descriptor);
+      return programChange;
     }
     if (dhis2.lastRefusedWrite && dhis2.lastRefusedWrite.tool === toolName) dhis2.lastRefusedWrite = null;
     return null;
@@ -3370,10 +3403,41 @@ function normalizeTrackerQuery(pathOrUrl, apiVersion) {
 // stage no longer gets its answer. Below the default keyAnalyticsMaxLimit of 100,000
 // (over it is 409 E7209). Pure and self-contained: its source is also written into
 // every generated app's app-guard.js. Works on a path or a full URL.
+// Some servers answer list queries with nothing for objects that exist. On play
+// 2.43.2 (2026-11-08) organisationUnits?filter=id:eq:<root>, maps (0 listed, 91 on
+// 2.42.7), indicators?filter=id:in:[…] and the metadata importer's own reference
+// check all found nothing, while organisationUnits/<id>, maps/<id> and
+// indicators/<id> answered. "Not found" from a list query is then no evidence. One
+// probe per server for 5 minutes: the user's own org unit (read from /me) looked up
+// through a list query.
+const _listQueryHealth = new Map();
+async function serverListQueriesBroken() {
+  const key = String(dhis2.baseUrl || '');
+  const hit = _listQueryHealth.get(key);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.value;
+  let value = { broken: false };
+  try {
+    const me = await safeDhis2Fetch('me?fields=organisationUnits[id]', { noTruncate: true });
+    const root = me && !me._error && ((me.organisationUnits || [])[0] || {}).id;
+    if (root) {
+      const r = await safeDhis2Fetch(`organisationUnits?filter=id:eq:${root}&fields=id&paging=false`, { noTruncate: true });
+      if (r && !r._error && Array.isArray(r.organisationUnits) && r.organisationUnits.length === 0) {
+        value = { broken: true, probe: `organisationUnits?filter=id:eq:${root} answered no rows although ${root} is the user's own org unit` };
+      }
+    }
+  } catch { /* cannot tell: treat as healthy */ }
+  _listQueryHealth.set(key, { at: Date.now(), value });
+  return value;
+}
+
 function withEventAggregateCacheKey(pathOrUrl) {
   var s = String(pathOrUrl);
   var at = s.indexOf('analytics/events/aggregate/');
-  if (at < 0 || /[?&]limit=/.test(s)) return s;
+  if (at < 0) return s;
+  // skipMeta=true on this endpoint answers 500 "org.hisp.dhis.common.Pager" on 2.43.2
+  // (fine on 2.42.7, and without it on both; verified 2026-11-04).
+  s = s.replace(/([?&])skipMeta=true(&|$)/, function (m, before, after) { return after ? before : ''; });
+  if (/[?&]limit=/.test(s)) return s;
   var key = s.slice(at), h = 0;
   for (var i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) | 0;
   return s + (s.indexOf('?') < 0 ? '?' : '&') + 'limit=' + (10000 + (Math.abs(h) % 40000));
@@ -3480,6 +3544,11 @@ async function safeDhis2Fetch(path, options = {}) {
         // into. Turned into a clean auth error below.
         redirect: 'manual',
       };
+      // With keyCacheStrategy on (CACHE_TWO_WEEKS on both playgrounds) analytics answers
+      // carry Cache-Control: max-age=1209600, public, and the browser reuses them without
+      // asking the server (verified in Chrome 2026-11-04: 0 bytes, 3 ms). A check run
+      // after an analytics rebuild would read the answer from before it.
+      if (!isWrite) fetchOpts.cache = 'no-store';
       if (bodyStr) fetchOpts.body = bodyStr;
 
       const resp = await fetch(fullUrl, fetchOpts);
@@ -3829,8 +3898,16 @@ async function captureResolvePrograms(type, ids) {
   const out = new Set();
   const opts = { noTruncate: true, _captureBump: true };
   if (CAPTURE_PROGRAM_REF_FIELDS[type]) {
-    const r = await safeDhis2Fetch(`${type}?filter=id:in:${inList}&fields=id,${CAPTURE_PROGRAM_REF_FIELDS[type]}&paging=false`, opts);
-    for (const o of (r && r[type]) || []) { const p = captureProgramIdOf(type, o); if (p) out.add(p); }
+    // An analytics-only indicator is not in Capture: deleting one must not write to
+    // its program, as creating one does not (cleanup of 6 dashboard indicators sent
+    // 6 PATCH programs/<id> on play 2.43.2, 2026-11-08).
+    const pi = type === 'programIndicators';
+    const r = await safeDhis2Fetch(`${type}?filter=id:in:${inList}&fields=id,${pi ? 'displayInForm,' : ''}${CAPTURE_PROGRAM_REF_FIELDS[type]}&paging=false`, opts);
+    for (const o of (r && r[type]) || []) {
+      if (pi && o.displayInForm !== true) continue;
+      const p = captureProgramIdOf(type, o);
+      if (p) out.add(p);
+    }
   } else if (type === 'dataElements' || type === 'dataEntryForms') {
     const f = type === 'dataElements' ? 'programStageDataElements.dataElement.id' : 'dataEntryForm.id';
     const r = await safeDhis2Fetch(`programStages?filter=${f}:in:${inList}&fields=program[id]&paging=false`, opts);
@@ -4722,10 +4799,16 @@ async function resolveFacilityScopedOu(ouId) {
   return { ouId: base.id, ouName: base.displayName || base.id, source: 'fallback_current_ou' };
 }
 
+// A saved chart's relativePeriods flag → the keyword analytics takes. Exact names first,
+// because the keywords are not regular (thisDay = TODAY, last2SixMonths = LAST_2_SIXMONTHS).
+// The old pattern gave LAST12_MONTHS, which analytics answers with 409, so a preview or
+// check of any chart on "last 12 months" failed (found by the data check, 2026-11-04).
 function relativeKeyToPeriodToken(key) {
-  return String(key || '')
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toUpperCase();
+  const k = String(key || '');
+  if (typeof VIZ_REL_PERIOD_FLAG !== 'undefined') {
+    for (const [token, flag] of Object.entries(VIZ_REL_PERIOD_FLAG)) if (flag === k) return token;
+  }
+  return k.replace(/([a-z])([0-9])/g, '$1_$2').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase();
 }
 
 function getRelativePeriodKeys(relativePeriods) {
@@ -4911,6 +4994,104 @@ function healPackedAnalyticsDimensions(path) {
   return { path: healed ? `${p.slice(0, qIdx)}?${out.join('&')}` : p, healed };
 }
 
+// A query parameter written inside a dimension or filter — `dimension=stage=<uid>`,
+// sent as one item of a dimension list — is a 409 ("Item identifier does not
+// reference any data element…", Malaria dashboard run, 2026-11-08). "=" is never
+// part of a dimension, so it becomes its own parameter. A parameter already given
+// keeps its own value.
+function healParamInsideDimension(path) {
+  const p = String(path || '');
+  if (!/^analytics(\.|\/|\?)/.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const parts = p.slice(qIdx + 1).split('&').filter(Boolean);
+  const has = (name) => parts.some(x => x.slice(0, x.indexOf('=')).toLowerCase() === name.toLowerCase());
+  const moved = [];
+  const dropped = [];
+  const out = [];
+  for (const part of parts) {
+    const m = part.match(/^(dimension|filter)=(.*)$/i);
+    const kv = m && dec(m[2]).match(/^([A-Za-z][A-Za-z0-9_]*)=(.+)$/);
+    if (!kv) { out.push(part); continue; }
+    if (has(kv[1]) || out.some(x => x.toLowerCase().startsWith(`${kv[1].toLowerCase()}=`))) { dropped.push(`${kv[1]}=${kv[2]}`); continue; }
+    moved.push(`${kv[1]}=${kv[2]}`);
+    out.push(`${kv[1]}=${encodeURIComponent(kv[2])}`);
+  }
+  if (!moved.length && !dropped.length) return { path: p, healed: false };
+  const said = [
+    moved.length ? `${moved.join(', ')} ${moved.length > 1 ? 'were' : 'was'} written inside a dimension (a 409) and sent as ${moved.length > 1 ? 'their own query parameters' : 'its own query parameter'}, e.g. &${moved[0]}` : '',
+    dropped.length ? `${dropped.join(', ')} inside a dimension was left out: the query already has that parameter` : '',
+  ].filter(Boolean).join('; ');
+  return { path: `${p.slice(0, qIdx)}?${out.join('&')}`, healed: true, note: `Query corrected: ${said}.` };
+}
+
+// An item filter needs an operator: `filter=<de>:CURED` and `filter=<de>:<option
+// id>` are 409 "Query item or filter is invalid" (Malaria follow-up board app,
+// 2026-11-08); `<de>:EQ:CURED` and `<de>:IN:A;B` answer (verified on 2.42.5:
+// 49 events either way, operator in any case). An option id is sent as its code,
+// the value analytics compares. Two segments only: anything already holding an
+// operator, or a legend set, is left alone.
+const ANALYTICS_ITEM_OPERATORS = /^(?:EQ|NE|NEQ|IEQ|GT|GE|LT|LE|LIKE|ILIKE|NLIKE|NILIKE|IN|NIN|SW|EW|NULL|NNULL|!NULL)$/i;
+async function healItemFilterOperator(path) {
+  const p = String(path || '');
+  if (!/^analytics\/(?:events|enrollments)\/(?:aggregate|query)\//.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  if (qIdx === -1) return { path: p, healed: false };
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const fixed = [];
+  const out = [];
+  for (const part of p.slice(qIdx + 1).split('&')) {
+    const m = part.match(/^(dimension|filter)=(.*)$/i);
+    const item = m && dec(m[2]).match(/^((?:[A-Za-z][A-Za-z0-9]{10}\.)?[A-Za-z][A-Za-z0-9]{10}):([^:]+)$/);
+    if (!item || ANALYTICS_ITEM_OPERATORS.test(item[2].trim())) { out.push(part); continue; }
+    const values = item[2].split(';').map(v => v.trim()).filter(Boolean);
+    // `<groupSet>:<group>;<group>` and `<category>:<option>` are real dimensions:
+    // an id value is rewritten only when it is an option of an option set. Asked as
+    // a list, so a group id is an empty answer, not a 404.
+    const ids = values.filter(v => /^[A-Za-z][A-Za-z0-9]{10}$/.test(v));
+    let codeOf = new Map();
+    if (ids.length) {
+      const r = await safeDhis2Fetch(`options?filter=id:in:[${ids.join(',')}]&fields=id,code&paging=false`);
+      codeOf = new Map(((r && !r._error && r.options) || []).filter(o => o.code).map(o => [o.id, o.code]));
+    }
+    if (ids.some(id => !codeOf.has(id)) || !values.length) { out.push(part); continue; }
+    const codes = values.map(v => codeOf.get(v) || v);
+    const healedItem = `${item[1]}:${codes.length > 1 ? 'IN' : 'EQ'}:${codes.join(';')}`;
+    fixed.push(`${item[1]}:${item[2]} → ${healedItem}`);
+    out.push(`${m[1]}=${encodeURIComponent(healedItem)}`);
+  }
+  if (!fixed.length) return { path: p, healed: false };
+  return {
+    path: `${p.slice(0, qIdx)}?${out.join('&')}`,
+    healed: true,
+    note: `Query corrected: an item filter needs an operator, and an option is compared by its code (DHIS2 answers 409 otherwise): ${fixed.join(', ')}. Use <item>:EQ:<code> (or IN:<code>;<code>) in any app or plugin code too.`,
+  };
+}
+
+// Yes/No values are 1 and 0 in analytics: `<de>:EQ:true` is a 409 "Expression
+// violation. Maybe an indicator caused division by zero?" (Malaria follow-up board
+// app, 2.42.5, 2026-11-08); `<de>:EQ:1` answers the true count (40 supervised
+// treatments). ES5, because the generated apps' request guard carries it too.
+function healAnalyticsBooleanFilter(pathOrUrl) {
+  var s = String(pathOrUrl || '');
+  var q = s.indexOf('?');
+  if (q === -1 || !/analytics\/(?:events|enrollments)\//.test(s.slice(0, q))) return s;
+  var parts = s.slice(q + 1).split('&');
+  var changed = false;
+  for (var i = 0; i < parts.length; i++) {
+    var m = parts[i].match(/^(dimension|filter)=(.*)$/i);
+    if (!m) continue;
+    var val;
+    try { val = decodeURIComponent(m[2]); } catch (e) { val = m[2]; }
+    var fixed = val.replace(/:(EQ|NE|NEQ|IEQ|IN):((?:true|false)(?:;(?:true|false))*)(?=[:,]|$)/gi, function (all, op, list) {
+      return ':' + op + ':' + list.split(';').map(function (b) { return /^true$/i.test(b) ? '1' : '0'; }).join(';');
+    });
+    if (fixed !== val) { parts[i] = m[1] + '=' + encodeURIComponent(fixed); changed = true; }
+  }
+  return changed ? s.slice(0, q + 1) + parts.join('&') : s;
+}
+
 // Status on analytics/events|enrollments is its own query parameter, never a
 // dimension or filter. Verified on 2.42.5 and 2.43.3 (2026-11-02):
 //   dimension=eventStatus:COMPLETED, filter=eventStatus:eq:COMPLETED → 409
@@ -5047,6 +5228,16 @@ async function routeProgramIndicatorAnalytics(path) {
   const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
   const items = [];
   const itemParts = new Set();
+  // value=<program indicator> on an event aggregate is a 409 "Value does not refer to
+  // a data element or attribute which are numeric" (TB dashboard through the panel,
+  // 2026-11-08; an AVERAGE given with the indicator as its only dimension is moved
+  // there by healEventAggregationValue). It is routed with the dimensions, and the
+  // aggregation type is dropped: an indicator brings its own.
+  let fromValue = false;
+  for (const part of parts) {
+    const vm = part.match(/^value=([A-Za-z][A-Za-z0-9]{10})$/i);
+    if (vm && /^analytics\/events\//.test(p)) { items.push(vm[1]); itemParts.add(part); fromValue = true; }
+  }
   for (const part of parts) {
     const kv = part.match(/^dimension=(.*)$/i);
     if (!kv) continue;
@@ -5092,8 +5283,9 @@ async function routeProgramIndicatorAnalytics(path) {
     }
     return { path: p, routed: false };
   }
-  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x));
-  return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true };
+  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x)
+    && !(fromValue && /^aggregationType=/i.test(x)));
+  return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true, ...(fromValue ? { note: 'Query corrected: a program indicator is not an event-analytics value (409); it was read from /analytics as a data item, with its own aggregation.' } : {}) };
 }
 
 // An average or sum on event analytics names its item in value=; aggregationType
