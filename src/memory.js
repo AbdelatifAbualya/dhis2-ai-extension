@@ -439,6 +439,8 @@ const MEMORY_IGNORED_SCOPES = new Set([
   'destructive_404_limit_reached', 'http_error_limit_reached', 'repeated_identical_failure',
   'same_error_family_limit', 'no_progress_repeat', 'unknown_uid_in_args',
   'known_endpoint_guidance', 'awaiting_placement_answer',
+  // What the user has or has not asked for in this conversation, not how DHIS2 works.
+  'sharing_not_requested', 'program_change_not_requested',
 ]);
 
 function memoryBeginTurn(userText, ctx, toolNames) {
@@ -484,6 +486,13 @@ function memoryIsFailure(result) {
   if (!(result._error || result.success === false)) return false;
   if (result._privacy_block || result._backup_failure) return false;
   if (MEMORY_IGNORED_SCOPES.has(result._scope)) return false;
+  // Not knowledge about DHIS2: a pause for the user's approval depends on what this
+  // user said, and a syntax error is about code written a moment ago. Both were
+  // saved as binding lessons in the Reporting Completeness Explorer thread
+  // ("JSX does not compile: app.jsx:437:10 Unexpected token"; "Not installed: the
+  // preview was made in this same turn"), and the second would hold back a later
+  // request that does ask to install.
+  if (result._awaiting_approval || Array.isArray(result.compile_errors)) return false;
   return true;
 }
 function memoryCallSig(tool, args) {

@@ -275,6 +275,25 @@ async function executeToolCall(name, args) {
           _scope: 'known_endpoint_guidance',
         };
       }
+      // Scorecard plugin (2026-11-10): GET apps/<key>/app-guard.js → 404, then "../apps/…".
+      // An installed app's files are served at /api/apps/<key>/, outside the versioned API.
+      const _appFile = /^apps\/([a-z0-9][a-z0-9-]*)\/(.+)$/i.exec(_gp);
+      if (_appFile) {
+        return {
+          _error: `Not sent: an installed app's files are not under the versioned API (apps/${_appFile[1]}/${_appFile[2]} is a 404).`,
+          _hint: `Read the source of an app this assistant built with manage_custom_app(action="get_source", key="${_appFile[1]}"). app-guard.js, app-config.js and the d2-kit files are written by the tool, not by you, and are the same in every app: they keep requests on this server, correct tracker parameter names, give event aggregates a cache key and each query its own cache entry, and during the install check keep records closed. They never change what a query returns, so look for the cause of a wrong number in plugin.jsx / app.jsx and in the query's parameters (run the same query with dhis2_query).`,
+          _scope: 'known_endpoint_guidance',
+        };
+      }
+      // Reporting Completeness replay (2026-11-10): GET periods?periodType=Monthly&… → 404.
+      // DHIS2 has no periods resource (verified 2.42.5, 2.42.7, 2.43.2).
+      if (/^periods?(?:\.json)?\/?$/i.test(_gp)) {
+        return {
+          _error: `Not sent: there is no "${_gp}" endpoint (404). Period ids are built, not fetched.`,
+          _hint: 'ISO period ids by period type: Daily 20251031, Weekly 2025W44, Monthly 202510, BiMonthly 202505B, Quarterly 2025Q4, SixMonthly 2025S2, SixMonthlyApril 2025AprilS1, Yearly 2025, FinancialApril 2025April, FinancialJuly 2025July, FinancialOct 2025Oct. A data set\'s periodType is on dataSets/<id>. In analytics, relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, LAST_52_WEEKS) need no ids, and each answer\'s metaData.items names its periods. periodTypes lists the types.',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
       if (isGuessedLogEndpoint(_gp)) return guessedLogEndpointRefusal(_gp);
       // Sharing exists per dataStore ENTRY, by its UID; a namespace has none, so
       // this is always a 404 (live 2026-11-02, two in a row while sizing an app).
@@ -958,6 +977,15 @@ async function executeToolCall(name, args) {
         safePath = paramHeal.path;
         queryNotes.push(paramHeal.note);
       }
+      const rrHeal = healReportingRateDx(safePath);
+      if (rrHeal.refusal) return rrHeal.refusal;
+      if (rrHeal.healed) {
+        console.log(`[dhis2_query] Reporting-rate items written with their data set → ${rrHeal.path}`);
+        safePath = rrHeal.path;
+        queryNotes.push(rrHeal.note);
+      }
+      const cdsr = completeRegistrationsRefusal(safePath);
+      if (cdsr) return cdsr;
       const stageHeal = await healBareStageDimension(safePath);
       if (stageHeal.refusal) return stageHeal.refusal;
       if (stageHeal.healed) {
@@ -1129,6 +1157,11 @@ async function executeToolCall(name, args) {
     if (method === 'GET' && isAnalyticsPath(safePath) && writeResult && typeof writeResult === 'object' && Array.isArray(writeResult.rows)) {
       const note = analyticsPeriodRowsNote(safePath);
       if (note) writeResult._period_rows_note = note;
+      // Verified 2.42.5 (2026-11-10): with no eventStatus the count includes visits
+      // that are only scheduled (biopsy stage: 10 = 7 done + 3 booked).
+      if (/^analytics\/events\/(?:aggregate|query)\//.test(safePath) && !/[?&]eventStatus=/.test(safePath)) {
+        writeResult._scheduled_visits_note = 'No eventStatus was sent, so this answer also counts visits that are only SCHEDULED (not yet done), if the program has any. For visits that happened add eventStatus=ACTIVE,COMPLETED — in app and plugin code too.';
+      }
     }
     // A 404 on GET <collection>/<uid>: the id often exists as ANOTHER type (a
     // dashboard tile's visualization id read as a program indicator — RMNCH
@@ -1560,6 +1593,61 @@ async function executeToolCall(name, args) {
       };
     }
 
+    // The whole program in one answer. Every dashboard, app and plugin thread of
+    // 2026-11-10 opened with five to seven stage_details calls, one per stage, each
+    // a round trip to the model and several KB of JSON; what the model needs to
+    // write a filter or a query is ids, names, value types and option codes.
+    if (args.info_type === 'structure') {
+      const fieldsFor = (opts) => 'id,displayName,programType,trackedEntityType[id,displayName],'
+        + `programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,valueType,optionSet[id${opts}]]],`
+        + `programStages[id,displayName,repeatable,sortOrder,programStageDataElements[compulsory,dataElement[id,displayName,valueType,optionSet[id${opts}]]]]`;
+      const build = (p, withOptions) => {
+        const field = (o, extra) => {
+          const os = o.optionSet;
+          const out = { id: o.id, name: o.displayName, type: o.valueType, ...extra };
+          if (os && os.id) {
+            if (withOptions && Array.isArray(os.options)) out.options = Object.fromEntries(os.options.map(x => [x.code, x.displayName]));
+            else out.option_set = os.id;
+          }
+          return out;
+        };
+        return {
+          program: { id: p.id, name: p.displayName, type: p.programType, tracked_entity_type: p.trackedEntityType ? p.trackedEntityType.displayName : undefined },
+          attributes: (p.programTrackedEntityAttributes || []).map(a => a.trackedEntityAttribute).filter(Boolean).map(a => field(a)),
+          stages: [...(p.programStages || [])].sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)).map(st => ({
+            id: st.id, name: st.displayName, repeatable: !!st.repeatable,
+            data_elements: (st.programStageDataElements || []).filter(x => x.dataElement).map(x => field(x.dataElement, x.compulsory ? { compulsory: true } : {})),
+          })),
+        };
+      };
+      let raw = await safeDhis2Fetch(`programs/${effProgramId}?fields=${fieldsFor(',options[code,displayName]')}`, { noTruncate: true });
+      if (raw?._error) return raw;
+      let out = build(raw, true);
+      let optionsNote = 'options are { CODE: "name" }: filters, program-indicator expressions and saved values use the CODE.';
+      if (JSON.stringify(out).length > 60000) {
+        // Too large with every option list (a drug list on fifteen fields): keep the
+        // fields, name the option sets.
+        raw = await safeDhis2Fetch(`programs/${effProgramId}?fields=${fieldsFor('')}`, { noTruncate: true });
+        if (raw?._error) return raw;
+        out = build(raw, false);
+        optionsNote = 'Option lists were left out because the program is large: option_set is the option set id — get one list with get_program_info(info_type="option_set", target_id=<option_set>).';
+      }
+      const deCount = out.stages.reduce((n, st) => n + st.data_elements.length, 0);
+      if (JSON.stringify(out).length > 75000) {
+        // Still too large: the stage list, with counts, and the per-stage call.
+        return {
+          program: out.program, attributes: out.attributes,
+          stages: out.stages.map(st => ({ id: st.id, name: st.name, repeatable: st.repeatable, data_element_count: st.data_elements.length })),
+          _note: `This program has ${deCount} data elements, too many for one answer. Read one stage at a time with get_program_info(info_type="stage_details", target_id=<stage id>).`,
+        };
+      }
+      return {
+        ...out,
+        totals: { stages: out.stages.length, data_elements: deCount, attributes: out.attributes.length },
+        _note: `This is the whole program: no stage_details call is needed for any stage listed here. In analytics and program indicators a stage field is <stageId>.<dataElementId> (#{stageId.deId} in expressions); attributes are A{attributeId}. ${optionsNote} Sections, descriptions and form layout are not included (stage_details has them).`,
+      };
+    }
+
     if (args.info_type === 'stage_details') {
       if (args.target_id) {
         // Guard: reject the PROGRAM ID used as a stage ID. Only meaningful for
@@ -1620,7 +1708,7 @@ async function executeToolCall(name, args) {
         program: { id: effProgramId, name: effProgramName },
         total_stages: result.programStages?.length || 0,
         stages: result.programStages || [],
-        _note: 'Use target_id with stage_details to get full data elements for a specific stage.',
+        _note: 'For EVERY stage\'s data elements in one call use get_program_info(info_type="structure"). Use target_id with stage_details for one stage in full (sections, descriptions).',
       };
     }
 
@@ -5511,8 +5599,19 @@ function buildVisualizationObject(spec, typeMap) {
       addLayoutNote(`Layout corrected: a chart without a category (x-axis) saves but shows "There was an error loading data". Saved with category ${rows.join(' + ')} and series ${cols.join(' + ')}.`);
     }
     if (!cols.length) {
+      // The series has to come from what was meant as a filter. Take the dimension
+      // with ONE item: a filter of twelve months is a total, and as the series it
+      // became twelve bars per data item ("Final diagnoses by category", sent as
+      // category dx + filters pe, ou, was saved with a legend of months, live
+      // 2026-11-10). One org unit as the series keeps one bar per item.
       const free = ['pe', 'ou'].filter(d => hasData[d] && !rows.includes(d));
-      cols = [free[0] || 'pe'];
+      const single = free.find(d => dimCount[d] <= 1);
+      cols = [single || free[0] || 'pe'];
+      if (free.length > 1) {
+        addLayoutNote(single
+          ? `A chart needs a series: ${single === 'ou' ? 'the org unit' : 'the period'} (one item) was made the series, so ${free.filter(d => d !== single).map(d => (d === 'pe' ? 'the periods' : 'the org units')).join(' and ')} stay a filter and each bar is the total for them.`
+          : `A chart needs a series: ${cols[0] === 'pe' ? 'the periods' : 'the org units'} became the series, so each data item has one bar per ${cols[0] === 'pe' ? 'period' : 'org unit'} rather than one total. For one total bar per item pass a single period (e.g. THIS_YEAR) or a single org unit.`);
+      }
     }
     layoutSpec = { columns: cols, rows, filters: axisDims(layoutSpec.filters).filter(d => !cols.includes(d) && !rows.includes(d)) };
   }
@@ -5963,7 +6062,12 @@ async function executeManageMaps(args) {
       ...(boundary ? { boundary_layer: `level ${boundary.organisationUnitLevels[0]} outlines, beneath the data layer` } : {}),
       ...(thematic.noDataColor ? { no_data_color: thematic.noDataColor } : {}),
       ...(thematic.thematicMapType === 'BUBBLE' ? { bubble_radius_px: `${thematic.radiusLow}–${thematic.radiusHigh}` } : {}),
-      ...(locationCoverage ? { location_coverage: locationCoverage, ...(locationCoverage.without_location ? { _location_note: `${locationCoverage.without_location} of ${locationCoverage.with_location + locationCoverage.without_location} level-${mapLevel} org units have no location, so their data is not drawn on this map. Tell the user.` } : {}) } : {}),
+      // One message when nothing at all can be drawn. With both notes a model took
+      // the weaker one ("33 of 49 facilities have no coordinates") and ticked the
+      // map as done, though the only facility holding the data had none
+      // (Breast Health dashboard, 2026-11-10).
+      ...(boundaryWarning ? { draws_no_data: true, _must_tell_user: 'Say plainly in your answer that this map shows NO data — no shaded area and no point — because every org unit that holds the data has no location on this server. "Some facilities are missing" is not true here, and do not list the map as working. Offer a table or chart by org unit instead.' } : {}),
+      ...(locationCoverage ? { location_coverage: locationCoverage, ...(locationCoverage.without_location && !boundaryWarning ? { _location_note: `${locationCoverage.without_location} of ${locationCoverage.with_location + locationCoverage.without_location} level-${mapLevel} org units have no location, so their data is not drawn on this map. Tell the user.` } : {}) } : {}),
       _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]) — or reference it in a new dashboard's items.`,
     };
   }
