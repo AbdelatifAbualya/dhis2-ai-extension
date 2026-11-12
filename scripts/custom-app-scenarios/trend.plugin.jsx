@@ -8,7 +8,7 @@ const PROGRAM = 'l0NXObayGhi';
 const TREND = {
   months: {
     resource: `analytics/events/aggregate/${PROGRAM}`,
-    params: ({ ou }) => ({ dimension: ['pe:LAST_12_MONTHS'], filter: [`ou:${ou}`], outputType: 'EVENT' }),
+    params: ({ ou }) => ({ dimension: ['pe:LAST_12_MONTHS'], filter: [`ou:${ou}`], outputType: 'EVENT', eventStatus: 'ACTIVE,COMPLETED' }),
   },
 };
 

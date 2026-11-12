@@ -144,7 +144,7 @@ async function analyticsValues(dx, ou, pe) {
   return out;
 }
 async function eventCount(program, ou, pe) {
-  const r = await api('GET', `analytics/events/aggregate/${program}?${qs([['filter', `ou:${ou}`], ['filter', `pe:${pe}`], ['outputType', 'EVENT']])}`);
+  const r = await api('GET', `analytics/events/aggregate/${program}?${qs([['filter', `ou:${ou}`], ['filter', `pe:${pe}`], ['outputType', 'EVENT'], ['eventStatus', 'ACTIVE,COMPLETED']])}`);
   return r.ok && r.json.rows.length ? Number(r.json.rows[0][r.json.rows[0].length - 1]) : null;
 }
 async function appsSnapshot() {
@@ -661,7 +661,7 @@ async function main() {
       const items = (await api('GET', `dashboards/${dashboards.kpi}?${qs({ fields: 'dashboardItems[type,appKey,x,y,width,height]' })}`)).json.dashboardItems;
       await api('PUT', `dashboards/${dashboards.kpi}`, { name: 'ai-test-kpi-trend', dashboardItems: [...items, { ...itemTemplate, appKey: 'ai-test-trend', x: 30, y: 0, width: 30, height: 20 }] });
       const expected = async (ou) => {
-        const r = await api('GET', `analytics/events/aggregate/l0NXObayGhi?${qs([['dimension', 'pe:LAST_12_MONTHS'], ['filter', `ou:${ou}`], ['outputType', 'EVENT']])}`);
+        const r = await api('GET', `analytics/events/aggregate/l0NXObayGhi?${qs([['dimension', 'pe:LAST_12_MONTHS'], ['filter', `ou:${ou}`], ['outputType', 'EVENT'], ['eventStatus', 'ACTIVE,COMPLETED']])}`);
         const h = r.json.headers.map((x) => x.name);
         const by = {};
         for (const row of r.json.rows) by[row[h.indexOf('pe')]] = Number(row[h.indexOf('value')]);

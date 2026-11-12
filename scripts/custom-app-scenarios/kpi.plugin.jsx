@@ -23,7 +23,7 @@ const KPIS = {
   },
   events: {
     resource: `analytics/events/aggregate/${EVENT_PROGRAM}`,
-    params: ({ ou, pe }) => ({ filter: [`ou:${ou}`, `pe:${pe}`], outputType: 'EVENT' }),
+    params: ({ ou, pe }) => ({ filter: [`ou:${ou}`, `pe:${pe}`], outputType: 'EVENT', eventStatus: 'ACTIVE,COMPLETED' }),
   },
 };
 

@@ -52,7 +52,7 @@ const CUSTOM_APP_MAX_FILE_CHARS = 200 * 1024;
 const CUSTOM_APP_PAGE_SIZES = ['5', '10', '20', '30', '40', '50', '75', '100'];
 const CUSTOM_APP_ACTIONS = ['list', 'get_source', 'preview', 'create', 'update', 'delete', 'rollback', 'place', 'unplace', 'placements'];
 const CUSTOM_APP_KIT_GLOBALS = new Set([
-  'React', 'ReactDOMClient', 'D2UI', 'D2Runtime', 'postRobot', 'echarts', 'D2_APP_CONFIG',
+  'React', 'ReactDOMClient', 'D2UI', 'D2Runtime', 'postRobot', 'echarts', 'D2_APP_CONFIG', 'D2Periods',
 ]);
 // React 18 + react-dom/client public exports (CJS packages, so the kit build
 // cannot read them from esbuild's metafile; these never change within 18.x).
@@ -885,6 +885,22 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     if (Number(dhis2.apiVersion) >= 41) {
       for (const [re, msg] of wrongParams) if (re.test(allCode)) warnings.push({ message: msg });
     }
+    // A tracker program's event list holds visits that have not happened: status
+    // SCHEDULE (also OVERDUE, SKIPPED), with scheduledAt and NO occurredAt and no
+    // values. Code that never tells them apart counts a booked biopsy as a biopsy:
+    // a "Turnaround" tab listed 11 women where 8 had one, three rows read "NaN"
+    // and the median came out 14 days instead of 10.5, every request answering
+    // 200 and all 16 of the app's own checks green, because its test events all
+    // had a date (deepseek, 2026-11-10). The install check cannot see it either:
+    // records are closed there.
+    if (/['"`]tracker\/events\b|\bevents\s*\[/.test(allCode) && /\boccurredAt\b/.test(allCode)
+        && !/\bSCHEDULE\b|\bscheduledAt\b/.test(allCode)
+        && !/!\s*[\w$.?[\]]*\.?occurredAt\b|\boccurredAt\s*(?:&&|\?(?!\.)|!==?|===?\s*(?:null|undefined)|\|\|)|\.filter\([^)]{0,80}\boccurredAt\b/.test(allBare)
+        // A status asked of the server in the events query itself (not a status
+        // elsewhere: enrollments have one too, and so do test fixtures).
+        && !/['"`]tracker\/events['"`][^;]{0,400}?\bstatus\s*:\s*['"`](?:COMPLETED|ACTIVE)['"`]/.test(allCode)) {
+      errors.push({ message: 'The code reads tracker events and never tells a visit that happened from one that is only scheduled. tracker/events (and events[…] of an enrollment) also returns scheduled visits: status "SCHEDULE" (or "OVERDUE", "SKIPPED"), a scheduledAt date, NO occurredAt and no values. Counted or listed as they are, a booked visit shows as done, its date is empty and date maths on it gives NaN. Drop them first — const done = events.filter((e) => e.occurredAt && e.status !== \'SCHEDULE\' && e.status !== \'SKIPPED\') — and use `done` for every count, list, "first / latest visit" and date difference; show scheduled visits only where the user asked for upcoming or missed appointments (from scheduledAt). Add a case with a scheduled event to D2_SELF_TEST.' });
+    }
     const nested = allCode.match(/fields\s*:\s*['"`][^'"`]*\b(orgUnit|trackedEntity|enrollment|program|programStage)\[/);
     if (nested) {
       errors.push({ message: `Tracker records carry ${nested[1]} as a plain UID string — "${nested[1]}[…]" in fields is ignored, so any name read from it is undefined. Request ${nested[1]} and look the names up (organisationUnits with filter id:in:[…], fields id,displayName).` });
@@ -908,6 +924,33 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
   // the server had 23, because Number(<org unit id>) || 0 is 0 (live 2026-11-02).
   if (/analytics\/(?:events|enrollments)\/aggregate/.test(allCode) && /\brows\b/.test(allBare) && !/\bheaders\b(?!\s*:\s*\{)/.test(allBare)) {
     errors.push({ message: 'analytics/events|enrollments/aggregate rows are read by position, but these endpoints have no fixed column order (enrollments: [value, ou, pe]; events: [ou, pe, value]; ou and pe swap between requests). row[row.length - 1] or row[0] then gives 0 or wrong numbers with no error. Read every column by name: const col = (r, name) => r.headers.findIndex((h) => h.name === name); r.rows.map((row) => ({ pe: row[col(r, \'pe\')], value: Number(row[col(r, \'value\')]) }));' });
+  }
+  // Event analytics counts SCHEDULED visits unless a status is given (verified
+  // 2.42.5: biopsy stage 10 without eventStatus, 7 with ACTIVE,COMPLETED, 3 with
+  // SCHEDULE). A scorecard plugin showed "Biopsies 10" where 7 were done, every
+  // request 200 and every self-test green (deepseek, 2026-11-10).
+  if (/analytics\/events\/(?:aggregate|query)/.test(allCode) && !/\beventStatus\b/.test(allCode)) {
+    errors.push({ message: 'analytics/events/aggregate | query is read with no eventStatus, so visits that are only SCHEDULED are counted as if they had happened (a stage with 7 visits done and 3 booked answers 10). Say which visits count on every such query: eventStatus: \'ACTIVE,COMPLETED\' for visits that happened (\'COMPLETED\' for finished ones only, \'SCHEDULE\' for booked ones). It is a query parameter next to stage, comma-separated, never a dimension or filter.' });
+  }
+  // Relative periods worked out by hand come out one period off: "last 12 months"
+  // as the 12 months ending with this one, where DHIS2 means the 12 before it
+  // (scorecard plugin, 2026-11-10: one tile on another window than the rest).
+  if (/(?:===?\s*|\bcase\s+)['"`](?:LAST_\d+_(?:DAYS|WEEKS|MONTHS|BIMONTHS|QUARTERS|SIXMONTHS|YEARS)|LAST_(?:WEEK|MONTH|BIMONTH|QUARTER|SIX_MONTH|YEAR)|THIS_(?:WEEK|MONTH|BIMONTH|QUARTER|SIX_MONTH|YEAR)|(?:MONTHS|QUARTERS)_(?:THIS|LAST)_YEAR)['"`]/.test(allCode)
+      && /\.get(?:UTC)?(?:Month|FullYear)\s*\(/.test(allBare)
+      // Month or year arithmetic, not just a year shown in a label ("This year (2026)").
+      && /[-+]\s*\d+\s*[,)\]]|[-+]=\s*\d+|\bset(?:UTC)?(?:Month|FullYear|Date)\s*\(/.test(allBare)
+      && !/\bD2Periods\b/.test(allBare)) {
+    errors.push({ message: 'The code works out the dates of relative periods (LAST_12_MONTHS, THIS_YEAR, …) by hand. That goes one period off: DHIS2\'s LAST_12_MONTHS is the 12 complete months BEFORE the current one, LAST_5_YEARS leaves this year out, LAST_4_QUARTERS the running quarter, so a part of the app computed from hand-made dates covers another window than its analytics queries. Use the built-in D2Periods.range(pe) → { start: \'YYYY-MM-DD\', end: \'YYYY-MM-DD\' } (relative keywords, ISO ids, several joined by ";"; null for a period it does not know) and remove the hand-written period maths.' });
+  }
+  // Reporting rates: <dataSetId>.REPORTING_RATE on the plain analytics resource.
+  // A bare dx:REPORTING_RATE or a ds: dimension is a 409 (verified 2.42.7.1); an
+  // app shipped with it, and its author then concluded the server had no
+  // reporting rates (Reporting Completeness Explorer thread, 2026-11-10).
+  {
+    const m = /['"`]dx:(?:REPORTING_RATE|ACTUAL_REPORTS|EXPECTED_REPORTS)\b|['"`;](?:REPORTING_RATE(?:_ON_TIME)?|ACTUAL_REPORTS(?:_ON_TIME)?|EXPECTED_REPORTS);(?:REPORTING_RATE|ACTUAL_REPORTS|EXPECTED_REPORTS)|['"`]ds:/.exec(allCode);
+    if (m) {
+      errors.push({ message: `The analytics request names a reporting-rate metric without its data set, or uses a "ds:" dimension (${m[0].replace(/^['"\`]/, '')}…): DHIS2 answers 409 to both, so the app would show no completeness at all. ${REPORTING_RATE_SYNTAX} In code: dimension: [\`dx:\${ds}.REPORTING_RATE;\${ds}.REPORTING_RATE_ON_TIME;\${ds}.ACTUAL_REPORTS;\${ds}.EXPECTED_REPORTS\`, \`ou:\${parent};LEVEL-2\`], filter: [\`pe:\${period}\`].` });
+    }
   }
   if (/\btype\s*:\s*['"`]delete['"`]/.test(allCode) && !/\bModal\b/.test(allBare)) {
     warnings.push({ message: 'The app deletes data without a confirmation step — ask in a Modal (ModalTitle / ModalContent / ModalActions + ButtonStrip) before every delete.' });
@@ -1299,6 +1342,114 @@ const CUSTOM_APP_TREE_ROOTS_SHIM = `  if (window.D2UI && window.D2UI.Organisatio
   }
 `;
 
+// useDataQuery caches by [query object, variables], hashed with JSON.stringify,
+// which drops functions (@dhis2/app-runtime 3.17, react-query). Two queries on the
+// same resource whose difference is inside params: ({…}) => … therefore share ONE
+// cache entry when their variables are equal, and the second hook is handed the
+// first one's data with no request and no error. A scorecard plugin showed
+// "Biopsies 29" (the imaging count; DHIS2 answers 10) because its four queries
+// were all { q: { resource: 'analytics/events/aggregate/<program>', params: fn } };
+// its author never found out why and rewrote the data layer five times in ten
+// minutes (deepseek, 2026-11-10). Each query object that holds a function gets
+// its own number as one more variable, which makes the cache key its own.
+const CUSTOM_APP_QUERY_KEY_SHIM = `  if (window.D2Runtime && typeof window.D2Runtime.useDataQuery === 'function') {
+    var useQ = window.D2Runtime.useDataQuery, seen = new WeakMap(), count = 0;
+    var own = function (v) { var w = Object.assign({}, v); delete w.__query; return w; };
+    // The query as the app wrote it, its functions never seeing the extra variable.
+    var numbered = function (q) {
+      var hit = seen.get(q);
+      if (hit !== undefined) return hit;
+      var out = {}, dyn = false;
+      for (var k in q) {
+        var d = q[k];
+        if (!d || typeof d !== 'object') { out[k] = d; continue; }
+        var c = Object.assign({}, d);
+        ['params', 'id'].forEach(function (f) {
+          if (typeof d[f] === 'function') { dyn = true; var fn = d[f]; c[f] = function (v) { return fn(own(v)); }; }
+        });
+        out[k] = c;
+      }
+      hit = dyn ? { query: out, n: ++count } : null;
+      seen.set(q, hit);
+      return hit;
+    };
+    window.D2Runtime = Object.assign({}, window.D2Runtime, { useDataQuery: function (query, options) {
+      var hit = query && typeof query === 'object' ? numbered(query) : null;
+      if (!hit) return useQ(query, options);
+      var o = Object.assign({}, options || {});
+      o.variables = Object.assign({ __query: hit.n }, o.variables || {});
+      return useQ(hit.query, o);
+    } });
+  }
+`;
+
+// A DHIS2 period (relative keyword or ISO id, several joined by ";") as inclusive
+// dates { start: 'YYYY-MM-DD', end: 'YYYY-MM-DD' }, or null when it is not known
+// (financial-year keywords depend on a server setting, and LAST_6_BIMONTHS ends
+// one bi-month earlier on the server than its name says). Every generated app
+// carries it as D2Periods.range. Written by hand, "last 12 months" came out as
+// the 12 months ending with THIS month; DHIS2 means the 12 complete months
+// before it, so one tile of a scorecard covered another window than the rest
+// (median 9 days where the dashboard's own period gives 7.5; deepseek,
+// 2026-11-10). Checked against the periods DHIS2 2.42.5 returns for each keyword
+// (scripts/verify.js has the fixed cases). ES5 and self-contained: it is copied
+// into the app by toString.
+function d2PeriodRange(pe, now) {
+  var today = now ? new Date(now) : new Date();
+  var Y = today.getFullYear(), M = today.getMonth(), D = today.getDate();
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  var iso = function (d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); };
+  var day = function (y, m, d) { return new Date(y, m, d); };
+  var months = function (y, m, n) { return { start: iso(day(y, m, 1)), end: iso(day(y, m + n, 0)) }; };
+  var days = function (from, to) { return { start: iso(day(Y, M, D + from)), end: iso(day(Y, M, D + to)) }; };
+  // ISO weeks: Monday to Sunday; week 1 holds the year's first Thursday.
+  var monday = function (d) { var x = day(d.getFullYear(), d.getMonth(), d.getDate()); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x; };
+  var weeks = function (offset, n) { var m = monday(today); var s = day(m.getFullYear(), m.getMonth(), m.getDate() + offset * 7); return { start: iso(s), end: iso(day(s.getFullYear(), s.getMonth(), s.getDate() + n * 7 - 1)) }; };
+  var isoWeek = function (y, w) { var jan4 = day(y, 0, 4); var m = monday(jan4); var s = day(m.getFullYear(), m.getMonth(), m.getDate() + (w - 1) * 7); return { start: iso(s), end: iso(day(s.getFullYear(), s.getMonth(), s.getDate() + 6)) }; };
+  var q = Math.floor(M / 3) * 3, h = M < 6 ? 0 : 6, b = Math.floor(M / 2) * 2;
+  var one = function (p) {
+    var m;
+    if ((m = /^(\d{4})$/.exec(p))) return months(+m[1], 0, 12);
+    if ((m = /^(\d{4})(\d{2})$/.exec(p))) return months(+m[1], +m[2] - 1, 1);
+    if ((m = /^(\d{4})(\d{2})(\d{2})$/.exec(p))) return { start: m[1] + '-' + m[2] + '-' + m[3], end: m[1] + '-' + m[2] + '-' + m[3] };
+    if ((m = /^(\d{4})Q([1-4])$/.exec(p))) return months(+m[1], (+m[2] - 1) * 3, 3);
+    if ((m = /^(\d{4})S([12])$/.exec(p))) return months(+m[1], (+m[2] - 1) * 6, 6);
+    if ((m = /^(\d{4})(\d{2})B$/.exec(p))) return months(+m[1], (+m[2] - 1) * 2, 2);
+    if ((m = /^(\d{4})W(\d{1,2})$/.exec(p))) return isoWeek(+m[1], +m[2]);
+    if ((m = /^(\d{4})(April|July|Oct|Nov)$/.exec(p))) return months(+m[1], { April: 3, July: 6, Oct: 9, Nov: 10 }[m[2]], 12);
+    if (p === 'TODAY') return days(0, 0);
+    if (p === 'YESTERDAY') return days(-1, -1);
+    if ((m = /^LAST_(\d+)_DAYS$/.exec(p))) return days(-(+m[1]), -1);
+    if (p === 'THIS_WEEK') return weeks(0, 1);
+    if (p === 'LAST_WEEK') return weeks(-1, 1);
+    if ((m = /^LAST_(\d+)_WEEKS$/.exec(p))) return weeks(-(+m[1]), +m[1]);
+    if (p === 'THIS_MONTH') return months(Y, M, 1);
+    if (p === 'LAST_MONTH') return months(Y, M - 1, 1);
+    if ((m = /^LAST_(\d+)_MONTHS$/.exec(p))) return months(Y, M - (+m[1]), +m[1]);
+    if (p === 'MONTHS_THIS_YEAR' || p === 'QUARTERS_THIS_YEAR' || p === 'BIMONTHS_THIS_YEAR' || p === 'THIS_YEAR') return months(Y, 0, 12);
+    if (p === 'MONTHS_LAST_YEAR' || p === 'QUARTERS_LAST_YEAR' || p === 'LAST_YEAR') return months(Y - 1, 0, 12);
+    if (p === 'THIS_BIMONTH') return months(Y, b, 2);
+    if (p === 'LAST_BIMONTH') return months(Y, b - 2, 2);
+    if (p === 'THIS_QUARTER') return months(Y, q, 3);
+    if (p === 'LAST_QUARTER') return months(Y, q - 3, 3);
+    if ((m = /^LAST_(\d+)_QUARTERS$/.exec(p))) return months(Y, q - 3 * (+m[1]), 3 * (+m[1]));
+    if (p === 'THIS_SIX_MONTH') return months(Y, h, 6);
+    if (p === 'LAST_SIX_MONTH') return months(Y, h - 6, 6);
+    if ((m = /^LAST_(\d+)_SIXMONTHS$/.exec(p))) return months(Y, h - 6 * (+m[1]), 6 * (+m[1]));
+    if ((m = /^LAST_(\d+)_YEARS$/.exec(p))) return months(Y - (+m[1]), 0, 12 * (+m[1]));
+    return null;
+  };
+  var parts = String(pe == null ? '' : pe).split(';'), out = null;
+  for (var i = 0; i < parts.length; i++) {
+    var p = parts[i].replace(/^\s+|\s+$/g, '');
+    if (!p) continue;
+    var r = one(p);
+    if (!r) return null;
+    out = out ? { start: r.start < out.start ? r.start : out.start, end: r.end > out.end ? r.end : out.end } : r;
+  }
+  return out;
+}
+
 function buildCustomAppConfigJs(spec) {
   const cfg = {
     key: spec.key, name: spec.name, version: spec.version, kind: spec.kind,
@@ -1312,6 +1463,8 @@ function buildCustomAppConfigJs(spec) {
     + `  cfg.baseUrl = location.origin + (i >= 0 ? p.slice(0, i) : '');\n`
     + `  window.D2_APP_CONFIG = Object.freeze(cfg);\n`
     + CUSTOM_APP_TREE_ROOTS_SHIM
+    + CUSTOM_APP_QUERY_KEY_SHIM
+    + `  window.D2Periods = Object.freeze({ range: ${d2PeriodRange.toString()} });\n`
     + `})();\n`;
 }
 
@@ -1840,9 +1993,13 @@ async function recallCustomAppPreview(token) {
 // their own message already asked to install ("create and install …").
 // Without this the model previewed and installed in one breath even when the
 // user wrote "Show me a preview first" (GLM-5.3-flash, live 2026-10-22).
+// "Show me a preview first", "a summary before installing", "do not install it".
+function userWantsToSeeItFirst(text) {
+  return /\bpreview\b[^.?!]*\bfirst\b|\b(?:don'?t|do\s+not|not|never|without|before)\s+(?:\w+\s+){0,2}install/.test(String(text || '').toLowerCase());
+}
 function userAskedToInstall(text) {
   const t = String(text || '').toLowerCase();
-  if (/\bpreview\b[^.?!]*\bfirst\b|\b(?:don'?t|do\s+not|not|never|without|before)\s+(?:\w+\s+){0,2}install/.test(t)) return false;
+  if (userWantsToSeeItFirst(t)) return false;
   // "Give me the finished app URL" cannot be met by a preview (ANC Follow-up
   // Explorer thread: the preview was refused an install, the user was given a URL
   // that did not exist and got "Unable to find an app for this URL").
@@ -1867,7 +2024,9 @@ function customAppApprovalProblem(key, token, previewTurn) {
   const turn = dhis2.turnCounter || 0;
   const said = installIntentText();
   if (userAskedToInstall(said)) return null;
-  if (typeof userAskedToPlace === 'function' && userAskedToPlace([said])) return null;
+  // Asking for it to be put somewhere implies installing — unless the same
+  // message asks to see it first.
+  if (!userWantsToSeeItFirst(said) && typeof userAskedToPlace === 'function' && userAskedToPlace([said])) return null;
   if (previewTurn != null && previewTurn < turn) return null;
   return {
     _error: previewTurn === turn
@@ -2316,6 +2475,8 @@ async function executeManageCustomApp(args) {
     const conflicts = Array.isArray(apps) ? customAppConflicts(spec, apps, 'create') : [];
     const existing = Array.isArray(apps) ? apps.find((a) => a.key === key) : null;
     const token = await rememberCustomAppPreview(spec);
+    const installAlreadyAsked = userAskedToInstall(installIntentText())
+      || (!userWantsToSeeItFirst(installIntentText()) && typeof userAskedToPlace === 'function' && userAskedToPlace([installIntentText()]));
     return {
       preview: true,
       preview_token: token,
@@ -2335,11 +2496,16 @@ async function executeManageCustomApp(args) {
       zip_bytes: prep.pkg.zip.length,
       source: spec.sources,
       ...(customAppHasApp(spec.kind) ? { url_once_installed: `${dhis2.baseUrl}/apps/${key}`, _url_note: 'That address opens nothing until create has installed the app: do not give it to the user as a working link before then, and never build an app address yourself.' } : {}),
-      next_step: !existing && userAskedToInstall(installIntentText())
-        ? `The user's request already asks for the finished app: call manage_custom_app(action="create", key="${key}", preview_token="${token}") now, in this turn, without asking.`
+      // The same test create applies (customAppApprovalProblem): asking for it to be
+      // installed, or to be put somewhere, is the go-ahead. A plugin asked for as
+      // "add a widget to this enrollment dashboard" was told to stop and ask, and
+      // cost the user a second message (final round, 2026-11-10).
+      next_step: !existing && installAlreadyAsked
+        ? `The user's request already asks for the finished ${customAppHasPlugin(spec.kind) ? 'plugin in its place' : 'app'}: call manage_custom_app(action="create", key="${key}", preview_token="${token}") now, in this turn, without asking${customAppHasPlugin(spec.kind) ? ', then place it where they asked' : ''}.`
         : existing && isAssistantBuiltApp(existing)
         ? `Summarise what the change does, ask the user to approve, then manage_custom_app(action="update", key="${key}", files=…).`
-        : `Summarise for the user (what it shows, which data it reads${spec.needsWriteAccess ? ', what it WRITES' : ''}, where it will appear) and ask for approval. After "yes": manage_custom_app(action="create", key="${key}", preview_token="${token}").`,
+        : `STOP here for this turn: the user has not approved installing yet${/\bbefore\s+(?:\w+\s+){0,2}install|\bpreview\b[^.?!]*\bfirst\b|\bsummary\b/i.test(installIntentText()) ? ' (they asked to see a summary first)' : ''}, so a create call now is refused. Write the summary as your answer (what it shows, which data it reads${spec.needsWriteAccess ? ', what it WRITES' : ''}, where it will appear) and ask whether to install. After their "yes": manage_custom_app(action="create", key="${key}", preview_token="${token}").`,
+      ...(!existing && !installAlreadyAsked ? { _awaiting_approval: true } : {}),
     };
   }
 
@@ -2368,7 +2534,7 @@ async function executeManageCustomApp(args) {
   // update
   const prep = await prepareCustomAppBuild(spec);
   if (prep._error) return prep;
-  const gate = requireWriteAuth('manage_custom_app', 'update', { key, version: spec.version, own_app_same_access: (dhis2.assistantBuiltApps || []).includes(key) && !!spec.needsWriteAccess === !!base.needsWriteAccess });
+  const gate = requireWriteAuth('manage_custom_app', 'update', { key, version: spec.version, own_app_same_access: (dhis2.assistantBuiltApps || []).includes(key) && !!spec.needsWriteAccess === !!base.needs_write_access });
   if (gate) return gate;
   const conflicts = customAppConflicts(spec, apps, 'replace');
   if (conflicts.length) return { _error: conflicts.map((c) => c.message).join(' '), conflicts };

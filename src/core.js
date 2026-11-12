@@ -1096,13 +1096,19 @@ function httpErrorLane(toolName, args) {
   return args && typeof args.action === 'string' && args.action ? `${toolName}:${args.action}` : toolName;
 }
 
+const HTTP_STATUS_IN_TEXT_RE = /\b(?:DHIS2 API|HTTP(?:\s+(?:status|error))?|status(?:\s+code)?|answered|returned|responded(?:\s+with)?)\s*:?\s*(4\d\d|5\d\d)\b/i;
 function noteHttpErrorFromResult(toolName, result, args) {
   if (!result || typeof result !== 'object') return;
   // Status comes from safeDhis2Fetch error envelopes (_status), nested error bodies,
   // or text-form _error like "DHIS2 API 404: ...".
   let status = Number(result._status) || 0;
   if (!status && typeof result._error === 'string') {
-    const m = result._error.match(/\b(4\d\d|5\d\d)\b/);
+    // Only a number that is SAID to be an HTTP status. Any 4xx/5xx-looking number
+    // used to count: "JSX does not compile: app.jsx:437:10 Unexpected token" was
+    // read as HTTP 437, became the fourth "HTTP error in a row" after three
+    // failed probes, and the corrected preview was refused for the rest of the
+    // turn (Reporting Completeness Explorer thread, 2026-11-10).
+    const m = result._error.match(HTTP_STATUS_IN_TEXT_RE);
     if (m) status = Number(m[1]);
   }
   if (status < 400) return;
@@ -5066,6 +5072,102 @@ async function healItemFilterOperator(path) {
     path: `${p.slice(0, qIdx)}?${out.join('&')}`,
     healed: true,
     note: `Query corrected: an item filter needs an operator, and an option is compared by its code (DHIS2 answers 409 otherwise): ${fixed.join(', ')}. Use <item>:EQ:<code> (or IN:<code>;<code>) in any app or plugin code too.`,
+  };
+}
+
+// Reporting rates are DATA ITEMS of the plain analytics resource, written
+// <dataSetUid>.<METRIC>. Verified on 2.42.7.1 (2026-11-10, Child Health):
+//   dx:BfMAe6Itzgt.REPORTING_RATE;BfMAe6Itzgt.REPORTING_RATE_ON_TIME → 96.1, …
+//   dx:REPORTING_RATE (bare)        → 409 E7124 "…without any valid dimension options: `dx`"
+//   dx:<dataSetUid> (no metric)     → 409 E7124
+//   filter=ds:<dataSetUid>          → 409 E7125 "…does not reference any dimension: `ds`"
+// A model sent the bare form with a ds filter, got the 409 twice, and told the
+// user "reporting-rate analytics dimensions don't exist on this server", then
+// rebuilt the app on completeDataSetRegistrations (Reporting Completeness
+// Explorer thread). The data set is in the query, so the item can be written
+// correctly here; without one the call is refused with the syntax, not sent.
+const REPORTING_RATE_METRICS = ['REPORTING_RATE', 'REPORTING_RATE_ON_TIME', 'ACTUAL_REPORTS', 'ACTUAL_REPORTS_ON_TIME', 'EXPECTED_REPORTS'];
+const REPORTING_RATE_SYNTAX = 'Reporting rates are data items of /api/analytics written <dataSetUid>.<METRIC>, with METRIC one of REPORTING_RATE (completeness %), REPORTING_RATE_ON_TIME (timeliness %), ACTUAL_REPORTS, ACTUAL_REPORTS_ON_TIME, EXPECTED_REPORTS — e.g. dimension=dx:BfMAe6Itzgt.REPORTING_RATE;BfMAe6Itzgt.REPORTING_RATE_ON_TIME&dimension=ou:<parent>;LEVEL-2&filter=pe:202510. There is no "ds" dimension and no bare REPORTING_RATE item (both 409).';
+function healReportingRateDx(path) {
+  const p = String(path || '');
+  if (!/^analytics(?:\.json)?\?/.test(p)) return { path: p, healed: false };
+  const qIdx = p.indexOf('?');
+  const dec = (v) => { try { return decodeURIComponent(v.replace(/\+/g, ' ')); } catch { return v; } };
+  const parts = p.slice(qIdx + 1).split('&').filter(Boolean);
+  const metricRe = new RegExp(`^(?:${REPORTING_RATE_METRICS.join('|')})$`, 'i');
+  const uidRe = /^[A-Za-z][A-Za-z0-9]{10}$/;
+  const dataSets = [];
+  let bare = false;
+  let rated = false;
+  for (const part of parts) {
+    const eq = part.indexOf('=');
+    const name = (eq === -1 ? part : part.slice(0, eq)).toLowerCase();
+    const val = eq === -1 ? '' : dec(part.slice(eq + 1));
+    if (name === 'dimension' || name === 'filter') {
+      if (/^ds:/i.test(val)) for (const id of val.slice(3).split(';')) if (uidRe.test(id.trim())) dataSets.push(id.trim());
+      if (/^dx:/i.test(val)) for (const it of val.slice(3).split(';')) {
+        if (metricRe.test(it.trim())) bare = true;
+        else if (new RegExp(`^[A-Za-z][A-Za-z0-9]{10}\\.(?:${REPORTING_RATE_METRICS.join('|')})$`, 'i').test(it.trim())) rated = true;
+      }
+    } else if (name === 'dataset' || name === 'ds') {
+      for (const id of val.split(/[;,]/)) if (uidRe.test(id.trim())) dataSets.push(id.trim());
+    }
+  }
+  const dsParam = parts.some(x => /^(?:dimension|filter)=ds(?::|%3A)/i.test(x) || /^(?:dataset|ds)=/i.test(x));
+  if (!bare && !(rated && dsParam)) return { path: p, healed: false };
+  const sets = [...new Set(dataSets)];
+  if (bare && !sets.length) {
+    return {
+      path: p, healed: false,
+      refusal: {
+        _error: 'Not sent: the query asks for a reporting-rate metric without saying which data set (DHIS2 answers 409 E7124 to a bare REPORTING_RATE item).',
+        _hint: `${REPORTING_RATE_SYNTAX} Look the data set up (manage_datasets list, or dataSets?fields=id,displayName,periodType) and resend. This server DOES have reporting rates; do not fall back to completeDataSetRegistrations for completeness figures.`,
+        _scope: 'reporting_rate_needs_data_set',
+      },
+    };
+  }
+  const out = [];
+  for (const part of parts) {
+    const eq = part.indexOf('=');
+    const name = (eq === -1 ? part : part.slice(0, eq));
+    const val = eq === -1 ? '' : dec(part.slice(eq + 1));
+    if (/^(?:dimension|filter)$/i.test(name) && /^ds:/i.test(val)) continue;
+    if (/^(?:dataset|ds)$/i.test(name)) continue;
+    if (/^(?:dimension|filter)$/i.test(name) && /^dx:/i.test(val)) {
+      const items = [];
+      for (const it of val.slice(3).split(';').map(x => x.trim()).filter(Boolean)) {
+        if (metricRe.test(it)) for (const ds of sets) items.push(`${ds}.${it.toUpperCase()}`);
+        else items.push(it);
+      }
+      out.push(`${name}=${encodeURIComponent(`dx:${[...new Set(items)].join(';')}`)}`);
+      continue;
+    }
+    out.push(part);
+  }
+  return {
+    path: `${p.slice(0, qIdx)}?${out.join('&')}`,
+    healed: true,
+    note: `Query corrected: ${bare ? `the reporting-rate items were written with their data set (${sets.map(d => `${d}.REPORTING_RATE`).join(', ')}, …)` : 'the items were already right'}${dsParam ? `${bare ? ' and' : ' but'} the ds / dataSet parameter was left out (it is a 409)` : ''}. ${REPORTING_RATE_SYNTAX} Use this form in any app or plugin code too; this server has reporting rates.`,
+  };
+}
+
+// completeDataSetRegistrations needs a data set (409 E2013), an org unit or org
+// unit group (E2006; children=true needs an org unit, E2008) and a time window.
+// Verified on 2.42.7.1 (2026-11-10). A call without them is a 409 that tells the
+// model little, and three of those block the lane; say what is missing instead.
+function completeRegistrationsRefusal(path) {
+  const p = String(path || '');
+  if (!/^completeDataSetRegistrations(?:\.json)?(?:\?|$)/.test(p)) return null;
+  const names = new Set((p.split('?')[1] || '').split('&').filter(Boolean).map(x => x.split('=')[0]));
+  const missing = [];
+  if (!names.has('dataSet')) missing.push('dataSet=<dataSetUid>');
+  if (!names.has('orgUnit') && !names.has('orgUnitGroup')) missing.push('orgUnit=<orgUnitUid> (add children=true for everything under it)');
+  if (!names.has('period') && !(names.has('startDate') && names.has('endDate')) && !names.has('created') && !names.has('createdDuration')) missing.push('period=<e.g. 202510> (or startDate and endDate)');
+  if (!missing.length) return null;
+  return {
+    _error: `Not sent: completeDataSetRegistrations needs ${missing.join(', ')} (DHIS2 answers 409 without ${missing.length > 1 ? 'them' : 'it'}).`,
+    _hint: `Example: completeDataSetRegistrations?dataSet=<uid>&period=202510&orgUnit=<uid>&children=true lists who completed. For completeness and timeliness NUMBERS use analytics reporting rates instead: ${REPORTING_RATE_SYNTAX}`,
+    _scope: 'complete_registrations_incomplete',
   };
 }
 

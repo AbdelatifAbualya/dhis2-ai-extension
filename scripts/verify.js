@@ -1430,6 +1430,14 @@ if (loaded) (async () => {
     observe('manage_metadata', { action: 'delete' }, { success: true });
     await end();
     eq('write-auth refusals never become lessons', st.entries.length, n1);
+    // Reporting Completeness Explorer thread (2026-11-10): both were saved as binding lessons.
+    begin('build and install an app, show me a summary before installing', { appType: 'Dashboard' }, new Set(['manage_custom_app', 'manage_memory']));
+    observe('manage_custom_app', { action: 'preview', name: 'X' }, { _error: 'JSX does not compile: app.jsx:437:10 Unexpected token', compile_errors: [{ file: 'app.jsx', line: 437 }], _hint: 'Fix exactly these lines (see frame) and resend the whole call. Common causes: an unclosed JSX tag.' });
+    observe('manage_custom_app', { action: 'preview', name: 'X' }, { preview: true, preview_token: 'pv-1' });
+    observe('manage_custom_app', { action: 'create', key: 'ai-x' }, { _error: 'Not installed: the preview was made in this same turn and the user has not approved it yet.', _hint: 'Do not call create again this turn — it will be refused the same way. End the turn: show the user the preview summary.', _awaiting_approval: true });
+    observe('manage_metadata', { action: 'update_sharing' }, { _error: 'Not changed: the user did not ask to share this dashboard.', _hint: 'Leave sharing as created (the owner and admins can open it).', _scope: 'sharing_not_requested' });
+    await end();
+    eq('a compile error, an approval pause and an unasked-sharing refusal never become lessons', st.entries.length, n1);
 
     // Privacy taint: a turn that touched patient records writes NOTHING.
     begin('fix the enrollment', { appType: 'Capture', teiId: 'a3kGcGpz8FJ', programId: 'CcHoHIzjuVo' }, new Set(['manage_memory']));
@@ -1773,6 +1781,73 @@ async function runCustomAppChecks() {
     truthy('…a refetch on those values is fine', !once("function A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); const { data, refetch } = useDataQuery(Q, { variables: { page, q } }); useEffect(() => { refetch({ page, q }); }, [page, q]); return null; }"));
     // NCD worklist (deepseek, 2026-11-08): data.pager / data['events'] on a useDataQuery
     // result → an empty first page, 0 patients shown, every request answering 200.
+    {
+      // Scorecard plugin (2026-11-10): two queries on one resource, different params
+      // functions, same variables → app-runtime served the second the first one's data.
+      const js = ctx.buildCustomAppConfigJs({ key: 'ai-x', name: 'x', version: '1.0.0', kind: 'app', apiVersion: 42, kitVersion: '1.0.0' });
+      const calls = [];
+      const win = { D2Runtime: { useDataQuery: (q, o) => { calls.push([q, o]); return {}; }, useDataEngine: 1 } };
+      new Function('window', 'location', js)(win, { pathname: '/api/apps/ai-x/index.html', origin: 'http://h' });
+      const QA = { q: { resource: 'analytics/events/aggregate/p', params: ({ ou }) => ({ stage: 'A', ou }) } };
+      const QB = { q: { resource: 'analytics/events/aggregate/p', params: ({ ou }) => ({ stage: 'B', ou }) } };
+      const QS = { me: { resource: 'me', params: { fields: 'id' } } };
+      win.D2Runtime.useDataQuery(QA, { variables: { ou: 'O' } });
+      win.D2Runtime.useDataQuery(QB, { variables: { ou: 'O' } });
+      win.D2Runtime.useDataQuery(QA, { variables: { ou: 'O' } });
+      win.D2Runtime.useDataQuery(QS);
+      truthy('generated apps give each query that holds a function its own cache key (app-runtime hashes the key without functions)',
+        calls[0][1].variables.__query !== calls[1][1].variables.__query && calls[0][1].variables.__query === calls[2][1].variables.__query && calls[0][0] === calls[2][0]);
+      truthy('…the app\'s params function never sees the extra variable, a static query is passed through untouched, other exports stay',
+        JSON.stringify(calls[1][0].q.params(calls[1][1].variables)) === '{"stage":"B","ou":"O"}' && calls[3][0] === QS && calls[3][1] === undefined && win.D2Runtime.useDataEngine === 1);
+    }
+    // Scorecard plugin (2026-11-10): "Biopsies 10" where 7 were done — event analytics counts scheduled visits.
+    const stLint = (params) => lint("const { useDataQuery } = D2Runtime;\nconst Q = { a: { resource: 'analytics/events/aggregate/abcdefghijk', params: " + params + " } };\nfunction A() { const { data } = useDataQuery(Q); const col = (r, n) => r.headers.findIndex((h) => h.name === n); return null; }" + root).errors.some((e) => /only SCHEDULED are counted/.test(e.message));
+    truthy('event analytics read with no eventStatus is an error (scheduled visits would be counted); with one it passes',
+      stLint("{ dimension: ['ou:USER_ORGUNIT'], filter: ['pe:LAST_12_MONTHS'], stage: 'abcdefghij2' }")
+      && !stLint("{ dimension: ['ou:USER_ORGUNIT'], filter: ['pe:LAST_12_MONTHS'], stage: 'abcdefghij2', eventStatus: 'ACTIVE,COMPLETED' }"));
+    {
+      // Scorecard plugin (2026-11-10): "last 12 months" computed as ending with the current month.
+      const pr = ctx.d2PeriodRange;
+      const at = new Date(2026, 10, 10, 15, 0, 0); // 10 Nov 2026 — the periods DHIS2 2.42.5 and 2.43.2 returned that day
+      const is = (pe, start, end) => { const r = pr(pe, at); return !!r && r.start === start && r.end === end; };
+      truthy('D2Periods.range gives DHIS2\'s own windows for relative periods (verified against the server\'s period lists)',
+        is('LAST_12_MONTHS', '2025-11-01', '2026-10-31') && is('LAST_3_MONTHS', '2026-08-01', '2026-10-31') && is('THIS_MONTH', '2026-11-01', '2026-11-30') && is('LAST_MONTH', '2026-10-01', '2026-10-31')
+        && is('THIS_QUARTER', '2026-10-01', '2026-12-31') && is('LAST_4_QUARTERS', '2025-10-01', '2026-09-30') && is('THIS_YEAR', '2026-01-01', '2026-12-31') && is('LAST_5_YEARS', '2021-01-01', '2025-12-31')
+        && is('LAST_SIX_MONTH', '2026-01-01', '2026-06-30') && is('LAST_2_SIXMONTHS', '2025-07-01', '2026-06-30') && is('THIS_BIMONTH', '2026-11-01', '2026-12-31') && is('MONTHS_THIS_YEAR', '2026-01-01', '2026-12-31')
+        && is('THIS_WEEK', '2026-11-09', '2026-11-15') && is('LAST_52_WEEKS', '2025-11-10', '2026-11-08') && is('LAST_7_DAYS', '2026-11-03', '2026-11-09') && is('TODAY', '2026-11-10', '2026-11-10'));
+      truthy('…ISO ids, several periods joined by ";", and null for what it does not know',
+        is('202602', '2026-02-01', '2026-02-28') && is('2024Q1', '2024-01-01', '2024-03-31') && is('2026S2', '2026-07-01', '2026-12-31') && is('2026W45', '2026-11-02', '2026-11-08') && is('2021W1', '2021-01-04', '2021-01-10')
+        && is('202605B', '2026-09-01', '2026-10-31') && is('2025April', '2025-04-01', '2026-03-31') && is('20261110', '2026-11-10', '2026-11-10') && is('202601;202603;LAST_YEAR', '2025-01-01', '2026-03-31')
+        && pr('THIS_FINANCIAL_YEAR', at) === null && pr('LAST_6_BIMONTHS', at) === null && pr('202601;NONSENSE', at) === null && pr('', at) === null);
+      const cfgJs = ctx.buildCustomAppConfigJs({ key: 'ai-x', name: 'x', version: '1.0.0', kind: 'app', apiVersion: 42, kitVersion: '1.0.0' });
+      const w2 = {};
+      new Function('window', 'location', cfgJs)(w2, { pathname: '/api/apps/ai-x/index.html', origin: 'http://h' });
+      truthy('every generated app carries it as D2Periods.range', w2.D2Periods && typeof w2.D2Periods.range === 'function' && w2.D2Periods.range('2026').start === '2026-01-01');
+      const handLint = (src) => lint(src + "\nfunction A() { return null; }" + root).errors.some((e) => /by hand/.test(e.message));
+      truthy('relative periods worked out by hand are an error naming D2Periods.range; using it, or only comparing a keyword, is fine',
+        handLint("function r(p) { const now = new Date(); const M = now.getMonth(); if (p === 'LAST_12_MONTHS') return [new Date(now.getFullYear(), M - 11, 1), now]; return null; }")
+        && !handLint("function r(p) { const x = D2Periods.range(p); return x; }\nconst label = (p) => (p === 'LAST_12_MONTHS' ? 'Last 12 months' : p);")
+        && !handLint("const label = (p) => (p === 'THIS_YEAR' ? 'This year' : p);")
+        && !handLint("const label = (p) => (p === 'THIS_YEAR' ? 'This year (' + new Date().getFullYear() + ')' : p);"));
+    }
+    // Reporting Completeness Explorer thread (2026-11-10): dx:REPORTING_RATE with a ds filter.
+    const rrLint = (src) => lint("const { useDataQuery } = D2Runtime;\n" + src + "\nfunction A() { const { data } = useDataQuery(Q, { variables: { ds: 'BfMAe6Itzgt', pe: '202510' } }); return null; }" + root).errors.some((e) => /reporting-rate metric without its data set/.test(e.message));
+    truthy('a bare dx:REPORTING_RATE or a ds: dimension in app code is an error that gives the right form',
+      rrLint("const Q = { a: { resource: 'analytics', params: ({ ds, pe }) => ({ dimension: ['dx:REPORTING_RATE;REPORTING_RATE_ON_TIME', 'ou:USER_ORGUNIT;LEVEL-2'], filter: [`pe:${pe}`, `ds:${ds}`] }) } };")
+      && rrLint("const Q = { a: { resource: 'analytics', params: ({ ds, pe }) => ({ dimension: [`dx:${ds}.REPORTING_RATE`, 'ou:USER_ORGUNIT'], filter: [`pe:${pe}`, `ds:${ds}`] }) } };")
+      && !rrLint("const M = ['REPORTING_RATE', 'REPORTING_RATE_ON_TIME', 'ACTUAL_REPORTS', 'EXPECTED_REPORTS'];\nconst Q = { a: { resource: 'analytics', params: ({ ds, pe }) => ({ dimension: [`dx:${M.map((m) => `${ds}.${m}`).join(';')}`, 'ou:USER_ORGUNIT;LEVEL-2'], filter: [`pe:${pe}`] }) } };"));
+    // Breast pathway monitor (deepseek, 2026-11-10): scheduled biopsies counted as
+    // biopsies — 11 rows where 8 women had one, "NaN" cells, a wrong median.
+    const schedLint = (src) => lint("const { useDataQuery } = D2Runtime;\n" + src + "\nfunction A() { const { data } = useDataQuery(Q); return null; }" + root).errors.some((e) => /only scheduled/.test(e.message));
+    const EVQ = "const Q = { ev: { resource: 'tracker/events', params: { program: 'p', orgUnitMode: 'ACCESSIBLE', fields: 'event,occurredAt,status', totalPages: true } } };\n";
+    truthy('tracker events read with occurredAt and no scheduled-visit handling is an error',
+      schedLint(EVQ + "const first = (evs) => String(evs[0].occurredAt).slice(0, 10);")
+      && schedLint(EVQ + "const fixture = { status: 'COMPLETED', occurredAt: '2026-01-01T00:00:00.000' };\nconst done = (evs) => evs.some((e) => e.status === 'COMPLETED' && String(e.occurredAt).slice(0, 10) > '2026');"));
+    truthy('…fine when scheduled visits are dropped, a missing date is handled, or the query asks for a status',
+      !schedLint(EVQ + "const done = (evs) => evs.filter((e) => e.occurredAt && e.status !== 'SCHEDULE');")
+      && !schedLint(EVQ + "const day = (e) => (e.occurredAt ? String(e.occurredAt).slice(0, 10) : null);")
+      && !schedLint("const Q = { ev: { resource: 'tracker/events', params: { program: 'p', status: 'COMPLETED', fields: 'event,occurredAt', totalPages: true } } };\nconst first = (evs) => String(evs[0].occurredAt).slice(0, 10);")
+      && !schedLint("const Q = { p: { resource: 'programs', params: { fields: 'id,displayName' } } };"));
     const pagerLint = (src) => lint(src + root).errors.some((e) => /\.pager is undefined/.test(e.message));
     truthy('data.pager read on a useDataQuery / engine.query result is an error (the answer sits under the query key)',
       pagerLint("const { useDataQuery } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events', params: { pageSize: 100, totalPages: true } } };\nfunction A() { const { data, refetch } = useDataQuery(Q); const pc = (data && data.pager && data.pager.pageCount) || 1; return null; }")
@@ -1938,7 +2013,7 @@ async function runCustomAppChecks() {
     const savedSdf = ctx.safeDhis2Fetch;
     ctx.safeDhis2Fetch = async (p, o) => (/^metadata\?fields=id&filter=id:in:/.test(p) ? { programIndicators: [{ id: 'YTg1u5yjZKQ' }], programs: [{ id: 'fbfJHSPpUQD' }] } : savedSdf(p, o));
     try {
-      const evAgg = clean.replace("resource: 'me'", "resource: 'analytics/events/aggregate/fbfJHSPpUQD', params: { dimension: ['ou:USER_ORGUNIT', 'YTg1u5yjZKQ'] }");
+      const evAgg = clean.replace("resource: 'me'", "resource: 'analytics/events/aggregate/fbfJHSPpUQD', params: { dimension: ['ou:USER_ORGUNIT', 'YTg1u5yjZKQ'], eventStatus: 'ACTIVE,COMPLETED' }");
       const piBad = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': evAgg }));
       truthy('program indicators read through analytics/events/aggregate are refused at preview (409 E7224 in the browser)', /refuses program indicators there/.test(piBad._error || ''));
       const piOk = await ctx.prepareCustomAppBuild(mkSpec('app', { 'app.jsx': clean.replace("resource: 'me'", "resource: 'analytics', params: { dimension: ['dx:YTg1u5yjZKQ', 'ou:USER_ORGUNIT'] }") }));
@@ -3394,6 +3469,54 @@ async function runDashboardThreadChecks() {
       vm.runInContext('lastUserText = "build the dashboard and make it public for everyone";', ctx);
       const r2 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'r-------' });
       truthy('…and allowed when the user asked for it', r2._scope !== 'sharing_not_requested' && sent > 0);
+      // Dashboard thread 2026-11-10: the assistant offered to share, the user said yes, refused twice.
+      sent = 0;
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: ${JSON.stringify(ask)} }, { role: 'assistant', content: 'Built. Want me to share the dashboard read-only with everyone?' }]; lastUserText = 'Yes, go ahead.';`, ctx);
+      const r3 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'r-------' });
+      truthy('a yes to the assistant\'s own sharing question allows view-only sharing', r3._scope !== 'sharing_not_requested' && sent > 0);
+      sent = 0;
+      const r4 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'rw------' });
+      const r5 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', user_group_accesses: [{ id: 'wl5cDMuUhmF' }] });
+      truthy('…but never edit access (public rw, or a group with no access string = rw)', r4._scope === 'sharing_not_requested' && r5._scope === 'sharing_not_requested' && sent === 0 && /view access only/.test(r4._error));
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: ${JSON.stringify(ask)} }, { role: 'assistant', content: 'Built. The dashboard has 9 tiles. Sharing was left as created.' }]; lastUserText = 'Yes, go ahead.';`, ctx);
+      const r6 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'r-------' });
+      vm.runInContext(`conversationHistory = [{ role: 'user', content: ${JSON.stringify(ask)} }, { role: 'assistant', content: 'Built. Want me to share the dashboard read-only with everyone?' }]; lastUserText = 'Now add a chart of imaging studies per month please';`, ctx);
+      const r7 = await ctx.executeTool('manage_metadata', { action: 'update_sharing', object_type: 'dashboards', object_id: 'w1e0muHG8Gk', public_access: 'r-------' });
+      truthy('…not a yes to a message that offered no sharing, and not another request after the offer', r6._scope === 'sharing_not_requested' && r7._scope === 'sharing_not_requested' && sent === 0);
+      {
+        // One call for a whole program (threads of 2026-11-10 made one stage_details call per stage).
+        const prog = (n) => ({ id: 'CcHoHIzjuVo', displayName: 'Breast Health', programType: 'WITH_REGISTRATION', trackedEntityType: { id: 'nEenWmSyUEp', displayName: 'Person' },
+          programTrackedEntityAttributes: [{ trackedEntityAttribute: { id: 'w75KJ2mc4zz', displayName: 'Full name', valueType: 'TEXT' } }],
+          programStages: [
+            { id: 'trE2SPFXJIt', displayName: 'Imaging', repeatable: true, sortOrder: 2, programStageDataElements: Array.from({ length: n }, (_, i) => ({ compulsory: i === 0, dataElement: { id: 'orFDELOK5v' + (i % 10), displayName: 'BI-RADS ' + i, valueType: 'TEXT', optionSet: { id: 'OptSet00001', options: [{ code: 'BIRADS_1', displayName: '1 - Negative' }, { code: 'BIRADS_5', displayName: '5 - Highly suggestive' }] } } })) },
+            { id: 'M6WPRaMqZsB', displayName: 'Exam', repeatable: false, sortOrder: 1, programStageDataElements: [{ dataElement: { id: 'Nme1rbqWUS7', displayName: 'Mass size', valueType: 'NUMBER' } }] },
+          ] });
+        const strip = (o) => JSON.parse(JSON.stringify(o).replace(/,"options":\[[^\]]*\]/g, ''));
+        let size = 3;
+        ctx.safeDhis2Fetch = async (path) => { sent++; return /options%5B|options\[/.test(path) ? prog(size) : strip(prog(size)); };
+        const st = await ctx.executeTool('get_program_info', { info_type: 'structure', program_id: 'CcHoHIzjuVo' });
+        truthy('get_program_info structure returns every stage in form order with ids, value types and option codes in one answer',
+          st.stages && st.stages.map((x) => x.id).join() === 'M6WPRaMqZsB,trE2SPFXJIt' && st.stages[1].repeatable === true
+          && st.stages[1].data_elements[0].options.BIRADS_5 === '5 - Highly suggestive' && st.stages[1].data_elements[0].compulsory === true
+          && st.attributes[0].id === 'w75KJ2mc4zz' && st.totals.data_elements === 4 && /no stage_details call is needed/.test(st._note));
+        size = 700;
+        const big = await ctx.executeTool('get_program_info', { info_type: 'structure', program_id: 'CcHoHIzjuVo' });
+        size = 3000;
+        const huge = await ctx.executeTool('get_program_info', { info_type: 'structure', program_id: 'CcHoHIzjuVo' });
+        truthy('…a large program drops the option lists (option set ids stay), a huge one answers the stage list with counts',
+          big.stages[1].data_elements[0].option_set === 'OptSet00001' && !big.stages[1].data_elements[0].options && /left out/.test(big._note)
+          && huge.stages[1].data_element_count === 3000 && !huge.stages[1].data_elements && /stage_details/.test(huge._note));
+        ctx.safeDhis2Fetch = async () => { sent++; return { object: { publicAccess: 'rw------', userGroupAccesses: [], userAccesses: [] } }; };
+        sent = 0;
+      }
+      sent = 0;
+      const rp = await ctx.executeTool('dhis2_query', { path: 'periods', query_params: { periodType: 'Monthly', startDate: '2025-01-01', endDate: '2026-12-31' } });
+      const rc = await ctx.executeTool('dhis2_query', { path: 'completeDataSetRegistrations', query_params: { dataSet: 'BfMAe6Itzgt', period: '202510', children: 'true' } });
+      const rr = await ctx.executeTool('dhis2_query', { path: 'analytics', query_params: { dimension: ['dx:REPORTING_RATE', 'ou:ImspTQPwCqd'], filter: 'pe:202510' } });
+      const ra = await ctx.executeTool('dhis2_query', { path: 'apps/ai-breast-imaging-scorecard/app-guard.js' });
+      truthy('dhis2_query answers the guessed "periods" endpoint, an incomplete completeDataSetRegistrations, a bare REPORTING_RATE and an app file read locally (nothing sent)',
+        rp._scope === 'known_endpoint_guidance' && /202510/.test(rp._hint) && rc._scope === 'complete_registrations_incomplete' && rr._scope === 'reporting_rate_needs_data_set'
+        && ra._scope === 'known_endpoint_guidance' && /get_source/.test(ra._hint) && sent === 0);
     } finally { ctx.safeDhis2Fetch = saved; d.writeAuth = savedWa; vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx); }
   }
 
@@ -3721,6 +3844,36 @@ async function runDashboardMapsTurnChecks() {
       for (let i = 0; i < 3; i++) ctx.noteHttpErrorFromResult('manage_maps', e409, { action: 'create' });
       const all = ctx.httpErrorStopOrNull('manage_dashboards', { action: 'add_items' });
       truthy('6 errors in a row (any mix) still block every tool', all && all._blocked_lanes === 'all' && /Every tool is blocked/.test(all._hint));
+      // Reporting Completeness Explorer thread (2026-11-10): a compile error on line 437 counted as "HTTP 437".
+      d.httpErrorCount = 0; d.httpErrorHistory = [];
+      for (let i = 0; i < 3; i++) ctx.noteHttpErrorFromResult('dhis2_query', e409, { method: 'GET', path: 'analytics?y=' + i });
+      ctx.noteHttpErrorFromResult('manage_custom_app', { _error: 'JSX does not compile: app.jsx:437:10 Unexpected token', compile_errors: [{ file: 'app.jsx', line: 437 }] }, { action: 'preview' });
+      ctx.noteHttpErrorFromResult('manage_custom_app', { _error: 'The code hard-codes 2 id(s) that do not exist on this server: abcdefghij1, abcdefghij2. 504 lines checked.' }, { action: 'preview' });
+      truthy('a line number or count in an error text is not an HTTP status: a failed compile neither counts nor blocks the next preview',
+        d.httpErrorCount === 3 && ctx.httpErrorStopOrNull('manage_custom_app', { action: 'preview' }) === null);
+      ctx.noteHttpErrorFromResult('manage_custom_app', { _error: 'Could not read program abc: DHIS2 API 404: not found' }, { action: 'preview' });
+      ctx.noteHttpErrorFromResult('manage_custom_app', { _error: 'Upload failed (HTTP 500)' }, { action: 'create' });
+      truthy('…a status named as one in the text (DHIS2 API 404, HTTP 500) still counts', d.httpErrorCount === 5);
+      {
+        const h = ctx.healReportingRateDx;
+        const dec = (r) => decodeURIComponent(r.path);
+        truthy('dhis2_query writes a bare reporting-rate item with the data set named in the query, and drops the ds filter (409 E7124 / E7125)',
+          dec(h('analytics?dimension=dx:REPORTING_RATE;REPORTING_RATE_ON_TIME&dimension=ou:ImspTQPwCqd;LEVEL-2&filter=pe:202510&filter=ds:BfMAe6Itzgt')) === 'analytics?dimension=dx:BfMAe6Itzgt.REPORTING_RATE;BfMAe6Itzgt.REPORTING_RATE_ON_TIME&dimension=ou:ImspTQPwCqd;LEVEL-2&filter=pe:202510'
+          && dec(h('analytics?dimension=dx%3AREPORTING_RATE&dimension=ou%3AImspTQPwCqd&filter=pe%3A202510&dataSet=BfMAe6Itzgt')) === 'analytics?dimension=dx:BfMAe6Itzgt.REPORTING_RATE&dimension=ou:ImspTQPwCqd&filter=pe:202510'
+          && /this server has reporting rates/.test(h('analytics?dimension=dx:REPORTING_RATE&filter=ds:BfMAe6Itzgt&filter=pe:202510').note));
+        const noDs = h('analytics?dimension=dx:REPORTING_RATE&dimension=ou:ImspTQPwCqd&filter=pe:202510');
+        truthy('…with no data set it is not sent and the answer gives the syntax; a right query and other endpoints are left alone',
+          noDs.refusal && /<dataSetUid>\.<METRIC>/.test(noDs.refusal._hint)
+          && !h('analytics?dimension=dx:BfMAe6Itzgt.REPORTING_RATE;Uvn6LCg7dVU&dimension=ou:ImspTQPwCqd&filter=pe:202510').healed
+          && !h('analytics/events/aggregate/IpHINAT79UW?dimension=dx:REPORTING_RATE').healed && !h('analytics/events/aggregate/IpHINAT79UW?dimension=dx:REPORTING_RATE').refusal);
+        const c = ctx.completeRegistrationsRefusal;
+        truthy('completeDataSetRegistrations without a data set, an org unit or a period is answered locally (409 E2013 / E2006 / E2008)',
+          /orgUnit=/.test(c('completeDataSetRegistrations?dataSet=BfMAe6Itzgt&period=202510&children=true')._error)
+          && /dataSet=/.test(c('completeDataSetRegistrations?period=202510&orgUnit=ImspTQPwCqd')._error)
+          && c('completeDataSetRegistrations?dataSet=BfMAe6Itzgt&period=202510&orgUnit=O6uvpzGd5pu&children=true') === null
+          && c('completeDataSetRegistrations?dataSet=BfMAe6Itzgt&startDate=2025-10-01&endDate=2025-10-31&orgUnit=O6uvpzGd5pu') === null
+          && c('dataSets?fields=id') === null);
+      }
       const pre = (d.httpErrorCount = 3, d.httpErrorHistory = d.httpErrorHistory.slice(0, 3), ctx.preflightCheckCall('manage_dashboards', { action: 'arrange', dashboard_id: 'xEtKQVG44h0', order: [] }));
       truthy('preflight lets the unrelated dashboard write through after the read lane is stopped', pre === null || pre._scope !== 'http_error_limit_reached');
     } finally { d.httpErrorCount = saved.n; d.httpErrorHistory = saved.h; }
@@ -4435,6 +4588,23 @@ async function runAncAppThreadChecks() {
   truthy('…"the link to the app", "install it"', asked('send me the link to the app') && asked('install it'));
   truthy('…a plain "create an app", or "preview first", does not', !asked('Create an app called X') && !asked('Show me a preview first, then the finished app') && !asked('do not install it'));
   {
+    // Final round 2026-11-10: "Add a widget to this enrollment dashboard" was previewed and then told to stop and ask.
+    const savedHist2 = vm.runInContext('conversationHistory', ctx);
+    const next = async (said) => {
+      vm.runInContext(`conversationHistory = []; lastUserText = ${JSON.stringify(said)};`, ctx);
+      const r = await ctx.executeManageCustomApp({ action: 'preview', name: 'Vx widget', key: 'ai-vx-widget', kind: 'plugin', plugin_type: 'CAPTURE', datastore_namespace: false, files: { 'plugin.jsx': "const { useState, useEffect } = React;\nfunction P() { const [p, setP] = useState(null); useEffect(() => { postRobot.send(window.parent, 'getPropsFromParent').then((e) => setP(e.data)); }, []); useEffect(() => { if (p && p.setPluginHeight) p.setPluginHeight(document.getElementById('root').getBoundingClientRect().height); }); return <div>{p ? String(p.enrollmentId || '') : ''}</div>; }\nReactDOMClient.createRoot(document.getElementById('root')).render(<P />);" } });
+      return r;
+    };
+    const placeAsk = await next('Add a widget to this enrollment dashboard that shows the visits');
+    const firstAsk = await next('Show me a preview first, then add a widget to this enrollment dashboard');
+    const plainAsk = await next('Build a widget that shows the visits');
+    truthy('a preview tells the model to install now when the user asked for the plugin in a place, and to stop and ask otherwise',
+      placeAsk.preview && /now, in this turn/.test(placeAsk.next_step) && !placeAsk._awaiting_approval
+      && firstAsk.preview && /STOP here for this turn/.test(firstAsk.next_step) && firstAsk._awaiting_approval === true
+      && plainAsk.preview && /STOP here for this turn/.test(plainAsk.next_step) && plainAsk._awaiting_approval === true, JSON.stringify([placeAsk._error, placeAsk.next_step, firstAsk.next_step]).slice(0, 400));
+    vm.runInContext(`lastUserText = ""; conversationHistory = ${JSON.stringify(savedHist2 || [])};`, ctx);
+  }
+  {
     const savedHist = vm.runInContext('conversationHistory', ctx);
     vm.runInContext(`conversationHistory = [{ role: 'user', content: 'Create an app called X for Y with many parts. Give me the finished app URL when done.' }, { role: 'assistant', content: 'ok' }]; lastUserText = 'I increased the max tokens, continue';`, ctx);
     truthy('"…, continue" keeps the install intent of the request it continues', asked(ctx.installIntentText()));
@@ -4444,6 +4614,8 @@ async function runAncAppThreadChecks() {
     vm.runInContext(`conversationHistory = ${JSON.stringify(savedHist || [])}`, ctx);
   }
 
+  truthy('the own-app repair gate compares write access with the manifest\'s needs_write_access (apps that write were never let through)',
+    /!!spec\.needsWriteAccess === !!base\.needs_write_access/.test(fs.readFileSync(path.join(ROOT, 'src/tools-apps.js'), 'utf8')));
   const repair = ctx.ownAppRepairAllowed;
   const own = { own_app_same_access: true };
   truthy('repairing its own app: allowed on an error report, in a turn that approved something else, and in a broad turn',

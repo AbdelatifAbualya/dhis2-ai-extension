@@ -3974,11 +3974,15 @@ async function executeManageMetadata(args) {
     // dashboard, the model gave every user metadata write access to it). The
     // request this turn continues must have asked for sharing / visibility.
     if (['dashboards', 'visualizations', 'maps', 'eventVisualizations'].includes(args.object_type)) {
-      const asked = typeof buildRoutingText === 'function' ? buildRoutingText(lastUserText) : String(lastUserText || '');
-      if (!SHARING_REQUEST_RE.test(asked)) {
+      if (!sharingWasRequested(args)) {
+        const offeredAndAgreed = sharingOfferAgreed();
         return {
-          _error: `Not changed: the user did not ask to share this ${args.object_type.replace(/s$/, '')}. Sharing decides who can see — and with public "rw" access edit or delete — it, so it is never a default step.`,
-          _hint: 'Leave sharing as created (the owner and admins can open it). In your answer you may OFFER to share it and ask with whom (everyone read-only = public_access "r-------").',
+          _error: offeredAndAgreed
+            ? `Not changed: the user said yes to sharing, but not to edit access. A "yes" to your own question covers view access only (public_access "r-------", or groups and users with "r-------"). Nothing was changed.`
+            : `Not changed: the user did not ask to share this ${args.object_type.replace(/s$/, '')}. Sharing decides who can see — and with public "rw" access edit or delete — it, so it is never a default step. This holds for every dashboard, chart, map and line list this turn: do not repeat the call for the other objects.`,
+          _hint: offeredAndAgreed
+            ? 'Repeat the call with view access only, or ask the user in plain words whether these people may also EDIT it, and wait for their answer.'
+            : 'Leave sharing as created (the owner and admins can open it). In your answer you may OFFER to share it: say with whom and that it would be view-only, and ask. When the user then answers yes, repeat the call with view access (everyone read-only = public_access "r-------") and it goes through.',
           _scope: 'sharing_not_requested',
         };
       }
@@ -7515,6 +7519,45 @@ function piAnalyticsRuntimeTraps(pi, stageById, apiMinor) {
 
 // Wording that asks for sharing / visibility of what was built.
 const SHARING_REQUEST_RE = /\b(?:shar(?:e|ed|es|ing)|public(?:ly)?|everyone|every\s+one|all\s+(?:the\s+)?users|other\s+users|my\s+(?:team|colleagues?)|colleagues?|user\s*groups?|access|permissions?|visible\s+to|(?:can(?:not|'?t)?|could)\s+see)\b/i;
+
+// The assistant asked whether to share (its own offer, or the question it was told
+// to ask after a refusal) and the user answered yes. The dashboard thread of
+// 2026-11-10: "Want me to share the dashboard …?" — "Yes, go ahead." was refused,
+// the assistant asked again as instructed, and the second yes was refused too,
+// because only the user's own words were read. A yes covers VIEW access only:
+// who may edit is never settled by a yes to a general question.
+const SHARING_OFFER_RE = /\bshar(?:e|ed|ing)\b[^.!]{0,240}\?|\b(?:confirm|say|reply|tell\s+me)\b[^.!?]{0,120}\bshar(?:e|ed|ing)\b|\bshar(?:e|ed|ing)\b[^.!?]{0,120}\b(?:confirm|say\s+the\s+word|let\s+me\s+know)\b/i;
+const SHARING_AGREE_RE = /^\s*(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|go\s+ahead|proceed|do\s+it|do\s+that|confirm(?:ed)?)\b/i;
+function sharingOfferAgreed() {
+  const said = String(typeof lastUserText === 'string' ? lastUserText : '');
+  const yes = (SHARING_AGREE_RE.test(said) && said.trim().split(/\s+/).length <= 8)
+    || (typeof writeIntentGloss === 'function' && writeIntentGloss(said) === 'yes');
+  if (!yes) return false;
+  const history = Array.isArray(conversationHistory) ? conversationHistory : [];
+  const text = (m) => (typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.map((p) => p.text || '').join(' ') : '');
+  // The message the user is answering. A turn is added to the history when it
+  // ends, so during a turn the last assistant text is the previous answer; if
+  // this turn's message is already there, look before it.
+  let end = history.length;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i] && history[i].role === 'user') { if (text(history[i]).trim() === said.trim()) end = i; break; }
+  }
+  const lastAssistant = history.slice(0, end).reverse().find((m) => m && m.role === 'assistant' && text(m).trim());
+  return !!lastAssistant && SHARING_OFFER_RE.test(text(lastAssistant));
+}
+function sharingIsViewOnly(args) {
+  const writes = (a) => /w/i.test(String(a == null ? 'rw' : a));
+  if (args.public_access !== undefined && writes(args.public_access)) return false;
+  for (const list of [args.user_group_accesses, args.user_accesses]) {
+    if (Array.isArray(list) && list.some((e) => writes(e && e.access))) return false;
+  }
+  return true;
+}
+function sharingWasRequested(args) {
+  const asked = typeof buildRoutingText === 'function' ? buildRoutingText(lastUserText) : String(lastUserText || '');
+  if (SHARING_REQUEST_RE.test(asked)) return true;
+  return sharingOfferAgreed() && sharingIsViewOnly(args || {});
+}
 
 // Flag EXISTING indicators (list / get) that hit piAnalyticsRuntimeTraps —
 // they are reused by later build steps. Read-only: adds _problem / _fix to
