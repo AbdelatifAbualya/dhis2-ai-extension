@@ -667,8 +667,11 @@ async function executeManageUsers(args) {
   if (action === 'list_authorities') {
     const catalog = await getAuthorityCatalog();
     if (!catalog) return { _error: 'Could not load the authority catalogue (GET /api/authorities).' };
-    const q = _lc(args.query);
-    const rows = q ? catalog.filter(a => _lc(a.id).includes(q) || _lc(a.name).includes(q)) : catalog;
+    // Several keywords in one call ("capture, dashboard, export" or queries:[…]):
+    // an authority matching any of them. Building two roles took ten one-keyword
+    // calls (TB data team thread, 2026-11-13).
+    const terms = [...(Array.isArray(args.queries) ? args.queries : []), ...String(args.query || '').split(/[,;|]/)].map(t => _lc(t).trim()).filter(Boolean);
+    const rows = terms.length ? catalog.filter(a => terms.some(q => _lc(a.id).includes(q) || _lc(a.name).includes(q))) : catalog;
     return { success: true, total: rows.length, authorities: rows.slice(0, Number(args.limit) || 60), ...(rows.length > (Number(args.limit) || 60) ? { _note: 'Truncated — narrow with query.' } : {}) };
   }
 

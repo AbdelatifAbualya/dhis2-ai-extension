@@ -512,6 +512,32 @@ function customAppOrigin(url) {
 
 // Static safety scan over the COMPILED code of every file (JSX text and
 // attributes are string literals there, so a `<script` in markup is caught).
+// A validation analysis is a read that DHIS2 only takes as POST: the one
+// engine.mutate a read-only app may make. The call must name that resource and
+// no other, and must not save or notify (persist / notification anything but
+// false). Data Quality Workbench 3 (2026-11-13): the scan refused the app as
+// "writing", and it was declared needs_write_access to get through, which the
+// user is then told. → [[from, to]] spans of such calls in the source.
+function customAppReadOnlyMutateSpans(views) {
+  const spans = [];
+  const bare = views.bare, code = views.code;
+  for (const m of bare.matchAll(/\.\s*mutate\s*\(/g)) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0, end = -1;
+    for (let i = open; i < bare.length && i < open + 4000; i++) {
+      if (bare[i] === '(') depth++;
+      else if (bare[i] === ')' && --depth === 0) { end = i + 1; break; }
+    }
+    if (end < 0) continue;
+    const call = code.slice(m.index, end);
+    const resources = [...call.matchAll(/\bresource\s*:\s*(['"`])([^'"`]*)\1/g)].map((x) => x[2]);
+    if (resources.length !== 1 || resources[0] !== 'dataAnalysis/validationRules') continue;
+    if (/\b(?:persist|notification)\s*:\s*(?!\s|false\b)/.test(call) || /\b(?:persist|notification)\s*[,}]/.test(call)) continue;
+    spans.push([m.index, end]);
+  }
+  return spans;
+}
+
 function scanCustomAppCode(compiled, opts = {}) {
   const violations = [];
   const allowedOrigin = opts.allowedOrigin ? customAppOrigin(opts.allowedOrigin) : null;
@@ -538,9 +564,11 @@ function scanCustomAppCode(compiled, opts = {}) {
       }
     }
     if (!opts.needsWriteAccess) {
+      const readOnly = customAppReadOnlyMutateSpans(views);
       for (const r of CUSTOM_APP_WRITE_RULES) {
         const re = new RegExp(r.re.source, r.re.flags);
         for (const m of views[r.view].matchAll(re)) {
+          if (readOnly.some(([from, to]) => m.index >= from && m.index < to)) continue;
           push(`write:${r.id}`, m.index, m[0], `${r.message} — the app was declared read-only (needs_write_access:false)`);
         }
       }
@@ -742,6 +770,24 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
   // empty first page and showed 0 patients forever, every request answering 200
   // (deepseek, 2026-11-08). The install check cannot see it (records are closed, so
   // every list is empty anyway). data.pager is never right on such a result.
+  // The data engine has two methods: query and mutate. engine.fetch({ resource… })
+  // looks plausible and throws "t.includes is not a function" on the first click
+  // (the runtime's own fetch takes a URL string), and get / post / request do
+  // not exist. Data Quality Workbench 2 (2026-11-13, play 2.42.7.1): installed
+  // with a clean check, and its Outliers and Consistency tabs failed when run.
+  for (const [file, v] of Object.entries(views)) {
+    const engines = new Set();
+    for (const m of v.bare.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*useDataEngine\s*\(/g)) engines.add(m[1]);
+    for (const name of engines) {
+      const n = name.replace(/\$/g, '\\$');
+      const seen = new Set();
+      for (const m of v.bare.matchAll(new RegExp(`(?<![\\w$.])${n}\\s*(?:\\?\\.|\\.)\\s*([A-Za-z_$][\\w$]*)\\s*\\(`, 'g'))) {
+        if (m[1] === 'query' || m[1] === 'mutate' || seen.has(m[1])) continue;
+        seen.add(m[1]);
+        errors.push({ file, line: lineAt(v.bare, m.index), message: `${name}.${m[1]}(…) is not part of the data engine: it has query and mutate only, so this call throws when the user reaches it. Read with const res = await ${name}.query({ key: { resource: 'analytics', params: { … } } }) and take res.key; write with ${name}.mutate({ resource, type: 'create' | 'update' | 'delete', data }).` });
+      }
+    }
+  }
   for (const [file, v] of Object.entries(views)) {
     const holders = new Set();
     for (const m of v.bare.matchAll(/\bconst\s*\{([^{}]*)\}\s*=\s*useDataQuery\s*\(/g)) {
@@ -867,10 +913,36 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     // orgUnit without orgUnitMode = SELECTED: only records entered AT that
     // unit. Live 2026-11-01 (2.42.7) a case explorer sent orgUnit=<country>
     // and showed 0 of 100,332 events for "All locations" and every district.
-    if (/['"`]tracker\/(?:events|enrollments|trackedEntities)\b/.test(allCode)
-        && (/\borgUnits?\s*:/.test(allBare) || /[?&]orgUnits?=/.test(allCode))
-        && !/\b(?:orgUnitMode|ouMode)\b/.test(allCode)) {
-      errors.push({ message: 'tracker/events | enrollments | trackedEntities with an org unit and no orgUnitMode return only the records entered AT that exact org unit (DHIS2 defaults to SELECTED). Records are entered at facilities, so a country or district — including "All locations" — shows 0 records. Send orgUnitMode: \'DESCENDANTS\' next to the org unit (orgUnits on enrollments and trackedEntities, orgUnit on events) for "this place and everything under it", or orgUnitMode: \'SELECTED\' only when the picker lists the units where records are entered.' });
+    // Events of ONE enrollment or person, narrowed by org unit as well: the unit
+    // then drops that person's visits made anywhere else (a referral, a transfer)
+    // with no error, and DESCENDANTS only widens it to the units below. Verified
+    // 2.42.5 (2026-11-13): enrollments=<id> alone answers all 8 events, with
+    // another facility's orgUnit 0. TB tracker widget: the rule below asked for
+    // an orgUnitMode, and the widget got orgUnit + DESCENDANTS.
+    let pinnedWithOrgUnit = false;
+    for (const m of allCode.matchAll(/['"`]tracker\/events['"`]/g)) {
+      const rest = allCode.slice(m.index, m.index + 700);
+      const next = rest.slice(1).search(/\bresource\s*:/);
+      const q = next === -1 ? rest : rest.slice(0, next + 1);
+      if (/\b(?:enrollments|trackedEntity)\s*:/.test(q) && /\borgUnit\s*:/.test(q)) { pinnedWithOrgUnit = true; break; }
+    }
+    if (pinnedWithOrgUnit) {
+      errors.push({ message: "A tracker/events read that is already pinned to one enrollment or person (enrollments: / trackedEntity:) also sends orgUnit. That keeps only the visits recorded at that unit (with orgUnitMode DESCENDANTS: at it and below), so a visit made at another facility — a referral, a transfer — is missing from the widget with no error. Remove orgUnit and orgUnitMode from that query: with neither, DHIS2 returns every event of the enrollment that the user may see." });
+    }
+    // Judged one read at a time: the org unit of an event being WRITTEN (a tracker
+    // import's events[].orgUnit) is not a filter. TB tracker widget, second run:
+    // the rule fired on the import payload, and the model added orgUnitMode to
+    // the write to get past it.
+    let orgUnitNoMode = false;
+    for (const m of allCode.matchAll(/['"`]tracker\/(?:events|enrollments|trackedEntities)\b[^'"`]*['"`]/g)) {
+      const rest = allCode.slice(m.index, m.index + 700);
+      const next = rest.slice(1).search(/\bresource\s*:/);
+      const q = next === -1 ? rest : rest.slice(0, next + 1);
+      if (/\btype\s*:\s*['"`](?:create|update|delete|json-patch)/.test(q)) continue;
+      if ((/\borgUnits?\s*:/.test(q) || /[?&]orgUnits?=/.test(q)) && !/\b(?:orgUnitMode|ouMode)\b/.test(q)) { orgUnitNoMode = true; break; }
+    }
+    if (!pinnedWithOrgUnit && orgUnitNoMode) {
+      errors.push({ message: 'tracker/events | enrollments | trackedEntities with an org unit and no orgUnitMode return only the records entered AT that exact org unit (DHIS2 defaults to SELECTED). Records are entered at facilities, so a country or district — including "All locations" — shows 0 records. Send orgUnitMode: \'DESCENDANTS\' next to the org unit (orgUnits on enrollments and trackedEntities, orgUnit on events) for "this place and everything under it", or orgUnitMode: \'SELECTED\' only when the picker lists the units where records are entered. A read of ONE person\'s or one enrollment\'s records (trackedEntity: / enrollments:) needs no org unit at all: leave it out, so visits made at another facility are kept.' });
     }
     // The app's guard corrects these at run time, but the code should say what it
     // sends, and a correction hides nothing from whoever reads it next.
@@ -1114,6 +1186,41 @@ function customAppApiResources(compiled) {
     for (const m of code.matchAll(/\bresource\s*:\s*`([^`]*)`/g)) out.add(m[1].replace(/\$\{[^}]*\}/g, '…'));
   }
   return [...out].slice(0, 30);
+}
+
+// Does the server have the endpoints the code calls? DHIS2 answers a path that
+// is no endpoint with a 404 and an HTML page; a real endpoint asked without its
+// parameters answers 200, 400, 405 or 409, and a missing object a 404 with a
+// JSON message (verified 2.42.5, 2.42.7.1, 2.44). Data Quality Workbench thread
+// (2026-11-13): an app installed with a tab calling "validation", which no DHIS2
+// has, and the install check never clicked it. Only fully written paths are
+// asked: a path with a template part cannot be judged from here.
+// Not asked: paths that depend on what is in them, and endpoints known to exist
+// that answer a bare GET with an error of their own (409 without parameters, 405
+// for a POST-only one), which would only add failed requests to the log.
+const CUSTOM_APP_ENDPOINT_SKIP_RE = /^(?:dataStore|userDataStore|apps|icons|fileResources|staticContent|sqlViews|documents|svg|tracker|analytics|outlierDetection|dataAnalysis\/(?:validationRules|stdDevOutlier|minMaxOutlier|followup)|dataValueSets|dataValues|completeDataSetRegistrations|me|system|metadata|maintenance|resourceTables)(?:\/|$)/i;
+// Resources written out in full: a string literal that is the whole value
+// (followed by , } or a line end), not the start of 'analytics/events/aggregate/' + id.
+function customAppStaticResources(compiled) {
+  const out = new Set();
+  for (const js of Object.values(compiled)) {
+    const { code } = customAppSourceViews(js);
+    for (const m of code.matchAll(/\bresource\s*:\s*(['"`])([^'"`$]+)\1\s*(?=[,}\n]|$)/g)) out.add(m[2].split(/[?#]/)[0].replace(/^\/+|\/+$/g, ''));
+  }
+  // A known guess (analytics/outliers, validation…) is kept whatever its first segment.
+  return [...out].filter((r) => r && !/\s/.test(r) && (GUESSED_DATA_QUALITY_PATH_RE.test(r) || (!CUSTOM_APP_ENDPOINT_SKIP_RE.test(r) && !/\/[A-Za-z][A-Za-z0-9]{10}(?:\/|$)/.test(`/${r}`))));
+}
+async function checkCustomAppEndpoints(compiled) {
+  const all = customAppStaticResources(compiled);
+  const missing = all.filter((r) => GUESSED_DATA_QUALITY_PATH_RE.test(r));
+  const todo = all.filter((r) => !missing.includes(r)).slice(0, 16);
+  await Promise.all(todo.map(async (r) => {
+    // fields + pageSize keep a list answer to one small row; both are ignored
+    // where they mean nothing.
+    const res = await safeDhis2Fetch(`${r}?fields=id&pageSize=1`, { noTruncate: true }).catch(() => null);
+    if (res && res._status === 404 && !res._body) missing.push(r);
+  }));
+  return missing.sort();
 }
 
 // The connected server's version as { major, minor, patch, full } — what
@@ -1865,6 +1972,19 @@ async function prepareCustomAppBuild(spec, opts = {}) {
     }
   }
 
+  const apiResources = customAppApiResources(compiled);
+  if (!opts.skipUidCheck) {
+    const missingEndpoints = await checkCustomAppEndpoints(compiled);
+    if (missingEndpoints.length) {
+      const dq = missingEndpoints.some((r) => /valid|outlier|quality/i.test(r));
+      return {
+        _error: `The code calls ${missingEndpoints.length > 1 ? 'endpoints' : 'an endpoint'} this server does not have: ${missingEndpoints.join(', ')} (404: the path does not exist on DHIS2 ${spec.serverVersion?.full || ''}).`.replace(' )', ')'),
+        missing_endpoints: missingEndpoints,
+        _hint: `That part of the app would only ever show an error. Do not try another spelling: use an endpoint you have seen answer in this conversation, or one from the manual.${dq ? ` The data-quality endpoints that exist:\n${DATA_QUALITY_ENDPOINTS_TEXT}` : ' For data no endpoint returns, a SQL view (manage_sql_views) can serve it. If the feature cannot be built on this server, leave it out and tell the user.'}`,
+      };
+    }
+  }
+
   const sqlCheck = await checkCustomAppSqlViews(compiled, uidCheck.found);
   if (sqlCheck.errors.length) {
     return {
@@ -1893,7 +2013,7 @@ async function prepareCustomAppBuild(spec, opts = {}) {
       warnings: lint.warnings,
       uid_check: uidCheck,
       sql_views: sqlCheck.views,
-      api_resources: customAppApiResources(compiled),
+      api_resources: apiResources,
     },
   };
 }
@@ -2551,7 +2671,8 @@ async function executeManageCustomApp(args) {
   const check = await customAppRuntimeCheck(inst.installedKey, spec);
   return customAppResult('update', spec, { prep, inst, ver, check }, {
     previous_version: base.version,
-    changed_files: Object.keys(files),
+    // Files sent whole and files changed through edits.
+    changed_files: [...new Set([...Object.keys(files), ...(Array.isArray(args.edits) ? args.edits.map((e) => String((e && e.file) || '').replace(/^src\//, '')).filter(Boolean) : [])])],
     backup: backup ? { key: backup.backup_key, version: backup.version, rollback_hint: `manage_custom_app(action="rollback", key="${key}")` } : { skipped: true },
   });
 }

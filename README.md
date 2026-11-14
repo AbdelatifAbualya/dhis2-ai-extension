@@ -354,6 +354,52 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.43 — Harness interventions shown as their own state, and a real-model round on event programs, aggregate data sets, data quality and user access (2026-11-14)
+
+Three rounds with a real model (Fireworks deepseek-v4p1-flash-1017) on localhost:8081 (2.42.5) and play 2.42.7.1, on work earlier rounds had not covered: an event program built from nothing with rules, indicators and a dashboard; an aggregate data set with disaggregation, validation rules, indicators, data entry and a dashboard; a data-quality app; a Capture widget that writes; a dashboard plugin on aggregate indicators; roles, users and sharing. Each finding below was fixed, covered in `npm run verify`, and the thread run again.
+
+**The side panel: "Harness blocked" and "Harness correcting" (asked for by the user).** A call the extension itself stopped (a loop guard, a write or privacy gate, a path that does not exist) or sent back to be fixed (lint problems, a cut-off call, a missing argument) used to show the same red "Failed" as a real error. It now has its own orange mark and label, the detail block reads "Why the harness stepped in", and such steps are not counted as failed ("Done in 6 steps, 3 corrected by the harness"). Red and "Failed" are kept for what DHIS2, the network or the provider refused. The worker decides the kind (`toolOutcomeKind` in `src/agent.js`, sent as `outcome` on `AI_TOOL_DONE`): an HTTP status or a server message is a failure whatever else the result carries; a refusal scope is the harness, even when it quotes the server error it will not repeat.
+
+**One wrong endpoint closed every endpoint.** After four 404s on guessed validation paths, the repeated-error stop refused the next `dhis2_query`, which was a correct analytics query, and the tool was then switched off for the turn. Failures of `dhis2_query` are now counted per method and endpoint (`dhis2QueryTarget`), in the HTTP-error lane as well, the refusal names the endpoint and says the others still work, and the tool is only switched off after twice as many blocked calls.
+
+**Data quality had no knowledge behind it.** The model guessed `validation`, `validation/analysis` and `validation` with POST, and the app it built called one of them: a Validation tab that could only show an error, installed with a clean check. Verified on 2.42.5, 2.42.7.1 and 2.44 and now in the `dhis2_query` description and the app manual: `outlierDetection` (ds or dx, never de; dates required; at most 500 results), `analytics/outlierDetection`, `POST dataAnalysis/validationRules` (an array of at most 500, the rule name is not in it), `validation/dataSet/<id>`. The guessed paths are answered locally with these. A validation analysis that saves nothing passes the write gate on a read-only turn, and a read-only app may make that one `engine.mutate`. Any 404 with no JSON body is now told as "this server has no such endpoint, do not try other spellings" (a missing object keeps DHIS2's own message).
+
+**The app preview asks the server for the endpoints the code names.** A resource written out in full that answers a bare 404 is refused at preview (`missing_endpoints`); paths built from parts, the dataStore, tracker and endpoints known to exist are not asked.
+
+**`engine.fetch({ resource … })`.** The second build of that app had the right endpoints and called them through a method the data engine does not have: "t.includes is not a function" on the first click, after a clean install check. Any call on the engine other than `query` and `mutate` is an error at preview. Third build: outliers, the trend chart and 49 validation violations, checked in Chrome against the server.
+
+**Reporting rates, one disaggregation, and a category as a dimension, on charts and maps.** `"<dataSet>.REPORTING_RATE"` (and the four other metrics) and `"<dataElement>.<categoryOptionCombo>"` are data items of `create_visualization`, dashboard tiles and `manage_maps`; they were refused, and the model made five wrapper indicators. A layout may name a disaggregation category by UID or name: "confirmed cases by age group per month" is one stacked chart with the category as the series, "age by sex" one pivot. An indicator cannot be split that way and is refused with the reason. Saved in the shape the Data Visualizer app writes; rendered in the Dashboard app with the server's numbers.
+
+**"The six numbers in one row."** Six single values came out as two rows of three and `arrange` could not change it. `kpis_per_row` (1 to 6) on `create_dashboard`, `add_items` and `arrange`; a dashboard that already has more than four in a row keeps that when it is re-flowed.
+
+**Analytics tables that were never built.** This server's hourly analytics job skips the data-value and completeness tables. `system/info` reported a run minutes old while every reporting rate was a 409 and no value entered that day was in analytics. The model spent 40 calls on SQL views and job settings, and its analytics run was refused because "the tables are newer than every program". A 409 "referenced table does not exist" now says what it means and that nothing else will explain it, is remembered for the turn, and allows one analytics run without the skip parameters that would leave the table out. A second run in the same turn with nothing written since is not started (the model had run it five times). The line-list check no longer keeps saying "tables predate the program" after the job has run (a stale answer was cached).
+
+**`columns=` / `rows=` on an analytics query.** DHIS2 answers a laid-out table with blank cells for any dimension not placed, and a 500 with a category on `rows=`. The model read the blank cells as "no data at district level" and reported a broken server. Those parameters are left out; every answer has the plain rows.
+
+**Events of one enrollment narrowed by org unit.** A lint rule asked for an `orgUnitMode`, and the Capture widget got `orgUnit` plus DESCENDANTS: a visit made at another facility would be missing with no error (verified: `enrollments=<id>` alone answers all 8 events, with another facility's `orgUnit` 0). Such a read is now an error that says to drop the org unit, and the old rule looks at one read at a time (it had fired on the `orgUnit` of an event being written).
+
+**Smaller fixes.**
+- Two "Yes, go ahead." in a row: the sharing gate looked for the offer in the answer before the previous one and refused an agreed share.
+- `manage_datasets(update)` takes its fields, and `indicator_ids`, at the top level (it answered "patch object required", then ignored `indicator_ids` beside a patch).
+- A map's "N of M units have no location" is counted under the map's own parents (it said 591 of 759 for a district with 232).
+- A data element or attribute renamed to stay unique keeps the requested name as its form label (`formName`), and the result says so.
+- An id one character short among program indicators on event analytics is named ("did you mean …"), and data elements joined by `;` in one `dimension=` are sent as one dimension each. The 409 they caused had been saved to the learning memory as "the dx: prefix is wrong".
+- `list_authorities` takes several keywords at once, and the users manual lists which authorities tracker entry, aggregate entry and analysis need (verified ids).
+- Sharing with a group on an object whose public access already allows the same is reported (`_public_access_still_open`): a "TB team only" program was public read-write, and the new clerk could capture in all 22 programs.
+- An app update made with `edits` lists the files it changed.
+
+**Final runs, real model (checked in Chrome against the server):**
+
+| Thread | Server | Seconds | Tool calls | Result |
+|---|---|---|---|---|
+| Event program: 19 fields in 4 sections, 9 rules, 17 indicators, dashboard | 8081 | 207 + 52 + 224 | 9 + 4 + 11 | program, rules and dashboard saved; second run of the dashboard: six headline tiles in one row |
+| Data set with age × sex, 4 validation rules, 5 indicators, data entry, validation | 8081 | 281 + 49 | 25 + 11 | 232 facilities assigned, two forms entered and completed, the planted violation found |
+| Malaria dashboard from that data set | 8081 | 59 | 14 | reporting-rate tiles, age-group stack, age × sex pivot, map: all drawn with the server's numbers |
+| Data Quality Workbench (app, three tabs) | play 2.42.7.1 | 268 | 16 | 12 outliers and their trend, 49 violations with rule names |
+| TB treatment tracker (Capture widget that writes) | 8081 | 179 | 6 | regimen, month boxes, alerts; "Schedule next follow-up" created the scheduled visit |
+| Immunization scorecard (dashboard plugin) | play 2.42.7.1 | 133 | 10 | district table equal to the server's indicators, drill-down, sort, chart |
+| TB data team: 2 roles, a group, 3 users, sharing | 8081 | 71 | 29 | signed in as the new clerk: sees the program and dashboard, cannot delete or edit metadata |
+
 ### 2.8.42 — The "Reporting Completeness Explorer" thread, and a real-model round on a program never tested before (2026-11-11)
 
 Two sources. First, a user thread on play 2.42.7.1 from the "create and install a custom app" suggestion card: four failed calls, a corrected build that was refused, and an app that ended up computing completeness itself because the assistant decided the server had no reporting rates. Second, a new round with a real model (Fireworks deepseek-v4p1-flash-1017) on localhost:8081, on the Breast Health program (7 stages, 129 data elements, 143 events): a 15-tile dashboard, a four-tab app, an enrollment widget, a form-field decision aid and a dashboard plugin. Every result was opened in real Chrome and compared with numbers computed from the records. Most of what is below made no failed API call and passed every check the tools ran.

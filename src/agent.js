@@ -850,7 +850,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             _scope: 'unknown_tool',
           };
           broadcast({ type: 'AI_TOOL_CALL', tool: toolName || '(unknown)', args });
-          broadcast({ type: 'AI_TOOL_DONE', tool: toolName || '(unknown)', success: false, summary: feedback._error, details: { scope: 'unknown_tool' } });
+          broadcast({ type: 'AI_TOOL_DONE', tool: toolName || '(unknown)', success: false, outcome: 'harness_correcting', summary: feedback._error, details: { scope: 'unknown_tool' } });
           messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
           lastToolName = toolName || null;
           continue;
@@ -879,7 +879,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
               _scope: 'tool_withheld_diagnostic_mode',
             };
             broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args });
-            broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: feedback._error, details: { scope: 'tool_withheld_diagnostic_mode' } });
+            broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, outcome: 'harness_blocked', summary: feedback._error, details: { scope: 'tool_withheld_diagnostic_mode' } });
             messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
             lastToolName = toolName;
             continue;
@@ -941,7 +941,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             _no_disable: true,
           };
           broadcast({ type: 'AI_TOOL_CALL', tool: toolName, args: {} });
-          broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, summary: `${toolName}: tool-call arguments were truncated/corrupted — asked model to resend`, details: { scope: 'incomplete_call' } });
+          broadcast({ type: 'AI_TOOL_DONE', tool: toolName, success: false, outcome: 'harness_correcting', summary: `${toolName}: tool-call arguments were truncated/corrupted — asked model to resend`, details: { scope: 'incomplete_call' } });
           messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(feedback) });
           lastToolName = toolName;
           continue;
@@ -964,7 +964,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             _scope: 'circuit_breaker_tool_disabled',
             _hint: `Do not call ${tc.function.name} again. Write your final answer now from the results already gathered: what was created (names + IDs), what failed and why, and one recommended next step.`,
           };
-          broadcast({ type: 'AI_TOOL_DONE', tool: tc.function.name, success: false, summary: `${tc.function.name} is disabled for this turn — not executed`, details: { scope: 'circuit_breaker_tool_disabled' } });
+          broadcast({ type: 'AI_TOOL_DONE', tool: tc.function.name, success: false, outcome: 'harness_blocked', summary: `${tc.function.name} is disabled for this turn — not executed`, details: { scope: 'circuit_breaker_tool_disabled' } });
           messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult) });
           continue;
         }
@@ -1012,7 +1012,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             if (isLoopBlock) {
               const n = (toolBlockCounts.get(tc.function.name) || 0) + 1;
               toolBlockCounts.set(tc.function.name, n);
-              if (n >= TOOL_BLOCK_DISABLE_THRESHOLD && !disabledToolNames.has(tc.function.name)) {
+              // dhis2_query is blocked one endpoint at a time, and the rest of the
+              // task usually still needs it: it goes only after twice as many blocks.
+              const disableAt = tc.function.name === 'dhis2_query' ? TOOL_BLOCK_DISABLE_THRESHOLD * 2 : TOOL_BLOCK_DISABLE_THRESHOLD;
+              if (n >= disableAt && !disabledToolNames.has(tc.function.name)) {
                 disabledToolNames.add(tc.function.name);
                 console.warn(`[AgenticLoop] Circuit breaker: disabling ${tc.function.name} for this turn after ${n} blocked attempts`);
                 toolResult = {
@@ -1127,7 +1130,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
         if (toolResult._tool_manual) {
           summary = 'Loaded usage manual — validating the call against it';
         } else if (toolResult._tool_disabled_this_turn) {
-          summary = `Stopped retrying ${toolResult._tool_disabled_this_turn} — it failed repeatedly with the same error and is disabled for the rest of this turn`;
+          summary = `Stopped retrying ${toolResult._tool_disabled_this_turn}: the same blocked call kept coming back, so it is switched off for the rest of this turn`;
         } else if (toolResult._error) {
           // Show the full error sentence in the inline summary (was 80 chars,
           // which truncated mid-message). The expandable details panel below
@@ -1281,6 +1284,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           type: 'AI_TOOL_DONE',
           tool: tc.function.name,
           success: isToolSuccess,
+          outcome: toolOutcomeKind(toolResult),
           summary,
           apiPath,
           details,
@@ -1746,6 +1750,44 @@ function injectedScreenshotSelection() {
 }
 
 // ── Broadcasting ─────────────────────────────────────────────────────────────
+
+// Who stopped a tool call that did not succeed. "failed" = DHIS2 (or the network)
+// refused it: a real error. "harness_blocked" = the extension itself did not let
+// it run (a loop guard, a write gate, a path that does not exist, a placeholder).
+// "harness_correcting" = the extension checked the call and sent it back to be
+// fixed (lint problems, a cut-off call, wrong arguments). The panel shows the two
+// harness kinds in orange under their own label, so that the assistant being kept
+// on track does not read as something breaking.
+const HARNESS_CORRECTING_SCOPES = new Set([
+  'incomplete_call', 'incomplete_call_repeat', 'unknown_tool', 'unresolved_data_item', 'tracker_data_element_not_aggregatable',
+  'unknown_uid_in_args', 'saved_object_as_data_item', 'stage_as_dimension', 'analytics_uid_case_slip', 'analytics_joined_dimension',
+  'event_analytics_multi_stage', 'reporting_rate_needs_data_set', 'complete_registrations_incomplete', 'known_endpoint_guidance',
+  'line_list_cannot_aggregate', 'line_list_no_record_id', 'analytics_no_record_id', 'icon_not_verified', 'requires_matching_tool',
+]);
+// Scopes that travel with an answer DHIS2 itself gave.
+const SERVER_FAILURE_SCOPES = new Set(['no_such_endpoint', 'unique_attribute_violation']);
+// The server, the network or the provider said no.
+const SERVER_FAILURE_TEXT_RE = /\bDHIS2 API \d{3}\b|\bHTTP \d{3}\b|\b(?:status|answered|returned)\s+(?:code\s+)?[45]\d\d\b|fetch failed|failed to fetch|network error|timed? ?out|^tool failed:|upload failed|import (?:failed|was rejected)|\bFAILED after\b/i;
+// A call sent back for its arguments: nothing was asked of the server.
+const ARGUMENT_PROBLEM_TEXT_RE = /\b(?:is|are) required\b|\brequired for\b|^missing\b|\bmust (?:be|list|have|name|occur)\b|^(?:pass|provide|supply)\b|^unsupported\b|^invalid\b|^unknown\b|\bneeds? (?:an?|the|one|at least)\b|does not compile/i;
+function toolOutcomeKind(result, scope) {
+  const r = result && typeof result === 'object' ? result : {};
+  if (!r._error && r.success !== false) return 'ok';
+  const sc = String(scope || r._scope || '');
+  // DHIS2 answered with an error, or the request got no answer: a real failure.
+  if (Number(r._status) >= 400 || r._url || r._httpStatus || SERVER_FAILURE_SCOPES.has(sc)) return 'failed';
+  // A refusal of the extension's own. Read before the text: a loop guard quotes
+  // the server error it is refusing to repeat.
+  if (sc) return HARNESS_CORRECTING_SCOPES.has(sc) ? 'harness_correcting' : 'harness_blocked';
+  const text = String(r._error || (Array.isArray(r.errors) && r.errors[0]) || r.message || '');
+  if (Array.isArray(r.problems) || Array.isArray(r.violations) || Array.isArray(r.compile_errors) || r._no_disable === true) return 'harness_correcting';
+  if (SERVER_FAILURE_TEXT_RE.test(text)) return 'failed';
+  if (Array.isArray(r.errors) && r.errors.length) return 'failed'; // an import report
+  if (/^(?:not sent|not changed|not started|not placed|blocked|refused|stop\b)/i.test(text) || r._refused || r._redirect) return 'harness_blocked';
+  if (ARGUMENT_PROBLEM_TEXT_RE.test(text)) return 'harness_correcting';
+  if (r._hint) return 'harness_blocked';
+  return 'failed';
+}
 
 function broadcast(data) {
   chrome.runtime.sendMessage(data).catch(() => {});
