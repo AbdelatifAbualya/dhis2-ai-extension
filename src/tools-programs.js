@@ -1920,7 +1920,13 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
   const objectRenames = []; // [{type, requested, final, existing_id, reason}]
   const renameForCoexistence = (obj, type, ex, reason) => {
     const finalName = `${obj.name} (${osSuffix})`.substring(0, 230);
-    objectRenames.push({ type, requested: obj.name, final: finalName, existing_id: ex.id, reason });
+    // The name must be unique; the label on the form need not be. Forms keep the
+    // name the user asked for (Facility Supervision thread, 2026-11-13: "Visit
+    // type" became "Visit type (ai-test Facility Supervision)" on the form, and
+    // the model then spent two writes renaming it).
+    const label = (type === 'dataElement' || type === 'trackedEntityAttribute') && !obj.formName ? String(obj.name).slice(0, 230) : null;
+    objectRenames.push({ type, requested: obj.name, final: finalName, existing_id: ex.id, reason, ...(label ? { shown_on_forms_as: label } : {}) });
+    if (label) obj.formName = label;
     obj.name = finalName;
     obj._renamed = true;
   };
@@ -2694,7 +2700,7 @@ async function createFullProgram(args, defaultCatComboId, contextOrgUnitId) {
     programIndicators: indicatorResults,
     orgUnits: orgUnitIds,
     ...(optionSetRenames.length ? { option_set_renames: optionSetRenames } : {}),
-    ...(objectRenames.length ? { reuse_conflict_renames: objectRenames } : {}),
+    ...(objectRenames.length ? { reuse_conflict_renames: objectRenames, _renames_note: 'A name must be unique on the server, so these got a suffix. Their label on data-entry forms is still the requested one (shown_on_forms_as): do not rename them again, and tell the user the stored name only where it matters (analytics, maintenance).' } : {}),
     ...(ruleAutoGuards.length ? { auto_guarded_conditions: ruleAutoGuards } : {}),
     ...(ruleConditionRewrites.length ? { condition_option_rewrites: ruleConditionRewrites } : {}),
     ...(ruleConditionAdvisories.length ? { condition_option_advisories: ruleConditionAdvisories } : {}),
@@ -3103,7 +3109,9 @@ async function addStageToProgram(args, defaultCatComboId) {
     const stageSuffix = (progResp.shortName || progResp.name || '').trim();
     const renameDe = (de, ex, reason) => {
       const finalName = `${de.name} (${stageSuffix})`.substring(0, 230);
-      deRenames.push({ type: 'dataElement', requested: de.name, final: finalName, existing_id: ex.id, reason });
+      const label = !de.formName ? String(de.name).slice(0, 230) : null;
+      deRenames.push({ type: 'dataElement', requested: de.name, final: finalName, existing_id: ex.id, reason, ...(label ? { shown_on_forms_as: label } : {}) });
+      if (label) de.formName = label;
       de.name = finalName;
       de._renamed = true;
     };
@@ -3222,7 +3230,7 @@ async function addStageToProgram(args, defaultCatComboId) {
       program_id: args.program_id,
       dataElements: Object.entries(deUidMap).map(([name, id]) => ({ name, id })),
       reused_existing_data_elements: reusedDataElements,
-      ...(deRenames.length ? { reuse_conflict_renames: deRenames } : {}),
+      ...(deRenames.length ? { reuse_conflict_renames: deRenames, _renames_note: 'A name must be unique on the server, so these got a suffix. Their label on data-entry forms is still the requested one (shown_on_forms_as): do not rename them again, and tell the user the stored name only where it matters (analytics, maintenance).' } : {}),
       ...(optionSetRenames.length ? { option_set_renames: optionSetRenames } : {}),
       optionSets: Object.entries(optionSetUidMap).map(([name, id]) => ({ name, id })),
       sections: psSections.map(s => ({ name: s.name, id: s.id })),
@@ -4141,6 +4149,7 @@ async function executeManageMetadata(args) {
       user_group_accesses: (verified.userGroupAccesses || obj.userGroupAccesses || []).length,
       user_accesses: (verified.userAccesses || obj.userAccesses || []).length,
       ...(sharingNote ? { _data_sharing_not_applicable: sharingNote } : {}),
+      ...sharingPublicStillOpenNote(args, actualPublic, verified.userGroupAccesses || obj.userGroupAccesses, verified.userAccesses || obj.userAccesses),
       ...(stageIds.length ? {
         stages_cascaded: stageResults,
         _cascade_note: `Sharing a program implies sharing its stages: the same access was applied to ${stageResults.filter(r => r.updated).length}/${stageIds.length} program stage(s). Stage DATA access is what allows event capture, so this is required for the program to be usable — not an extra.`,
@@ -7539,8 +7548,16 @@ function sharingOfferAgreed() {
   // ends, so during a turn the last assistant text is the previous answer; if
   // this turn's message is already there, look before it.
   let end = history.length;
+  // "Already there" means the last user message with no answer after it. The same
+  // words as an EARLIER, answered turn are not this turn: two "Yes, go ahead."
+  // in a row made this read the answer before the previous one, which offered
+  // no sharing, and the agreed share was refused (Malaria report thread, 2026-11-13).
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i] && history[i].role === 'user') { if (text(history[i]).trim() === said.trim()) end = i; break; }
+    if (history[i] && history[i].role === 'user') {
+      const answered = history.slice(i + 1).some((m) => m && m.role === 'assistant' && text(m).trim());
+      if (!answered && text(history[i]).trim() === said.trim()) end = i;
+      break;
+    }
   }
   const lastAssistant = history.slice(0, end).reverse().find((m) => m && m.role === 'assistant' && text(m).trim());
   return !!lastAssistant && SHARING_OFFER_RE.test(text(lastAssistant));
@@ -7553,6 +7570,23 @@ function sharingIsViewOnly(args) {
   }
   return true;
 }
+// A group or user was given access to an object every signed-in user already
+// reaches through its PUBLIC access: the grant restricts nothing, and "only
+// this team can capture" would be false. TB data team thread (2026-11-13): the
+// program stayed public rwrw----, a new clerk "who can only enter TB data"
+// could capture in all 22 programs, and the answer did not say so.
+function sharingPublicStillOpenNote(args, publicAccess, groupAccesses, userAccesses) {
+  const grants = [...(Array.isArray(groupAccesses) ? groupAccesses : []), ...(Array.isArray(userAccesses) ? userAccesses : [])];
+  if (!grants.length || !(Array.isArray(args.user_group_accesses) || Array.isArray(args.user_accesses))) return {};
+  const pub = String(publicAccess || '--------').padEnd(8, '-');
+  const open = [pub[0] === 'r' ? 'see it' : null, pub[1] === 'w' ? 'edit it' : null, pub[2] === 'r' ? 'view its data' : null, pub[3] === 'w' ? 'enter data in it' : null].filter(Boolean);
+  if (!open.length) return {};
+  const widest = grants.every((g) => { const a = String(g.access || '').padEnd(8, '-'); return [0, 1, 2, 3].every((i) => a[i] === '-' || pub[i] === a[i]); });
+  return {
+    _public_access_still_open: `Public access is "${pub}": EVERY signed-in user can ${open.join(', ')}${widest ? ', so this grant gives the group or user nothing they did not already have' : ''}. If the request was for ONLY these people to have access, say this to the user and ask whether to close public access (public_access "--------", or "r-------" to keep it visible); do not change it unasked, since other users may depend on it.`,
+  };
+}
+
 function sharingWasRequested(args) {
   const asked = typeof buildRoutingText === 'function' ? buildRoutingText(lastUserText) : String(lastUserText || '');
   if (SHARING_REQUEST_RE.test(asked)) return true;

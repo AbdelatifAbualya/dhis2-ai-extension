@@ -486,7 +486,7 @@
         showToolCall(msg.tool, msg.args);
         break;
       case 'AI_TOOL_DONE':
-        markToolDone(msg.tool, msg.success, msg.summary, msg.apiPath, msg.details);
+        markToolDone(msg.tool, msg.success, msg.summary, msg.apiPath, msg.details, msg.outcome);
         break;
       case 'AI_CHART':
         renderChart(msg.spec);
@@ -2210,6 +2210,7 @@ ${turnXml}
     if (!group) return;
     const cards = [...group.querySelectorAll('.tool-card')];
     const failed = cards.filter(c => c.querySelector('.tool-fail')).length;
+    const guided = cards.filter(c => c.querySelector('.tool-harness')).length;
     const running = cards.filter(c => !c.classList.contains('tool-done'));
     const label = group.querySelector('.tool-group-label');
     const count = group.querySelector('.tool-group-count');
@@ -2217,10 +2218,11 @@ ${turnXml}
     if (running.length && !group.classList.contains('tool-group-done')) {
       label.textContent = `Working: ${running[running.length - 1].dataset.label || 'running a step'}`;
     } else {
-      label.textContent = failed ? `${steps}, ${failed} failed` : `Done in ${steps}`;
+      label.textContent = failed ? `${steps}, ${failed} failed` : guided ? `Done in ${steps}, ${guided} corrected by the harness` : `Done in ${steps}`;
     }
-    count.textContent = failed ? `${failed} failed` : steps;
+    count.textContent = failed ? `${failed} failed` : guided ? `${guided} by harness` : steps;
     count.classList.toggle('has-fail', failed > 0);
+    count.classList.toggle('has-harness', !failed && guided > 0);
   }
 
   function closeToolGroups() {
@@ -2231,7 +2233,11 @@ ${turnXml}
     });
   }
 
-  function markToolDone(tool, success, summary, apiPath, details) {
+  // outcome: 'failed' (DHIS2 or the network refused the call) or, when the
+  // extension itself stepped in, 'harness_blocked' / 'harness_correcting'. Those
+  // two are not failures: they get their own label and orange, never red.
+  function markToolDone(tool, success, summary, apiPath, details, outcome) {
+    const harness = !success && (outcome === 'harness_blocked' || outcome === 'harness_correcting');
     const cards = messagesDiv.querySelectorAll('.tool-card:not(.tool-done)');
     const card = cards[cards.length - 1];
     if (!card) return;
@@ -2244,10 +2250,11 @@ ${turnXml}
     if (spinner) {
       spinner.classList.add('hidden');
       const check = document.createElement('div');
-      check.className = success ? 'tool-check' : 'tool-fail';
-      check.textContent = success ? '\u2713' : '\u2717';
+      check.className = success ? 'tool-check' : harness ? 'tool-harness' : 'tool-fail';
+      check.textContent = success ? '\u2713' : harness ? '!' : '\u2717';
       spinner.parentNode.insertBefore(check, spinner);
     }
+    if (harness) card.classList.add('tool-card-harness');
     if (summary) {
       const detail = card.querySelector('.tool-detail');
       if (detail) detail.textContent += ` | ${summary}`;
@@ -2263,10 +2270,11 @@ ${turnXml}
     refreshToolGroup(card.closest('.tool-group'));
     const state = card.querySelector('.tool-state');
     if (state) {
-      const statusText = success ? 'Done' : 'Failed';
+      const statusText = success ? 'Done' : outcome === 'harness_correcting' ? 'Harness correcting' : harness ? 'Harness blocked' : 'Failed';
       const timeText = elapsedMs != null ? ` (${(elapsedMs / 1000).toFixed(1)}s)` : '';
       state.textContent = statusText + timeText;
-      state.classList.toggle('tool-state-fail', !success);
+      state.classList.toggle('tool-state-fail', !success && !harness);
+      state.classList.toggle('tool-state-harness', harness);
     }
 
     // \u2500\u2500 Failure-detail panel \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -2276,9 +2284,9 @@ ${turnXml}
     // background.js produced is shown verbatim. Keeps successful runs compact.
     if (!success && details && typeof details === 'object') {
       const block = document.createElement('details');
-      block.className = 'tool-failure-details';
+      block.className = harness ? 'tool-failure-details tool-harness-details' : 'tool-failure-details';
       const fields = [];
-      if (details.error)        fields.push(['Error', String(details.error)]);
+      if (details.error)        fields.push([harness ? 'Reason' : 'Error', String(details.error)]);
       if (details.scope)        fields.push(['Scope', String(details.scope)]);
       if (details.hint)         fields.push(['Hint', String(details.hint)]);
       if (details.originServer) fields.push(['Server', String(details.originServer)]);
@@ -2298,7 +2306,7 @@ ${turnXml}
       if (!fields.length) return;
 
       const summaryEl = document.createElement('summary');
-      summaryEl.textContent = 'Why it failed (full detail)';
+      summaryEl.textContent = harness ? 'Why the harness stepped in (full detail)' : 'Why it failed (full detail)';
       block.appendChild(summaryEl);
 
       for (const [label, value] of fields) {

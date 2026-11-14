@@ -111,7 +111,7 @@ function dataCheckAnalyticsState(programId) {
 }
 
 // ── Reading what a saved object asks for ─────────────────────────────────────
-const DATA_CHECK_DX_FIELDS = 'dataDimensionItemType,programIndicator[id,displayName,expression,filter,aggregationType,program[id]],indicator[id,displayName],dataElement[id,displayName]';
+const DATA_CHECK_DX_FIELDS = 'dataDimensionItemType,programIndicator[id,displayName,expression,filter,aggregationType,program[id]],indicator[id,displayName],dataElement[id,displayName],reportingRate[id,dimensionItem,displayName],dataElementOperand[id,dimensionItem,displayName]';
 const DATA_CHECK_SAVED_FIELDS = `periods[id],relativePeriods,organisationUnits[id],organisationUnitLevels,userOrganisationUnit,userOrganisationUnitChildren,userOrganisationUnitGrandChildren,dataDimensionItems[${DATA_CHECK_DX_FIELDS}]`;
 
 function dataCheckOuDimension(saved) {
@@ -148,8 +148,10 @@ const dataCheckIsCount = (pi) => /^\s*V\{(?:event|enrollment|tei)_count\}\s*$/.t
 
 function dataCheckItems(dims) {
   return (dims || []).map((d) => {
-    const o = d.programIndicator || d.indicator || d.dataElement;
-    return o?.id ? { id: o.id, name: o.displayName || o.id, indicator: d.programIndicator || null } : null;
+    // A reporting rate's id is its data set's: the item analytics takes is dimensionItem.
+    const o = d.programIndicator || d.indicator || d.dataElement || d.reportingRate || d.dataElementOperand;
+    const id = o && (o.dimensionItem || o.id);
+    return id ? { id, name: o.displayName || id, indicator: d.programIndicator || null } : null;
   }).filter(Boolean);
 }
 

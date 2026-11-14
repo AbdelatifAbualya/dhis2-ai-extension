@@ -3836,11 +3836,12 @@ async function runDashboardMapsTurnChecks() {
     try {
       const e409 = { _error: 'DHIS2 API 409: Dimension is present in query without any valid dimension options: `dx`', _status: 409 };
       for (let i = 0; i < 3; i++) ctx.noteHttpErrorFromResult('dhis2_query', e409, { method: 'GET', path: 'analytics?x=' + i });
-      const read = ctx.httpErrorStopOrNull('dhis2_query', { method: 'GET', path: 'programIndicators/XJruzyOnBWS' });
+      const read = ctx.httpErrorStopOrNull('dhis2_query', { method: 'GET', path: 'analytics?x=9' });
+      const otherEndpoint = ctx.httpErrorStopOrNull('dhis2_query', { method: 'GET', path: 'programIndicators/XJruzyOnBWS' });
       const write = ctx.httpErrorStopOrNull('manage_dashboards', { action: 'add_items', dashboard_id: 'xEtKQVG44h0' });
       const getDash = ctx.httpErrorStopOrNull('manage_dashboards', { action: 'get', dashboard_id: 'xEtKQVG44h0' });
-      truthy('3 failed dhis2_query GETs block more dhis2_query GETs (saying every other tool still works) but not manage_dashboards add_items / get',
-        read && read._scope === 'http_error_limit_reached' && /every other tool still works/.test(read._hint) && write === null && getDash === null);
+      truthy('3 failed dhis2_query GETs on analytics block more analytics GETs (saying every other tool still works) but not another endpoint, nor manage_dashboards add_items / get',
+        read && read._scope === 'http_error_limit_reached' && /every other tool still works/.test(read._hint) && otherEndpoint === null && write === null && getDash === null);
       for (let i = 0; i < 3; i++) ctx.noteHttpErrorFromResult('manage_maps', e409, { action: 'create' });
       const all = ctx.httpErrorStopOrNull('manage_dashboards', { action: 'add_items' });
       truthy('6 errors in a row (any mix) still block every tool', all && all._blocked_lanes === 'all' && /Every tool is blocked/.test(all._hint));
@@ -4663,6 +4664,286 @@ async function runAncAppThreadChecks() {
   truthy('the app manual gives the parameter table, the timeline recipe and the install check', /enrollments \(PLURAL\)/.test(allDocs) && /ONE REGISTRATION'S WHOLE TIMELINE/.test(allDocs) && /D2_SELF_TEST/.test(allDocs) && /Install check/.test(allDocs));
 }
 
+// ── Real-model round of 2026-11-13: Data Quality Workbench app, Facility
+//    Supervision event program, Monthly Malaria Report data set, TB tracker widget ──
+async function runDataQualityThreadChecks() {
+  console.log('\nData quality / supervision / malaria-report threads (endpoint-scoped stops, data-quality endpoints, reporting rates and categories on charts, tiles per row, harness outcomes):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const d = vm.runInContext('dhis2', ctx);
+  const saved = { sdf: ctx.safeDhis2Fetch, wa: d.writeAuth, n: d.httpErrorCount, h: d.httpErrorHistory, f: d.failedCallSigs, fam: d.toolErrorFamilies, base: d.baseUrl, connected: d.connected };
+  Object.assign(d, { baseUrl: d.baseUrl || 'https://verify.example/dhis', connected: true });
+  try {
+    // 1. One wrong endpoint does not close the others.
+    const tgt = ctx.dhis2QueryTarget;
+    truthy('a dhis2_query call is identified by its method and endpoint: ids, queries, the /api/<v>/ prefix and a full URL do not change it',
+      tgt({ path: 'validation?vrg=a&ou=b' }) === 'GET validation' && tgt({ path: '/api/42/dataElements/fbfJHSPpUQD?fields=id' }) === 'GET dataelements'
+      && tgt({ path: 'https://play.example/stable/api/analytics/events/query/IpHINAT79UW?stage=x' }) === 'GET analytics/events' && tgt({ method: 'post', path: 'dataAnalysis/validationRules' }) === 'POST dataanalysis/validationrules'
+      && tgt({ path: 'analytics?dimension=dx:a' }) === 'GET analytics' && tgt({ path: 'tracker/events?program=x' }) === 'GET tracker/events');
+    d.failedCallSigs = new Map(); d.toolErrorFamilies = new Map(); d.httpErrorCount = 0; d.httpErrorHistory = [];
+    const e404 = { _error: 'DHIS2 API 404', _status: 404 };
+    ['validation?vrg=a', 'validation/analysis?vrg=a', 'validation', 'validation?x=1'].forEach((path) => ctx.noteToolFailure('dhis2_query', { path }, e404));
+    const again = ctx.repeatedFailureStopOrNull('dhis2_query', { path: 'validation?y=2' });
+    const other = ctx.repeatedFailureStopOrNull('dhis2_query', { path: 'analytics?dimension=dx:fbfJHSPpUQD&dimension=pe:LAST_12_MONTHS' });
+    truthy('four 404s on guessed validation paths stop more validation calls, naming the endpoint and saying the others still work; a correct analytics query is not refused',
+      again && again._scope === 'same_error_family_limit' && /GET validation/.test(again._error) && /every other endpoint/.test(again._hint) && other === null);
+    ['a', 'b', 'c', 'd'].forEach((n) => ctx.noteToolFailure('manage_maps', { action: 'create', name: n }, { _error: 'DHIS2 API 409: no' }));
+    const maps = ctx.repeatedFailureStopOrNull('manage_maps', { action: 'create', name: 'e' });
+    truthy('…a tool with actions is stopped as before', maps && /Do NOT call manage_maps again/.test(maps._hint));
+
+    // 2. Data-quality endpoints: the guess is answered, the real ones go out.
+    const calls = [];
+    ctx.safeDhis2Fetch = async (p, o = {}) => { calls.push(`${(o && o.method) || 'GET'} ${p}`); return /^nonsense/.test(p) ? { _error: 'DHIS2 API 404', _status: 404, _url: 'x' } : /^dataElements\/abcdefghij1/.test(p) ? { _error: 'DHIS2 API 404: DataElement with id abcdefghij1 could not be found.', _status: 404, _body: { message: 'x' } } : /^identifiableObjects/.test(p) ? { _error: 'DHIS2 API 404', _status: 404 } : []; };
+    d.writeAuth = { scope: 'read_only', reason: 'verify' };
+    const g1 = await ctx.executeTool('dhis2_query', { path: 'validation', query_params: { vrg: 'UiOSY1iIdub', ou: 'ImspTQPwCqd', pe: '2024' } });
+    const g2 = await ctx.executeTool('dhis2_query', { path: 'validation/analysis', method: 'POST', body: {} });
+    truthy('GET validation and POST validation/analysis are answered with the endpoints that exist, on a read-only turn too, and nothing is sent',
+      g1._scope === 'known_endpoint_guidance' && /POST dataAnalysis\/validationRules/.test(g1._hint) && /outlierDetection/.test(g1._hint)
+      && g2._scope === 'known_endpoint_guidance' && calls.length === 0);
+    const re = vm.runInContext('GUESSED_DATA_QUALITY_PATH_RE', ctx);
+    truthy('…the real endpoints are not taken for guesses',
+      ['validation/dataSet/BfMAe6Itzgt', 'outlierDetection', 'analytics/outlierDetection', 'dataAnalysis/validationRules', 'validationRules', 'validationResults', 'validationRuleGroups'].every((x) => !re.test(x))
+      && ['validation', 'validation/analysis', 'dataQuality', 'outliers', 'analytics/outliers', 'dataAnalysis'].every((x) => re.test(x)));
+    const run = await ctx.executeTool('dhis2_query', { path: 'dataAnalysis/validationRules', method: 'POST', body: { ou: 'ImspTQPwCqd', startDate: '2025-01-01', endDate: '2025-01-31', notification: false, persist: false } });
+    const persist = await ctx.executeTool('dhis2_query', { path: 'dataAnalysis/validationRules', method: 'POST', body: { ou: 'ImspTQPwCqd', startDate: '2025-01-01', endDate: '2025-01-31', persist: true } });
+    truthy('a validation analysis that saves nothing runs on a read-only turn (DHIS2 has no GET for it); with persist:true it is a write and is refused',
+      Array.isArray(run) && calls.some((c) => /^POST dataAnalysis\/validationRules/.test(c)) && persist && /write|authoriz|read-only|not authorized|confirm/i.test(JSON.stringify(persist)) && calls.filter((c) => /^POST dataAnalysis/.test(c)).length === 1);
+    const none = await ctx.executeTool('dhis2_query', { path: 'nonsenseEndpoint' });
+    const missing = await ctx.executeTool('dhis2_query', { path: 'dataElements/abcdefghij1' });
+    truthy('a 404 with no JSON body is told as "no such endpoint, do not try other spellings"; a missing object keeps DHIS2\'s own message',
+      none._scope === 'no_such_endpoint' && /no GET endpoint at "nonsenseEndpoint"/.test(none._error) && /other spellings/.test(none._hint) && missing._scope !== 'no_such_endpoint' && /could not be found/.test(missing._error));
+    truthy('the dhis2_query description and the app manual carry the data-quality endpoints',
+      /dataAnalysis\/validationRules/.test(JSON.stringify(vm.runInContext('TOOLS.find(t => t.function.name === "dhis2_query").function.description', ctx))) && /dataAnalysis\/validationRules/.test(vm.runInContext('KB_CUSTOM_APPS_DETAILS', ctx)));
+
+    // 3. The app preview asks the server for each endpoint the code names in full.
+    const compiled = { 'app.jsx': [
+      "const A = { a: { resource: 'validation', params: { ou: 'x' } } };",
+      "const B = { b: { resource: 'analytics/events/aggregate/' + PROGRAM, params: {} } };",
+      "const C = { c: { resource: `tracker/enrollments/${id}/note`, type: 'create' } };",
+      "const D = { d: { resource: 'dataStore/' + NS + '/k' }, e: { resource: 'dataElements', id: X }, f: { resource: 'dataAnalysis/validationRules', type: 'create', data: {} } };",
+    ].join('\n') };
+    truthy('only resources written out in full are checked: not a path built with + or a template, nor the dataStore, tracker or an endpoint known to exist',
+      JSON.stringify(ctx.customAppStaticResources(compiled).sort()) === JSON.stringify(['dataElements', 'validation']));
+    ctx.safeDhis2Fetch = async (p) => (/^validation\?/.test(p) ? { _error: 'DHIS2 API 404', _status: 404 } : /^lockExceptions/.test(p) ? { _error: 'DHIS2 API 405: Request method GET is not supported', _status: 405, _body: {} } : { dataElements: [] });
+    compiled['app.jsx'] += "\nconst E = { g: { resource: 'lockExceptions', type: 'create', data: {} } };";
+    compiled['app.jsx'] += "\nconst F = { h: { resource: 'analytics/outliers', params: {} }, i: { resource: 'nonsenseThing', params: {} } };";
+    const asked = [];
+    const sdf0 = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => { asked.push(p.split('?')[0]); return /^nonsenseThing/.test(p) ? { _error: 'DHIS2 API 404', _status: 404 } : sdf0(p); };
+    truthy('a path the server answers with a bare 404 is reported, and a known guess without asking; 405 and 200 mean the endpoint exists',
+      JSON.stringify(await ctx.checkCustomAppEndpoints(compiled)) === '["analytics/outliers","nonsenseThing","validation"]' && !asked.includes('validation') && !asked.includes('analytics/outliers') && asked.includes('lockExceptions'));
+
+    // 4. Events of one enrollment narrowed by org unit.
+    const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+    const lintErr = (src) => ctx.lintCustomAppCode({ 'plugin.jsx': ctx.compileCustomAppFile('plugin.jsx', src).code }, 'plugin', kitMeta, 'CAPTURE').errors.map((e) => e.message).join(' | ');
+    const q = (params) => `const { useDataQuery } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events', params: ({ enrollment, orgUnit }) => ({ ${params} fields: 'event,occurredAt', paging: false }) } };\nfunction A(props) { const r = useDataQuery(Q, { variables: props }); return null; }`;
+    truthy('tracker/events pinned to an enrollment AND an org unit is an error that says to drop the org unit (with or without orgUnitMode), and asks for no orgUnitMode',
+      /already pinned to one enrollment/.test(lintErr(q("enrollments: enrollment, orgUnit: orgUnit, orgUnitMode: 'DESCENDANTS',"))) && /already pinned to one enrollment/.test(lintErr(q('enrollments: enrollment, orgUnit: orgUnit,')))
+      && !/no orgUnitMode return only/.test(lintErr(q('enrollments: enrollment, orgUnit: orgUnit,'))));
+    truthy('…the enrollment alone passes, and an org unit with no enrollment still needs its orgUnitMode',
+      !/pinned|orgUnitMode/.test(lintErr(q('enrollments: enrollment,'))) && /no orgUnitMode return only/.test(lintErr(q('orgUnit: orgUnit,'))) && /needs no org unit at all/.test(lintErr(q('orgUnit: orgUnit,'))));
+
+    const writeOnly = `const { useDataEngine, useDataQuery } = D2Runtime;\nconst Q = { ev: { resource: 'tracker/events', params: ({ enrollment }) => ({ enrollments: enrollment, fields: 'event,occurredAt', paging: false }) } };\nfunction A(props) { const engine = useDataEngine(); const r = useDataQuery(Q, { variables: props });\n  const save = () => engine.mutate({ resource: 'tracker', type: 'create', params: { async: 'false' }, data: { events: [{ program: 'fofUFvr9eUY', orgUnit: props.orgUnitId, status: 'SCHEDULE' }] } });\n  return null; }`;
+    truthy('the org unit of an event being written is not a read filter: no orgUnitMode is asked for', !/orgUnitMode/.test(lintErr(writeOnly)));
+    const appLint = (src) => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src + "\nReactDOMClient.createRoot(document.getElementById('root')).render(<A />);").code }, 'app', kitMeta).errors.map((e) => e.message).join(' | ');
+    const eng = (call) => `const { useDataEngine, Provider } = D2Runtime;\nfunction A() { const engine = useDataEngine(); const run = () => ${call}; return <button onClick={run}>Run</button>; }`;
+    truthy('engine.fetch({ resource… }) and other calls the data engine does not have are an error at preview; query and mutate pass',
+      /engine\.fetch\(…\) is not part of the data engine/.test(appLint(eng("engine.fetch({ resource: 'outlierDetection', params: { ds: 'x' } }).then((r) => r)")))
+      && /engine\.get\(…\) is not part of the data engine/.test(appLint(eng("engine.get('analytics')")))
+      && !/not part of the data engine/.test(appLint(eng("engine.query({ o: { resource: 'outlierDetection', params: { ds: 'x' } } }).then((r) => r.o)")))
+      && !/not part of the data engine/.test(appLint(eng("engine.mutate({ resource: 'dataAnalysis/validationRules', type: 'create', data: {} })"))));
+
+    const scanOf = (src) => ctx.scanCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }).filter((v) => v.rule.startsWith('write:')).length;
+    const va = (data, res = "'dataAnalysis/validationRules'") => `const { useDataEngine } = D2Runtime;\nfunction A() { const engine = useDataEngine(); const run = (ou) => engine.mutate({ resource: ${res}, type: 'create', data: ${data} }); return null; }`;
+    truthy('a read-only app may run a validation analysis (engine.mutate on dataAnalysis/validationRules, persist and notification false or absent); with persist:true, a shorthand persist, another resource or a second mutation it is still a write',
+      scanOf(va('{ ou, startDate: a, endDate: b, notification: false, persist: false }')) === 0 && scanOf(va('{ ou, startDate: a, endDate: b }')) === 0
+      && scanOf(va('{ ou, persist: true }')) > 0 && scanOf(va('{ ou, persist }')) > 0 && scanOf(va('{ ou, notification: flag }')) > 0
+      && scanOf(va('{ ou }', "'dataValueSets'")) > 0 && scanOf(va('{ ou }', 'RES')) > 0
+      && scanOf(va('{ ou, persist: false }') + "\nfunction B() { const e2 = D2Runtime.useDataEngine(); return e2.mutate({ resource: 'dataStore/x/y', type: 'update', data: {} }); }") > 0);
+
+    // 5. Headline tiles per row.
+    const kpi = (n) => ({ itemType: 'VISUALIZATION', vizType: 'SINGLE_VALUE', name: `Number ${n}` });
+    const six = [1, 2, 3, 4, 5, 6].map(kpi);
+    const def = ctx.layoutDashboardItems(six.map(() => ({})), six, 0, {});
+    const one = ctx.layoutDashboardItems(six.map(() => ({})), six, 0, {}, { kpisPerRow: 6 });
+    const nine = ctx.layoutDashboardItems(six.map(() => ({})), six, 0, {}, { kpisPerRow: 9 });
+    truthy('six single values: two rows of three by default, one row of six 10-column tiles with kpis_per_row 6 (never more than 6)',
+      def.shapes.filter((s) => s.y === 0).length === 3 && def.shapes[0].width === 20 && one.shapes.every((s) => s.y === 0 && s.width === 10) && one.rows.length === 1 && nine.shapes.every((s) => s.width === 10));
+    truthy('a saved dashboard with six small tiles in a row keeps six when it is re-flowed; four in a row is the default and is not pinned',
+      ctx.savedKpisPerRow(one.shapes) === 6 && ctx.savedKpisPerRow(ctx.layoutDashboardItems(six.slice(0, 4).map(() => ({})), six.slice(0, 4), 0, {}).shapes) === null);
+
+    // 6. Reporting rates, one disaggregation, and a category as a dimension.
+    ctx.safeDhis2Fetch = async (p) => {
+      if (/^dataSets\?filter=id:in:\[BfMAe6Itzgt/.test(p)) return { dataSets: [{ id: 'BfMAe6Itzgt' }] };
+      if (/^dataElements\?filter=id:in:\[fbfJHSPpUQD\]&filter=domainType/.test(p)) return { dataElements: [{ id: 'fbfJHSPpUQD' }] };
+      if (/^categoryOptionCombos\?/.test(p)) return { categoryOptionCombos: [{ id: 'pq2XI5kz2BY' }] };
+      if (/^dataElements\.json/.test(p)) return { dataElements: [{ id: 'fbfJHSPpUQD', domainType: 'AGGREGATE' }] };
+      if (/^indicators\.json/.test(p)) return { indicators: /Uvn6LCg7dVU/.test(p) ? [{ id: 'Uvn6LCg7dVU' }] : [] };
+      if (/^categories\/fMZEcRHuamy/.test(p)) return { id: 'fMZEcRHuamy', displayName: 'Location Fixed/Outreach', dataDimension: true, categoryOptions: [{ id: 'qkPbeWaFsnU' }, { id: 'wbrDrL2aYEc' }] };
+      if (/^categories\?filter=displayName:ilike:Age/.test(p)) return { categories: [{ id: 'cX5k9anHEHd', displayName: 'Age', dataDimension: true, categoryOptions: [{ id: 'aaaaaaaaaa1' }, { id: 'aaaaaaaaaa2' }] }] };
+      if (/^categories\?filter=displayName:ilike:/.test(p)) return { categories: [] };
+      return {};
+    };
+    const items = ['BfMAe6Itzgt.REPORTING_RATE', 'BfMAe6Itzgt.ACTUAL_REPORTS_ON_TIME', 'fbfJHSPpUQD.pq2XI5kz2BY', 'fbfJHSPpUQD', 'zzzzzzzzzzz.REPORTING_RATE', 'fbfJHSPpUQD.zzzzzzzzzzz'];
+    const res = await ctx.resolveDataItemTypes(items);
+    truthy('"<dataSet>.REPORTING_RATE", another reporting metric and "<dataElement>.<categoryOptionCombo>" resolve; an unknown data set or disaggregation does not',
+      res.typeMap['BfMAe6Itzgt.REPORTING_RATE'] === 'REPORTING_RATE' && res.typeMap['BfMAe6Itzgt.ACTUAL_REPORTS_ON_TIME'] === 'REPORTING_RATE' && res.typeMap['fbfJHSPpUQD.pq2XI5kz2BY'] === 'DATA_ELEMENT_OPERAND'
+      && res.typeMap.fbfJHSPpUQD === 'DATA_ELEMENT' && JSON.stringify(res.unresolved) === '["zzzzzzzzzzz.REPORTING_RATE","fbfJHSPpUQD.zzzzzzzzzzz"]');
+    const rr = ctx.buildVisualizationObject({ name: 'Reporting', vis_type: 'LINE', data_items: ['BfMAe6Itzgt.REPORTING_RATE', 'fbfJHSPpUQD.pq2XI5kz2BY'], periods: ['LAST_12_MONTHS'], org_units: ['ImspTQPwCqd'], layout: { category: ['pe'], series: ['dx'], filters: ['ou'] } }, res.typeMap);
+    truthy('they are saved in the shape the Data Visualizer app writes',
+      rr.ok && JSON.stringify(rr.viz.dataDimensionItems[0]) === '{"dataDimensionItemType":"REPORTING_RATE","reportingRate":{"id":"BfMAe6Itzgt.REPORTING_RATE","dataSet":{"id":"BfMAe6Itzgt"},"metric":"REPORTING_RATE"}}'
+      && JSON.stringify(rr.viz.dataDimensionItems[1]) === '{"dataDimensionItemType":"DATA_ELEMENT_OPERAND","dataElementOperand":{"id":"fbfJHSPpUQD.pq2XI5kz2BY","dataElement":{"id":"fbfJHSPpUQD"},"categoryOptionCombo":{"id":"pq2XI5kz2BY"}}}');
+    truthy('a reporting rate shades a map too', ctx.buildMapObject({ name: 'RR map', data_item: 'BfMAe6Itzgt.REPORTING_RATE', org_unit_level: 2, period: 'LAST_MONTH' }, res.typeMap).ok !== false && !ctx.buildMapObject({ name: 'RR map', data_item: 'BfMAe6Itzgt.REPORTING_RATE', org_unit_level: 2, period: 'LAST_MONTH' }, res.typeMap)._error);
+    const spec = { name: 'ANC 1 by location per month', vis_type: 'STACKED_COLUMN', data_items: ['fbfJHSPpUQD'], periods: ['LAST_12_MONTHS'], org_units: ['ImspTQPwCqd'], layout: { series: ['fMZEcRHuamy'], category: ['pe'], filters: ['ou'] } };
+    const catErr = await ctx.resolveVizCategoryDimensions(spec, res.typeMap);
+    const cat = ctx.buildVisualizationObject(spec, res.typeMap);
+    truthy('a category UID in the layout becomes a dimension with its options: series = the category, x-axis = periods, the data element moves to the filter',
+      catErr === null && cat.ok && JSON.stringify(cat.viz.columnDimensions) === '["fMZEcRHuamy"]' && JSON.stringify(cat.viz.rowDimensions) === '["pe"]' && cat.viz.filterDimensions.includes('dx') && cat.viz.filterDimensions.includes('ou')
+      && JSON.stringify(cat.viz.categoryDimensions) === '[{"category":{"id":"fMZEcRHuamy"},"categoryOptions":[{"id":"qkPbeWaFsnU"},{"id":"wbrDrL2aYEc"}]}]');
+    const byName = { name: 'By age', vis_type: 'PIVOT_TABLE', data_items: ['fbfJHSPpUQD'], periods: ['2025'], org_units: ['ImspTQPwCqd'], layout: { rows: ['Age'], columns: ['pe'], filters: ['ou', 'dx'] } };
+    const nameErr = await ctx.resolveVizCategoryDimensions(byName, res.typeMap);
+    truthy('…a category given by name is resolved to its UID', nameErr === null && byName.layout.rows[0] === 'cX5k9anHEHd' && ctx.buildVisualizationObject(byName, res.typeMap).viz.rowDimensions[0] === 'cX5k9anHEHd');
+    const ind = await ctx.resolveDataItemTypes(['Uvn6LCg7dVU']);
+    const indErr = await ctx.resolveVizCategoryDimensions({ data_items: ['Uvn6LCg7dVU'], layout: { series: ['fMZEcRHuamy'], category: ['pe'] } }, ind.typeMap);
+    const unknownDim = await ctx.resolveVizCategoryDimensions({ data_items: ['fbfJHSPpUQD'], layout: { series: ['gender'], category: ['pe'] } }, res.typeMap);
+    const plain = await ctx.resolveVizCategoryDimensions({ data_items: ['fbfJHSPpUQD'], layout: { series: ['dx'], category: ['pe'], filters: ['ou'] } }, res.typeMap);
+    truthy('an indicator cannot be split by a category, a word that is no category is refused with what a layout takes, and a plain layout is untouched',
+      indErr && /not a plain aggregate data element/.test(indErr._error) && unknownDim && /not dx, pe, ou or a disaggregation category/.test(unknownDim._error) && plain === null);
+    truthy('the data check and the dashboard read-back use the item analytics takes (the reporting rate\'s id is its data set\'s)',
+      ctx.dataCheckItems([{ reportingRate: { id: 'BfMAe6Itzgt', dimensionItem: 'BfMAe6Itzgt.REPORTING_RATE', displayName: 'RR' } }])[0].id === 'BfMAe6Itzgt.REPORTING_RATE'
+      && ctx.savedObjectDataItems([{ dataDimensionItemType: 'DATA_ELEMENT_OPERAND', dataElementOperand: { id: 'fbfJHSPpUQD.pq2XI5kz2BY', dimensionItem: 'fbfJHSPpUQD.pq2XI5kz2BY' } }])[0].id === 'fbfJHSPpUQD.pq2XI5kz2BY');
+
+    // 7. Two identical yeses in a row.
+    const offer = 'Want me to share the dashboard publicly, or add a facility-level pivot instead of the monthly one?';
+    vm.runInContext(`lastUserText = "Yes, go ahead."; conversationHistory = ${JSON.stringify([
+      { role: 'user', content: 'Set up the report' }, { role: 'assistant', content: 'Done. Want me to add these indicators to the form, or build a dashboard?' },
+      { role: 'user', content: 'Yes, go ahead.' }, { role: 'assistant', content: `Both done. ${offer}` },
+    ])};`, ctx);
+    const second = ctx.sharingOfferAgreed();
+    vm.runInContext(`conversationHistory = conversationHistory.concat([{ role: 'user', content: 'Yes, go ahead.' }]);`, ctx);
+    const inTurn = ctx.sharingOfferAgreed();
+    vm.runInContext(`conversationHistory = ${JSON.stringify([{ role: 'user', content: 'Set up the report' }, { role: 'assistant', content: 'Done. Want me to build a dashboard?' }])};`, ctx);
+    const noOffer = ctx.sharingOfferAgreed();
+    truthy('a second "Yes, go ahead." answers the LAST question (the sharing offer), also when this turn\'s message is already in the history; with no sharing offer it agrees to none',
+      second === true && inTurn === true && noOffer === false && ctx.sharingWasRequested({ public_access: 'r-------' }) === false);
+    vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx);
+
+    // 8. A stale "analytics tables predate the program" is not remembered.
+    let last = '2026-11-13T13:00:01.448';
+    ctx.safeDhis2Fetch = async (p) => (/^system\/info/.test(p) ? { lastAnalyticsTableSuccess: last } : { id: 'DgJkLZz5cR2', created: '2026-11-13T13:09:45.120' });
+    vm.runInContext('_analyticsFreshCache.clear();', ctx);
+    const stale = await ctx.lineListAnalyticsFresh('DgJkLZz5cR2');
+    last = '2026-11-13T13:13:21.480';
+    const fresh = await ctx.lineListAnalyticsFresh('DgJkLZz5cR2');
+    truthy('after the analytics job has run, the line-list check stops saying the tables predate the program', stale.fresh === false && fresh.fresh === true);
+    vm.runInContext('_analyticsFreshCache.clear();', ctx);
+
+    // 8b. A mistyped id and a joined list on event analytics.
+    ctx.safeDhis2Fetch = async (p) => {
+      if (/^programIndicators\?filter=id:in:/.test(p)) return { programIndicators: ['QNcTSbHbszb', 'qSiJfRk4Quy', 'ZPFgT0IUynJ'].filter((id) => p.includes(id)).map((id) => ({ id })) };
+      if (/^programIndicators\?filter=program\.id:eq:/.test(p)) return { programIndicators: [{ id: 'QNcTSbHbszb', displayName: 'Supervision visits' }, { id: 'qSiJfRk4Quy', displayName: 'Average total score' }, { id: 'ZPFgT0IUynJ', displayName: 'Visits with band Poor' }] };
+      return {};
+    };
+    const base = 'analytics/events/aggregate/DgJkLZz5cR2?dimension=ou:hkoY6TPi00f&dimension=pe:LAST_12_MONTHS&stage=mFGnGuwp6qt&dimension=';
+    const typo = await ctx.routeProgramIndicatorAnalytics(`${base}QNcTSbHbszb;qSiJfRk4Quy;ZPFg0IUynJ`);
+    const changed = await ctx.routeProgramIndicatorAnalytics(`${base}QNcTSbHbszb;ZPFgT0IUynX`);
+    const good = await ctx.routeProgramIndicatorAnalytics(`${base}QNcTSbHbszb;qSiJfRk4Quy;ZPFgT0IUynJ`);
+    truthy('an id one character short (or with one changed) among program indicators is not sent: the answer names the indicator that was meant; the right ids are read from /analytics',
+      typo.refusal && /"ZPFg0IUynJ" is not a program indicator — did you mean ZPFgT0IUynJ \("Visits with band Poor"\)/.test(typo.refusal._error)
+      && changed.refusal && /did you mean ZPFgT0IUynJ/.test(changed.refusal._error) && good.routed === true && /^analytics\?dimension=dx%3AQNcTSbHbszb%3BqSiJfRk4Quy%3BZPFgT0IUynJ/.test(good.path));
+    const des = await ctx.routeProgramIndicatorAnalytics(`${base}cQpIbTxJRtp;zexhnHw1CzB`);
+    const single = await ctx.routeProgramIndicatorAnalytics(`${base}cQpIbTxJRtp`);
+    truthy('data elements joined by ";" in one dimension= are sent as one dimension each (409 as written); a single one is left alone',
+      des.healed === true && /dimension=cQpIbTxJRtp&dimension=zexhnHw1CzB$/.test(des.path) && /stage=mFGnGuwp6qt/.test(des.path) && !single.healed && !single.routed && !single.refusal);
+    truthy('one edit apart: a dropped, an added or a changed character, and nothing further',
+      ctx.uidWithinOneEdit('ZPFg0IUynJ', 'ZPFgT0IUynJ') && ctx.uidWithinOneEdit('ZPFgT0IUynJJ', 'ZPFgT0IUynJ') && ctx.uidWithinOneEdit('ZPFgT0IUynX', 'ZPFgT0IUynJ')
+      && !ctx.uidWithinOneEdit('ZPFgT0IUynJ', 'ZPFgT0IUynJ') && !ctx.uidWithinOneEdit('ZPFg0IUynX', 'ZPFgT0IUynJ') && !ctx.uidWithinOneEdit('abcdefghijk', 'ZPFgT0IUynJ'));
+
+    // 8c. A table that was never built.
+    {
+      const hint = ctx.analyticsMissingTableHint;
+      const e7144 = { errorCode: 'E7144', message: 'Query failed because a referenced table does not exist. Please ensure analytics job was run (SqlState: 42P01)' };
+      d.analyticsTableMissing = null;
+      const none = hint('GET', 'analytics?dimension=dx:abc', 'DHIS2 API 409: Dimension is present in query without any valid dimension options', { errorCode: 'E7124' });
+      const sql = hint('GET', 'sqlViews/abcdefghijk/data', 'DHIS2 API 409: referenced table does not exist', e7144);
+      const before = ctx.analyticsTableMissingThisTurn();
+      const rr = hint('GET', 'analytics?dimension=dx%3An9XXALn5EoL.REPORTING_RATE&dimension=pe%3A202610', `DHIS2 API 409: ${e7144.message}`, e7144);
+      truthy('409 "referenced table does not exist" on analytics is explained (the table was never built: a scheduled job can skip it; only a run builds it; do not investigate) and remembered for the turn; other 409s and SQL views are not',
+        none === null && sql === null && before === false && /reporting-completeness analytics table/.test(rr) && /resourceTables\/analytics/.test(rr) && /Do not look for the reason/.test(rr) && ctx.analyticsTableMissingThisTurn() === true);
+      const sent = [];
+      ctx.safeDhis2Fetch = async (p, o = {}) => { sent.push(`${(o && o.method) || 'GET'} ${p}`); return /^resourceTables/.test(p) ? { response: { id: 'jobAAAAAAAA' } } : /^system\/tasks/.test(p) ? [{ completed: true, message: 'done' }] : /^system\/info/.test(p) ? { lastAnalyticsTableSuccess: '2026-11-13T21:00:01.039' } : { programs: [{ id: 'DgJkLZz5cR2', displayName: 'P', created: '2026-11-13T13:09:45.120' }] }; };
+      d.writeAuth = { scope: 'read_only', reason: 'verify' };
+      vm.runInContext('lastUserText = "Build a dashboard of reporting rates"; conversationHistory = [];', ctx);
+      const savedWait = vm.runInContext('typeof ANALYTICS_JOB_POLL_MS', ctx);
+      const runIt = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'resourceTables/analytics', query_params: { skipResourceTables: 'true', skipTableTypes: 'COMPLETENESS', lastYears: '2' } });
+      const again = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'resourceTables/analytics' });
+      d.writeSeq = (d.writeSeq || 0) + 1; // something was saved since
+      vm.runInContext('lastUserText = "run the analytics tables again please";', ctx);
+      const afterWrite = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'resourceTables/analytics' });
+      d.analyticsRun = null;
+      vm.runInContext('lastUserText = "Build a dashboard of reporting rates";', ctx);
+      const refused = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'resourceTables/analytics' });
+      truthy('with a table proved missing this turn an analytics run the user did not ask for is started, without the skip parameters that would leave the table out; with none missing it is still refused',
+        savedWait === 'number' && runIt && runIt.success === true && sent.some((x) => x === 'POST resourceTables/analytics?lastYears=2') && refused && refused._scope === 'analytics_run_not_requested');
+      truthy('a second run in the same turn with nothing written since is not started (it would build the same tables); after a write it is',
+        again && again._scope === 'analytics_run_repeat' && /Not started: the analytics tables were already rebuilt in this turn/.test(again._error) && afterWrite && afterWrite.success === true);
+      const lay = ctx.healAnalyticsTableLayout;
+      truthy('columns= / rows= / tableLayout are left out of analytics queries (a laid-out table with blank cells reads like "no data"); other parameters and other endpoints are untouched',
+        lay('analytics?dimension=dx:a;b&dimension=pe:202610&dimension=ou:X&columns=dx&rows=ou').path === 'analytics?dimension=dx:a;b&dimension=pe:202610&dimension=ou:X'
+        && lay('analytics/events/aggregate/DgJkLZz5cR2?dimension=ou:X&rows=ou&columns=pe&stage=S').path === 'analytics/events/aggregate/DgJkLZz5cR2?dimension=ou:X&stage=S'
+        && /blank cells/.test(lay('analytics?dimension=dx:a&tableLayout=true&columns=dx&rows=pe').note)
+        && !lay('analytics?dimension=dx:a&dimension=pe:2026&skipMeta=true').healed && !lay('dataValueSets?dataSet=a&rows=1').healed && !lay('analytics/events/query/DgJkLZz5cR2?rows=ou').healed);
+      vm.runInContext('lastUserText = "";', ctx);
+    }
+
+    // 8d. A grant on an object that is public anyway.
+    {
+      const note = ctx.sharingPublicStillOpenNote;
+      const grp = [{ id: 'Xxe4VF5QEfF', access: 'r-rw----' }];
+      const open = note({ user_group_accesses: grp }, 'rwrw----', grp, []);
+      truthy('a group given capture access to a program that is public rwrw---- is told: everyone can already do this, ask before closing it; a closed or metadata-only-public object, or a call that grants nobody, gets no note',
+        /EVERY signed-in user can see it, edit it, view its data, enter data in it, so this grant gives the group or user nothing/.test(open._public_access_still_open || '')
+        && !note({ user_group_accesses: grp }, '--------', grp, [])._public_access_still_open
+        && /can see it\./.test(note({ user_group_accesses: grp }, 'r-------', grp, [])._public_access_still_open || '') && !/nothing they did not already have/.test(note({ user_group_accesses: grp }, 'r-------', grp, [])._public_access_still_open)
+        && !note({ public_access: 'rwrw----' }, 'rwrw----', [], [])._public_access_still_open);
+      const cat = [{ id: 'F_DATAVALUE_ADD', name: 'Add/Update Data Value' }, { id: 'M_dhis-web-capture', name: 'Capture app' }, { id: 'F_EXPORT_DATA', name: 'Export data' }, { id: 'F_USER_ADD', name: 'Add/Update User' }];
+      ctx.safeDhis2Fetch = async (p) => (/^authorities/.test(p) ? { systemAuthorities: cat } : {});
+      vm.runInContext('_adminCache.authorities = null;', ctx);
+      const many = await ctx.executeTool('manage_users', { action: 'list_authorities', query: 'capture, export | data value' });
+      const oneQ = await ctx.executeTool('manage_users', { action: 'list_authorities', query: 'user' });
+      truthy('list_authorities takes several keywords at once and returns the authorities matching any of them',
+        many.total === 3 && !many.authorities.some((a) => a.id === 'F_USER_ADD') && oneQ.total === 1);
+      vm.runInContext('_adminCache.authorities = null;', ctx);
+    }
+
+    // 9. What the panel shows for a call that did not succeed.
+    const kind = ctx.toolOutcomeKind;
+    truthy('DHIS2 or the network refusing a call is "failed"',
+      kind({ _error: 'DHIS2 API 409: Conflict', _status: 409, _url: 'x' }) === 'failed' && kind({ _error: 'DHIS2 API 404: this server has no GET endpoint at "foo".', _status: 404, _hint: 'h', _scope: 'no_such_endpoint' }) === 'failed'
+      && kind({ _error: 'Failed to update dataset: DHIS2 API 409: E5003', _hint: 'rename it' }) === 'failed' && kind({ _error: 'Fetch failed: fetch failed' }) === 'failed'
+      && kind({ success: false, errors: ['Property `name` already exists'] }) === 'failed' && kind({ _error: 'Tool failed: x is not a function' }) === 'failed'
+      && kind({ _error: 'Analytics table generation FAILED after 75s: boom', _hint: 'report it' }) === 'failed' && kind({ _error: 'Upload failed (HTTP 500)' }) === 'failed' && kind({ _error: 'something odd' }) === 'failed');
+    truthy('a call the extension itself stopped is "harness_blocked": loop guards (even when they quote a server error), write and privacy gates, unrequested sharing',
+      kind({ _error: 'BLOCKED: this exact dhis2_query call already failed 1 time(s) this turn with: "DHIS2 API 404".', _scope: 'repeated_identical_failure' }) === 'harness_blocked'
+      && kind({ _error: 'STOP: 3 HTTP 4xx/5xx errors in a row this turn', _scope: 'http_error_limit_reached' }) === 'harness_blocked' && kind({ _error: 'Refused: deletes', _refused: {}, _scope: 'delete_not_requested' }) === 'harness_blocked'
+      && kind({ _error: 'x is disabled for the rest of this turn', _scope: 'circuit_breaker_tool_disabled' }) === 'harness_blocked' && kind({ _error: 'Not changed: the user did not ask to share this dashboard.' }) === 'harness_blocked'
+      && kind({ _error: 'Row-level patient data is not sent to a cloud model.', _scope: 'patient_data_privacy_gate' }) === 'harness_blocked' && kind({ _error: 'No program in context', _hint: 'pass program_override' }) === 'harness_blocked');
+    truthy('a call sent back to be fixed is "harness_correcting": lint problems, a cut-off call, a guessed endpoint, a missing argument',
+      kind({ _error: 'The code would fail at runtime: 2 problem(s).', problems: [{ message: 'x' }], _hint: 'fix' }) === 'harness_correcting' && kind({ _error: 'args truncated', _scope: 'incomplete_call', _no_disable: true }) === 'harness_correcting'
+      && kind({ _error: 'Not sent: there is no "validation" endpoint on DHIS2 (404).', _scope: 'known_endpoint_guidance' }) === 'harness_correcting' && kind({ _error: 'dataset_id required for update' }) === 'harness_correcting'
+      && kind({ _error: 'patch object required for update', _hint: 'Pass patch:{…}' }) === 'harness_correcting' && kind({ _error: 'JSX does not compile: app.jsx:437:10 Unexpected token', compile_errors: [{}] }) === 'harness_correcting');
+    truthy('a successful call has no outcome to show', kind({ success: true }) === 'ok' && kind({ rows: [] }) === 'ok');
+    const panelJs = fs.readFileSync(path.join(ROOT, 'sidepanel/panel.js'), 'utf8');
+    const panelCss = fs.readFileSync(path.join(ROOT, 'sidepanel/panel.css'), 'utf8');
+    truthy('the panel labels those "Harness blocked" / "Harness correcting" in orange, keeps "Failed" and red for real failures, and does not count them as failed steps',
+      /'Harness correcting'/.test(panelJs) && /'Harness blocked'/.test(panelJs) && /tool-harness/.test(panelJs) && /\.tool-harness\s*\{[^}]*var\(--harness\)/.test(panelCss) && /--harness:\s*#f97316/.test(panelCss)
+      && /msg\.outcome/.test(panelJs) && /querySelector\('\.tool-fail'\)\)\.length/.test(panelJs));
+  } finally {
+    ctx.safeDhis2Fetch = saved.sdf;
+    Object.assign(d, { writeAuth: saved.wa, httpErrorCount: saved.n, httpErrorHistory: saved.h, failedCallSigs: saved.f, toolErrorFamilies: saved.fam, baseUrl: saved.base, connected: saved.connected });
+    vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx);
+  }
+}
+
 // ── Maternity thread (src/data-check.js): what saved items will really show ───
 async function runMaternityThreadChecks() {
   console.log('\nMaternity thread (data check, fresh reads, maps that never open empty, list notes):');
@@ -4879,6 +5160,7 @@ setImmediate(async () => {
   if (loaded) await runMalariaThreadChecks().catch((e) => bad(`Malaria thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runAncAppThreadChecks().catch((e) => bad(`ANC app thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runMaternityThreadChecks().catch((e) => bad(`Maternity thread checks threw: ${e && e.stack || e}`));
+  if (loaded) await runDataQualityThreadChecks().catch((e) => bad(`data-quality thread checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

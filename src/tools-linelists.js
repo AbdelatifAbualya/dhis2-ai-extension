@@ -655,7 +655,11 @@ async function lineListAnalyticsFresh(programId) {
       };
     }
   } catch { /* on any doubt, probe as usual */ }
-  _analyticsFreshCache.set(programId, out);
+  // Only "fresh" is remembered: it cannot turn stale. "Stale" ends the moment the
+  // job runs, and a remembered answer kept saying "tables predate the program"
+  // after the model had run it (Facility Supervision thread, 2026-11-13: two
+  // validate calls after a 75 s analytics run, both still "skipped").
+  if (out.fresh) _analyticsFreshCache.set(programId, out);
   return out;
 }
 

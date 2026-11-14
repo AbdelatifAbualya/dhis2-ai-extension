@@ -1091,9 +1091,102 @@ function extractUidsFromCallArgs(toolName, args) {
 const HTTP_ERROR_LANE_LIMIT = 3;
 const HTTP_ERROR_HARD_LIMIT = 6;
 
+// An analytics query answered "referenced table does not exist" (409 E7144): the
+// table it reads was never built. That is a fact about the server, not about the
+// query, and only an analytics run changes it. system/info cannot tell: it gives
+// the time of the last run of ANY kind, and a scheduled job may skip table types.
+// localhost:8081, 2026-11-13: an hourly job with skipTableTypes DATA_VALUE and
+// COMPLETENESS reported a run minutes old while every reporting rate was a 409
+// and no aggregate value entered that day was in analytics. The model spent 40
+// calls on SQL views and other endpoints looking for the reason, and its
+// analytics run was refused because "the tables are newer than every program".
+// The error is remembered for the turn (analyticsTableMissingThisTurn) so that
+// the run is allowed, and the answer says what it means.
+function analyticsMissingTableHint(method, path, errMsg, errBody) {
+  if (method !== 'GET' || !/^analytics(?:\/|\?|\.|$)/i.test(String(path || ''))) return null;
+  const code = errBody && errBody.errorCode;
+  if (code !== 'E7144' && !/referenced table does not exist/i.test(String(errMsg || ''))) return null;
+  dhis2.analyticsTableMissing = { turn: dhis2.turnCounter || 0, path: String(path).slice(0, 200) };
+  let what = 'the analytics table this query reads';
+  try {
+    const q = decodeURIComponent(String(path));
+    if (/\.(?:REPORTING_RATE|ACTUAL_REPORTS|EXPECTED_REPORTS)/.test(q)) what = 'the reporting-completeness analytics table (reporting rates are read from it)';
+    else if (/^analytics\/(?:events|enrollments)\//i.test(q)) what = "this program's analytics table";
+  } catch { /* keep the general wording */ }
+  return `The query is not wrong: ${what} has not been built on this server. The time of the last analytics run does not show this: a scheduled job can skip table types (completeness, data values) or programs, and a program or data set made after the last full run has no table yet. Only a full analytics run builds it: dhis2_query(method="POST", path="resourceTables/analytics") is allowed in this turn because of this error, and waits for the job. Do not look for the reason through other endpoints, SQL views or job settings. What you were asked to build is valid and can be saved now; until the run, the tiles that read this table show an error: say so.`;
+}
+// columns= / rows= turn an analytics answer into a laid-out TABLE: one row per
+// "rows" item, a column per "columns" item, other headers, and blank cells for
+// any dimension left out of both. Verified 2.42.5 (2026-11-14):
+// analytics?dimension=dx:a;b&dimension=pe:202610&dimension=ou:X answers
+// [a, 202610, X, 12], [b, 202610, X, 56]; with &columns=dx&rows=ou the one row is
+// [X, Hebron, 50, '', '', ''], and with a category on rows= it is a 500. A model
+// read the blank cells as "no data at district level", rebuilt the analytics
+// tables five times and told the user the server's roll-up was broken. Queries
+// made here always get the plain rows. Pure.
+function healAnalyticsTableLayout(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q < 0 || !/^\/?(?:api\/(?:\d+\/)?)?analytics(?:\.json)?$|^\/?(?:api\/(?:\d+\/)?)?analytics\/(?:events|enrollments)\/aggregate\//i.test(p.slice(0, q))) return { path: p, healed: false };
+  const parts = p.slice(q + 1).split('&').filter(Boolean);
+  const kept = parts.filter((x) => !/^(?:columns|rows|tableLayout|hideEmptyRows|hideEmptyColumns|showHierarchy)=/i.test(x));
+  if (kept.length === parts.length) return { path: p, healed: false };
+  return {
+    path: `${p.slice(0, q)}?${kept.join('&')}`,
+    healed: true,
+    note: 'Query corrected: columns= / rows= (a table layout) were left out. With them DHIS2 answers one laid-out row per org unit with other headers, and blank cells for any dimension not placed, which reads like "no data". This answer has the plain rows: one per combination, columns named in headers, the number in "value".',
+  };
+}
+
+function analyticsTableMissingThisTurn() {
+  const m = dhis2.analyticsTableMissing;
+  return !!(m && m.turn === (dhis2.turnCounter || 0));
+}
+
+// Data-quality endpoints, verified on 2.42.5, 2.42.7.1 and 2.44 (2026-11-13). A
+// model that does not know them guesses "validation", "validation/analysis" or
+// "dataQuality" (all 404): the Data Quality Workbench app shipped a Validation
+// tab that called one of those. One text, used by the dhis2_query description,
+// its 404 answer, the app manual and the app preview.
+const DATA_QUALITY_ENDPOINTS = [
+  "Outliers from raw data values: GET outlierDetection?ds=<dataSetId>&ou=<orgUnitId>&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&algorithm=Z_SCORE&threshold=3&maxResults=100. ds and ou repeat (ds=a&ds=b), ou covers everything below it; dx=<dataElementId> replaces ds (de= is refused, 409 E2200); the two dates are required (409 E2201); algorithm Z_SCORE | MOD_Z_SCORE | MIN_MAX; orderBy MEAN_ABS_DEV | Z_SCORE; maxResults at most 500 (409 E2206). Answer: { metadata, outlierValues: [{ de, deName, pe, ou, ouName, coc, cocName, aoc, aocName, value, mean, stdDev, absDev, zScore, lowerBound, upperBound, followup }] }, numbers as numbers (MOD_Z_SCORE gives median, not mean; MIN_MAX gives only value, absDev and the bounds).",
+  "The same from the analytics tables (2.41+): GET analytics/outlierDetection with ds/dx/ou as above and pe=LAST_12_MONTHS (or startDate/endDate); algorithm Z_SCORE | MODIFIED_Z_SCORE (MIN_MAX is 409 E2211). Answer: an analytics grid, { headers: [{ name }], rows }, with columns dx, dxname, pe, pename, ou, ouname, ounamehierarchy, coc, cocname, aoc, aocname, value, mean, stddev, absdev, zscore, lowerbound, upperbound, every value a STRING.",
+  "Validation analysis (run the validation rules over an org unit and everything below it): POST dataAnalysis/validationRules with JSON body { \"ou\": \"<orgUnitId>\", \"startDate\": \"YYYY-MM-DD\", \"endDate\": \"YYYY-MM-DD\", \"vrg\": \"<validationRuleGroupId, optional>\", \"notification\": false, \"persist\": false }. Answer: an ARRAY (at most 500) of { validationRuleId, validationRuleDescription, organisationUnitId, organisationUnitDisplayName, organisationUnitPath, organisationUnitAncestorNames, periodId, periodDisplayName, attributeOptionComboId, attributeOptionComboDisplayName, importance, leftSideValue, operator, rightSideValue }. The rule NAME is not in it: read validationRules?fields=id,displayName and join on validationRuleId. GET is 405. In an app: engine.mutate({ resource: 'dataAnalysis/validationRules', type: 'create', data: { ou, startDate, endDate, notification: false, persist: false } }) — it saves nothing, so the app stays read-only (needs_write_access:false).",
+  "One form's validation: GET validation/dataSet/<dataSetId>?pe=<period>&ou=<orgUnitId> gives { validationRuleViolations: [], commentRequiredViolations: [] }. validationResults lists only results that were SAVED (persist: true or the scheduled job). There is no validation, validation/analysis, dataQuality or outliers endpoint (404).",
+];
+const DATA_QUALITY_ENDPOINTS_TEXT = DATA_QUALITY_ENDPOINTS.map((l) => `- ${l}`).join('\n');
+// Paths models guess for those two analyses.
+const GUESSED_DATA_QUALITY_PATH_RE = /^(?:validation(?:\/(?:analysis|run|rules?|results?|violations?))?|validationAnalysis|validationRules\/(?:run|analysis|validate)|dataQuality(?:\/.*)?|outliers?(?:\/.*)?|outlierAnalysis|dataAnalysis(?:\/(?:validation|outliers?))?|analytics\/(?:outliers?|validation))\/?$/i;
+
+// What a dhis2_query call is aimed at: its method and the endpoint it reads. The
+// tool has no action, so this stands in for one. Data Quality Workbench thread
+// (2026-11-13, play 2.42.7.1): four 404s on guessed validation paths closed
+// every dhis2_query, and the correct analytics query that came next was refused.
+// A wrong guess at one endpoint says nothing about another.
+function dhis2QueryTarget(args) {
+  const method = String(args?.method || 'GET').toUpperCase();
+  let p = String(args?.path || '').trim().split(/[?#]/)[0];
+  const api = p.match(/(?:^|\/)api\/(?:\d+\/)?(.*)$/i);
+  if (api) p = api[1];
+  const segs = p.replace(/^https?:\/\/[^/]+/i, '').split('/').filter(Boolean);
+  let res = (segs[0] || '').toLowerCase();
+  // analytics/events, tracker/events, dataAnalysis/validationRules… are endpoints of their own.
+  if (/^(?:analytics|tracker|dataanalysis|datastore|userdatastore)$/.test(res) && segs[1] && !/^[A-Za-z][A-Za-z0-9]{10}$/.test(segs[1])) {
+    res += `/${segs[1].toLowerCase()}`;
+  }
+  return res ? `${method} ${res}` : method;
+}
+
 function httpErrorLane(toolName, args) {
-  if (toolName === 'dhis2_query') return `dhis2_query:${String(args?.method || 'GET').toUpperCase()}`;
+  if (toolName === 'dhis2_query') return `dhis2_query:${dhis2QueryTarget(args)}`;
   return args && typeof args.action === 'string' && args.action ? `${toolName}:${args.action}` : toolName;
+}
+
+// The scope a run of failures is counted in: the tool's action, or for
+// dhis2_query the endpoint (see dhis2QueryTarget).
+function toolFailureScope(toolName, args) {
+  if (toolName === 'dhis2_query') return `${toolName}:${dhis2QueryTarget(args)}`;
+  return `${toolName}:${args?.action || ''}`;
 }
 
 const HTTP_STATUS_IN_TEXT_RE = /\b(?:DHIS2 API|HTTP(?:\s+(?:status|error))?|status(?:\s+code)?|answered|returned|responded(?:\s+with)?)\s*:?\s*(4\d\d|5\d\d)\b/i;
@@ -1400,7 +1493,7 @@ function noteToolFailure(toolName, args, result) {
   // 2026-11-01: four different lint results were blocked as one error).
   const problems = Array.isArray(result?.problems) && result.problems.length
     ? ` ${result.problems.map((p) => toolErrorFamily((p && p.message) || p).slice(0, 60)).sort().join(' | ')}` : '';
-  const famKey = `${toolName}:${args?.action || ''}|${toolErrorFamily(errText)}${problems}`;
+  const famKey = `${toolFailureScope(toolName, args)}|${toolErrorFamily(errText)}${problems}`;
   const famCount = (dhis2.toolErrorFamilies.get(famKey) || 0) + 1;
   dhis2.toolErrorFamilies.set(famKey, famCount);
   return { famCount, error: entry.error };
@@ -1464,7 +1557,9 @@ function repeatedFailureStopOrNull(toolName, args) {
     }
   }
   if (dhis2.toolErrorFamilies instanceof Map && dhis2.toolErrorFamilies.size) {
-    const prefix = `${toolName}:${args?.action || ''}|`;
+    const prefix = `${toolFailureScope(toolName, args)}|`;
+    // dhis2_query is stopped one endpoint at a time: the others stay open.
+    const endpoint = toolName === 'dhis2_query' ? dhis2QueryTarget(args) : null;
     let worst = 0;
     let worstFamily = null;
     for (const [k, n] of dhis2.toolErrorFamilies) {
@@ -1485,8 +1580,10 @@ function repeatedFailureStopOrNull(toolName, args) {
         };
       }
       return {
-        _error: `STOP: ${toolName}${args?.action ? `(action=${args.action})` : ''} has failed ${worst} times this turn with the same class of error ("${worstFamily}"). Further calls to this operation are blocked for this turn.`,
-        _hint: `This error is not going away by resending variations of the same attempt. Give the user your final answer NOW: (1) list everything successfully created this turn (names + IDs), (2) quote the exact server error for what failed, (3) recommend one concrete next step (e.g. show the corrected expression you would try and ask the user to confirm, or suggest skipping the failing objects). Do NOT call ${toolName} again this turn.`,
+        _error: `STOP: ${toolName}${args?.action ? `(action=${args.action})` : ''}${endpoint ? ` (${endpoint})` : ''} has failed ${worst} times this turn with the same class of error ("${worstFamily}"). Further calls to this operation are blocked for this turn.`,
+        _hint: endpoint
+          ? `Only ${endpoint} is blocked: dhis2_query on every other endpoint, and every other tool, still works. Resending variations of this request will not help, and neither will guessing another spelling of the path. Carry on with the rest of the task using what you already know; if this request was essential, tell the user exactly what failed (quote the server error) and what you did instead.`
+          : `This error is not going away by resending variations of the same attempt. Give the user your final answer NOW: (1) list everything successfully created this turn (names + IDs), (2) quote the exact server error for what failed, (3) recommend one concrete next step (e.g. show the corrected expression you would try and ask the user to confirm, or suggest skipping the failing objects). Do NOT call ${toolName} again this turn.`,
         _scope: 'same_error_family_limit',
         _family_error: worstFamily,
         _family_failures: worst,
@@ -2173,7 +2270,7 @@ function healBareDxList(path) {
 // for the data items it plots (what the model meant: "check that tile's
 // value"); a line list or dashboard id is refused with the tool that reads it.
 const _savedObjectByUid = new Map(); // uid → null (not a saved chart/map/list/dashboard) | { kind, type, name, items }
-const SAVED_OBJECT_ITEM_FIELDS = 'dataDimensionItemType,indicator[id,displayName],dataElement[id,displayName],programIndicator[id,displayName],programDataElement[id,displayName],programAttribute[id,displayName],reportingRate[id,displayName],expressionDimensionItem[id,displayName]';
+const SAVED_OBJECT_ITEM_FIELDS = 'dataDimensionItemType,indicator[id,displayName],dataElement[id,displayName],programIndicator[id,displayName],programDataElement[id,displayName],programAttribute[id,displayName],reportingRate[id,dimensionItem,displayName],dataElementOperand[id,dimensionItem,displayName],expressionDimensionItem[id,displayName]';
 
 // Plain data-item UIDs of an analytics GET path: dx items on /analytics, the
 // item part of each non-ou/pe dimension on event/enrollment analytics.
@@ -2204,8 +2301,10 @@ function analyticsDataItemUids(path) {
 function savedObjectDataItems(dims) {
   const items = [];
   for (const d of Array.isArray(dims) ? dims : []) {
-    const o = d && (d.programIndicator || d.indicator || d.dataElement || d.programDataElement || d.programAttribute || d.reportingRate || d.expressionDimensionItem);
-    if (o && o.id && !items.some(x => x.id === o.id)) items.push({ id: o.id, name: o.displayName || null, type: d.dataDimensionItemType || null });
+    const o = d && (d.programIndicator || d.indicator || d.dataElement || d.programDataElement || d.programAttribute || d.reportingRate || d.dataElementOperand || d.expressionDimensionItem);
+    // A reporting rate's id is its data set's id: what analytics takes is "<dataSet>.REPORTING_RATE".
+    const id = o && (o.dimensionItem || o.id);
+    if (id && !items.some(x => x.id === id)) items.push({ id, name: o.displayName || null, type: d.dataDimensionItemType || null });
   }
   return items;
 }
@@ -3656,10 +3755,12 @@ async function safeDhis2Fetch(path, options = {}) {
       // 2.42.5.1, 2026-10-20). Only data pruning removes them — destructive, so
       // the hint demands explicit confirmation.
       const blockedByAggregate = !blockedByEvent && (importErrors.some(m => AGGREGATE_DATA_BLOCK_RE.test(m)) || AGGREGATE_DATA_BLOCK_RE.test(errMsg));
+      const missingTable = analyticsMissingTableHint(method, cleanPath, errMsg, errBody);
       return {
         _error: errMsg, _url: fullUrl, _status: rawResp.status,
         ...(errBody ? { _body: errBody } : {}),
         ...(importErrors.length ? { error_details: importErrors } : {}),
+        ...(missingTable ? { _hint: missingTable, _analytics_table_missing: true } : {}),
         ...(blockedByAggregate ? { _hint: aggregateDataBlockHint(`${cleanPath} ${bodyStr || ''}`) } : {}),
         ...(blockedByEvent ? {
           _hint: 'This object still has event data values referencing it. If the user says the events were already deleted in the Capture UI, they are only SOFT-deleted and still block deletion: run dhis2_query(method=POST, path="maintenance?softDeletedEventRemoval=true") (admin), then retry this SAME delete once. If real (non-deleted) events still hold values, tell the user which events must be deleted first. Do NOT probe analytics, tracker reads, or count_records — they cannot remove the association.',
@@ -3668,6 +3769,8 @@ async function safeDhis2Fetch(path, options = {}) {
     }
 
     if (isWrite && !options._captureBump) noteCaptureMetadataWrite(method, cleanPath, bodyStr, captureDeletedFrom);
+    // Counts accepted writes: "has anything changed since the analytics run?"
+    if (isWrite) dhis2.writeSeq = (dhis2.writeSeq || 0) + 1;
 
     if (rawResp.status === 204) return { success: true, message: 'Deleted successfully.' };
 
@@ -5322,6 +5425,16 @@ async function healBareStageDimension(path) {
 // reported BP control 31% (really 29.0%) and HbA1c 8.8% (really 8.3%).
 // Program-indicator values by org unit / period come from /api/analytics with
 // dx. When every data item of the query is a program indicator, route it there.
+// Two ids that differ by one dropped, added or changed character.
+function uidWithinOneEdit(a, b) {
+  const x = String(a), y = String(b);
+  if (x === y || Math.abs(x.length - y.length) > 1) return false;
+  let i = 0;
+  while (i < x.length && i < y.length && x[i] === y[i]) i++;
+  if (x.length === y.length) return x.slice(i + 1) === y.slice(i + 1);
+  return x.length > y.length ? x.slice(i + 1) === y.slice(i) : x.slice(i) === y.slice(i + 1);
+}
+
 async function routeProgramIndicatorAnalytics(path) {
   const p = String(path || '');
   const m = p.match(/^analytics\/(?:events|enrollments)\/aggregate\/[A-Za-z][A-Za-z0-9]{10}(?:\.json)?\?(.*)$/);
@@ -5347,14 +5460,35 @@ async function routeProgramIndicatorAnalytics(path) {
     if (/^(ou|pe|co|ao|longitude|latitude):/i.test(val)) continue;
     const list = val.replace(/^dx:/i, '');
     const ids = list.split(';').map(x => x.trim()).filter(Boolean);
-    if (!ids.length || !ids.every(x => /^[A-Za-z][A-Za-z0-9]{10}$/.test(x))) return { path: p, routed: false };
+    // An id one character short or long is a typing slip, not another kind of
+    // item: it stays in the list so the slip can be named (supervision dashboard,
+    // 2026-11-13: "ZPFg0IUynJ" for ZPFgT0IUynJ went out as sent, came back 409,
+    // and the model concluded the dx: prefix was wrong and saved that as a lesson).
+    if (!ids.length || !ids.every(x => /^[A-Za-z][A-Za-z0-9]{8,12}$/.test(x)) || !ids.some(x => x.length === 11)) return { path: p, routed: false };
     items.push(...ids);
     itemParts.add(part);
   }
   if (!items.length) return { path: p, routed: false };
-  const r = await safeDhis2Fetch(`programIndicators?filter=id:in:[${[...new Set(items)].join(',')}]&fields=id&paging=false`);
+  const wellFormed = [...new Set(items)].filter(x => x.length === 11);
+  const r = await safeDhis2Fetch(`programIndicators?filter=id:in:[${wellFormed.join(',')}]&fields=id&paging=false`);
   if (!r || r._error) return { path: p, routed: false };
   const found = new Set((r.programIndicators || []).map(x => x.id));
+  // A list with no program indicator in it, several ids joined by ";" in one
+  // dimension=: data elements or attributes, which take one dimension= each
+  // (409 E7224 as sent). Split it; the server then answers for each item.
+  if (!found.size && wellFormed.length === new Set(items).size) {
+    let split = false;
+    const out = parts.flatMap((x) => {
+      const kv = x.match(/^dimension=(.*)$/i);
+      const val = kv ? dec(kv[1]) : '';
+      if (!kv || /^(?:dx|ou|pe|co|ao|longitude|latitude):/i.test(val) || !val.includes(';') || !val.split(';').every(id => /^[A-Za-z][A-Za-z0-9]{10}$/.test(id.trim()))) return [x];
+      split = true;
+      return val.split(';').map(id => `dimension=${id.trim()}`);
+    });
+    return split
+      ? { path: `${p.slice(0, p.indexOf('?'))}?${out.join('&')}`, routed: false, healed: true, note: 'Query corrected: event and enrollment analytics take ONE item per dimension= (several joined by ";" are a 409), so the list was sent as separate dimensions.' }
+      : { path: p, routed: false };
+  }
   if (found.size !== new Set(items).size) {
     // Some ids are not program indicators. RMNCH replay 2026-11-01: twelve PI
     // ids joined by ";" in one dimension=, one typed "lblLRKmS7Vs" for
@@ -5364,10 +5498,24 @@ async function routeProgramIndicatorAnalytics(path) {
     const pid = (p.match(/aggregate\/([A-Za-z][A-Za-z0-9]{10})/) || [])[1];
     const all = found.size && pid ? await safeDhis2Fetch(`programIndicators?filter=program.id:eq:${pid}&fields=id,displayName&paging=false`) : null;
     const byLower = new Map((all?.programIndicators || []).map(x => [x.id.toLowerCase(), x]));
-    const slips = missing.map(id => [id, byLower.get(id.toLowerCase())]).filter(([, hit]) => hit);
+    // One of this program's indicators with the case changed, or one character
+    // dropped, added or changed (only when exactly one indicator is that close).
+    const near = (id) => {
+      const hits = (all?.programIndicators || []).filter(x => !found.has(x.id) && uidWithinOneEdit(id, x.id));
+      return hits.length === 1 ? hits[0] : null;
+    };
+    const slips = missing.map(id => [id, byLower.get(id.toLowerCase()) || near(id)]).filter(([, hit]) => hit);
+    const malformed = missing.filter(id => id.length !== 11 && !slips.some(([x]) => x === id));
+    if (malformed.length) {
+      return { path: p, routed: false, refusal: {
+        _error: `Not sent: ${malformed.map(id => `"${id}" has ${id.length} characters`).join(', ')}; a DHIS2 UID has exactly 11, so DHIS2 would answer 409.`,
+        _hint: 'Copy each id from the tool result it came from: a character was dropped or added while typing it. The rest of the query is fine.',
+        _scope: 'analytics_uid_case_slip',
+      } };
+    }
     if (slips.length) {
       return { path: p, routed: false, refusal: {
-        _error: `Not sent: ${slips.map(([id, hit]) => `"${id}" is not a program indicator — did you mean ${hit.id} ("${hit.displayName}")?`).join(' ')} UIDs are case-sensitive; DHIS2 would answer 409.`,
+        _error: `Not sent: ${slips.map(([id, hit]) => `"${id}" is not a program indicator — did you mean ${hit.id} ("${hit.displayName}")?`).join(' ')} UIDs are exact and case-sensitive; DHIS2 would answer 409.`,
         _hint: `Use the exact ids (also in any chart or dashboard you build next). Several program indicators at once: analytics?dimension=dx:<id1>;<id2>&dimension=pe:<period>&filter=ou:<orgUnit>.`,
         _scope: 'analytics_uid_case_slip',
       } };

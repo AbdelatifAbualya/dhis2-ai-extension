@@ -26,6 +26,8 @@
   --error-light: #fee2e2;
   --warning: #f59e0b;
   --warning-light: #fef3c7;
+  --harness: #f97316;
+  --harness-text: #9a3412;
   --success-text: #065f46;
   --error-text: #991b1b;
   --info-bg: #ecfeff;
@@ -89,6 +91,7 @@ body.theme-dark {
   --success-light: #11291f;
   --error-light: #3b1515;
   --warning-light: #3a2f12;
+  --harness-text: #fdba74;
   --success-text: #6ee7b7;
   --error-text: #fca5a5;
   --info-bg: #0e2a33;
@@ -887,6 +890,40 @@ body.theme-dark .tool-icon { background: var(--icon-chip) !important; }
   flex-shrink: 0;
 }
 
+/* A call the extension itself stopped or sent back to be corrected: not a
+   failure, so orange and its own label instead of the red cross. */
+.tool-harness {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--harness);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.tool-state-harness {
+  color: var(--harness-text);
+  border-color: rgba(249, 115, 22, 0.45);
+}
+
+.tool-card.tool-card-harness {
+  border-color: rgba(249, 115, 22, 0.45);
+}
+
+.tool-failure-details.tool-harness-details {
+  border-color: var(--harness);
+  background: rgba(249, 115, 22, 0.07);
+}
+
+.tool-failure-details.tool-harness-details > summary {
+  color: var(--harness-text);
+}
+
 .tool-card:not(.tool-done) {
   border-color: var(--primary);
   background: var(--primary-light);
@@ -994,6 +1031,7 @@ body.theme-dark .tool-icon { background: var(--icon-chip) !important; }
   white-space: nowrap;
 }
 .tool-group-count.has-fail { color: var(--error-text); border-color: rgba(239, 68, 68, 0.4); }
+.tool-group-count.has-harness { color: var(--harness-text); border-color: rgba(249, 115, 22, 0.45); }
 .tool-group-live { width: 7px; height: 7px; border-radius: 50%; background: var(--primary); flex-shrink: 0; animation: toolGroupPulse 1.2s ease-in-out infinite; }
 .tool-group.tool-group-done .tool-group-live { display: none; }
 @keyframes toolGroupPulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }

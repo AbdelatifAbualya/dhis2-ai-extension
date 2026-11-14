@@ -224,6 +224,20 @@ async function executeToolCall(name, args) {
         _hint: 'Take the real UID from an earlier tool result (or look it up with search_metadata / a list call) and re-issue the call. Never send placeholders.',
       };
     }
+    // Data Quality Workbench thread (2026-11-13, play 2.42.7.1): validation,
+    // validation/analysis, validation again with POST: five 404s, and the app
+    // was built on the guess. Answered for every method, before the write gate:
+    // "you may not write" is the wrong answer to a path that does not exist.
+    {
+      const _dq = canonicalApiPath(String(args.path || ''));
+      if (GUESSED_DATA_QUALITY_PATH_RE.test(_dq)) {
+        return {
+          _error: `Not sent: there is no "${_dq}" endpoint on DHIS2 (404).`,
+          _hint: `The data-quality endpoints that exist:\n${DATA_QUALITY_ENDPOINTS_TEXT}`,
+          _scope: 'known_endpoint_guidance',
+        };
+      }
+    }
     // dhis2_query write methods (POST/PUT/PATCH/DELETE) are destructive — gate on
     // write authorization the same way as the dedicated manage_* tools, so the
     // model cannot route around the gates by sending a raw API call.
@@ -235,7 +249,13 @@ async function executeToolCall(name, args) {
       // an otherwise read-only turn, with nothing destructive at stake.
       const _isAnalyticsRun = /^(?:resourceTables(?:\/analytics)?|jobConfigurations\/analytics|maintenance\/analyticsTables?)(\b|\?|$)/i
         .test(String(args.path || '').replace(/^\//, '').replace(/^api\/\d+\//, ''));
-      if (!_isAnalyticsRun) {
+      // A validation analysis that saves nothing and notifies nobody is a read
+      // sent as POST: DHIS2 has no GET for it (405).
+      const _isReadOnlyAnalysis = method === 'POST'
+        && /^dataAnalysis\/validationRules\/?(\?|$)/i.test(String(args.path || '').replace(/^\//, '').replace(/^api\/(?:\d+\/)?/, ''))
+        && !(args.body && typeof args.body === 'object' && (args.body.persist === true || args.body.notification === true))
+        && !/"(?:persist|notification)"\s*:\s*true/.test(typeof args.body === 'string' ? args.body : '');
+      if (!_isAnalyticsRun && !_isReadOnlyAnalysis) {
         const _gate = requireWriteAuth('dhis2_query', method, { path: args.path });
         if (_gate) return _gate;
       }
@@ -508,6 +528,19 @@ async function executeToolCall(name, args) {
       || /^maintenance\/analytic/i.test(safePath)
       || (/analytic/i.test(safePath.split('?')[0]) && !/^analytics(\/|\?|$)/i.test(safePath));
     if (method === 'POST' && analyticsRunMatch) {
+      // One run a turn is all a run can do: a second with nothing written in
+      // between builds the same tables. Malaria review thread (2026-11-14): five
+      // runs in one turn, each "to see if the district numbers appear".
+      {
+        const prev = dhis2.analyticsRun;
+        if (prev && prev.turn === (dhis2.turnCounter || 0) && prev.writeSeq === (dhis2.writeSeq || 0)) {
+          return {
+            _error: `Not started: the analytics tables were already rebuilt in this turn (${prev.seconds}s, completed) and nothing has been written since, so another run would build the same tables.`,
+            _hint: 'If a number is still missing, the tables are not the reason. Read the answer by its header names (a plain query has the number in "value"; do not send columns= or rows=), then check the data item, the period and the org unit (a parent adds up everything under it). If the values really are not on the server, say so and go on with the task.',
+            _scope: 'analytics_run_repeat',
+          };
+        }
+      }
       // Unrequested runs. Live 2026-10-28 the model started the analytics job
       // TWICE in one dashboard turn, telling the user new program indicators
       // "need a rebuild" — false: indicators and charts are computed at query
@@ -517,7 +550,9 @@ async function executeToolCall(name, args) {
       const wa0 = dhis2.writeAuth || {};
       const asked = /\banalytic|resource\s*tables?|regenerat|rebuild|refresh (?:the )?(?:data|tables)/i.test(userWordsThisThread())
         || (wa0.scope === 'scoped' && wa0.tool === 'dhis2_query');
-      if (!asked) {
+      // A table proved missing this turn (409 "referenced table does not exist")
+      // is a reason of its own: nothing else builds it.
+      if (!asked && !analyticsTableMissingThisTurn()) {
         const [info, newest] = await Promise.all([
           safeDhis2Fetch('system/info'),
           safeDhis2Fetch('programs?order=created:desc&fields=id,displayName,created&pageSize=1'),
@@ -538,7 +573,12 @@ async function executeToolCall(name, args) {
       // fictional endpoint and would be ignored or rejected.
       const keepParams = new URLSearchParams();
       for (const [k, v] of new URLSearchParams(safePath.split('?')[1] || '')) {
-        if (/^(lastYears|skipResourceTables|skipOutliers|skipTableTypes|skipPrograms)$/i.test(k)) keepParams.append(k, v);
+        if (!/^(lastYears|skipResourceTables|skipOutliers|skipTableTypes|skipPrograms)$/i.test(k)) continue;
+        // A run started because a table is missing must not skip the tables it is
+        // for: a new category needs the resource tables, a reporting rate the
+        // completeness tables.
+        if (analyticsTableMissingThisTurn() && /^(skipResourceTables|skipTableTypes|skipPrograms)$/i.test(k)) continue;
+        keepParams.append(k, v);
       }
       const qs = keepParams.toString();
       const analyticsPath = `resourceTables/analytics${qs ? `?${qs}` : ''}`;
@@ -585,6 +625,10 @@ async function executeToolCall(name, args) {
           _hint: 'Analytics data will not be available. Report this to the user; do not retry blindly — the same job will fail the same way. The rest of the metadata you created is unaffected.',
           job_id: jobId, status: 'FAILED', waited_seconds: waited,
         };
+      }
+      if (status === 'COMPLETED') {
+        dhis2.analyticsRun = { turn: dhis2.turnCounter || 0, writeSeq: dhis2.writeSeq || 0, seconds: waited };
+        dhis2.analyticsTableMissing = null; // built now
       }
       return {
         success: true,
@@ -943,6 +987,14 @@ async function executeToolCall(name, args) {
     }
 
     const queryNotes = []; // corrections made to the query, returned with its result
+    if (method === 'GET') {
+      const layoutHeal = healAnalyticsTableLayout(safePath);
+      if (layoutHeal.healed) {
+        console.log(`[dhis2_query] Table-layout parameters dropped → ${layoutHeal.path}`);
+        safePath = layoutHeal.path;
+        queryNotes.push(layoutHeal.note);
+      }
+    }
     if (method === 'GET' && isAnalyticsPath(safePath)) {
       const ctxVizId = ctx.visualizationId || dhis2.visualizationContext?.id || extractVisualizationIdFromText(lastUserText);
       safePath = await enrichAnalyticsPathWithVisualizationContext(safePath, ctxVizId);
@@ -1046,6 +1098,11 @@ async function executeToolCall(name, args) {
           if (aggHeal.healed) { const at = queryNotes.indexOf(aggHeal.note); if (at >= 0) queryNotes.splice(at, 1); }
           queryNotes.push(piRoute.note);
         }
+      }
+      if (piRoute.healed) {
+        console.log(`[dhis2_query] Joined dimension list split → ${piRoute.path}`);
+        safePath = piRoute.path;
+        if (piRoute.note) queryNotes.push(piRoute.note);
       }
       const periodRefusal = analyticsUnknownPeriodRefusal(safePath);
       if (periodRefusal) return periodRefusal;
@@ -1166,6 +1223,18 @@ async function executeToolCall(name, args) {
     // A 404 on GET <collection>/<uid>: the id often exists as ANOTHER type (a
     // dashboard tile's visualization id read as a program indicator — RMNCH
     // 2026-11-01). Name what it really is so the next call is right.
+    // DHIS2 answers a path that is no endpoint with a 404 and an HTML page; a
+    // missing OBJECT gets a JSON body with a message. Say which one this was, so
+    // the next call is not another spelling of the same guess.
+    if (writeResult && writeResult._status === 404 && !writeResult._body && !writeResult._hint) {
+      const _np = canonicalApiPath(safePath).split('?')[0];
+      if (!/\/[A-Za-z][A-Za-z0-9]{10}(?:\/|$)/.test(`/${_np}`)) {
+        writeResult._error = `DHIS2 API 404: this server has no ${method} endpoint at "${_np}".`;
+        writeResult._hint = `The path itself does not exist on DHIS2 ${dhis2.systemInfo?.version || ''} (a missing object would have answered with a message). Do not try other spellings of it. `.replace('  ', ' ')
+          + (/valid|outlier|quality/i.test(_np) ? `The data-quality endpoints that exist:\n${DATA_QUALITY_ENDPOINTS_TEXT}` : 'Metadata collections are listed by GET resources (plural names such as dataElements, validationRules); for data no endpoint returns, manage_sql_views reads the database. If the task does not depend on this call, carry on without it and say what could not be checked.');
+        writeResult._scope = 'no_such_endpoint';
+      }
+    }
     if (method === 'GET' && writeResult && writeResult._status === 404) {
       const one = safePath.split('?')[0].match(/^(?:\/?api\/(?:\d+\/)?)?([A-Za-z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
       if (one && isLikelyDhisUid(one[2])) {
@@ -4943,10 +5012,102 @@ function vizDefaultLayout(type) {
 // Resolve each data-item UID to its DHIS2 type AND verify it exists. Looks the
 // UIDs up across indicators / dataElements / programIndicators in parallel.
 // Returns { typeMap, unresolved:[…] }. Any UID found in none is unresolved.
+// Data items that are not one object: a data set's reporting figure
+// ("<dataSetUid>.REPORTING_RATE") and one disaggregation of a data element
+// ("<dataElementUid>.<categoryOptionComboUid>"). Both are ordinary data items in
+// the Data Visualizer and Maps apps (verified 2.42.5 and 2.42.7.1, 2026-11-13).
+// Refused before: a dashboard thread made five wrapper indicators instead.
+const REPORTING_RATE_ITEM_RE = /^([A-Za-z][A-Za-z0-9]{10})\.(REPORTING_RATE|REPORTING_RATE_ON_TIME|ACTUAL_REPORTS|ACTUAL_REPORTS_ON_TIME|EXPECTED_REPORTS)$/;
+const OPERAND_ITEM_RE = /^([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})$/;
+async function resolveDottedDataItems(list, typeMap) {
+  const rr = list.map(u => u.match(REPORTING_RATE_ITEM_RE)).filter(Boolean);
+  const ops = list.map(u => (REPORTING_RATE_ITEM_RE.test(u) ? null : u.match(OPERAND_ITEM_RE))).filter(Boolean);
+  if (!rr.length && !ops.length) return;
+  const ids = (xs) => [...new Set(xs)].join(',');
+  const [ds, de, coc] = await Promise.all([
+    rr.length ? safeDhis2Fetch(`dataSets?filter=id:in:[${ids(rr.map(m => m[1]))}]&fields=id&paging=false`) : null,
+    ops.length ? safeDhis2Fetch(`dataElements?filter=id:in:[${ids(ops.map(m => m[1]))}]&filter=domainType:eq:AGGREGATE&fields=id&paging=false`) : null,
+    ops.length ? safeDhis2Fetch(`categoryOptionCombos?filter=id:in:[${ids(ops.map(m => m[2]))}]&fields=id&paging=false`) : null,
+  ]);
+  const has = (r, key) => new Set((r?.[key] || []).map(o => o.id));
+  const dsIds = has(ds, 'dataSets'), deIds = has(de, 'dataElements'), cocIds = has(coc, 'categoryOptionCombos');
+  for (const m of rr) if (dsIds.has(m[1])) typeMap[m[0]] = 'REPORTING_RATE';
+  for (const m of ops) if (deIds.has(m[1]) && cocIds.has(m[2])) typeMap[m[0]] = 'DATA_ELEMENT_OPERAND';
+}
+// The typed entry DHIS2 stores for one data item.
+function dataDimensionItemFor(u, t) {
+  if (t === 'REPORTING_RATE') { const [ds, metric] = u.split('.'); return { dataDimensionItemType: t, reportingRate: { id: u, dataSet: { id: ds }, metric } }; }
+  if (t === 'DATA_ELEMENT_OPERAND') { const [de, coc] = u.split('.'); return { dataDimensionItemType: t, dataElementOperand: { id: u, dataElement: { id: de }, categoryOptionCombo: { id: coc } } }; }
+  const key = VIZ_DDI_KEY[t];
+  return key ? { dataDimensionItemType: t, [key]: { id: u } } : null;
+}
+
+// Layout entries that are not dx / pe / ou: a disaggregation CATEGORY, by UID or
+// exact name ("Age"). Reads its options into spec._categoryDims and rewrites a
+// name to the UID in the layout. Every data item must be an aggregate data
+// element: an indicator or reporting rate has no disaggregation to split by.
+// → null, or { _error }.
+async function resolveVizCategoryDimensions(spec, typeMap) {
+  if (!spec || !spec.layout || typeof spec.layout !== 'object') return null;
+  const axes = ['columns', 'rows', 'filters', 'filter', 'series', 'category', 'x_axis'];
+  const std = /^(?:dx|pe|ou|data|periods?|org_?units?|organisation_?units?)$/i;
+  const wanted = [];
+  for (const a of axes) {
+    const v = spec.layout[a];
+    for (const d of (Array.isArray(v) ? v : v ? [v] : [])) { const t = String(d).trim(); if (t && !std.test(t) && !wanted.includes(t)) wanted.push(t); }
+  }
+  if (!wanted.length) return null;
+  const fields = 'id,displayName,dataDimension,categoryOptions[id,displayName]';
+  const dims = {};
+  const rename = {};
+  for (const w of wanted) {
+    const byId = /^[A-Za-z][A-Za-z0-9]{10}$/.test(w) ? await safeDhis2Fetch(`categories/${w}?fields=${fields}`) : null;
+    let cat = byId && !byId._error && byId.id ? byId : null;
+    if (!cat) {
+      const byName = await safeDhis2Fetch(`categories?filter=displayName:ilike:${encodeURIComponent(w)}&fields=${fields}&pageSize=10`);
+      const hits = (byName?.categories || []);
+      const exact = hits.filter(c => String(c.displayName).toLowerCase() === w.toLowerCase());
+      cat = exact.length === 1 ? exact[0] : hits.length === 1 ? hits[0] : null;
+      if (!cat) {
+        return {
+          _error: `The layout names "${w}", which is not dx, pe, ou or ${hits.length > 1 ? 'ONE' : 'a'} disaggregation category on this server${hits.length > 1 ? ` (${hits.length} categories match: ${hits.map(c => `${c.displayName} ${c.id}`).join('; ')})` : ''}.`,
+          _hint: 'A layout takes dx (the data items), pe, ou and the UID of a category the data elements are disaggregated by (dataElements/<id>?fields=categoryCombo[categories[id,displayName]]). To split by something that is not a category, use one data item per slice.',
+        };
+      }
+    }
+    if (cat.dataDimension === false) {
+      return { _error: `Category "${cat.displayName}" is not a data dimension (dataDimension is false), so analytics cannot split by it and the tile would show an error.`, _hint: `Either set it: dhis2_query(method="PATCH", path="categories/${cat.id}", body={ "dataDimension": true }) and run analytics, or plot one data item per disaggregation ("<dataElementUid>.<categoryOptionComboUid>").` };
+    }
+    const options = (cat.categoryOptions || []).map(o => o.id).filter(Boolean);
+    if (!options.length) return { _error: `Category "${cat.displayName}" has no options.` };
+    dims[cat.id] = options;
+    if (cat.id !== w) rename[w] = cat.id;
+  }
+  const notElements = (Array.isArray(spec.data_items) ? spec.data_items : []).map(String).filter(u => typeMap[u] && typeMap[u] !== 'DATA_ELEMENT');
+  if (notElements.length) {
+    return {
+      _error: `A category in the layout splits DATA ELEMENTS by their disaggregation. ${notElements.join(', ')} ${notElements.length > 1 ? 'are' : 'is'} not a plain aggregate data element (${[...new Set(notElements.map(u => typeMap[u]))].join(', ')}), and has nothing to split.`,
+      _hint: 'Use the data elements themselves as data_items with the category in the layout, e.g. layout { series:["<categoryUid>"], category:["pe"], filters:["ou"] }. An indicator is split with one indicator per group, or one "<dataElementUid>.<categoryOptionComboUid>" item per cell.',
+    };
+  }
+  if (Object.keys(rename).length) {
+    for (const a of axes) {
+      const v = spec.layout[a];
+      if (Array.isArray(v)) spec.layout[a] = v.map(d => rename[String(d).trim()] || d);
+      else if (v && rename[String(v).trim()]) spec.layout[a] = rename[String(v).trim()];
+    }
+  }
+  spec._categoryDims = dims;
+  return null;
+}
+
 async function resolveDataItemTypes(uids) {
-  const list = [...new Set((uids || []).map(u => String(u).trim()).filter(Boolean))];
+  const all = [...new Set((uids || []).map(u => String(u).trim()).filter(Boolean))];
   const typeMap = {};
-  if (!list.length) return { typeMap, unresolved: [] };
+  if (!all.length) return { typeMap, unresolved: [] };
+  await resolveDottedDataItems(all, typeMap);
+  const list = all.filter(u => !typeMap[u] && !OPERAND_ITEM_RE.test(u) && !REPORTING_RATE_ITEM_RE.test(u));
+  if (!list.length) return { typeMap, unresolved: all.filter(u => !typeMap[u]), trackerNames: {}, aliases: [] };
   const inFilter = `id:in:[${list.join(',')}]`;
   const [indResp, deResp, piResp] = await Promise.all([
     safeDhis2Fetch(`indicators.json?filter=${inFilter}&fields=id&paging=false`),
@@ -4969,7 +5130,7 @@ async function resolveDataItemTypes(uids) {
     }
   }
   for (const o of (piResp?.programIndicators || [])) if (!typeMap[o.id]) typeMap[o.id] = 'PROGRAM_INDICATOR';
-  let unresolved = list.filter(u => !typeMap[u]);
+  let unresolved = all.filter(u => !typeMap[u]);
 
   // Name → UID aliasing: models routinely pass an object's NAME as a data
   // item (observed live 2026-07-19: data_items:["Early ANC initiation
@@ -5047,7 +5208,7 @@ async function prepareInlineVisualizations(items) {
   if (allDataItems.length) {
     const res = await resolveDataItemTypes(allDataItems);
     if (res.unresolved.length) {
-      return { _error: `These data_items UIDs (across the new visualizations) do not exist as an indicator, data element or program indicator: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs.' };
+      return { _error: `These data_items UIDs (across the new visualizations) do not exist as an indicator, data element or program indicator: ${res.unresolved.join(', ')}.`, _hint: 'Resolve them with search_metadata; never invent UIDs. A reporting figure is "<dataSetUid>.REPORTING_RATE" (also REPORTING_RATE_ON_TIME, ACTUAL_REPORTS, ACTUAL_REPORTS_ON_TIME, EXPECTED_REPORTS); one disaggregation of a data element is "<dataElementUid>.<categoryOptionComboUid>".' };
     }
     typeMap = res.typeMap;
   }
@@ -5058,6 +5219,8 @@ async function prepareInlineVisualizations(items) {
   for (const { index, spec } of inlineSpecs) {
     const levelWarning = await orgLevelNameWarning(spec.name, spec.org_units);
     if (levelWarning) layoutNotes.push(`"${spec.name}": ${levelWarning}`);
+    const catProblem = await resolveVizCategoryDimensions(spec, typeMap);
+    if (catProblem) return { ...catProblem, _error: `Item ${index + 1} (new_visualization "${spec.name || ''}"): ${catProblem._error}` };
     const overall = await applyOverallRow(spec);
     if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
     if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
@@ -5287,7 +5450,31 @@ function dashboardSizeHints(items) {
 // asked for) and every wide tile take a whole row, and each row is as tall as
 // its tallest tile — no holes, no slivers.
 // tiles: [{ kind, wide, h, name, size?, strict?, height? }] in reading order.
-function packDashboardTiles(tiles, startY = 0) {
+// Headline tiles a row holds: 4 unless the user asked for another number
+// (kpis_per_row, 1 to 6). Six in one row are 10 columns each: narrow, and the
+// tiles grow taller for their wrapped titles, but it is what was asked for
+// (Facility Supervision thread, 2026-11-13: "the six numbers in one row" came
+// back as two rows of three, and arrange could not change it).
+const DASH_KPIS_PER_ROW = 4;
+const DASH_KPIS_PER_ROW_MAX = 6;
+function dashKpisPerRow(v) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n >= 1 ? Math.min(DASH_KPIS_PER_ROW_MAX, n) : null;
+}
+// A saved dashboard that already has more than 4 small tiles in a row keeps
+// that when its tiles are re-flowed.
+function savedKpisPerRow(items) {
+  const perY = {};
+  for (const it of Array.isArray(items) ? items : []) {
+    const w = Number(it && it.width) || 0;
+    if (w > 0 && w <= DASH_GRID_COLS / DASH_KPIS_PER_ROW - 1) perY[Number(it.y) || 0] = (perY[Number(it.y) || 0] || 0) + 1;
+  }
+  const most = Math.max(0, ...Object.values(perY));
+  return most > DASH_KPIS_PER_ROW ? Math.min(DASH_KPIS_PER_ROW_MAX, most) : null;
+}
+
+function packDashboardTiles(tiles, startY = 0, opts = {}) {
+  const perRow = dashKpisPerRow(opts.kpisPerRow) || DASH_KPIS_PER_ROW;
   const cls = tiles.map(t => {
     const want = t.size || (t.kind === 'kpi' ? 'small' : t.wide ? 'full' : 'half');
     if (want === 'small') return ['kpi', 'text', 'app'].includes(t.kind) ? 'small' : 'half';
@@ -5299,7 +5486,7 @@ function packDashboardTiles(tiles, startY = 0) {
     if (cls[i] === 'small') {
       let j = i;
       while (j < tiles.length && cls[j] === 'small') j++;
-      const n = j - i, rowCount = Math.ceil(n / 4), base = Math.floor(n / rowCount), extra = n % rowCount;
+      const n = j - i, rowCount = Math.ceil(n / perRow), base = Math.floor(n / rowCount), extra = n % rowCount;
       for (let r = 0, k = i; r < rowCount; r++) {
         const m = base + (r < extra ? 1 : 0);
         rows.push(Array.from({ length: m }, (_, q) => k + q));
@@ -5334,10 +5521,10 @@ function packDashboardTiles(tiles, startY = 0) {
 
 // Sizes for dashboard entries, in the entries' order. infos[i] describes what
 // entry i shows (dashboardTileInfos); items[i] may carry the model's numbers.
-function layoutDashboardItems(items, infos, startY = 0, levelCounts = {}) {
+function layoutDashboardItems(items, infos, startY = 0, levelCounts = {}, opts = {}) {
   const { order, hints, scale, gaveNumbers } = dashboardSizeHints(items);
   const tiles = order.map(i => ({ ...dashTileNeeds(infos[i] || {}, levelCounts), ...(hints[i].size ? { size: hints[i].size, strict: hints[i].strict } : {}), ...(hints[i].height ? { height: hints[i].height } : {}) }));
-  const packed = packDashboardTiles(tiles, startY);
+  const packed = packDashboardTiles(tiles, startY, opts);
   const shapes = new Array(items.length);
   order.forEach((i, k) => { shapes[i] = packed.shapes[k]; });
   const note = !gaveNumbers ? null
@@ -5505,9 +5692,9 @@ function buildVisualizationObject(spec, typeMap) {
         _tracker_data_element: u,
       };
     }
-    const key = VIZ_DDI_KEY[t];
-    if (!key) return { _error: `Data item "${u}" has unsupported type ${t} for a visualization.` };
-    dataDimensionItems.push({ dataDimensionItemType: t, [key]: { id: u } });
+    const ddi = dataDimensionItemFor(u, t);
+    if (!ddi) return { _error: `Data item "${u}" has unsupported type ${t} for a visualization.` };
+    dataDimensionItems.push(ddi);
   }
 
   // pe — relative flags + fixed periods
@@ -5540,11 +5727,18 @@ function buildVisualizationObject(spec, typeMap) {
   }
 
   // Layout — store dimension lists; only include a dimension that has data.
+  // A disaggregation category (age, sex…) is a dimension of its own, placed in
+  // the layout by its UID. resolveVizCategoryDimensions has read its options
+  // into spec._categoryDims: { <categoryUid>: [optionUid…] }.
+  const catDims = spec._categoryDims && typeof spec._categoryDims === 'object' ? spec._categoryDims : {};
+  const catIds = Object.keys(catDims);
   const hasData = { dx: dataDimensionItems.length > 0, pe: hasPe, ou: hasOu };
+  for (const c of catIds) hasData[c] = true;
   let layoutSpec = spec.layout && typeof spec.layout === 'object' ? spec.layout : vizDefaultLayout(type);
-  const ALLOWED_DIMS = new Set(['dx', 'pe', 'ou']);
+  const ALLOWED_DIMS = new Set(['dx', 'pe', 'ou', ...catIds]);
+  const dimName = (d) => { const raw = String(d).trim(); return catIds.includes(raw) ? raw : raw.toLowerCase(); };
   const axisDims = (dims) => (Array.isArray(dims) ? dims : (dims ? [dims] : []))
-    .map(d => String(d).toLowerCase())
+    .map(dimName)
     .filter(d => ALLOWED_DIMS.has(d) && hasData[d]);
   // In a DHIS2 CHART, rows are the CATEGORY (x-axis) and columns the SERIES
   // (legend) — every stock chart on the demo DB is columns:[dx|ou],
@@ -5570,6 +5764,7 @@ function buildVisualizationObject(spec, typeMap) {
     pe: periods.reduce((n, p) => n + dashPeriodCount(p), 0),
     ou: orgUnits.some(o => /^LEVEL-|CHILDREN$/i.test(o)) ? 99 : orgUnits.length,
   };
+  for (const c of catIds) dimCount[c] = catDims[c].length;
   if (isChart && spec.keep_layout !== true) {
     const cols = axisDims(layoutSpec.columns), rows = axisDims(layoutSpec.rows);
     // Not for several data items with ONE period and ONE place: items on the axis
@@ -5622,6 +5817,8 @@ function buildVisualizationObject(spec, typeMap) {
   for (const d of ['dx', 'pe', 'ou']) {
     if (hasData[d] && !placed.has(d)) fallbackFilters.push(d);
   }
+  // A category the layout does not place is not part of this visualization.
+  const usedCats = catIds.filter(c => placed.has(c));
   const columnDimensions = axisDims(layoutSpec.columns);
   const rowDimensions = axisDims(layoutSpec.rows).filter(d => !columnDimensions.includes(d));
   // A dimension is on one axis only.
@@ -5648,6 +5845,7 @@ function buildVisualizationObject(spec, typeMap) {
     relativePeriods,
     periods: fixedPeriods,
   };
+  if (usedCats.length) viz.categoryDimensions = usedCats.map(c => ({ category: { id: c }, categoryOptions: catDims[c].map(o => ({ id: o })) }));
   // Chronological period order. With relative-period flags alone the server
   // orders them its own way — "each quarter of this year and last year" drew
   // 2026 Q1–Q4 BEFORE 2025 Q1–Q4 (live 2026-10-28). Explicit axis items keep
@@ -5659,6 +5857,7 @@ function buildVisualizationObject(spec, typeMap) {
     const ordered = periods.map((p, i) => ({ id: VIZ_REL_PERIOD_FLAG[p.toUpperCase()] ? p.toUpperCase() : p, i }))
       .sort((a, b) => ((yearRank(a.id) ?? 0.5) - (yearRank(b.id) ?? 0.5)) || (a.i - b.i)).map(x => ({ id: x.id }));
     const items = {
+      ...Object.fromEntries(usedCats.map(c => [c, catDims[c].map(o => ({ id: o }))])),
       dx: dataDimensionItems.map(d => ({ id: (Object.values(d).find(v => v && typeof v === 'object' && v.id) || {}).id })),
       pe: ordered,
       ou: [
@@ -5777,7 +5976,7 @@ function buildMapObject(spec, typeMap) {
   const t = typeMap[item];
   if (!t) return { _error: `Could not resolve data item "${item}" to a known type. Verify the UID with search_metadata.` };
   const ddiKey = VIZ_DDI_KEY[t];
-  if (!ddiKey) return { _error: `Data item "${item}" has unsupported type ${t} for a map.` };
+  if (!ddiKey && t !== 'REPORTING_RATE' && t !== 'DATA_ELEMENT_OPERAND') return { _error: `Data item "${item}" has unsupported type ${t} for a map.` };
 
   let period = String(spec.period || (Array.isArray(spec.periods) ? spec.periods[0] : '') || 'LAST_12_MONTHS').trim();
   const yearFix = namedYearPeriods([period]);
@@ -6022,13 +6221,19 @@ async function executeManageMaps(args) {
     const mapLevel = Number(spec.org_unit_level) || Number((String((Array.isArray(spec.org_units) ? spec.org_units : []).find(o => /^LEVEL-\d+$/i.test(String(o))) || '').match(/\d+/) || [])[0]) || null;
     let locationCoverage = null;
     if (mapLevel) {
-      const [withGeo, noGeo] = await Promise.all([
-        safeDhis2Fetch(`organisationUnits?filter=level:eq:${mapLevel}&filter=geometry:!null&fields=id&pageSize=1`),
-        safeDhis2Fetch(`organisationUnits?filter=level:eq:${mapLevel}&filter=geometry:null&fields=id&pageSize=1`),
-      ]);
-      if (Number.isFinite(withGeo?.pager?.total) && Number.isFinite(noGeo?.pager?.total)) {
-        locationCoverage = { level: mapLevel, with_location: withGeo.pager.total, without_location: noGeo.pager.total };
-        spec._drawn_units = withGeo.pager.total;
+      // Counted under the map's own parent units. Counting the whole level said
+      // "591 of 759 level-6 units have no location" for a map of one district
+      // with 232 of them (Facility Supervision thread, 2026-11-13).
+      const parents = [...new Set((Array.isArray(spec.org_units) ? spec.org_units : []).map(String).filter((o) => /^[A-Za-z][A-Za-z0-9]{10}$/.test(o)))];
+      const scopes = parents.length && parents.length <= 8 ? parents : [null];
+      const countAt = async (geo) => {
+        const answers = await Promise.all(scopes.map((p) => safeDhis2Fetch(`organisationUnits?filter=level:eq:${mapLevel}${p ? `&filter=path:like:${p}` : ''}&filter=geometry:${geo}&fields=id&pageSize=1`)));
+        return answers.every((r) => Number.isFinite(r?.pager?.total)) ? answers.reduce((n, r) => n + r.pager.total, 0) : null;
+      };
+      const [withGeo, noGeo] = await Promise.all([countAt('!null'), countAt('null')]);
+      if (withGeo !== null && noGeo !== null) {
+        locationCoverage = { level: mapLevel, ...(scopes[0] ? { under: parents } : {}), with_location: withGeo, without_location: noGeo };
+        spec._drawn_units = withGeo;
       }
     }
     if (!String(spec.basemap || '').trim()) spec.basemap = await defaultMapBasemap();
@@ -6206,8 +6411,10 @@ async function executeManageDashboards(args) {
     }
     const { typeMap, unresolved } = await resolveDataItemTypes(spec.data_items);
     if (unresolved.length) {
-      return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${unresolved.join(', ')}.`, _hint: 'Resolve the correct UIDs with search_metadata first; never invent UIDs.' };
+      return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${unresolved.join(', ')}.`, _hint: 'Resolve the correct UIDs with search_metadata first; never invent UIDs. A reporting figure is "<dataSetUid>.REPORTING_RATE" (also REPORTING_RATE_ON_TIME, ACTUAL_REPORTS, ACTUAL_REPORTS_ON_TIME, EXPECTED_REPORTS); one disaggregation of a data element is "<dataElementUid>.<categoryOptionComboUid>".' };
     }
+    const catProblem = await resolveVizCategoryDimensions(spec, typeMap);
+    if (catProblem) return catProblem;
     const levelWarning = await orgLevelNameWarning(spec.name, spec.org_units);
     const overall = await applyOverallRow(spec);
     if (overall?._error) return overall;
@@ -6273,7 +6480,7 @@ async function executeManageDashboards(args) {
 
     // Size every tile from what it shows (layoutDashboardItems).
     const { infos, levelCounts } = await dashboardTileInfos(items.map((it, i) => dashboardEntryOf(it || {}, inlineVizIdByIndex[i])), inlineInfo);
-    const laid = layoutDashboardItems(items, infos, 0, levelCounts);
+    const laid = layoutDashboardItems(items, infos, 0, levelCounts, { kpisPerRow: args.kpis_per_row });
     const dashboardItems = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i] || {};
@@ -6439,7 +6646,8 @@ async function executeManageDashboards(args) {
     let startY = 0;
     for (const it of existingItems) { const y = Number(it.y) || 0, h = Number(it.height) || 0; if (y + h > startY) startY = y + h; }
     const { infos, levelCounts } = await dashboardTileInfos(items.map((it, i) => dashboardEntryOf(it || {}, inlineVizIdByIndex[i])), inlineInfo);
-    const laid = layoutDashboardItems(items, infos, startY, levelCounts);
+    const kpisPerRow = dashKpisPerRow(args.kpis_per_row) || savedKpisPerRow(existingItems);
+    const laid = layoutDashboardItems(items, infos, startY, levelCounts, { kpisPerRow });
     const newItems = [];
     const summary = [];
     for (let i = 0; i < items.length; i++) {
@@ -6515,7 +6723,7 @@ async function executeManageDashboards(args) {
       const infoOf = new Map([...ordered.map((it, i) => [it, ex.infos[i]]), ...newItems.map((di, i) => [di, infos[i]])]);
       // A replacement keeps the width its tile had, unless a new size was asked for.
       const sizeOf = new Map([...ordered.map(it => [it, { size: savedDashboardTileSize(it) }]), ...newItems.map((di, i) => [di, { size: (items[i] || {}).size || (replaced ? savedDashboardTileSize(replaced) : undefined) }])]);
-      const re = layoutDashboardItems(combined.map(x => sizeOf.get(x)), combined.map(x => infoOf.get(x)), 0, { ...ex.levelCounts, ...levelCounts });
+      const re = layoutDashboardItems(combined.map(x => sizeOf.get(x)), combined.map(x => infoOf.get(x)), 0, { ...ex.levelCounts, ...levelCounts }, { kpisPerRow });
       combined.forEach((x, i) => Object.assign(x, re.shapes[i]));
       owner.dashboardItems = combined;
       insertedRows = re.rows;
@@ -6587,7 +6795,7 @@ async function executeManageDashboards(args) {
       ordered = [...picked, ...unlisted];
     }
     const { infos, levelCounts } = await dashboardTileInfos(ordered.map(savedDashboardEntry), {});
-    const laid = layoutDashboardItems(ordered.map(it => ({ size: sizeById[it.id] })), infos, 0, levelCounts);
+    const laid = layoutDashboardItems(ordered.map(it => ({ size: sizeById[it.id] })), infos, 0, levelCounts, { kpisPerRow: dashKpisPerRow(args.kpis_per_row) || savedKpisPerRow(existing) });
     const changed = ordered.filter((it, k) => ['x', 'y', 'width', 'height'].some(f => Number(it[f]) !== laid.shapes[k][f])).length;
     const unlistedNote = unlisted.length ? { _unlisted_tiles: `${unlisted.length} tile(s) were not in order and follow the listed ones, in their current order: ${unlisted.map(it => `${it.id} ${savedDashboardTileLabel(it)}`).join('; ')}.` } : {};
     if (args.dry_run_only) return { success: true, dry_run: true, dashboard_id: dId, tiles: ordered.length, would_change: changed, tile_rows: laid.rows, ...unlistedNote, message: 'Nothing saved (dry_run_only=true).' };
@@ -6856,8 +7064,20 @@ async function executeManageDatasets(args) {
     if (_gate) return _gate;
     const dsId = args.dataset_id || args.object_id;
     if (!dsId) return { _error: 'dataset_id required for update' };
+    // The fields are also read from the top level (update + indicator_ids, or
+    // name / description beside dataset_id, is how models send it), and
+    // indicator_ids sets the form's own indicators. Malaria report thread
+    // (2026-11-13): "patch object required", then indicator_ids ignored beside a
+    // patch, then a raw PATCH of the data set.
+    {
+      const topLevel = ['name', 'short_name', 'description', 'code', 'period_type', 'form_type', 'open_future_periods', 'expiry_days', 'timely_days', 'render_as_tabs', 'render_horizontally', 'mobile', 'valid_complete_only', 'compulsory_fields_complete_only', 'notify_completing_user', 'no_value_requires_comment', 'skip_offline', 'data_element_decoration', 'field_combination_required', 'indicator_ids'];
+      const lifted = {};
+      for (const k of topLevel) if (args[k] !== undefined && args[k] !== null) lifted[k] = args[k];
+      if (args.dataset_name !== undefined && lifted.name === undefined && (!args.patch || args.patch.name === undefined)) lifted.name = args.dataset_name;
+      if (Object.keys(lifted).length) args = { ...args, patch: { ...lifted, ...(args.patch && typeof args.patch === 'object' ? args.patch : {}) } };
+    }
     if (!args.patch || typeof args.patch !== 'object') {
-      return { _error: 'patch object required for update', _hint: 'Pass patch:{ name?, short_name?, description?, period_type?, form_type?, open_future_periods?, expiry_days?, timely_days?, render_as_tabs?, render_horizontally?, mobile?, valid_complete_only?, compulsory_fields_complete_only?, notify_completing_user?, no_value_requires_comment?, skip_offline?, data_element_decoration?, field_combination_required?, code? }' };
+      return { _error: 'patch object required for update', _hint: 'Pass patch:{ indicator_ids?, name?, short_name?, description?, period_type?, form_type?, open_future_periods?, expiry_days?, timely_days?, render_as_tabs?, render_horizontally?, mobile?, valid_complete_only?, compulsory_fields_complete_only?, notify_completing_user?, no_value_requires_comment?, skip_offline?, data_element_decoration?, field_combination_required?, code? }' };
     }
     const exists = await verifyTargetExists('dataSets', dsId, 'manage_datasets', 'update', 'id,displayName');
     if (!exists.exists) return exists.refusal;
@@ -6897,6 +7117,19 @@ async function executeManageDatasets(args) {
     const applied = {};
     const ignored = [];
     for (const [k, v] of Object.entries(args.patch)) {
+      // The indicators shown on the form: the whole set, as create takes it.
+      if (k === 'indicator_ids' || k === 'indicators') {
+        const ids = [...new Set((Array.isArray(v) ? v : []).map((x) => (x && typeof x === 'object' ? x.id : x)).filter(Boolean).map(String))];
+        if (ids.length) {
+          const found = await safeDhis2Fetch(`indicators?filter=id:in:[${ids.join(',')}]&fields=id&paging=false`);
+          const have = new Set((found?.indicators || []).map((i) => i.id));
+          const unknown = ids.filter((id) => !have.has(id));
+          if (unknown.length) return { _error: `Indicator(s) not found: ${unknown.join(', ')}. Nothing was changed.`, _hint: 'These must be aggregate indicators (manage_indicators), not program indicators.', backup: backup.block };
+        }
+        dsResp.indicators = ids.map((id) => ({ id }));
+        applied.indicators = ids;
+        continue;
+      }
       const mapped = KEY_MAP[k];
       if (!mapped) { ignored.push(k); continue; }
       if (mapped === 'shortName' && typeof v === 'string' && v.length > 50) {
