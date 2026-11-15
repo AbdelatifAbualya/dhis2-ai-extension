@@ -354,6 +354,14 @@ Useful test target: `https://play.im.dhis2.org/stable-2-41-8` (admin / district)
 
 Newest first. The long investigation write-ups for releases up to 2.8.25 lived in `changes.md` and `CHANGES_*.md`. Those files were folded into this section and removed; their full text is in the git history.
 
+### 2.8.44 — Slightly bolder chat text (2026-11-15)
+
+- Running text in the side panel (messages, the input box, descriptions) is drawn a step heavier: one token, `--w-text: 520` in `sidepanel/panel.css`, replaces the scattered `500`s. Tables stay one step lighter than running text (`calc(var(--w-text) - 50)`); headings, labels and bold words keep their weights.
+- Why a font had to be bundled: on Linux the stack resolved to Liberation Sans, which has only regular and bold faces, so `500` was drawn as regular and anything from `600` up as bold. No in-between weight could be shown. The panel now ships **Arimo** (`sidepanel/fonts/`, variable 400–700, SIL OFL 1.1, licence in `fonts/OFL.txt`, about 210 KB in eight unicode-range subsets). Arimo is the same design as Liberation Sans, so the look is unchanged apart from the weight. It is declared as `'Panel Sans'` after the system fonts: macOS (San Francisco) and Windows (Segoe UI) keep their own font, and on Windows the new weight is drawn as Segoe UI Semibold, the next face up.
+- `'Panel Sans'` is declared twice per subset: weights 400–599 are drawn exactly, and 600 and above at 700, as the old static bold drew them. Labels and headings therefore look the same as before.
+- Monospace text (`code`, `pre`, tool details, settings inputs) is pinned to `500`: monospace fonts have no medium face, and inheriting the heavier text weight could have turned every code span bold.
+- Checked in Chrome on Linux, light and dark: every text element is drawn with Arimo at the exact weight, code stays regular DejaVu Sans Mono, and the page logs no errors.
+
 ### 2.8.43 — Harness interventions shown as their own state, and a real-model round on event programs, aggregate data sets, data quality and user access (2026-11-14)
 
 Three rounds with a real model (Fireworks deepseek-v4p1-flash-1017) on localhost:8081 (2.42.5) and play 2.42.7.1, on work earlier rounds had not covered: an event program built from nothing with rules, indicators and a dashboard; an aggregate data set with disaggregation, validation rules, indicators, data entry and a dashboard; a data-quality app; a Capture widget that writes; a dashboard plugin on aggregate indicators; roles, users and sharing. Each finding below was fixed, covered in `npm run verify`, and the thread run again.
