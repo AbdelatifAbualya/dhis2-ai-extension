@@ -385,7 +385,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   }
 
   const messages = [
-    { role: 'system', content: systemPrompt },
+    // Today's date, so "this year" / "last month" and period ids need no
+    // lookup: models guessed a systemDate endpoint for it (404, twice on
+    // 2026-11-17). The browser's date; system/info.serverDate is the server's.
+    { role: 'system', content: `${systemPrompt}\n\nToday's date: ${todayIsoDate()} (the user's computer). The current year is ${todayIsoDate().slice(0, 4)}.` },
     ...conversationHistory,
     { role: 'user', content: userContent },
   ];
@@ -397,6 +400,11 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   {
     const memoryBlock = buildMemoryPromptBlock(userText, [...contextualToolNames]);
     if (memoryBlock) messages.push({ role: 'system', content: memoryBlock.trim() });
+  }
+  // A plan-first request, said once where the model reads it (transient, like
+  // the lessons above): research, then present the plan and stop.
+  if (dhis2.writeAuth && dhis2.writeAuth.planFirst) {
+    messages.push({ role: 'system', content: 'THIS TURN IS PLAN-FIRST: the user asked to see the plan / summary / mapping before anything is created, installed or placed. Look up what you need, then present it (for an app or plugin, manage_custom_app preview builds what you show) and ask for approval. Do not call any create, install, place, update or delete action this turn: they are refused, and the user\'s "yes" next turn approves them.' });
   }
 
   const charts = [];
@@ -674,6 +682,17 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   // Wire tools sent to the provider each iteration, minus anything disabled.
   const effectiveWireTools = () =>
     disabledToolNames.size ? wireTools.filter(t => !disabledToolNames.has(t?.function?.name)) : wireTools;
+  const WIND_DOWN_AFTER_DISABLE = 4;
+  let failedSinceDisable = 0;   // calls in a row, after a tool was switched off, that did not succeed
+  let windDownReason = null;    // set → the tools close and the model writes its answer
+  const noteWindDown = (outcomeKind) => {
+    if (!disabledToolNames.size) return;
+    failedSinceDisable = outcomeKind === 'ok' ? 0 : failedSinceDisable + 1;
+    if (failedSinceDisable >= WIND_DOWN_AFTER_DISABLE && !windDownReason) {
+      windDownReason = `${[...disabledToolNames].join(', ')} ${disabledToolNames.size > 1 ? 'are' : 'is'} switched off for this turn, and the ${failedSinceDisable} calls since then were refused or failed`;
+      console.warn(`[AgenticLoop] Wind-down: ${windDownReason}`);
+    }
+  };
 
   // Marker: everything in `messages` from this index on is THIS turn (the user
   // message + any prefetch + every assistant/tool message the loop adds). The
@@ -690,6 +709,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   const turnEpoch = conversationEpoch;
 
   for (let i = 0; i < 50; i++) {
+    // Tools closed (see WIND_DOWN_AFTER_DISABLE): the final tool-free answer
+    // below the loop takes over.
+    if (windDownReason) break;
     // Contextual thinking label
     const thinkLabel = lastToolName
       ? thinkingAfterTool[lastToolName] || 'Processing results'
@@ -840,6 +862,18 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             args = healedEntities.value;
           }
         }
+        // Bring the arguments to the shapes the tool's schema declares (lists
+        // a constrained decoder wrote as {"item": …}, "true" for true, …).
+        // An object where text or a list of values belongs cannot be repaired
+        // and is refused below, before anything runs.
+        let argShapeRefusal = null;
+        if (args && typeof args === 'object' && toolName && TOOL_ROUTER[toolName]) {
+          const shaped = normalizeToolArgs(toolName, args);
+          if (shaped.notes.length) console.warn(`[AgenticLoop] Normalized ${toolName} argument shapes: ${shaped.notes.slice(0, 6).join('; ')}${shaped.notes.length > 6 ? ' …' : ''}`);
+          args = shaped.value;
+          const blocking = shaped.problems.filter(p => p.blocking);
+          if (blocking.length) argShapeRefusal = argumentShapeRefusal(toolName, blocking);
+        }
 
         // ── Unknown tool (hallucinated name) — answer, do not execute ──
         if (!toolName || !TOOL_ROUTER[toolName]) {
@@ -966,6 +1000,7 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           };
           broadcast({ type: 'AI_TOOL_DONE', tool: tc.function.name, success: false, outcome: 'harness_blocked', summary: `${tc.function.name} is disabled for this turn — not executed`, details: { scope: 'circuit_breaker_tool_disabled' } });
           messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult) });
+          noteWindDown('harness_blocked');
           continue;
         }
         // ── Manual gate (two-tier tool docs): the FIRST call to a
@@ -1027,10 +1062,15 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
               }
             }
           } else {
-            try {
-              toolResult = await executeTool(tc.function.name, args);
-            } catch (toolErr) {
-              toolResult = { _error: `Tool failed: ${toolErr.message}` };
+            if (argShapeRefusal) {
+              toolResult = argShapeRefusal;
+            } else {
+              try {
+                toolResult = await executeTool(tc.function.name, args);
+              } catch (toolErr) {
+                console.error(`[AgenticLoop] ${tc.function.name} threw:`, toolErr);
+                toolResult = internalToolErrorResult(tc.function.name, args, toolErr);
+              }
             }
             // Record this dispatch so the no-progress guard can refuse a model
             // that keeps re-issuing the SAME call and getting the same result.
@@ -1080,6 +1120,14 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
               toolResult._hint = toolResult._redirect && contextualToolNames.has(toolResult._redirect)
                 ? `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of the same refusal. Your next call must be ${toolResult._redirect}: it is in your tool list now.`
                 : `${toolResult._hint ? toolResult._hint + ' ' : ''}⚠ This is failure #${failNote.famCount} of ${tc.function.name} with the same error this turn. Identical retries are BLOCKED. Change the failing part based on the exact error above (e.g. simplify the expression to the supported grammar, or test with dry_run). If you cannot fix it now, STOP calling ${tc.function.name}: give the user a final answer listing what succeeded (names + IDs), what failed with this exact error, and your recommended next step.`;
+            }
+            // A refusal must never send the model to a tool that is switched off
+            // this turn. Malaria thread 2026-11-17: "That tool is available now"
+            // on every blocked raw POST, while manage_dashboards was off — the
+            // model read it as "available again" and called it nine more times.
+            if (toolResult && typeof toolResult._redirect === 'string' && disabledToolNames.has(toolResult._redirect)) {
+              toolResult._hint = `${toolResult._redirect}, the only tool that saves this correctly, is switched off for the rest of this turn after repeated failures. No other route (dhis2_query, /metadata, another endpoint) can do it, so do not try one. Write your final answer now: what was created (names + ids), what is missing, and the exact error that stopped it.`;
+              delete toolResult._redirect;
             }
             // Learning memory: a failure gets the stored fix for it attached; a
             // success that resolves an earlier failure this turn gets a nudge
@@ -1280,15 +1328,23 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
           status: toolResult.status || toolResult.response?.status || null,
           httpStatus: toolResult._httpStatus || null,
         };
+        const outcomeKind = toolOutcomeKind(toolResult);
         broadcast({
           type: 'AI_TOOL_DONE',
           tool: tc.function.name,
           success: isToolSuccess,
-          outcome: toolOutcomeKind(toolResult),
+          outcome: outcomeKind,
           summary,
           apiPath,
           details,
         });
+        // Wind-down: once a tool is switched off, calls that keep coming back
+        // refused or failed are a model probing for a way round (Malaria thread
+        // 2026-11-17: 35 more calls after manage_dashboards went off — raw
+        // POSTs, PUTs, "test whether the tool recovered"). After
+        // WIND_DOWN_AFTER_DISABLE of them in a row, the tools close and the
+        // model writes its answer. Any success resets the count.
+        if (!toolResult._tool_manual) noteWindDown(outcomeKind);
 
         messages.push({
           role: 'tool',
@@ -1441,7 +1497,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     messages.push({
       role: 'system',
       content:
-        'TOOL BUDGET EXHAUSTED — you cannot make any more tool calls this turn. ' +
+        (windDownReason
+          ? `TOOLS CLOSED FOR THIS TURN — ${windDownReason}. No other route can do that step: do not suggest one you have not run. `
+          : 'TOOL BUDGET EXHAUSTED — you cannot make any more tool calls this turn. ') +
         'Write your final answer to the user NOW, in plain language: ' +
         '(1) what completed successfully this turn (object names + IDs), ' +
         '(2) what failed — quote the exact error message(s), ' +
@@ -1763,13 +1821,87 @@ const HARNESS_CORRECTING_SCOPES = new Set([
   'unknown_uid_in_args', 'saved_object_as_data_item', 'stage_as_dimension', 'analytics_uid_case_slip', 'analytics_joined_dimension',
   'event_analytics_multi_stage', 'reporting_rate_needs_data_set', 'complete_registrations_incomplete', 'known_endpoint_guidance',
   'line_list_cannot_aggregate', 'line_list_no_record_id', 'analytics_no_record_id', 'icon_not_verified', 'requires_matching_tool',
+  'argument_shape', 'analytics_period_needed', 'org_level_mismatch', 'analytics_ou_level',
 ]);
-// Scopes that travel with an answer DHIS2 itself gave.
-const SERVER_FAILURE_SCOPES = new Set(['no_such_endpoint', 'unique_attribute_violation']);
+// Scopes that travel with an answer DHIS2 itself gave — and a tool's own crash,
+// which is a real fault (red), not the harness steering the model.
+const SERVER_FAILURE_SCOPES = new Set(['no_such_endpoint', 'unique_attribute_violation', 'tool_internal_error']);
+
+// Today as YYYY-MM-DD in the browser's own time zone.
+function todayIsoDate() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// ── Argument shapes at the dispatch boundary ────────────────────────────────
+// The FULL schema of each tool (registry TOOLS, nested properties included),
+// not the slim wire copy: see normalizeArgsToSchema in core.js.
+const _toolSchemaCache = new Map();
+function fullToolSchema(toolName) {
+  if (!_toolSchemaCache.has(toolName)) {
+    const def = TOOLS.find(t => t?.function?.name === toolName);
+    _toolSchemaCache.set(toolName, def?.function?.parameters || null);
+  }
+  return _toolSchemaCache.get(toolName);
+}
+function normalizeToolArgs(toolName, args) {
+  const schema = fullToolSchema(toolName);
+  if (!schema || !args || typeof args !== 'object' || Array.isArray(args)) return { value: args, notes: [], problems: [] };
+  const r = normalizeArgsToSchema(args, schema);
+  // A dataStore value is the user's own JSON: {"item": …} in it may be real.
+  if (toolName === 'dhis2_query' && args.body !== undefined
+    && /^\/?(?:api\/(?:\d+\/)?)?(?:dataStore|userDataStore)\b/i.test(String(args.path || ''))) {
+    r.value = { ...r.value, body: args.body };
+    r.notes = r.notes.filter(n => !/^body\b/.test(n));
+  }
+  // The same encoding one level up: dimensions written as a sibling "item" key
+  // of query_params ({ dimension:[…], item:[["pe:LAST_12_MONTHS"],["ou:…"]] },
+  // Child Programme review 2026-11-17) — DHIS2 has no item= parameter, so the
+  // period and org unit were silently dropped. Dimension strings move into
+  // dimension; anything else under item is left for the tool to report.
+  const qp = toolName === 'dhis2_query' && r.value && r.value.query_params;
+  if (qp && typeof qp === 'object' && !Array.isArray(qp)) {
+    const flat = (v) => [].concat(queryParamValue(v) ?? []).flat(Infinity).filter(x => x != null).map(String);
+    for (const k of ['item', 'items']) {
+      if (!(k in qp)) continue;
+      const vals = flat(qp[k]);
+      if (!vals.length || !vals.every(v => /^(?:dx|pe|ou|co|ao|[A-Za-z][A-Za-z0-9]{10}(?:\.[A-Za-z][A-Za-z0-9]{10})?):\S/.test(v))) continue;
+      const next = { ...r.value.query_params, dimension: [...flat(r.value.query_params.dimension), ...vals] };
+      delete next[k];
+      r.value = { ...r.value, query_params: next };
+      r.notes.push(`query_params.${k}: dimension strings moved into dimension`);
+    }
+  }
+  return r;
+}
+const argProblemLine = (p) => `${p.path} must be ${p.expected}, but it is ${p.got}`;
+function argumentShapeRefusal(toolName, problems) {
+  return {
+    _error: `Not sent: ${problems.length === 1 ? 'one argument has' : `${problems.length} arguments have`} a shape ${toolName} cannot take — ${problems.slice(0, 6).map(argProblemLine).join('; ')}${problems.length > 6 ? '; …' : ''}.`,
+    _hint: `Send the same call again with exactly ${problems.length === 1 ? 'that argument' : 'those arguments'} fixed: a list is written [ "a", "b" ], one value as plain text, true/false without quotes. Everything else in the call was fine.`,
+    _scope: 'argument_shape',
+  };
+}
+// A tool that THREW: a fault in the extension's own code. It used to reach the
+// model as "Tool failed: object is not iterable…" with nothing else; the model
+// blamed its "nested arrays", sent the same call, and the tool was switched
+// off (Malaria thread 2026-11-17).
+function internalToolErrorResult(toolName, args, err) {
+  const msg = String((err && err.message) || err || 'unknown error').slice(0, 300);
+  const action = args && typeof args.action === 'string' ? ` (action "${args.action}")` : '';
+  const loose = normalizeToolArgs(toolName, args).problems;
+  return {
+    _error: `Internal error in ${toolName}${action}: ${msg}. This is a fault in the extension's own tool code — not an answer from DHIS2.`,
+    _hint: loose.length
+      ? `These arguments are not in the shape the tool's manual gives: ${loose.slice(0, 5).map(argProblemLine).join('; ')}. Fix only those and call once more. If it fails again, do not rebuild this step by hand through dhis2_query (a hand-written body saves objects the apps cannot open): finish the rest of the task and tell the user this step failed with an internal error of the extension, quoting the error.`
+      : `Your arguments match the tool's schema, so the same call will fail the same way: do not resend it, and do not rebuild this step by hand through dhis2_query (a hand-written body saves objects the apps cannot open). If one argument is clearly not what the manual describes, fix that and call once more; otherwise finish the rest of the task and tell the user this step failed with an internal error of the extension, quoting the error, so it can be reported.`,
+    _scope: 'tool_internal_error',
+  };
+}
 // The server, the network or the provider said no.
 const SERVER_FAILURE_TEXT_RE = /\bDHIS2 API \d{3}\b|\bHTTP \d{3}\b|\b(?:status|answered|returned)\s+(?:code\s+)?[45]\d\d\b|fetch failed|failed to fetch|network error|timed? ?out|^tool failed:|upload failed|import (?:failed|was rejected)|\bFAILED after\b/i;
 // A call sent back for its arguments: nothing was asked of the server.
-const ARGUMENT_PROBLEM_TEXT_RE = /\b(?:is|are) required\b|\brequired for\b|^missing\b|\bmust (?:be|list|have|name|occur)\b|^(?:pass|provide|supply)\b|^unsupported\b|^invalid\b|^unknown\b|\bneeds? (?:an?|the|one|at least)\b|does not compile/i;
+const ARGUMENT_PROBLEM_TEXT_RE = /\b(?:is|are) required\b|\brequired for\b|^missing\b|\bmust (?:be|list|have|name|occur)\b|^(?:pass|provide|supply)\b|^unsupported\b|^invalid\b|^unknown\b|\bneeds? (?:an?|the|one|exactly|at least)\b|does not compile/i;
 function toolOutcomeKind(result, scope) {
   const r = result && typeof result === 'object' ? result : {};
   if (!r._error && r.success !== false) return 'ok';

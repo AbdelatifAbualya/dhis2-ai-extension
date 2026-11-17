@@ -143,6 +143,46 @@ async function getSchemaFor(type) {
   return schema;
 }
 
+// ── dhis2_query GET filter pre-check ─────────────────────────────────────────
+// A metadata list filtered on a property the type does not have is a sure HTTP
+// 400 (dataElements?filter=program.id:eq:… — a data element reaches a program
+// only through its stages; Child Programme review, 2026-11-17). The schema says
+// so before the request. Only the first segment of the property path is
+// checked (nested paths are the server's to judge), "identifiable" is DHIS2's
+// own search token, and nothing is refused when the schema cannot be read.
+const FILTER_TYPE_HINTS = {
+  dataElements: { program: 'A data element belongs to a program only through its stages: get_program_info(info_type="structure", program_id) lists them, or programDataElements?program=<uid>, or programStages?filter=program.id:eq:<uid>&fields=programStageDataElements[dataElement[id,displayName]].' },
+};
+async function precheckFilterAgainstSchema(safePath) {
+  const q = String(safePath || '').indexOf('?');
+  if (q < 0) return null;
+  const base = String(safePath).slice(0, q).replace(/^\/+/, '');
+  // Metadata collections only: analytics, tracker, dataStore … have filters of
+  // their own grammar (filter=pe:2025) and no schema.
+  if (!/^[A-Za-z]+$/.test(base) || (typeof NOT_A_COLLECTION_RE !== 'undefined' && NOT_A_COLLECTION_RE.test(base))) return null;
+  const filters = new URLSearchParams(String(safePath).slice(q + 1)).getAll('filter');
+  if (!filters.length) return null;
+  const schema = await getSchemaFor(base);
+  if (!schema || schema.plural !== base) return null;
+  // The property name and its collection name only: the Java field name is
+  // not a query path (dashboards: fieldName "items" → 400 "Unknown path
+  // property: items.content", program review 2026-11-17).
+  const names = new Set(['identifiable']);
+  for (const p of schema.properties) for (const k of [p.name, p.collectionName]) if (k) names.add(k);
+  const unknown = [];
+  for (const f of filters) {
+    const prop = String(f).split(':')[0].split('.')[0].trim();
+    if (prop && !names.has(prop) && !unknown.includes(prop)) unknown.push(prop);
+  }
+  if (!unknown.length) return null;
+  const tip = unknown.map(u => FILTER_TYPE_HINTS[base]?.[u]).filter(Boolean).join(' ');
+  return {
+    _error: `Not sent: ${base} has no property ${unknown.map(u => `"${u}"`).join(', ')} to filter on — DHIS2 answers 400.`,
+    _hint: `${tip ? tip + ' ' : ''}Properties of ${schema.name} close to it: ${unknown.map(u => _closest(u, [...names].filter(n => n !== 'identifiable'), 5).join(', ')).join(' | ')}.`,
+    _scope: 'known_endpoint_guidance',
+  };
+}
+
 // ── dhis2_query PATCH pre-check ──────────────────────────────────────────────
 // A PATCH whose op path names a property the schema does not have is a
 // guaranteed HTTP 400 ("Property allowFutureEnrollment does not exist on

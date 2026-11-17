@@ -718,7 +718,10 @@ async function unplaceCustomAppPlugin(args, opts = {}) {
   const removed = [];
   const backups = [];
   const memo = {};
-  const want = (t) => !args.target || args.target === t;
+  // "all" (the gate's own label for no target) means every target: it used to
+  // match none, and unplace answered "not placed anywhere" while a dashboard
+  // tile and a form entry stayed (found 2026-11-17 cleaning up test plugins).
+  const want = (t) => !args.target || String(args.target).toLowerCase() === 'all' || args.target === t;
 
   if (want('dashboard')) {
     const dash = await safeDhis2Fetch(`dashboards?filter=${encodeURIComponent(`dashboardItems.appKey:eq:${key}`)}&fields=id,displayName,dashboardItems[id,appKey]&paging=false`, { noTruncate: true });

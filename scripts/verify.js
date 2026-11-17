@@ -326,9 +326,12 @@ if (loaded) {
   if (discoStop && cwa2 && D3) {
     // The agentic loop ASSIGNS the classification onto dhis2.writeAuth; mirror
     // that here so the guard sees the same state it does at runtime.
-    D3.consecutiveDiscoveryCalls = 99;                    // a long streak
+    D3.consecutiveDiscoveryCalls = 40;                    // a long streak, under the read-only bound
     D3.writeAuth = cwa2('check that the dashboard renders correctly'); // read_only
-    eq('a long read-only streak is NOT blocked', discoStop('get_program_info', {}), null);
+    eq('a long read-only streak (40) is NOT blocked — verifying is all reads', discoStop('get_program_info', {}), null);
+    D3.consecutiveDiscoveryCalls = 99;                    // past READ_ONLY_DISCOVERY_LIMIT
+    truthy('…past 60 reads a read-only turn is told to answer from what it found (never to write)', /enough to answer/.test((discoStop('get_program_info', {}) || {})._error || '') && !/Issue the actual write/.test((discoStop('get_program_info', {}) || {})._hint || ''));
+    D3.consecutiveDiscoveryCalls = 99;
     D3.writeAuth = cwa2('create a tracker program for TB');            // broad
     eq('…but a write turn still enforces the streak limit',
       (discoStop('get_program_info', {}) || {})._scope, 'no_progress_repeat');
@@ -3511,11 +3514,17 @@ async function runDashboardThreadChecks() {
       }
       sent = 0;
       const rp = await ctx.executeTool('dhis2_query', { path: 'periods', query_params: { periodType: 'Monthly', startDate: '2025-01-01', endDate: '2026-12-31' } });
+      const rrp = await ctx.executeTool('dhis2_query', { path: 'relativePeriods', query_params: { fields: 'id,name', paging: 'false' } });
+      const rpa = await ctx.executeTool('dhis2_query', { path: 'programAttributes', query_params: { filter: 'program.id:eq:IpHINAT79UW', fields: 'id' } });
+      const rap = await ctx.executeTool('dhis2_query', { path: 'analytics/periods', query_params: { fields: 'id' } });
+      const rpse = await ctx.executeTool('dhis2_query', { path: 'programStageElements' });
+      const rnt = await ctx.executeTool('dhis2_query', { path: 'notificationTemplates' });
+      const rsd = await ctx.executeTool('dhis2_query', { path: 'programStageDataElements', query_params: { filter: 'programStage.id:eq:A03MvHHogjR' } });
       const rc = await ctx.executeTool('dhis2_query', { path: 'completeDataSetRegistrations', query_params: { dataSet: 'BfMAe6Itzgt', period: '202510', children: 'true' } });
       const rr = await ctx.executeTool('dhis2_query', { path: 'analytics', query_params: { dimension: ['dx:REPORTING_RATE', 'ou:ImspTQPwCqd'], filter: 'pe:202510' } });
       const ra = await ctx.executeTool('dhis2_query', { path: 'apps/ai-breast-imaging-scorecard/app-guard.js' });
       truthy('dhis2_query answers the guessed "periods" endpoint, an incomplete completeDataSetRegistrations, a bare REPORTING_RATE and an app file read locally (nothing sent)',
-        rp._scope === 'known_endpoint_guidance' && /202510/.test(rp._hint) && rc._scope === 'complete_registrations_incomplete' && rr._scope === 'reporting_rate_needs_data_set'
+        rp._scope === 'known_endpoint_guidance' && /202510/.test(rp._hint) && rrp._scope === 'known_endpoint_guidance' && [rap, rpse, rnt].every(x => x._scope === 'known_endpoint_guidance') && rpa._scope === 'known_endpoint_guidance' && /programs\/IpHINAT79UW\?fields=programTrackedEntityAttributes/.test(rpa._hint) && /programStages\/A03MvHHogjR\?fields=programStageDataElements/.test(rsd._hint) && rc._scope === 'complete_registrations_incomplete' && rr._scope === 'reporting_rate_needs_data_set'
         && ra._scope === 'known_endpoint_guidance' && /get_source/.test(ra._hint) && sent === 0);
     } finally { ctx.safeDhis2Fetch = saved; d.writeAuth = savedWa; vm.runInContext('lastUserText = ""; conversationHistory = [];', ctx); }
   }
@@ -5136,6 +5145,367 @@ async function runMaternityThreadChecks() {
   vm.runInContext(`conversationHistory = ${JSON.stringify(saved.hist)};`, ctx);
 }
 
+
+// ── Malaria Testing and Treatment Review thread (2026-11-17, MiniMax-M3.1-flash) ──
+async function runArgumentShapeThreadChecks() {
+  console.log('\nArgument shapes, tool crashes and switched-off tools (Malaria Testing and Treatment Review thread):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  const d = vm.runInContext('dhis2', ctx);
+  const saved = { sdf: ctx.safeDhis2Fetch, wa: d.writeAuth, base: d.baseUrl, connected: d.connected, apiVersion: d.apiVersion, exec: ctx.executeTool, fetch: ctx.fetch, broadcast: ctx.broadcast, hist: JSON.parse(JSON.stringify(vm.runInContext('conversationHistory', ctx))), pageContext: d.pageContext };
+  Object.assign(d, { baseUrl: 'https://verify.example/dhis', connected: true, apiVersion: 42 });
+  try {
+    // 1. Every nested object a model fills in declares its fields on the wire.
+    const FREE_FORM = new Set(['dhis2_query.body', 'dhis2_query.query_params', 'manage_program_notifications.patch', 'manage_datasets.patch']);
+    const fieldless = [];
+    const walk = (sch, p) => {
+      if (!sch || typeof sch !== 'object') return;
+      if (sch.type === 'object' && !sch.properties && !sch.additionalProperties && !FREE_FORM.has(p)) fieldless.push(p);
+      if (sch.type === 'array' && !sch.items) fieldless.push(`${p} (list without items)`);
+      if (sch.properties) for (const [k, v] of Object.entries(sch.properties)) walk(v, `${p}.${k}`);
+      if (sch.items) walk(sch.items, `${p}[]`);
+    };
+    for (const t of vm.runInContext('TOOLS', ctx)) walk(t.function.parameters, t.function.name);
+    eq('no tool parameter is an object or list without a field list (a constrained decoder writes lists inside one as {"item": …})', fieldless, []);
+    const wire = vm.runInContext('toWireTools(TOOLS.filter(t => t.function.name === "manage_dashboards"))', ctx)[0].function.parameters;
+    truthy('…new_visualization reaches the wire with its fields (data_items, periods, org_units, layout, overall_row)', ['data_items', 'periods', 'org_units', 'layout', 'overall_row'].every(k => wire.properties.items.items.properties.new_visualization.properties?.[k]));
+
+    // 2. The exact arguments that crashed create_dashboard come out in the right shape.
+    const crash = { action: 'create_dashboard', dashboard: { name: 'Malaria Testing and Treatment Review' }, items: [
+      { new_visualization: { name: 'Total tests recorded', vis_type: 'SINGLE_VALUE', data_items: { item: 'JBg6UCsP4Zq' }, periods: { item: 'THIS_YEAR' }, org_units: { item: 'ImspTQPwCqd' } } },
+      { new_visualization: { name: 'Treatment choices', vis_type: 'bar', data_items: { item: ['HyRTIlibfw2', 'jjP9uqdlAsZ'] }, periods: { item: 'THIS_YEAR' }, org_units: { item: 'ImspTQPwCqd' }, layout: { category: { item: 'dx' }, filters: { item: ['pe', 'ou'] } } } },
+      { new_visualization: { name: 'District table', vis_type: 'PIVOT_TABLE', data_items: { item: ['JBg6UCsP4Zq'] }, periods: { item: 'THIS_YEAR' }, org_units: { item: ['ImspTQPwCqd', 'LEVEL-2'] }, overall_row: 'true', layout: { rows: { item: 'ou' }, columns: { item: 'dx' }, filters: { item: 'pe' } } } },
+      { type: 'map', map_id: 'sE5EGukhe4B' } ] };
+    const n = ctx.normalizeToolArgs('manage_dashboards', crash);
+    const nv = (i) => n.value.items[i].new_visualization;
+    eq('{"item": …} lists in an inline visualization are read as lists, "true" as true, a case slip of an enum fixed', [nv(0).data_items, nv(0).periods, nv(1).layout, n.value.items[3].type, nv(2).org_units, nv(2).overall_row, nv(2).layout.rows, n.problems.length],
+      [['JBg6UCsP4Zq'], ['THIS_YEAR'], { category: ['dx'], filters: ['pe', 'ou'] }, 'MAP', ['ImspTQPwCqd', 'LEVEL-2'], true, ['ou'], 0]);
+    const m = ctx.normalizeToolArgs('manage_maps', { action: 'create', org_unit_level: '2', period: ['THIS_YEAR'], org_units: 'ImspTQPwCqd', thematic_map_type: 'choropleth' }).value;
+    eq('…map arguments: "2" → 2, ["THIS_YEAR"] → "THIS_YEAR", one org unit → a list, "choropleth" → CHOROPLETH', [m.org_unit_level, m.period, m.org_units, m.thematic_map_type], [2, 'THIS_YEAR', ['ImspTQPwCqd'], 'CHOROPLETH']);
+    const body = ctx.normalizeToolArgs('dhis2_query', { path: 'metadata', method: 'POST', body: { visualizations: { item: [{ name: 'x', columnDimensions: { item: 'dx' } }] } }, query_params: { dimension: { item: ['ou:ImspTQPwCqd', 'pe:THIS_YEAR'] } } }).value;
+    eq('…free-form bodies and query parameters: {"item": …} → a list at any depth', [Array.isArray(body.body.visualizations), body.body.visualizations[0].columnDimensions, body.query_params.dimension], [true, ['dx'], ['ou:ImspTQPwCqd', 'pe:THIS_YEAR']]);
+    const ds = ctx.normalizeToolArgs('dhis2_query', { path: 'dataStore/ns/key', method: 'PUT', body: { item: { a: 1 } } }).value;
+    eq('…a dataStore value is the user\'s own JSON and is left as sent', ds.body, { item: { a: 1 } });
+    const blocked = ctx.normalizeToolArgs('manage_dashboards', { action: 'create_dashboard', dashboard: { name: { a: 1, b: 2 } }, items: [{ new_visualization: { name: 'x', data_items: { a: 'x', b: 'y' } } }] }).problems.filter(p => p.blocking);
+    const refusal = ctx.argumentShapeRefusal('manage_dashboards', blocked);
+    truthy('an object where text or a list of ids belongs is refused before anything runs, naming each argument; the panel shows it as "correcting"',
+      blocked.length === 2 && /dashboard\.name must be text/.test(refusal._error) && /items\[0\]\.new_visualization\.data_items must be a list/.test(refusal._error) && ctx.toolOutcomeKind(refusal) === 'harness_correcting');
+    eq('a comma list stays text for the tool to read (not split by the dispatcher)', ctx.normalizeToolArgs('search_metadata', { object_type: 'dataElements', filters: 'a:eq:1,b' }).value.filters, 'a:eq:1,b');
+
+    // 3. Query parameters never reach the URL as [object Object].
+    eq('{"item": […]} query parameters become one parameter each', ctx.appendQueryParamsToPath('analytics/events/aggregate/p', { dimension: { item: ['ou:A', 'B.C'] }, stage: 'S' }), 'analytics/events/aggregate/p?dimension=ou%3AA&dimension=B.C&stage=S');
+    eq('…an object with several fields is reported', ctx.queryParamsShapeProblems({ dimension: { ou: 'A', pe: 'B' }, stage: 'S' }), ['dimension']);
+    const sent = [];
+    ctx.fetch = async (u) => { sent.push(String(u)); return new Response('{}', { status: 200 }); };
+    d.writeAuth = { scope: 'read_only', reason: 'verify' };
+    const qp = await ctx.executeTool('dhis2_query', { path: 'analytics/events/aggregate/bMcwwoVnbSR', query_params: { dimension: { ou: 'ImspTQPwCqd', pe: 'THIS_YEAR' } } });
+    const obj = await ctx.__realSafeDhis2Fetch('analytics/events/aggregate/bMcwwoVnbSR?dimension=[object Object]');
+    truthy('dhis2_query refuses such a parameter and the transport refuses any URL holding "[object Object]" — nothing is sent', qp._scope === 'argument_shape' && /"dimension"/.test(qp._error) && obj._scope === 'argument_shape' && sent.length === 0);
+
+    // 4. Hand-written analytics objects: every way round is closed.
+    const posts = [];
+    ctx.safeDhis2Fetch = async (p, o = {}) => { posts.push(`${o.method || 'GET'} ${p}`); return { status: 'OK' }; };
+    d.writeAuth = { scope: 'broad', reason: 'verify' };
+    const keyed = await ctx.executeTool('dhis2_query', { path: 'metadata', method: 'POST', body: { visualizations: { mT1a7xKq9Bd: { name: 'x' } } } });
+    const items = await ctx.executeTool('dhis2_query', { path: 'dashboardItems', method: 'POST', body: { type: 'TEXT', text: 'x' } });
+    const made = await ctx.executeTool('dhis2_query', { path: 'dashboards/malariaTTR01', method: 'PUT', body: { name: 'x', dashboardItems: [] } });
+    truthy('POST metadata with visualizations keyed by id, POST dashboardItems and PUT dashboards/<made-up id> are refused and sent to manage_dashboards; nothing is written',
+      [keyed, items, made].every(r => /^Blocked/.test(r._error || '') && r._redirect === 'manage_dashboards') && !posts.some(p => /^(?:POST|PUT)/.test(p)));
+
+    // 4b. Analytics periods and org units as a model guesses them (verified 2.42.7).
+    const h = (u) => ctx.healAnalyticsPeriodAndOrgUnitParams(u);
+    const bareDates = h('analytics/events/aggregate/bMcwwoVnbSR?dimension=ou:ImspTQPwCqd&dimension=pe&stage=kO3z4Dhc038&startDate=2024-01-01&endDate=2026-12-31');
+    const bareWithParam = h('analytics/events/aggregate/bMcwwoVnbSR?dimension=pe&dimension=ou:ImspTQPwCqd&stage=kO3z4Dhc038&periods=LAST_12_MONTHS');
+    const aggParam = h('analytics?dimension=dx:SWEIWH5VuTj&dimension=ou:ImspTQPwCqd&periods=THIS_YEAR');
+    const evParam = h('analytics/events/aggregate/bMcwwoVnbSR?dimension=ou:ImspTQPwCqd&stage=kO3z4Dhc038&period=THIS_YEAR');
+    const noOu = h('analytics/events/aggregate/bMcwwoVnbSR?dimension=pe:THIS_YEAR&stage=kO3z4Dhc038');
+    const enrFilter = h('analytics/enrollments/aggregate/IpHINAT79UW?filter=ou:ImspTQPwCqd&dimension=pe:THIS_YEAR');
+    const aggNoPe = h('analytics?dimension=dx:SWEIWH5VuTj&dimension=ou:ImspTQPwCqd');
+    const evNoPe = h('analytics/events/aggregate/bMcwwoVnbSR?dimension=ou:ImspTQPwCqd&stage=kO3z4Dhc038');
+    const fine = h('analytics?dimension=dx:SWEIWH5VuTj&dimension=ou:ImspTQPwCqd&filter=pe:THIS_YEAR');
+    truthy('a bare pe dimension is refused with the forms that work, or filled from a period= parameter beside it',
+      bareDates.refusal?._scope === 'analytics_period_needed' && /dimension=pe:LAST_12_MONTHS&dimension=ou:ImspTQPwCqd/.test(bareWithParam.path) && !/periods=/.test(bareWithParam.path));
+    truthy('period= / periods= (no such parameter: a 409 on /analytics, silently ignored by event analytics) become filter=pe:…',
+      /&filter=pe:THIS_YEAR$/.test(aggParam.path) && !/periods=/.test(aggParam.path) && /filter=pe:THIS_YEAR/.test(evParam.path) && !/period=/.test(evParam.path) && /ignored/.test(evParam.notes[0]));
+    truthy('no org unit → dimension=ou:USER_ORGUNIT; an org-unit FILTER on enrollment aggregate (SQL 42601) becomes a dimension',
+      /dimension=ou:USER_ORGUNIT/.test(noOu.path) && /dimension=ou:ImspTQPwCqd/.test(enrFilter.path) && !/filter=ou/.test(enrFilter.path));
+    truthy('/analytics with no period is refused before sending; event analytics without one is sent with a note that DHIS2 answers the last 12 months; a correct query is untouched',
+      aggNoPe.refusal?._scope === 'analytics_period_needed' && !evNoPe.healed && /last 12 months/.test(evNoPe.notes[0] || '') && fine.healed === false && fine.notes.length === 0);
+    // 4c. A guessed collection name goes to the collection the server has.
+    const savedIdx = ctx.getSchemaIndex;
+    const idx = new Map();
+    for (const e of [{ name: 'organisationUnit', plural: 'organisationUnits' }, { name: 'organisationUnitLevel', plural: 'organisationUnitLevels' }, { name: 'dataElement', plural: 'dataElements' }, { name: 'dataStore', plural: 'dataStores' }]) { idx.set(e.name.toLowerCase(), e); idx.set(e.plural.toLowerCase(), e); }
+    ctx.getSchemaIndex = async () => idx;
+    const col = async (u) => (await ctx.healCollectionPath(u)).path;
+    eq('orgUnits / organizationUnitLevels / dataElement / dataelements → the real collection; a real name, dataStore and analytics are untouched',
+      [await col('orgUnits?fields=id&filter=level:eq:2'), await col('organizationUnitLevels'), await col('dataElement/abc'), await col('dataelements'), await col('organisationUnits?fields=id'), await col('dataStore/ns/key'), await col('analytics?dimension=dx:a')],
+      ['organisationUnits?fields=id&filter=level:eq:2', 'organisationUnitLevels', 'dataElements/abc', 'dataElements', 'organisationUnits?fields=id', 'dataStore/ns/key', 'analytics?dimension=dx:a']);
+    ctx.getSchemaIndex = savedIdx;
+
+    // 4c'. Hand-written reads of a program review (Child Programme, 2026-11-17).
+    {
+      const pde = ctx.healProgramDataElementsQuery('programDataElements?filter=program.id:eq:IpHINAT79UW&fields=id,displayName', null);
+      const pdeCtx = ctx.healProgramDataElementsQuery('programDataElements?fields=id', 'IpHINAT79UW');
+      const pdeNone = ctx.healProgramDataElementsQuery('programDataElements?fields=id', null);
+      truthy('programDataElements gets its program as program=<uid> (from a filter or the page\'s program); with none known it is refused before a 400',
+        /^programDataElements\?program=IpHINAT79UW&fields=id%2CdisplayName$/.test(pde.path) && /^programDataElements\?program=IpHINAT79UW&fields=id$/.test(pdeCtx.path) && pdeNone.refusal?._scope === 'known_endpoint_guidance');
+      const moved = ctx.normalizeToolArgs('dhis2_query', { path: 'analytics/events/aggregate/IpHINAT79UW', query_params: { dimension: { item: [['dx:A03MvHHogjR.bx6fsa0t90x']] }, item: [['pe:LAST_12_MONTHS'], ['ou:ImspTQPwCqd']], stage: 'A03MvHHogjR' } }).value.query_params;
+      eq('dimensions written under a sibling "item" key move into dimension (DHIS2 has no item= parameter)', moved, { dimension: ['dx:A03MvHHogjR.bx6fsa0t90x', 'pe:LAST_12_MONTHS', 'ou:ImspTQPwCqd'], stage: 'A03MvHHogjR' });
+      const savedVal = ctx.validateProgramRuleCondition; const checked = [];
+      ctx.validateProgramRuleCondition = async (c, pid) => { checked.push([c, pid]); return { status: 'OK', message: 'Valid', description: 'x' }; };
+      d.writeAuth = { scope: 'read_only', reason: 'the user asked for no changes' };
+      ctx.safeDhis2Fetch = async (p2, o = {}) => ({ _error: `unexpected ${o.method || 'GET'} ${p2}` });
+      const rc = await ctx.executeTool('dhis2_query', { path: 'programRules/condition/description', query_params: { condition: "#{apgarscore} < 0", programId: 'IpHINAT79UW' } });
+      const rc2 = await ctx.executeTool('dhis2_query', { path: 'programRules/condition/description?programId=IpHINAT79UW', method: 'POST', body: { condition: '#{apgarscore} >= 0' } });
+      ctx.safeDhis2Fetch = async (p2) => (/^programRules\/NAgjOfWMXg6\?/.test(p2) ? { id: 'NAgjOfWMXg6', condition: '#{apgarscore} > 7', program: { id: 'IpHINAT79UW' } } : { _error: 'unexpected' });
+      const rc3 = await ctx.executeTool('dhis2_query', { path: 'programRules/NAgjOfWMXg6/condition/description', query_params: { fields: 'condition' } });
+      ctx.validateProgramRuleCondition = savedVal;
+      truthy('a rule-condition check sent as GET, or as POST with a JSON body, runs as the POST with a text body — also on a read-only turn (it saves nothing)',
+        rc.message === 'Valid' && rc2.message === 'Valid' && rc3.message === 'Valid' && JSON.stringify(checked) === JSON.stringify([['#{apgarscore} < 0', 'IpHINAT79UW'], ['#{apgarscore} >= 0', 'IpHINAT79UW'], ['#{apgarscore} > 7', 'IpHINAT79UW']]));
+      d.writeAuth = { scope: 'broad', reason: 'verify' };
+    }
+
+    // 4c''. Org-unit levels and plan-first turns.
+    {
+      const savedLevels = d.orgLevelNames;
+      d.orgLevelNames = [{ level: 1, name: 'National' }, { level: 2, name: 'District' }, { level: 3, name: 'Chiefdom' }, { level: 4, name: 'Facility' }];
+      ctx.safeDhis2Fetch = async (p2) => (/^organisationUnits\?filter=id:in:/.test(p2) ? { organisationUnits: [{ id: 'YuQRtpLP10I', displayName: 'Badjia', level: 3 }, { id: 'O6uvpzGd5pu', displayName: 'Bo', level: 2 }].filter(u => p2.includes(u.id)) } : {});
+      const deep = await ctx.analyticsOrgUnitLevelRefusal('analytics?dimension=dx:Uvn6LCg7dVU&dimension=ou:YuQRtpLP10I;LEVEL-2&filter=pe:2025');
+      const at = await ctx.analyticsOrgUnitLevelRefusal('analytics?dimension=dx:Uvn6LCg7dVU&dimension=ou:O6uvpzGd5pu;LEVEL-2&filter=pe:2025');
+      truthy('ou:<chiefdom>;LEVEL-2 is refused before its 409, naming the unit\'s level and USER_ORGUNIT;LEVEL-2; a unit at the level itself is sent',
+        deep?._scope === 'analytics_ou_level' && /Badjia \(YuQRtpLP10I\) is level 3 \(Chiefdom\)/.test(deep._error) && /USER_ORGUNIT;LEVEL-2/.test(deep._hint) && at === null);
+      d.orgLevelNames = savedLevels;
+      const pf = ctx.userAskedForPlanFirst;
+      eq('plan-first requests are recognised; ordinary build requests are not',
+        [pf('Design and create a tracker program for TB. Show me the plan before creating anything.'), pf('Build and install an app … show me a short summary before installing'), pf('Show me the field mapping before you place it.'), pf('List what you find and propose fixes, but do not change anything yet.'), pf('Create a dashboard called X and give me the link.'), pf('Show me the dashboard')],
+        [true, true, true, true, false, false]);
+      const cw = (t) => { const r = ctx.classifyWriteAuthorization(t); return `${r.scope}${r.planFirst ? '+plan' : ''}`; };
+      eq('a plan-first request writes nothing in its first turn, whatever verbs it has; the approval turn authorizes',
+        [cw('Design and create a tracker program for TB case follow-up … Show me the plan before creating anything.'), cw('Build and install a DHIS2 app … show me a short summary before installing, and give me the app link.'), cw('Add a form-field plugin … Show me the field mapping before you place it.'), cw('Create a dashboard called X for the Malaria program and give me the link.'), cw('Yes, the plan looks good. Create it.'), cw('Looks good, yes install it.')],
+        ['read_only+plan', 'read_only+plan', 'read_only+plan', 'broad', 'broad', 'broad']);
+      const savedText = vm.runInContext('lastUserText', ctx); const savedWa = d.writeAuth; const savedStreak = d.consecutiveDiscoveryCalls;
+      d.writeAuth = { scope: 'read_only', planFirst: true, reason: 'verify' };
+      vm.runInContext(`lastUserText = ${JSON.stringify('Design and create a TB program. Show me the plan before creating anything.')};`, ctx);
+      d.consecutiveDiscoveryCalls = 12;
+      const early = ctx.discoveryStreakStopOrNull('search_metadata', { object_type: 'optionSets' });
+      d.consecutiveDiscoveryCalls = 20;
+      const late = ctx.discoveryStreakStopOrNull('search_metadata', { object_type: 'optionSets' });
+      truthy('on a plan-first turn the research limit is 20 and the stop says "write the plan, create nothing" (never "issue the write now")',
+        early === null && late && /plan first/.test(late._error) && /Create, install or place nothing this turn/.test(late._hint) && !/Issue the actual write/.test(late._hint));
+      d.writeAuth = { scope: 'read_only', reason: 'the user asked for no changes' };
+      vm.runInContext(`lastUserText = ${JSON.stringify('Review this program. List what you find and propose fixes, but do not change anything yet.')};`, ctx);
+      d.consecutiveDiscoveryCalls = 40;
+      const ro40 = ctx.discoveryStreakStopOrNull('search_metadata', { object_type: 'optionSets' });
+      d.consecutiveDiscoveryCalls = 60;
+      const ro60 = ctx.discoveryStreakStopOrNull('search_metadata', { object_type: 'optionSets' });
+      truthy('…a read-only review ("do not change anything yet") is not held to the 12-read stop, but stops at 60 and is told to answer (not to write)', ro40 === null && ro60 && /enough to answer/.test(ro60._error) && /Write your answer now/.test(ro60._hint));
+      vm.runInContext(`lastUserText = ${JSON.stringify(savedText)};`, ctx); d.writeAuth = savedWa; d.consecutiveDiscoveryCalls = savedStreak;
+    }
+
+    // 4c'''. A filter on a property the type does not have, and /me.
+    {
+      const savedGsf = ctx.getSchemaFor;
+      ctx.getSchemaFor = async (t) => (t === 'dataElements' ? { name: 'dataElement', plural: 'dataElements', properties: [{ name: 'id' }, { name: 'displayName' }, { name: 'valueType' }, { name: 'domainType' }, { name: 'dataSetElement', collectionName: 'dataSetElements' }, { name: 'optionSet' }] } : null);
+      const badF = await ctx.precheckFilterAgainstSchema('dataElements?filter=program.id:eq:IpHINAT79UW&fields=id');
+      const goodF = await ctx.precheckFilterAgainstSchema('dataElements?filter=dataSetElements.dataSet.id:eq:BfMAe6Itzgt&filter=identifiable:token:mal&filter=valueType:eq:NUMBER');
+      const otherT = await ctx.precheckFilterAgainstSchema('organisationUnits?filter=anything:eq:1');
+      ctx.getSchemaFor = savedGsf;
+      truthy('a list filtered on a property the type does not have is refused before its 400 (with the way a data element reaches a program); real properties, nested paths, identifiable and unknown schemas pass',
+        badF?._scope === 'known_endpoint_guidance' && /no property "program"/.test(badF._error) && /get_program_info/.test(badF._hint) && goodF === null && otherT === null);
+      eq('users/me and currentUser go to /me', [(await ctx.healCollectionPath('users/me?fields=id')).path, (await ctx.healCollectionPath('currentUser')).path], ['me?fields=id', 'me']);
+    }
+
+    truthy('unplace with target "all" removes the plugin from every target (it matched none and reported "not placed anywhere")',
+      /String\(args\.target\)\.toLowerCase\(\) === 'all'/.test(vm.runInContext('unplaceCustomAppPlugin.toString()', ctx)));
+
+    {
+      const savedIcons = d.knownIcons;
+      d.knownIcons = vm.runInContext("new Set(['clinical_f_positive'])", ctx);
+      ctx.seedKnownIcons();
+      const kept = d.knownIcons.has('clinical_f_positive');
+      d.knownIcons = {}; // a session-restored Set arrives as a plain object
+      ctx.seedKnownIcons();
+      truthy('an icon key proven earlier in the conversation stays proven on the next turn; a restored non-Set starts empty', kept && d.knownIcons.constructor.name === 'Set' && d.knownIcons.size === 0);
+      d.knownIcons = savedIcons;
+    }
+
+    {
+      const urls = [];
+      const savedSdf2 = ctx.safeDhis2Fetch;
+      ctx.safeDhis2Fetch = async (p3) => { urls.push(p3); if (/^organisationUnits\/ImspTQPwCqd/.test(p3)) return { id: 'ImspTQPwCqd', level: 1 }; if (/^programIndicators\?filter=id:in:/.test(p3)) return { programIndicators: [{ id: 'rXoaHGAXWy9' }] }; return { headers: [], rows: [] }; };
+      const pc = d.pageContext; d.pageContext = { appType: 'Capture', programId: 'IpHINAT79UW' }; const savedOuCtx = d.ouContext; d.ouContext = null;
+      const g1 = await ctx.executeTool('get_event_analytics', { aggregate_type: 'aggregate', breakdown_dimension: 'pi:rXoaHGAXWy9', period: 'LAST_5_YEARS' });
+      const u1 = urls[urls.length - 1];
+      const g2 = await ctx.executeTool('get_event_analytics', { aggregate_type: 'aggregate', ou_override: 'ImspTQPwCqd;CHILDREN', period: 'THIS_YEAR' });
+      const u2 = urls[urls.length - 1];
+      d.pageContext = pc; d.ouContext = savedOuCtx; ctx.safeDhis2Fetch = savedSdf2;
+      truthy('get_event_analytics: no org unit → USER_ORGUNIT; a pi:-prefixed program indicator goes to /analytics as dx; a period sends no default dates; ;CHILDREN / DESCENDANTS → the next level under the unit',
+        !g1._error && /^analytics\?dimension=dx%3ArXoaHGAXWy9&dimension=ou:USER_ORGUNIT&dimension=pe:LAST_5_YEARS$/.test(u1) && /USER_ORGUNIT/.test(g1._query_corrected || '')
+        && !g2._error && /dimension=ou:ImspTQPwCqd;LEVEL-2&dimension=pe:THIS_YEAR$/.test(u2) && !/startDate/.test(u2));
+    }
+
+    eq('"dx:A;dx:B;dx:C" (the prefix repeated inside one list) becomes "dx:A;B;C"; a normal list is untouched',
+      [ctx.healRepeatedDimensionPrefix('analytics/events/aggregate/bMcwwoVnbSR?dimension=dx:JBg6UCsP4Zq;dx:QDs1bjQhClp&dimension=ou:ImspTQPwCqd').path, ctx.healRepeatedDimensionPrefix('analytics?dimension=dx:JBg6UCsP4Zq;QDs1bjQhClp').healed],
+      ['analytics/events/aggregate/bMcwwoVnbSR?dimension=dx:JBg6UCsP4Zq;QDs1bjQhClp&dimension=ou:ImspTQPwCqd', false]);
+    {
+      const dq = await ctx.executeTool('dhis2_query', { path: 'systemDate' });
+      truthy('a guessed date endpoint is answered with today\'s date and no call; the system prompt carries the date', /^\d{4}-\d{2}-\d{2}$/.test(dq.today || '') && !dq._error && /Today's date: \$\{todayIsoDate\(\)\}/.test(vm.runInContext('_runAgenticLoopInner.toString()', ctx)));
+    }
+
+    {
+      const savedSdf3 = ctx.safeDhis2Fetch; const sent3 = [];
+      ctx.safeDhis2Fetch = async (p4) => {
+        sent3.push(p4);
+        if (/^system\/info/.test(p4)) return { lastAnalyticsTableSuccess: '2026-11-17T01:28:20.059' };
+        if (/^programIndicators\?filter=id:in:/.test(p4)) return { programIndicators: [{ id: 'piNewField01', expression: 'd2:condition("#{ZkbAXlQUYJG.boFqnNiTgdd} == \'CURED\'", 100, 0)' }, { id: 'piOldField01', expression: '#{ZkbAXlQUYJG.oldDataEl001}' }] };
+        if (/^dataElements\?filter=id:in:/.test(p4)) return { dataElements: [{ id: 'boFqnNiTgdd', created: '2026-11-17T12:50:01.000' }, { id: 'oldDataEl001', created: '2024-01-01T00:00:00.000' }] };
+        return { rows: [['piOldField01', '2026', '5']] };
+      };
+      const rc3 = await vm.runInContext('piRuntimeAnalyticsCheck', ctx)(null, ['piNewField01', 'piOldField01']);
+      ctx.safeDhis2Fetch = savedSdf3;
+      truthy('an indicator reading a field created after the last analytics run is reported as needs_full_analytics_run without its sure-409 query; the others are queried as before',
+        rc3.checked === 2 && (rc3.needs_full_analytics_run || []).some(b => b.id === 'piNewField01' && b.data_element === 'boFqnNiTgdd') && !sent3.some(p4 => /^analytics\?.*piNewField01/.test(p4)) && sent3.some(p4 => /^analytics\?dimension=dx:piOldField01/.test(p4)) && rc3.with_data.includes('piOldField01'));
+    }
+
+    {
+      const sd = ctx.analyticsStatusDimensionRefusal('analytics/events/aggregate/IpHINAT79UW?dimension=ou:USER_ORGUNIT&dimension=enrollment_status');
+      const dxF = ctx.healEventAnalyticsDxDimension('analytics/events/aggregate/IpHINAT79UW?dimension=bx6fsa0t90x&filter=dx:UXz7xuGCEhU:lt:2700&stage=A03MvHHogjR');
+      eq('an empty-value test ":null" / ":notnull" in an event filter becomes EQ:NV / NE:NV', [ctx.healEventAnalyticsDxDimension('analytics/events/aggregate/IpHINAT79UW?filter=dx:UXz7xuGCEhU:null&stage=A03MvHHogjR').path, ctx.healEventAnalyticsDxDimension('analytics/events/aggregate/IpHINAT79UW?filter=A03MvHHogjR.UXz7xuGCEhU:notnull').path],
+        ['analytics/events/aggregate/IpHINAT79UW?filter=UXz7xuGCEhU:EQ:NV&stage=A03MvHHogjR', 'analytics/events/aggregate/IpHINAT79UW?filter=A03MvHHogjR.UXz7xuGCEhU:NE:NV']);
+      const savedSdf4 = ctx.safeDhis2Fetch;
+      ctx.safeDhis2Fetch = async () => ({ programStages: [{ id: 'A03MvHHogjR', displayName: 'Birth', programStageDataElements: [{ dataElement: { id: 'UXz7xuGCEhU' } }, { dataElement: { id: 'sharedDe001' } }] }, { id: 'ZzYYXq4fJie', displayName: 'Postnatal', programStageDataElements: [{ dataElement: { id: 'GQY2lXrypjO' } }, { dataElement: { id: 'sharedDe001' } }] }] });
+      const one = await ctx.healBareDataElementItems('analytics/enrollments/aggregate/IpHINAT79UW?dimension=UXz7xuGCEhU&filter=GQY2lXrypjO:GT:5&dimension=ou:USER_ORGUNIT');
+      const two = await ctx.healBareDataElementItems('analytics/enrollments/aggregate/IpHINAT79UW?dimension=sharedDe001');
+      const withStage = await ctx.healBareDataElementItems('analytics/events/aggregate/IpHINAT79UW?dimension=UXz7xuGCEhU&stage=A03MvHHogjR');
+      ctx.safeDhis2Fetch = savedSdf4;
+      truthy('event/enrollment analytics: a status as a dimension is refused; dx: inside a filter is dropped; a bare data element gets its stage (refused when in several; left alone next to stage=)',
+        sd?._scope === 'known_endpoint_guidance' && /filter=UXz7xuGCEhU:lt:2700/.test(dxF.path)
+        && one.path === 'analytics/enrollments/aggregate/IpHINAT79UW?dimension=A03MvHHogjR.UXz7xuGCEhU&filter=ZzYYXq4fJie.GQY2lXrypjO:GT:5&dimension=ou:USER_ORGUNIT'
+        && /several stages/.test(two.refusal?._error || '') && withStage.healed === false);
+      truthy('the indicator audit runs every valid indicator through analytics and says which cannot be calculated', /cannot_be_calculated/.test(vm.runInContext('executeManageProgramIndicators.toString()', ctx)));
+    }
+
+    truthy('create_dashboard on an existing name tells the model to ask before changing someone else\'s dashboard (not to "fix" it unasked)',
+      /do not change it or its charts, maps and line lists unasked/.test(vm.runInContext('executeManageDashboards.toString()', ctx)));
+
+    {
+      const savedIdx2 = ctx.getSchemaIndex; const savedSdf5 = ctx.safeDhis2Fetch; const savedWa5 = d.writeAuth; const seen5 = [];
+      const idx2 = new Map(); const os = { name: 'optionSet', plural: 'optionSets' }; idx2.set('optionset', os); idx2.set('optionsets', os);
+      ctx.getSchemaIndex = async () => idx2;
+      ctx.safeDhis2Fetch = async (p5) => { seen5.push(p5); return { object: { publicAccess: 'rw------' } }; };
+      d.writeAuth = { scope: 'read_only', reason: 'verify' };
+      await ctx.executeTool('dhis2_query', { path: 'sharing?type=optionSets&uid=x31y45jvIQL' });
+      ctx.getSchemaIndex = savedIdx2; ctx.safeDhis2Fetch = savedSdf5; d.writeAuth = savedWa5;
+      truthy('GET sharing with uid= and a plural type is sent as type=<singular>&id= (uid= is a 400, a plural type a 409)', seen5.some(p5 => /^sharing\?type=optionSet&id=x31y45jvIQL/.test(p5)));
+      ctx.getSchemaIndex = async () => idx2; ctx.safeDhis2Fetch = async (p5) => { seen5.push(p5); return { optionSets: [] }; }; d.writeAuth = { scope: 'read_only', reason: 'verify' };
+      const noId = await ctx.executeTool('dhis2_query', { path: 'sharing', query_params: { type: 'optionSets', fields: 'id' } });
+      seen5.length = 0;
+      await ctx.executeTool('dhis2_query', { path: 'sharing', query_params: { 'type=optionSet&id=x31y45jvIQL': '' } });
+      const keyQs = seen5.some(p5 => /^sharing\?type=optionSet&id=x31y45jvIQL$/.test(p5));
+      seen5.length = 0;
+      await ctx.executeTool('dhis2_query', { path: 'optionSets', query_params: { fields: 'id,sharing', filters: ['id:in:[f38bstJioPs,kzgQRhOCadd]'] } });
+      ctx.getSchemaIndex = savedIdx2; ctx.safeDhis2Fetch = savedSdf5; d.writeAuth = savedWa5;
+      truthy('…sharing without an id is refused with the collection read that gives many objects\' sharing; a "filters" query parameter is sent as filter=',
+        noId._scope === 'known_endpoint_guidance' && /optionSets\?fields=id,displayName,sharing/.test(noId._hint) && keyQs && seen5.some(p5 => /^optionSets\?fields=id%2Csharing&filter=id%3Ain%3A/.test(p5)));
+    }
+
+    // 4d. A "by district" object at the chiefdom level is refused before saving
+    //     when the user's own words settle it.
+    {
+      const savedLevels = d.orgLevelNames; const savedText = vm.runInContext('lastUserText', ctx);
+      d.orgLevelNames = [{ level: 1, name: 'National' }, { level: 2, name: 'District' }, { level: 3, name: 'Chiefdom' }, { level: 4, name: 'Facility' }];
+      const said = (t) => vm.runInContext(`lastUserText = ${JSON.stringify(t)};`, ctx);
+      said('Include a district table and a district map of the positivity rate');
+      const map3 = await ctx.orgLevelMismatchRefusal('Positivity rate by district', ['ImspTQPwCqd'], 3, 'Map');
+      const map2 = await ctx.orgLevelMismatchRefusal('Positivity rate by district', ['ImspTQPwCqd'], 2, 'Map');
+      const table3 = await ctx.orgLevelMismatchRefusal('District summary', ['ImspTQPwCqd', 'LEVEL-3'], null, 'Visualization');
+      said('a map of districts and chiefdoms');
+      const both = await ctx.orgLevelMismatchRefusal('Positivity rate by district', ['ImspTQPwCqd'], 3, 'Map');
+      said('a positivity map');
+      const unsaid = await ctx.orgLevelMismatchRefusal('Positivity rate by district', ['ImspTQPwCqd'], 3, 'Map');
+      truthy('a "by district" map or table at level 3 (Chiefdom) is refused before saving when the user asked for districts; level 2, a request naming chiefdoms too, or one naming neither is not refused',
+        map3?._scope === 'org_level_mismatch' && /org_unit_level: 2/.test(map3._hint) && map2 === null && table3?._scope === 'org_level_mismatch' && /LEVEL-2/.test(table3._hint) && both === null && unsaid === null
+        && /rebuild it at level 2/.test(await ctx.orgLevelNameWarning('Positivity rate by district', ['ImspTQPwCqd'], 3)));
+      d.orgLevelNames = savedLevels; said(savedText);
+    }
+
+    // 5. The dashboard filter bar.
+    ctx.safeDhis2Fetch = async (p) => (/^dimensions\/KfdsGBcoiCa/.test(p) ? { id: 'KfdsGBcoiCa', displayName: 'Births attended by' } : { _error: 'DHIS2 API 404', _status: 404 });
+    const fs1 = await ctx.dashboardFilterSettings(['period', 'Location', 'KfdsGBcoiCa']);
+    const fs2 = await ctx.dashboardFilterSettings(['pe', 'facility type']);
+    const fs3 = await ctx.dashboardFilterSettings(['abcdefghijk']);
+    truthy('allowed_filters: period / location / a dimension uid → restrictFilters + allowedFilters; an unknown word or uid is refused; none → no restriction',
+      JSON.stringify(fs1) === JSON.stringify({ restrictFilters: true, allowedFilters: ['pe', 'ou', 'KfdsGBcoiCa'] }) && /not a dimension/.test(fs2._error) && /not a dimension on this server/.test(fs3._error) && (await ctx.dashboardFilterSettings(undefined)) === null
+      && /no setting was needed/.test(ctx.dashboardFilterBarNote(null).note) && /only Period and Organisation unit/.test(ctx.dashboardFilterBarNote({ restrictFilters: true, allowedFilters: ['pe', 'ou'] }).note));
+    truthy('…the manual says every dashboard already has period and location filters', /needs NO setting/.test(vm.runInContext('KB_DASHBOARDS_DETAILS', ctx)));
+
+    // 6. Learning memory keeps only fixes that worked.
+    const st = ctx.__memoryState();
+    st.enabled = true;
+    const before = st.entries.length;
+    ctx.memoryBeginTurn('create a dashboard', { appType: 'Maintenance' }, new Set(['manage_dashboards', 'manage_memory']));
+    ctx.memoryObserveCall('manage_dashboards', { action: 'create_dashboard' }, { _error: 'DHIS2 API 409: E4000 Missing required property `name`', _status: 409 });
+    const lesson = { action: 'record', area: 'dashboards', tools: ['manage_dashboards'], title: 'manage_dashboards needs flat arrays', problem: 'create_dashboard failed with a 409.', solution: 'Send data_items as a flat list of ids.' };
+    const guess = await ctx.executeManageMemory(lesson);
+    ctx.memoryObserveCall('manage_dashboards', { action: 'create_dashboard' }, { success: true, dashboard_id: 'dashAAAAAAA' });
+    const proven = await ctx.executeManageMemory(lesson);
+    truthy('a lesson about a tool that failed and has not worked since is refused; once the corrected call worked it is stored',
+      guess._scope === 'memory_unproven_lesson' && proven.success === true && st.entries.length === before + 1);
+    st.entries = st.entries.slice(0, before);
+    truthy('…a tool crash and a call in the wrong shape are never lessons', ['tool_internal_error', 'argument_shape'].every(sc => vm.runInContext('MEMORY_IGNORED_SCOPES', ctx).has(sc)));
+
+    // 7. The loop: shapes repaired before the tool runs, a crash explained,
+    //    a switched-off tool never advertised, and the tools close when the
+    //    model keeps probing.
+    const enc = new TextEncoder();
+    const sse = (o) => `data: ${JSON.stringify({ choices: [{ index: 0, ...o }] })}\n\n`;
+    const turn = async (script, userText, exec) => {
+      vm.runInContext('conversationHistory = []; if (typeof _dataCheckCache !== "undefined") _dataCheckCache.clear();', ctx);
+      const events = []; const seen = []; let k = 0;
+      ctx.broadcast = (x) => events.push(x);
+      ctx.safeDhis2Fetch = async () => ({});
+      ctx.executeTool = async (name, args) => { seen.push({ name, args: JSON.parse(JSON.stringify(args)) }); return exec(name, args, seen.length); };
+      ctx.fetch = async (url, opts = {}) => {
+        if (!String(url).startsWith('https://llm.invalid')) return new Response('{"version":"2.42"}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        // A request without tools can only be answered in text, as a real provider does.
+        let toolsOffered = true;
+        try { toolsOffered = Array.isArray(JSON.parse(opts.body).tools); } catch { /* keep */ }
+        const step = toolsOffered ? script[Math.min(k++, script.length - 1)] : script[script.length - 1];
+        const payload = step.call
+          ? sse({ delta: { tool_calls: [{ index: 0, id: `c${k}`, type: 'function', function: { name: step.call, arguments: JSON.stringify(step.args) } }] }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'tool_calls' })
+          : sse({ delta: { content: step.text }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'stop' });
+        return new Response(new ReadableStream({ start(cc) { cc.enqueue(enc.encode(`${payload}data: [DONE]\n\n`)); cc.close(); } }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      };
+      const res = await ctx.runAgenticLoop(userText, null, false);
+      const msgs = vm.runInContext('conversationHistory', ctx);
+      return { res, events, seen, k, toolMsgs: JSON.parse(JSON.stringify(msgs)).filter(x => x.role === 'tool').map(x => { try { return JSON.parse(x.content); } catch { return {}; } }) };
+    };
+    vm.runInContext(`_cachedApiKey = 'verify-key'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+    d.pageContext = { appType: 'Dashboard' };
+    const MANUAL = { call: 'manage_dashboards', args: { action: 'create_dashboard' } };
+    const shaped = await turn([MANUAL, { call: 'manage_dashboards', args: crash }, { text: 'Done.' }], 'Create a dashboard called Malaria Testing and Treatment Review',
+      () => ({ success: true, dashboard_id: 'dashAAAAAAA' }));
+    const got = shaped.seen.find(x => x.args.action === 'create_dashboard' && x.args.items)?.args;
+    eq('the loop hands the tool repaired arguments (lists, true)', got && [got.items[0].new_visualization.data_items, got.items[2].new_visualization.overall_row], [['JBg6UCsP4Zq'], true]);
+    const CRASH = { call: 'manage_dashboards', args: { action: 'create_dashboard', dashboard: { name: 'X' }, items: [{ type: 'TEXT', text: 'a' }] } };
+    const crashed = await turn([MANUAL, CRASH, { text: 'It failed.' }], 'Create a dashboard called X', () => { throw new TypeError('object is not iterable (cannot read property Symbol(Symbol.iterator))'); });
+    const ie = crashed.toolMsgs.find(x => x._scope === 'tool_internal_error');
+    truthy('a tool that throws is reported as an internal error of the extension, not of DHIS2 or the model, and shown as failed',
+      ie && /Internal error in manage_dashboards \(action "create_dashboard"\)/.test(ie._error) && /not an answer from DHIS2/.test(ie._error) && /do not rebuild this step by hand through dhis2_query/.test(ie._hint)
+      && crashed.events.some(x => x.type === 'AI_TOOL_DONE' && x.outcome === 'failed' && /Internal error/.test(x.summary || '')));
+    const RAW = { call: 'dhis2_query', args: { path: 'metadata', method: 'POST', body: { visualizations: [{ name: 'x' }] } } };
+    const probe = await turn([MANUAL, CRASH, CRASH, CRASH, CRASH, RAW, RAW, CRASH, CRASH, CRASH, CRASH, CRASH, CRASH, { text: 'Summary: nothing was created.' }], 'Create a dashboard called X',
+      (name, args) => { if (name === 'dhis2_query') return saved.exec(name, args); throw new TypeError('object is not iterable'); });
+    const rawResult = probe.toolMsgs.find(x => /^Blocked: POST visualizations/.test(x._error || '') && /switched off for the rest of this turn/.test(x._hint || ''));
+    truthy('once manage_dashboards is switched off, a refusal no longer says "that tool is available now"', rawResult && !rawResult._redirect && !/available now/.test(rawResult._hint));
+    truthy('…and after four more refused calls the tools close and the model writes its answer (no 50-step probing)', probe.k <= 11 && /nothing was created/.test(probe.res?.text || ''));
+  } finally {
+    ctx.safeDhis2Fetch = saved.sdf; ctx.executeTool = saved.exec; ctx.fetch = saved.fetch; ctx.broadcast = saved.broadcast;
+    Object.assign(d, { writeAuth: saved.wa, baseUrl: saved.base, connected: saved.connected, apiVersion: saved.apiVersion, pageContext: saved.pageContext });
+    vm.runInContext(`conversationHistory = ${JSON.stringify(saved.hist)};`, ctx);
+  }
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -5161,6 +5531,7 @@ setImmediate(async () => {
   if (loaded) await runAncAppThreadChecks().catch((e) => bad(`ANC app thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runMaternityThreadChecks().catch((e) => bad(`Maternity thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runDataQualityThreadChecks().catch((e) => bad(`data-quality thread checks threw: ${e && e.stack || e}`));
+  if (loaded) await runArgumentShapeThreadChecks().catch((e) => bad(`argument-shape thread checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

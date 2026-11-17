@@ -503,6 +503,15 @@ function classifyWriteAuthorization(userText) {
   const isRefusal = /\bno(?:\s+thanks)?,?\s+(?:don'?t|do\s+not|leave|stop|just\s+(?:diagnose|check|explain|look))\b/i.test(text)
     || WRITE_AUTH_NO_CHANGE_RE.test(text);
   if (isRefusal) return { scope: 'read_only', reason: 'the user asked for no changes (explain / read-only)' };
+  // "Show me the plan / a summary / the mapping before you create / install /
+  // place it": nothing is written this turn, whatever verbs the request also
+  // has. TB program design (2026-11-17): "Design and create … Show me the plan
+  // before creating anything" was read as a create and the whole program, its
+  // rules and 14 indicators were built in the first turn. The refused writes
+  // are recorded, so the user's "yes" next turn approves exactly them.
+  if (userAskedForPlanFirst(text)) {
+    return { scope: 'read_only', planFirst: true, reason: 'the user asked to see the plan / summary / mapping FIRST — present it now (an app or plugin preview is fine) and create, install or place nothing until they approve it' };
+  }
   if (isBroad) {
     // A BARE affirmation ("yes", "go ahead") directly after a refused write is
     // an answer to THAT proposal — scope the authorization to the proposed
@@ -941,9 +950,12 @@ function harvestIconKeysInto(set, value, depth = 0) {
 }
 
 function seedKnownIcons() {
-  // Fresh empty Set per turn — no static seeding: a key only counts as "known"
-  // once an API response this turn has proven it exists.
-  dhis2.knownIcons = new Set();
+  // No static seeding: a key only counts as "known" once an API response has
+  // proven it exists. Icon keys are fixed per server, so a key proven earlier
+  // in this conversation stays proven (the set is cleared on a new thread and
+  // on a server switch). TB program build, 2026-11-17: the icon verified while
+  // planning was refused as "not verified this turn" when the user approved.
+  if (!(dhis2.knownIcons instanceof Set)) dhis2.knownIcons = new Set();
 }
 
 // ── Per-turn recent-creations registry ─────────────────────────────────────
@@ -1456,6 +1468,164 @@ function healToolArgumentShape(value, depth = 0) {
   return { value, healed: false };
 }
 
+// ── Tool-call arguments brought to the shapes the tool's schema declares ──
+// Grammar-constrained providers write a LIST that sits under an object with no
+// declared fields as {"item": <one value or the whole list>}, and a boolean as
+// "true". Fireworks + MiniMax-M3.1-flash, Malaria dashboard thread 2026-11-17:
+// every data_items / periods / org_units / layout list of an inline
+// new_visualization arrived as {"item": …}; prepareInlineVisualizations threw
+// "object is not iterable"; the model, told only "Tool failed", blamed "nested
+// arrays", re-sent the same call and the tool was switched off. The same
+// encoding reached dhis2_query bodies ({"visualizations":{"item":[…]}}, a 500
+// from DHIS2) and query_params ({"dimension":{"item":[…]}} → "[object Object]"
+// in the URL, a 409).
+// normalizeArgsToSchema(value, schema) walks the arguments against the tool's
+// FULL schema (registry TOOLS) and repairs what has only one meaning:
+//   • list expected: {"item": X} → X (one value → [X]); a JSON-list text → the
+//     list; {"0":a,"1":b} → [a,b]; one value with no , or ; → [value]; a lone
+//     object where a list of objects is expected → [object];
+//   • text expected: {"<any>": "x"} → "x"; ["x"] → "x"; a number → its text;
+//     a case slip of an enum value ("pivot_table") → the listed value;
+//   • true/false expected: "true"/"false"/1/0; a number expected: "12" → 12;
+//   • object expected: a JSON-object text → the object; [one object] → it;
+//   • an object with no declared fields (a request body, query parameters):
+//     every {"item": X} inside it → a list (opts.freeForm=false skips this,
+//     e.g. for dataStore values, whose keys are the user's own).
+// An object where text, a number or a list of values is expected cannot be
+// repaired: it is listed in problems with blocking:true and must not be sent.
+// Other mismatches are listed with blocking:false (the tool may accept them).
+// Pure. Returns { value, notes:[…], problems:[{ path, expected, got, blocking }] }.
+function argShapeLabel(v) {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return `a list of ${v.length}`;
+  if (typeof v === 'object') {
+    const ks = Object.keys(v);
+    return ks.length ? `an object with ${ks.slice(0, 4).map(k => `"${k}"`).join(', ')}${ks.length > 4 ? ', …' : ''}` : 'an empty object';
+  }
+  return `${typeof v === 'string' ? 'text' : typeof v} ${JSON.stringify(v).slice(0, 40)}`;
+}
+function normalizeArgsToSchema(value, schema, opts = {}) {
+  const notes = [];
+  const problems = [];
+  const freeForm = opts.freeForm !== false;
+  const isPlain = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  const isScalar = (v) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+  const at = (p) => p || '(arguments)';
+  const unwrapFree = (v, path, depth) => {
+    if (depth > 16) return v;
+    if (Array.isArray(v)) return v.map((x, i) => unwrapFree(x, `${path}[${i}]`, depth + 1));
+    if (!isPlain(v)) return v;
+    const ks = Object.keys(v);
+    if (ks.length === 1 && ks[0] === 'item') {
+      notes.push(`${at(path)}: {"item": …} read as a list`);
+      return (Array.isArray(v.item) ? v.item : [v.item]).map((x, i) => unwrapFree(x, `${path}[${i}]`, depth + 1));
+    }
+    const out = {};
+    for (const k of ks) out[k] = unwrapFree(v[k], path ? `${path}.${k}` : k, depth + 1);
+    return out;
+  };
+  const walk = (v, s, path, depth) => {
+    if (depth > 16 || !s || typeof s !== 'object' || v === undefined || v === null || !s.type) return v;
+    const t = s.type;
+    if (t === 'array') {
+      let a = v;
+      if (typeof a === 'string' && a.trim().startsWith('[')) {
+        try { const p = JSON.parse(a.trim()); if (Array.isArray(p)) { a = p; notes.push(`${at(path)}: list written as JSON text`); } } catch { /* below */ }
+      }
+      const itemType = s.items && s.items.type;
+      if (isPlain(a)) {
+        const ks = Object.keys(a);
+        if (ks.length === 1 && /^(?:item|items|values|\$text)$/.test(ks[0])) {
+          a = Array.isArray(a[ks[0]]) ? a[ks[0]] : [a[ks[0]]];
+          notes.push(`${at(path)}: {"${ks[0]}": …} read as a list`);
+        } else if (ks.length && ks.every(k => /^\d+$/.test(k))) {
+          a = ks.sort((x, y) => Number(x) - Number(y)).map(k => a[k]);
+          notes.push(`${at(path)}: numbered keys read as a list`);
+        } else if (itemType === 'object') {
+          a = [a];
+          notes.push(`${at(path)}: one object read as a list of one`);
+        } else if (ks.length === 1 && (isScalar(a[ks[0]]) || Array.isArray(a[ks[0]]))) {
+          a = Array.isArray(a[ks[0]]) ? a[ks[0]] : [a[ks[0]]];
+          notes.push(`${at(path)}: {"${ks[0]}": …} read as a list`);
+        } else {
+          problems.push({ path: at(path), expected: 'a list', got: argShapeLabel(a), blocking: true });
+          return a;
+        }
+      } else if (isScalar(a)) {
+        if (typeof a === 'string' && /[,;]/.test(a)) {
+          problems.push({ path: at(path), expected: 'a list', got: argShapeLabel(a), blocking: false });
+          return a;
+        }
+        a = [a];
+        notes.push(`${at(path)}: one value read as a list of one`);
+      }
+      if (Array.isArray(a) && s.items) a = a.map((x, i) => walk(x, s.items, `${path}[${i}]`, depth + 1));
+      return a;
+    }
+    if (t === 'object') {
+      let o = v;
+      if (typeof o === 'string' && o.trim().startsWith('{')) {
+        try { const p = JSON.parse(o.trim()); if (isPlain(p)) { o = p; notes.push(`${at(path)}: object written as JSON text`); } } catch { /* below */ }
+      }
+      if (Array.isArray(o) && o.length === 1 && isPlain(o[0])) { o = o[0]; notes.push(`${at(path)}: list of one object read as the object`); }
+      if (!isPlain(o)) {
+        problems.push({ path: at(path), expected: 'an object', got: argShapeLabel(o), blocking: false });
+        return o;
+      }
+      if (s.properties) {
+        const out = { ...o };
+        for (const [k, sub] of Object.entries(s.properties)) {
+          if (out[k] !== undefined && out[k] !== null) out[k] = walk(out[k], sub, path ? `${path}.${k}` : k, depth + 1);
+        }
+        return out;
+      }
+      if (s.additionalProperties) return o; // a map: its keys are data
+      return freeForm ? unwrapFree(o, path, depth) : o;
+    }
+    if (t === 'string') {
+      let x = v;
+      if (isPlain(x)) {
+        const ks = Object.keys(x);
+        const inner = ks.length === 1 ? x[ks[0]] : undefined;
+        if (isScalar(inner)) { x = String(inner); notes.push(`${at(path)}: {"${ks[0]}": …} read as its text`); }
+        else if (Array.isArray(inner) && inner.length === 1 && isScalar(inner[0])) { x = String(inner[0]); notes.push(`${at(path)}: {"${ks[0]}": […]} read as its text`); }
+      }
+      if (Array.isArray(x) && x.length === 1 && isScalar(x[0])) { x = String(x[0]); notes.push(`${at(path)}: list of one read as its text`); }
+      if (typeof x === 'number' || typeof x === 'boolean') x = String(x);
+      if (isPlain(x)) { problems.push({ path: at(path), expected: 'text', got: argShapeLabel(x), blocking: true }); return x; }
+      if (Array.isArray(x)) { problems.push({ path: at(path), expected: 'one text value', got: argShapeLabel(x), blocking: x.some(e => e && typeof e === 'object') }); return x; }
+      if (Array.isArray(s.enum) && !s.enum.includes(x)) {
+        const hit = s.enum.find(e => String(e).toLowerCase() === String(x).trim().toLowerCase());
+        if (hit !== undefined) { notes.push(`${at(path)}: "${x}" read as "${hit}"`); x = hit; }
+      }
+      return x;
+    }
+    if (t === 'boolean') {
+      let b = v;
+      if (isPlain(b) && Object.keys(b).length === 1) b = b[Object.keys(b)[0]];
+      if (Array.isArray(b) && b.length === 1) b = b[0];
+      if (typeof b === 'string' && /^(?:true|yes|1)$/i.test(b.trim())) b = true;
+      else if (typeof b === 'string' && /^(?:false|no|0)$/i.test(b.trim())) b = false;
+      else if (b === 1 || b === 0) b = b === 1;
+      if (typeof b !== 'boolean') { problems.push({ path: at(path), expected: 'true or false', got: argShapeLabel(v), blocking: !!b && typeof b === 'object' }); return v; }
+      if (b !== v) notes.push(`${at(path)}: ${JSON.stringify(v)} read as ${b}`);
+      return b;
+    }
+    if (t === 'integer' || t === 'number') {
+      let n = v;
+      if (isPlain(n) && Object.keys(n).length === 1) n = n[Object.keys(n)[0]];
+      if (Array.isArray(n) && n.length === 1) n = n[0];
+      if (typeof n === 'string' && n.trim() !== '' && Number.isFinite(Number(n.trim()))) n = Number(n.trim());
+      if (typeof n !== 'number') { problems.push({ path: at(path), expected: 'a number', got: argShapeLabel(v), blocking: !!n && typeof n === 'object' }); return v; }
+      if (n !== v) notes.push(`${at(path)}: ${JSON.stringify(v)} read as ${n}`);
+      return n;
+    }
+    return v;
+  };
+  const out = walk(value, schema, '', 0);
+  return { value: out, notes, problems };
+}
+
 // Collapse an error message into a "family" key: same message modulo UIDs,
 // numbers and whitespace. Lets us catch "same error, slightly different args".
 function toolErrorFamily(text) {
@@ -1646,6 +1816,7 @@ function noProgressStopOrNull(toolName, args) {
 // The counter (dhis2.consecutiveDiscoveryCalls) is reset by the agent loop on
 // any successful non-discovery (write/action) call and at the start of a turn.
 const DISCOVERY_STREAK_LIMIT = 12;
+const READ_ONLY_DISCOVERY_LIMIT = 60;
 // A long request with many parts has more to look up before its first write: an
 // eight-part dashboard on a program with existing indicators hit 12 while reading
 // them (Malaria replay, 2026-11-03).
@@ -1670,6 +1841,19 @@ function isDiscoveryCall(toolName, args) {
   const acts = DISCOVERY_ACTIONS[toolName];
   return !!(acts && args && acts.has(args.action));
 }
+// "Show me the plan / a summary / the mapping before you create / install /
+// place it", "don't change anything yet": this turn's job is the plan. The
+// streak guard below used to answer such a turn with "issue the actual write
+// the task needs NOW" — pushing a weak model to create what the user wanted
+// to see first (TB program design, 2026-11-17).
+function userAskedForPlanFirst(text) {
+  const t = String(text || '');
+  const showFirst = /\b(?:show|give|send|tell|present|walk)\s+me\b[^.?!]{0,40}\b(?:plan|design|summary|preview|mapping|proposal|outline|draft|overview)\b/i.test(t)
+    && /\b(?:before|first|prior\s+to|then\s+wait)\b/i.test(t);
+  const notYet = /\b(?:don'?t|do\s+not)\s+(?:create|change|install|place|build|make|apply|save|import)\s+anything\s+yet\b/i.test(t);
+  return showFirst || notYet;
+}
+
 function discoveryStreakStopOrNull(toolName, args) {
   if (!isDiscoveryCall(toolName, args)) return null;
   // A preview is the first step of building an app — the very move this
@@ -1683,9 +1867,35 @@ function discoveryStreakStopOrNull(toolName, args) {
   // there strands the model with no legal move (live 2026-07-25: a
   // "check that the dashboard renders" turn was cut off mid-verification).
   const scope = (dhis2.writeAuth && dhis2.writeAuth.scope) || 'read_only';
-  if (scope === 'read_only') return null;
+  // A plan-first turn is read-only for writes but still has a deliverable (the
+  // plan), so its research is bounded too.
+  // Only the classifier's plan-first turn: a read-only review ("propose fixes,
+  // but do not change anything yet") keeps unlimited research, as every
+  // read-only turn does.
+  const planFirst = !!(dhis2.writeAuth && dhis2.writeAuth.planFirst);
   const streak = dhis2.consecutiveDiscoveryCalls || 0;
-  if (streak < discoveryStreakLimit()) return null;
+  // A read-only turn (review, diagnosis, explanation) has no write to make, so
+  // the 12-read stop never applies — but its research is still bounded: a
+  // program review read on for 166 calls and half an hour (2026-11-17) when
+  // the good reviews had needed 43–83.
+  if (scope === 'read_only' && !planFirst) {
+    if (streak < READ_ONLY_DISCOVERY_LIMIT) return null;
+    return {
+      _error: `STOP researching: ${streak} read-only calls in a row. You have enough to answer.`,
+      _hint: 'Write your answer now from what you found, and say plainly which parts you could not check. Do NOT make another lookup.',
+      _scope: 'no_progress_repeat',
+      _discovery_streak: streak,
+    };
+  }
+  if (streak < (planFirst ? Math.max(20, discoveryStreakLimit()) : discoveryStreakLimit())) return null;
+  if (planFirst) {
+    return {
+      _error: `STOP researching: ${streak} read-only calls in a row. The user asked to see the plan first, and you have enough to write it.`,
+      _hint: 'Write the plan, summary or mapping the user asked for now, from what you found (for an app or plugin, manage_custom_app preview builds it). Create, install or place nothing this turn: the user approves it first. Do NOT make another discovery call.',
+      _scope: 'no_progress_repeat',
+      _discovery_streak: streak,
+    };
+  }
   return {
     _error: `STOP researching: ${streak} read-only/discovery calls in a row this turn with NOTHING created or changed. You already have enough information to act.`,
     _hint: `Issue the actual write the task needs NOW (an app or plugin: manage_custom_app preview; data no endpoint has: manage_sql_views create). To build a program, send create_metadata(action=create_program) — it auto-reuses existing option sets / data elements / attributes by exact name, so you do NOT need to look each one up first. For a small/medium program put ALL components in that one call; for a VERY LARGE program (>2 stages / >40 data elements / >20 rules) send the shell + attributes + first stage now, then add_stage and add_program_rules calls for the rest. If you truly cannot proceed, give the user a final answer stating what is blocking you. Do NOT make another discovery call.`,
@@ -2237,6 +2447,107 @@ function healAnalyticsPeriodAndDates(path) {
   return { path: `${base}?${parts.filter(x => !/^(startDate|endDate)=/i.test(x)).join('&')}`, healed: true };
 }
 
+// Periods and org units written the way a model guesses them (Malaria thread
+// 2026-11-17, MiniMax-M3.1-flash; each answer verified on 2.42.7):
+//  • a bare pe dimension or filter (no periods) — SQL error 42703 next to
+//    startDate/endDate, "Start and end date or at least one period must be
+//    specified" without. With a period= / periods= parameter beside it, those
+//    periods go into it; otherwise the call is refused with the forms that work.
+//  • no analytics resource has a period= / periods= parameter: /analytics
+//    answers 409 "A end date was not specified"; event analytics IGNORES it and
+//    answers for its default, the last 12 months by month, whatever the value —
+//    the model then "learned" that THIS_YEAR means the trailing 12 months. They
+//    become filter=pe:<periods>, or are dropped when a pe dimension already
+//    says it.
+//  • no period at all: /analytics answers 409 (refused here with the forms that
+//    work); event/enrollment analytics silently uses the last 12 months — said
+//    in a note so the numbers are not read as "this year".
+//  • no org unit anywhere — 409 "At least one organisation unit must be
+//    specified" on /analytics and on event and enrollment analytics alike:
+//    dimension=ou:USER_ORGUNIT is added (the viewer's own units, the apps'
+//    default). Not a filter: enrollment aggregate answers filter=ou with SQL
+//    error 42601, and a model's own filter=ou there is moved to a dimension.
+// → { path, healed, notes:[…] } or { refusal }.
+// "dx:A;dx:B;dx:C" — the prefix repeated inside one ;-list — is read by
+// DHIS2 (and by the program-indicator router) as items named "dx:B", a 409 or
+// an SQL error 42703 (Malaria card, 2026-11-17). One prefix per list. Pure.
+function healRepeatedDimensionPrefix(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q < 0 || !/^analytics\b/.test(p)) return { path: p, healed: false };
+  let healed = false;
+  const parts = p.slice(q + 1).split('&').map(x => {
+    const m = x.match(/^(dimension|filter)=(.*)$/i);
+    if (!m) return x;
+    let v = m[2];
+    try { v = decodeURIComponent(v); } catch { /* raw */ }
+    const pm = v.match(/^(dx|pe|ou|co|ao):(.+)$/i);
+    if (!pm || !new RegExp(`(?:^|;)${pm[1]}:`, 'i').test(pm[2])) return x;
+    healed = true;
+    return `${m[1]}=${pm[1]}:${pm[2].split(';').map(i => i.replace(new RegExp(`^${pm[1]}:`, 'i'), '')).join(';')}`;
+  });
+  return healed ? { path: `${p.slice(0, q)}?${parts.join('&')}`, healed } : { path: p, healed: false };
+}
+
+function healAnalyticsPeriodAndOrgUnitParams(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q < 0) return { path: p, healed: false, notes: [] };
+  const base = p.slice(0, q);
+  const isAgg = /^analytics(?:\.json)?$/.test(base);
+  const isEvEn = /^analytics\/(?:events|enrollments)\/(?:aggregate|query)\/[A-Za-z][A-Za-z0-9]{10}(?:\.json)?$/.test(base);
+  if (!isAgg && !isEvEn) return { path: p, healed: false, notes: [] };
+  const dec = (v) => { try { return decodeURIComponent(String(v).replace(/\+/g, ' ')); } catch { return v; } };
+  let parts = p.slice(q + 1).split('&').filter(Boolean);
+  const kv = (x) => { const i = x.indexOf('='); return i < 0 ? [x, ''] : [x.slice(0, i), dec(x.slice(i + 1))]; };
+  const notes = [];
+  const periodParams = parts.filter(x => /^periods?$/i.test(kv(x)[0]));
+  const periodVals = [...new Set(periodParams.flatMap(x => kv(x)[1].split(/[;,]/).map(s => s.trim()).filter(Boolean)))];
+  const isBarePe = (x) => /^(?:dimension|filter)$/i.test(kv(x)[0]) && /^pe:?$/i.test(kv(x)[1].trim());
+  const hasPeItems = parts.some(x => /^(?:dimension|filter)$/i.test(kv(x)[0]) && /^pe:\S/i.test(kv(x)[1].trim()));
+  if (parts.some(isBarePe)) {
+    if (!periodVals.length) {
+      return {
+        refusal: {
+          _error: 'Not sent: a "pe" dimension needs its periods — a bare dimension=pe is a 409 (an SQL error next to startDate/endDate).',
+          _hint: 'Name the periods in it: dimension=pe:MONTHS_THIS_YEAR (one row per month this year), pe:LAST_12_MONTHS, pe:THIS_YEAR (one total) or fixed ids (202601;202602). A period replaces startDate/endDate — send one or the other.',
+          _scope: 'analytics_period_needed',
+        },
+      };
+    }
+    parts = parts.filter(x => !periodParams.includes(x)).map(x => (isBarePe(x) ? `${kv(x)[0]}=pe:${periodVals.join(';')}` : x));
+    notes.push(`Query corrected: a bare "pe" dimension has no periods (409); the ${periodParams.map(x => kv(x)[0]).join('/')} value went into it as pe:${periodVals.join(';')}.`);
+  } else if (periodVals.length) {
+    parts = parts.filter(x => !periodParams.includes(x));
+    const hasDates = parts.some(x => /^(?:startDate|endDate)$/i.test(kv(x)[0]));
+    if (!hasPeItems && !hasDates) parts.push(`filter=pe:${periodVals.join(';')}`);
+    notes.push(`Query corrected: DHIS2 analytics has no "${kv(periodParams[0])[0]}" parameter (${isAgg ? '409' : 'it is ignored and the last 12 months are answered instead'}); ${hasPeItems || hasDates ? 'it was dropped — the pe dimension or the dates already set the period' : `the periods were sent as filter=pe:${periodVals.join(';')} (one total; dimension=pe:… gives one row per period)`}.`);
+  } else if (!hasPeItems && !parts.some(x => /^(?:startDate|endDate)$/i.test(kv(x)[0]))) {
+    if (isAgg) {
+      return {
+        refusal: {
+          _error: 'Not sent: /analytics needs a period (409 "A end date was not specified in periods, dimensions, filters").',
+          _hint: 'Add one: filter=pe:THIS_YEAR for one total, or dimension=pe:MONTHS_THIS_YEAR (one row per month), pe:LAST_12_MONTHS, or fixed ids such as 2026 / 202601.',
+          _scope: 'analytics_period_needed',
+        },
+      };
+    }
+    notes.push('No period or dates were sent, so DHIS2 answered for its default period, the last 12 months — not "this year". Add filter=pe:THIS_YEAR (or dimension=pe:…) for another period.');
+  }
+  const hasOu = parts.some(x => /^(?:dimension|filter)$/i.test(kv(x)[0]) && /^ou:\S/i.test(kv(x)[1].trim()));
+  if (!hasOu) {
+    parts.push('dimension=ou:USER_ORGUNIT');
+    notes.push('Query corrected: analytics needs an org unit (409 without one); dimension=ou:USER_ORGUNIT (the user\'s own org units) was added — give dimension=ou:<uid> for another scope.');
+  } else if (/^analytics\/enrollments\/aggregate\//.test(base) && parts.some(x => /^filter$/i.test(kv(x)[0]) && /^ou:/i.test(kv(x)[1].trim()))) {
+    // Enrollment aggregate answers an org-unit FILTER with SQL error 42601
+    // (2.42.7); the same units as a dimension work.
+    parts = parts.map(x => (/^filter$/i.test(kv(x)[0]) && /^ou:/i.test(kv(x)[1].trim()) ? `dimension=${x.slice(x.indexOf('=') + 1)}` : x));
+    notes.push('Query corrected: enrollment aggregate analytics fails on an org-unit filter (SQL error 42601); the org units were sent as a dimension.');
+  }
+  const out = `${base}?${parts.join('&')}`;
+  return { path: out, healed: out !== p, notes };
+}
+
 // /api/analytics: dimension=A;B (two or more bare UIDs, no prefix) is never a
 // dimension — 409 E7125 "does not reference any dimension" (verified 2.43.2).
 // It can only mean data items: give it the dx: prefix. One bare UID is left
@@ -2653,11 +2964,38 @@ function apiUrl(path) {
   return `${dhis2.baseUrl}/api/${dhis2.apiVersion}/${s.substring(0, qIdx)}?${encodeStrictQueryChars(s.substring(qIdx + 1))}`;
 }
 
+// A query parameter value as the URL takes it: text, a number, or a list of
+// them (one parameter each). A provider's {"item": X} list encoding (or any
+// one-key wrapper) is unwrapped; see normalizeArgsToSchema.
+function queryParamValue(v, depth = 0) {
+  if (v == null || depth > 6) return v;
+  if (Array.isArray(v)) return v.flatMap(x => { const u = queryParamValue(x, depth + 1); return Array.isArray(u) ? u : [u]; }).filter(x => x != null);
+  if (typeof v === 'object') {
+    const ks = Object.keys(v);
+    if (ks.length === 1) return queryParamValue(v[ks[0]], depth + 1);
+  }
+  return v;
+}
+// The query parameters that cannot become URL text (an object with several
+// fields): sent as is they read "[object Object]" and the server answers 409
+// for a value nobody wrote. → [name] (empty when all are fine).
+function queryParamsShapeProblems(queryParams) {
+  if (!queryParams || typeof queryParams !== 'object' || Array.isArray(queryParams)) return [];
+  const bad = [];
+  for (const [k, raw] of Object.entries(queryParams)) {
+    const v = queryParamValue(raw);
+    const vals = Array.isArray(v) ? v : [v];
+    if (vals.some(x => x != null && typeof x === 'object')) bad.push(k);
+  }
+  return bad;
+}
+
 function appendQueryParamsToPath(path, queryParams) {
   if (!queryParams || typeof queryParams !== 'object') return path;
   const [base, q = ''] = String(path).split('?');
   const usp = new URLSearchParams(q);
-  for (const [k, v] of Object.entries(queryParams)) {
+  for (const [k, raw] of Object.entries(queryParams)) {
+    const v = queryParamValue(raw);
     if (v == null) continue;
     if (Array.isArray(v)) {
       for (const item of v) usp.append(k, String(item));
@@ -3566,6 +3904,15 @@ async function safeDhis2Fetch(path, options = {}) {
   }
 
   let cleanPath = withEventAggregateCacheKey(path.replace(/^\//, '').replace(/^api\/\d+\//, ''));
+  // An object turned into URL text: no server can answer it, and its 409
+  // ("… does not reference …: `[object Object]`") reads like a DHIS2 rule.
+  if (/\[object (?:Object|Array)\]|%5Bobject(?:%20|\+)Object%5D/i.test(cleanPath)) {
+    return {
+      _error: `Not sent: the request URL contains "[object Object]" — an argument that should be text or a list of text was an object (${cleanPath.split('?')[0]}). This is a shape problem in the call, not a DHIS2 answer.`,
+      _hint: 'Give each query parameter as text or a list of text, e.g. query_params:{ dimension:["ou:<uid>","pe:THIS_YEAR"] }, and send the call again.',
+      _scope: 'argument_shape',
+    };
+  }
   const ambiguous = ambiguousApiPathReason(cleanPath);
   if (ambiguous) {
     return {
@@ -5347,6 +5694,22 @@ function healAnalyticsStatusParams(path) {
   return { path: `${p.slice(0, qIdx)}?${parts.join('&')}`, healed: true, note: `Query corrected: ${notes.join('; ')}. Use this form in any app or plugin code too.` };
 }
 
+// A status as a breakdown dimension (dimension=enrollment_status, program_status,
+// eventStatus …) is a 409 on event and enrollment analytics: statuses only
+// filter, through eventStatus= / programStatus= (program review, 2026-11-17).
+function analyticsStatusDimensionRefusal(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q < 0 || !/^analytics\/(?:events|enrollments)\//.test(p)) return null;
+  const bad = p.slice(q + 1).split('&').find(x => /^dimension=(?:enrollment_?status|program_?status|event_?status|status)$/i.test(x));
+  if (!bad) return null;
+  return {
+    _error: `Not sent: "${bad.slice(10)}" is not an analytics dimension (409) — a status cannot be a row or column here.`,
+    _hint: 'Statuses filter, one query per status: eventStatus=ACTIVE,COMPLETED (events) or programStatus=ACTIVE | COMPLETED | CANCELLED (enrollments). For a count by status, send one query per status and compare the totals.',
+    _scope: 'known_endpoint_guidance',
+  };
+}
+
 function healEventAnalyticsDxDimension(path) {
   const p = String(path || '');
   if (!/^analytics\/(events|enrollments)\//.test(p)) return { path: p, healed: false };
@@ -5359,6 +5722,18 @@ function healEventAnalyticsDxDimension(path) {
     if (eq === -1) return part;
     const key = part.slice(0, eq);
     const val = part.slice(eq + 1);
+    // filter=dx:<item>:<op>:<value> — the same prefix in a filter (program
+    // review, 2026-11-17: 409): the item stands bare here too.
+    if (/^filter$/i.test(key)) {
+      let v = val;
+      const fm = v.match(/^dx(?::|%3A)([A-Za-z][A-Za-z0-9]{10}(?:\.[A-Za-z][A-Za-z0-9]{10})?(?:(?::|%3A).*)?)$/i);
+      if (fm) { v = fm[1]; healed = true; }
+      // An empty-value test written ":null" / ":notnull" is a 409; DHIS2's form
+      // is EQ:NV / NE:NV (NV = no value; verified 2.42.7, 2026-11-17).
+      const nm = v.match(/^(.+?)(?::|%3A)(!?null|not_?null|is_?null|empty|!?empty)$/i);
+      if (nm) { v = `${nm[1]}:${/^(?:!|not)/i.test(nm[2]) ? 'NE' : 'EQ'}:NV`; healed = true; }
+      return `${key}=${v}`;
+    }
     if (!/^dimension$/i.test(key)) return part;
     // `dimension=stage:<uid>` is a 409 ("Query item or filter is invalid") —
     // the stage is its own parameter on these endpoints (live 2026-10-28).
@@ -5533,7 +5908,7 @@ async function routeProgramIndicatorAnalytics(path) {
     }
     return { path: p, routed: false };
   }
-  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate)=/i.test(x)
+  const keep = parts.filter(x => !itemParts.has(x) && /^(dimension|filter|displayProperty|skipMeta|includeNumDen|hierarchyMeta|showHierarchy|aggregationType|startDate|endDate|relativePeriodDate|periods?)=/i.test(x)
     && !(fromValue && /^aggregationType=/i.test(x)));
   return { path: `analytics?dimension=dx%3A${[...new Set(items)].join('%3B')}${keep.length ? '&' + keep.join('&') : ''}`, routed: true, ...(fromValue ? { note: 'Query corrected: a program indicator is not an event-analytics value (409); it was read from /analytics as a data item, with its own aggregation.' } : {}) };
 }

@@ -86,12 +86,13 @@ async function dataCheckFieldCoverage(f) {
 function dataCheckAnalyticsState(programId) {
   return dataCheckCached(`analytics:${programId}`, async () => {
     const y = new Date().getFullYear();
-    const [live, inTables] = await Promise.all([
-      dataCheckTrackerCount(`tracker/events?program=${programId}&orgUnitMode=CAPTURE&occurredAfter=${y - 5}-01-01&occurredBefore=${y}-12-31&pageSize=1&totalPages=true&fields=event`),
-      safeDhis2Fetch(`analytics/events/aggregate/${programId}?dimension=pe:THIS_YEAR;LAST_5_YEARS&filter=ou:USER_ORGUNIT`),
-    ]);
+    const live = await dataCheckTrackerCount(`tracker/events?program=${programId}&orgUnitMode=CAPTURE&occurredAfter=${y - 5}-01-01&occurredBefore=${y}-12-31&pageSize=1&totalPages=true&fields=event`);
     if (live == null) return { state: 'unknown' };
     if (live === 0) return { state: 'no_records', live };
+    // Only a program with records is asked about its analytics table: a program
+    // created this turn has none, and the query is a sure 409 E7144 (TB program
+    // build, 2026-11-17 — the one failed call of an otherwise clean turn).
+    const inTables = await safeDhis2Fetch(`analytics/events/aggregate/${programId}?dimension=pe:THIS_YEAR;LAST_5_YEARS&filter=ou:USER_ORGUNIT`);
     if (inTables?._error) {
       return /E7144|does not exist/i.test(String(inTables._error)) ? { state: 'missing', live } : { state: 'unknown' };
     }
