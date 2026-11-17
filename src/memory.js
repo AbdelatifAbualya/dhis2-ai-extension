@@ -439,6 +439,9 @@ const MEMORY_IGNORED_SCOPES = new Set([
   'destructive_404_limit_reached', 'http_error_limit_reached', 'repeated_identical_failure',
   'same_error_family_limit', 'no_progress_repeat', 'unknown_uid_in_args',
   'known_endpoint_guidance', 'awaiting_placement_answer',
+  // A call in a shape no tool takes, and a tool's own crash: about this call or
+  // the extension's code, never about DHIS2.
+  'argument_shape', 'tool_internal_error', 'analytics_period_needed', 'org_level_mismatch', 'analytics_ou_level', 'memory_unproven_lesson',
   // What the user has or has not asked for in this conversation, not how DHIS2 works.
   'sharing_not_requested', 'program_change_not_requested',
 ]);
@@ -668,6 +671,23 @@ async function executeManageMemory(args) {
     }, memoryUserAskedToRemember() ? 'user' : 'assistant');
     const bad = memoryValidateEntry(entry);
     if (bad) return { _error: `Not recorded: ${bad}`, _hint: 'Write the lesson as general DHIS2/API knowledge (endpoints, parameters, rules) with no names, values or identifiers of people.' };
+    // A lesson is a fix that WORKED. One about a tool that failed this turn and
+    // has not worked since is a guess, and a stored guess misleads every later
+    // task: the Malaria dashboard thread (2026-11-17) stored "manage_dashboards
+    // needs flat arrays" and "the dhis2_query body encoder mangles nested
+    // arrays" — both wrong — while the tool was switched off and nothing had
+    // worked. The user's own "remember this" is always kept.
+    if (entry.source !== 'user' && memoryTurn) {
+      const unproven = (entry.tools || []).filter(t => memoryTurn.failures.some(f => f.tool === t)
+        && !memoryTurn.recoveries.some(r => r.tool === t || r.failure?.tool === t));
+      if (unproven.length) {
+        return {
+          _error: `Not recorded: ${unproven.join(', ')} failed this turn and no corrected call of it has worked since, so this lesson is a guess about the cause, not a proven fix.`,
+          _hint: 'Record a lesson only after the corrected call succeeded. Continue the task (or tell the user what failed, quoting the error) instead.',
+          _scope: 'memory_unproven_lesson',
+        };
+      }
+    }
     const { entry: saved, merged } = upsertMemoryEntry(entry, { supersedes: args.supersedes || null });
     if (memoryTurn) {
       memoryTurn.recorded.push(saved.id);

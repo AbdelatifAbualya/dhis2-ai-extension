@@ -2,6 +2,37 @@
 // Design: Few focused tools that cover all use cases. The LLM has the metadata
 // in its system prompt, so it knows IDs. Tools handle URL construction properly.
 
+// The fields of one visualization: create_visualization's `visualization` and
+// each create_dashboard / add_items item's `new_visualization`. new_visualization
+// had NO field list on the wire, and Fireworks' constrained decoder then wrote
+// every list inside it as {"item": …} and overall_row as "true" (MiniMax-M3.1-flash,
+// Malaria thread 2026-11-17) — the dashboard tool crashed on it. Every nested
+// object a model fills in must declare its fields (verify checks this).
+const VIZ_SPEC_PROPERTIES = {
+              name: { type: 'string', description: 'Visualization display name (required).' },
+              vis_type: { type: 'string', description: 'Chart type: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, STACKED_AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, YEAR_OVER_YEAR_COLUMN, SCATTER, BUBBLE. Default COLUMN.' },
+              data_items: { type: 'array', items: { type: 'string' }, description: 'Indicator / dataElement / programIndicator UIDs to plot (the dx dimension). Also "<dataSetUid>.REPORTING_RATE" (or .REPORTING_RATE_ON_TIME, .ACTUAL_REPORTS, .ACTUAL_REPORTS_ON_TIME, .EXPECTED_REPORTS) for a data set\'s reporting figures, and "<dataElementUid>.<categoryOptionComboUid>" for one disaggregation of a data element. Types are auto-resolved and existence-verified.' },
+              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords and/or fixed ISO periods (202401, 2025Q1, 2025). A request phrased relative to today MUST use relative keywords so the saved chart rolls forward: "each quarter of this year and last year" = ["QUARTERS_THIS_YEAR","QUARTERS_LAST_YEAR"], "by month this year" = ["MONTHS_THIS_YEAR"], "last 12 months" = ["LAST_12_MONTHS"], "this year" = ["THIS_YEAR"], "last 4 quarters" = ["LAST_4_QUARTERS"]. Fixed periods only when the user names them. ⚠ LAST_N_YEARS / LAST_YEAR are COMPLETED years only — in 2026, LAST_5_YEARS is 2021–2025 and EXCLUDES 2026; for "the last five years" including this one pass ["THIS_YEAR","LAST_5_YEARS"].' },
+              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2). "The whole hierarchy" = ["USER_ORGUNIT"]; "facilities at level N" everywhere = ["USER_ORGUNIT","LEVEL-N"].' },
+              short_name: { type: 'string', description: 'Optional short name (max 50 chars).' },
+              description: { type: 'string', description: 'Optional description.' },
+              layout: {
+                type: 'object',
+                description: 'Optional layout — which of ["dx","pe","ou"] sits where. For CHARTS (COLUMN/BAR/LINE/AREA/STACKED_*) use category (the x-axis) + series (the legend): monthly trend of indicators = { category:["pe"], series:["dx"], filters:["ou"] }; districts compared by indicators = { category:["ou"], series:["dx"], filters:["pe"] }; one bar per indicator with its TOTAL for the whole period (a distribution, e.g. diagnoses by type) = { category:["dx"], filters:["pe","ou"] } — never series:["pe"] with a multi-month period, which draws one bar per month for every item. (DHIS2 stores category as rows and series as columns — columns is NOT the x-axis; a chart with only dx on the x-axis is auto-corrected unless keep_layout:true.) Pivot tables use columns/rows as written: org units down the side = { rows:["ou"], columns:["dx"], filters:["pe"] }. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → series[dx] category[pe] filters[ou].',
+                properties: {
+                  category: { type: 'array', items: { type: 'string' }, description: 'Charts: the x-axis dimension(s).' },
+                  series: { type: 'array', items: { type: 'string' }, description: 'Charts: the legend / series dimension(s).' },
+                  columns: { type: 'array', items: { type: 'string' } },
+                  rows: { type: 'array', items: { type: 'string' } },
+                  filters: { type: 'array', items: { type: 'string' } }
+                }
+              },
+              keep_layout: { type: 'boolean', description: 'Keep a chart layout that puts only the data items on the x-axis (normally auto-corrected).' },
+              show_empty: { type: 'boolean', description: 'Keep org units with no data as empty rows / x-axis places. Normally hidden when org_units uses a level or children. Only for a report of who has NOT reported.' },
+              sort: { type: 'string', enum: ['desc', 'asc'], description: 'Charts only: order the x-axis by value, desc = highest first. Saved tables cannot be sorted. DHIS2 has no saved "top N": see the manual before promising one.' },
+              overall_row: { type: 'boolean', description: 'Pivot of org units WITH an overall row: pass org_units [<parent uid>, "LEVEL-<n>"] and overall_row:true — the parent becomes its own row, computed from ALL records (correct for percentages; DHIS2 pivot totals only add up or average the cells). The level-n units are saved as explicit rows.' }
+            };
+
 const TOOLS = [
   {
     type: 'function',
@@ -169,7 +200,7 @@ Examples:
           },
           breakdown_dimension: {
             type: 'string',
-            description: 'Dimension to break down by. Format: {stageId}.{dataElementId} for data element breakdown, or {stageId}.{dataElementId}:{optionCode} to filter by specific value.'
+            description: 'Dimension to break down by. Format: {stageId}.{dataElementId} for data element breakdown, or {stageId}.{dataElementId}:{optionCode} to filter by specific value. A program indicator UID (no prefix) is read from /analytics.'
           },
           value_dimensions: {
             type: 'array',
@@ -185,12 +216,12 @@ Examples:
           },
           ou_override: {
             type: 'string',
-            description: 'Override org unit. Use {ouId};CHILDREN for children, LEVEL-{n} for a level.'
+            description: 'Override org unit: a UID, USER_ORGUNIT, or LEVEL-{n}. Default: the selected org unit, else the user\'s own (USER_ORGUNIT). For one row per child unit use ou_mode DESCENDANTS.'
           },
           ou_mode: {
             type: 'string',
             enum: ['SELECTED', 'DESCENDANTS'],
-            description: 'Org unit mode for analytics. DESCENDANTS expands to child org units.'
+            description: 'SELECTED = one total for the org unit (it already includes every unit below it). DESCENDANTS = one row per child org unit (the next level down).'
           },
           page_size: {
             type: 'number',
@@ -2108,37 +2139,15 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
           visualization: {
             type: 'object',
             description: 'For create_visualization: the visualization spec.',
-            properties: {
-              name: { type: 'string', description: 'Visualization display name (required).' },
-              vis_type: { type: 'string', description: 'Chart type: COLUMN, STACKED_COLUMN, BAR, STACKED_BAR, LINE, AREA, STACKED_AREA, PIE, RADAR, GAUGE, SINGLE_VALUE, PIVOT_TABLE, YEAR_OVER_YEAR_LINE, YEAR_OVER_YEAR_COLUMN, SCATTER, BUBBLE. Default COLUMN.' },
-              data_items: { type: 'array', items: { type: 'string' }, description: 'Indicator / dataElement / programIndicator UIDs to plot (the dx dimension). Also "<dataSetUid>.REPORTING_RATE" (or .REPORTING_RATE_ON_TIME, .ACTUAL_REPORTS, .ACTUAL_REPORTS_ON_TIME, .EXPECTED_REPORTS) for a data set\'s reporting figures, and "<dataElementUid>.<categoryOptionComboUid>" for one disaggregation of a data element. Types are auto-resolved and existence-verified.' },
-              periods: { type: 'array', items: { type: 'string' }, description: 'Periods (the pe dimension): relative keywords and/or fixed ISO periods (202401, 2025Q1, 2025). A request phrased relative to today MUST use relative keywords so the saved chart rolls forward: "each quarter of this year and last year" = ["QUARTERS_THIS_YEAR","QUARTERS_LAST_YEAR"], "by month this year" = ["MONTHS_THIS_YEAR"], "last 12 months" = ["LAST_12_MONTHS"], "this year" = ["THIS_YEAR"], "last 4 quarters" = ["LAST_4_QUARTERS"]. Fixed periods only when the user names them. ⚠ LAST_N_YEARS / LAST_YEAR are COMPLETED years only — in 2026, LAST_5_YEARS is 2021–2025 and EXCLUDES 2026; for "the last five years" including this one pass ["THIS_YEAR","LAST_5_YEARS"].' },
-              org_units: { type: 'array', items: { type: 'string' }, description: 'Org units (the ou dimension): UIDs and/or relative keywords USER_ORGUNIT, USER_ORGUNIT_CHILDREN, USER_ORGUNIT_GRANDCHILDREN, or LEVEL-<n> (e.g. LEVEL-2). "The whole hierarchy" = ["USER_ORGUNIT"]; "facilities at level N" everywhere = ["USER_ORGUNIT","LEVEL-N"].' },
-              short_name: { type: 'string', description: 'Optional short name (max 50 chars).' },
-              description: { type: 'string', description: 'Optional description.' },
-              layout: {
-                type: 'object',
-                description: 'Optional layout — which of ["dx","pe","ou"] sits where. For CHARTS (COLUMN/BAR/LINE/AREA/STACKED_*) use category (the x-axis) + series (the legend): monthly trend of indicators = { category:["pe"], series:["dx"], filters:["ou"] }; districts compared by indicators = { category:["ou"], series:["dx"], filters:["pe"] }; one bar per indicator with its TOTAL for the whole period (a distribution, e.g. diagnoses by type) = { category:["dx"], filters:["pe","ou"] } — never series:["pe"] with a multi-month period, which draws one bar per month for every item. (DHIS2 stores category as rows and series as columns — columns is NOT the x-axis; a chart with only dx on the x-axis is auto-corrected unless keep_layout:true.) Pivot tables use columns/rows as written: org units down the side = { rows:["ou"], columns:["dx"], filters:["pe"] }. Defaults: pivot → columns[pe] rows[dx] filters[ou]; single-value/gauge/pie → columns[dx] filters[pe,ou]; charts → series[dx] category[pe] filters[ou].',
-                properties: {
-                  category: { type: 'array', items: { type: 'string' }, description: 'Charts: the x-axis dimension(s).' },
-                  series: { type: 'array', items: { type: 'string' }, description: 'Charts: the legend / series dimension(s).' },
-                  columns: { type: 'array', items: { type: 'string' } },
-                  rows: { type: 'array', items: { type: 'string' } },
-                  filters: { type: 'array', items: { type: 'string' } }
-                }
-              },
-              keep_layout: { type: 'boolean', description: 'Keep a chart layout that puts only the data items on the x-axis (normally auto-corrected).' },
-              show_empty: { type: 'boolean', description: 'Keep org units with no data as empty rows / x-axis places. Normally hidden when org_units uses a level or children. Only for a report of who has NOT reported.' },
-              sort: { type: 'string', enum: ['desc', 'asc'], description: 'Charts only: order the x-axis by value, desc = highest first. Saved tables cannot be sorted. DHIS2 has no saved "top N": see the manual before promising one.' },
-              overall_row: { type: 'boolean', description: 'Pivot of org units WITH an overall row: pass org_units [<parent uid>, "LEVEL-<n>"] and overall_row:true — the parent becomes its own row, computed from ALL records (correct for percentages; DHIS2 pivot totals only add up or average the cells). The level-n units are saved as explicit rows.' }
-            }
+            properties: VIZ_SPEC_PROPERTIES
           },
           dashboard: {
             type: 'object',
-            description: 'For create_dashboard (name required) and update (name and/or description to change).',
+            description: 'For create_dashboard (name required) and update (name, description and/or allowed_filters to change).',
             properties: {
               name: { type: 'string', description: 'Dashboard display name.' },
-              description: { type: 'string', description: 'Optional description.' }
+              description: { type: 'string', description: 'Optional description.' },
+              allowed_filters: { type: 'array', items: { type: 'string' }, description: 'Optional. Every dashboard already has period and org-unit (location) filters in its filter bar, plus every other dimension — nothing to set for "add period and location filters". Pass this ONLY to limit the filter bar to these dimensions: "pe" = period, "ou" = org unit, or a dimension UID (e.g. ["pe","ou"]). [] on update = every dimension again.' }
             }
           },
           items: {
@@ -2155,7 +2164,8 @@ Every mutating action is backed up first (undo via manage_backups). For sharing 
                 text: { type: 'string', description: 'Tile text (type TEXT).' },
                 new_visualization: {
                   type: 'object',
-                  description: 'Inline-create a NEW visualization for this item (same fields as the create_visualization "visualization" spec): name, vis_type, data_items, periods, org_units, short_name, description, layout.'
+                  description: 'Inline-create a NEW visualization for this item (same fields as the create_visualization "visualization" spec): name, vis_type, data_items, periods, org_units, short_name, description, layout.',
+                  properties: VIZ_SPEC_PROPERTIES
                 },
                 size: { type: 'string', enum: ['small', 'half', 'full'], description: 'Only when the user asks for a size: small = a KPI-sized tile sharing a row (single values, text, plugins), half = two per row, full = the whole width. Omit it — the tool sizes each tile from what it shows.' },
                 item_id: { type: 'string', description: 'For arrange: the dashboardItem UID whose size to change.' }
@@ -2256,7 +2266,7 @@ Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVEN
                 periods: { type: 'array', items: { type: 'string' }, description: 'For a time dimension: relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, …) and/or fixed ISO periods (202605, 2026Q1, 2026).' },
                 statuses: { type: 'array', items: { type: 'string' }, description: 'For event_status (ACTIVE, COMPLETED, SCHEDULE, OVERDUE, SKIPPED) or program_status (ACTIVE, COMPLETED, CANCELLED).' },
                 program_stage_id: { type: 'string', description: 'Stage UID or name — only needed when the data element appears in several stages.' },
-                filter: { description: 'Condition on this dimension: { operator, value | values:[…] } or a raw "OP:value" string. Option-set values auto-map name→code; booleans → true/false.', type: 'object', properties: { operator: { type: 'string' }, value: {}, values: { type: 'array' } } },
+                filter: { description: 'Condition on this dimension: { operator, value | values:[…] } or a raw "OP:value" string. Option-set values auto-map name→code; booleans → true/false.', type: 'object', properties: { operator: { type: 'string' }, value: {}, values: { type: 'array', items: { type: 'string' } } } },
                 repeated_events: { type: 'object', properties: { most_recent: { type: 'integer' }, oldest: { type: 'integer' } }, description: 'ENROLLMENT output + repeatable stage only: how many latest/earliest event occurrences of this DE to show as separate columns. Or pass repetition_indexes:[1,2,-1,0].' },
                 repetition_indexes: { type: 'array', items: { type: 'integer' }, description: 'Explicit occurrence indexes: 1=first, 2=second, …; 0=latest, -1=second-latest.' },
                 allow_risky_program_indicator: { type: 'boolean', description: 'Override the division-PI or percentage-PI refusal for THIS column — only when certain the per-row denominator can never be 0, or when the user explicitly wants a 0/100 value per record.' }
@@ -2264,7 +2274,7 @@ Place a saved line list on a dashboard via manage_dashboards items [{ type:"EVEN
             },
             description: 'The table columns, in order. Strings allowed as shorthand for { dimension:"…" }. Must include an org-unit dimension and (for EVENT/ENROLLMENT) a time dimension somewhere in columns+filters.'
           },
-          filters: { type: 'array', items: { type: 'object', properties: { dimension: { type: 'string' }, org_units: { type: 'array' }, periods: { type: 'array' }, statuses: { type: 'array' }, program_stage_id: { type: 'string' }, filter: { type: 'object' } } }, description: 'Same spec as columns, but the dimension constrains the rows WITHOUT showing as a column.' },
+          filters: { type: 'array', items: { type: 'object', properties: { dimension: { type: 'string' }, org_units: { type: 'array', items: { type: 'string' } }, periods: { type: 'array', items: { type: 'string' } }, statuses: { type: 'array', items: { type: 'string' } }, program_stage_id: { type: 'string' }, filter: { type: 'object', properties: { operator: { type: 'string' }, value: {}, values: { type: 'array', items: { type: 'string' } } } } } }, description: 'Same spec as columns, but the dimension constrains the rows WITHOUT showing as a column.' },
           sorting: { type: 'array', items: { type: 'object', properties: { dimension: { type: 'string' }, direction: { type: 'string', enum: ['ASC', 'DESC'] } } }, description: 'Sort order; each dimension must be one of the columns (name, UID or time keyword accepted).' },
           legend: { type: 'object', properties: { legend_set_id: { type: 'string' }, legend_set_name: { type: 'string' }, style: { type: 'string', enum: ['FILL', 'TEXT'] }, strategy: { type: 'string', enum: ['FIXED', 'BY_DATA_ITEM'] }, show_key: { type: 'boolean' } }, description: 'Colour numeric cells: FIXED = one legend set for the whole list (pass legend_set_id/name); BY_DATA_ITEM = each item\'s own legend set. style FILL = cell background.' },
           completed_only: { type: 'boolean', description: 'Only completed events/enrollments.' },
@@ -2568,8 +2578,8 @@ Never claim a view works or shows data unless create/update/run reported it: say
               user_groups: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, access: { type: 'string' } } } },
             },
           },
-          test_variables: { type: 'object', description: 'create / update: a value for EVERY \${variable} in the SQL, used for the test run, e.g. {"startDate":"2020-01-01","endDate":"2030-12-31","orgUnit":"ALL"}. Letters, digits, spaces, "_" and "-" only.' },
-          variables: { type: 'object', description: 'run: a value for every \${variable}.' },
+          test_variables: { type: 'object', additionalProperties: { type: 'string' }, description: 'create / update: a value for EVERY \${variable} in the SQL, used for the test run, e.g. {"startDate":"2020-01-01","endDate":"2030-12-31","orgUnit":"ALL"}. Letters, digits, spaces, "_" and "-" only.' },
+          variables: { type: 'object', additionalProperties: { type: 'string' }, description: 'run: a value for every \${variable}.' },
           tables: { type: 'array', items: { type: 'string' }, description: 'describe: database table names, e.g. ["programownershiphistory","trackedentityprogramowner","organisationunit"].' },
           search: { type: 'string', description: 'describe: list tables whose name contains this word.' },
           query: { type: 'string', description: 'list: filter by name.' },
@@ -3164,12 +3174,13 @@ DHIS2 stores a visualization's LAYOUT as \`columnDimensions\`/\`rowDimensions\`/
 - **Empty units**: with a LEVEL or children on the rows, units with no data are hidden automatically (table rows, x-axis places). Pass show_empty:true only for a report of who has NOT reported.
 
 ### Rules
+- **A new dashboard the user names: check the name FIRST**, before building any indicator, chart, map or line list for it: manage_dashboards(action="list", name_filter="<the name>"). If one exists, tell the user (with its link) and ask whether to update it or use another name — never change someone's existing dashboard or its tiles unasked.
 - "Next to", "beside", "side by side": give BOTH tiles size:"half" and list them one right after the other, because tiles only pair with their immediate neighbour. A plugin placed with manage_custom_app place takes the same size.
 - data_items types (indicator / dataElement / programIndicator) are auto-resolved AND existence-verified; an invalid UID is rejected, not silently dropped. NEVER invent visualization, map or data-item UIDs.
 - "Replace this chart with…": add_items with replace_item_id=<the old tile's id> and the new tile in items. It stays exactly where the old one was, in one write. Do not remove_item and then insert: a stale anchor puts the new tile somewhere else.
 - add_items reads the full dashboard, adds below the current tiles (or at a place: insert_after_item_id / insert_before_item_id with a tile id from get — the dashboard is re-flowed around them), and writes the COMPLETE item set back, snapshotting to backups first. To change the ORDER of existing tiles use arrange with order:[every tile id, in the new reading order]. Never rebuild an existing dashboard with create_dashboard — it makes a second dashboard (refused when the name exists). NEVER add to a dashboard with a raw dhis2_query PUT /dashboards/{id} — a dashboard PUT is a whole-object REPLACE that permanently wipes every existing tile (now blocked in code).
 - **Layout is the tool's job.** The Dashboard app grid is 60 columns wide (a column scales with the screen) and its rows are a fixed 20 px, so a guessed width/height makes slivers. The tool sizes each tile from what it shows: single-value tiles share one row (up to 4, tall enough for their wrapped title; when the user asks for more in one row, pass kpis_per_row, up to 6), charts two per row — full width when dense (more than 12 x-axis categories, more than 5 series or more than 24 bars), pivot tables full width and as tall as their rows, line lists full width, a half tile with no partner widened to full. List items in reading order (KPIs first, then charts, then tables), never pass x/y/width/height (they count only as order + small/half/full), and use size:"small"|"half"|"full" only when the user asks for a size. The result's tile_rows lists the rows top to bottom — describe the arrangement from it. To fix an existing dashboard's squeezed or messy tiles, action="arrange" (get flags tiles too small to read). Item shapes: { visualization_id } | { type:"MAP", map_id } | { type:"EVENT_VISUALIZATION", event_visualization_id } (a saved line list from manage_line_lists) | { type:"TEXT", text } | { new_visualization:{ name, vis_type, data_items, periods, org_units } }. Text tiles use *bold* and _italic_ with single marks and # headings (the tool converts **bold**). A text tile is for what the user asked to have explained: every chart, map and table already has a title, so do not add header tiles between them.
-- **Dashboard filters** (verified 2.42.7): a period or org-unit filter re-queries single values, charts, pivot tables and maps (it replaces their saved period / org units). Line-list tiles do not follow it: while a filter is on, each line list shows "Filters are not applied to line list dashboard items" with a "Show without filters" button that shows its saved rows. Text and plugin tiles do not change. Tell the user this when they ask to filter by year or location.
+- **Dashboard filters** (verified 2.42.7): every dashboard already has a filter bar with Period, Organisation unit (location) and every other dimension — "add period and location filters" needs NO setting and NO schema research; the create_dashboard result's filter_bar says what it offers. Pass dashboard.allowed_filters:["pe","ou"] only to LIMIT the bar to those (update takes it too). A period or org-unit filter re-queries single values, charts, pivot tables and maps (it replaces their saved period / org units). Line-list tiles do not follow it: while a filter is on, each line list shows "Filters are not applied to line list dashboard items" with a "Show without filters" button that shows its saved rows. Text and plugin tiles do not change. Tell the user this when they ask to filter by year or location.
 - **Checking a tile's numbers:** get lists each chart's and map's data_items. Query those ids (analytics?dimension=dx:<data item ids>…). A visualization, map or line-list id is not a data item: analytics answers 409 for it.
 - To delete a whole dashboard use action="delete" (snapshots first). Sharing/deletion of standalone visualizations/maps → manage_metadata.
 

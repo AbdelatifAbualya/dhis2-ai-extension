@@ -251,10 +251,14 @@ async function executeToolCall(name, args) {
         .test(String(args.path || '').replace(/^\//, '').replace(/^api\/\d+\//, ''));
       // A validation analysis that saves nothing and notifies nobody is a read
       // sent as POST: DHIS2 has no GET for it (405).
-      const _isReadOnlyAnalysis = method === 'POST'
-        && /^dataAnalysis\/validationRules\/?(\?|$)/i.test(String(args.path || '').replace(/^\//, '').replace(/^api\/(?:\d+\/)?/, ''))
+      const _plainPath = String(args.path || '').replace(/^\//, '').replace(/^api\/(?:\d+\/)?/, '');
+      const _isReadOnlyAnalysis = (method === 'POST'
+        && /^dataAnalysis\/validationRules\/?(\?|$)/i.test(_plainPath)
         && !(args.body && typeof args.body === 'object' && (args.body.persist === true || args.body.notification === true))
-        && !/"(?:persist|notification)"\s*:\s*true/.test(typeof args.body === 'string' ? args.body : '');
+        && !/"(?:persist|notification)"\s*:\s*true/.test(typeof args.body === 'string' ? args.body : ''))
+        // The expression/condition checkers are POST-only and save nothing: a
+        // read-only review was refused one (Child Programme review, 2026-11-17).
+        || (method === 'POST' && EXPRESSION_DESCRIPTION_RE.test(_plainPath));
       if (!_isAnalyticsRun && !_isReadOnlyAnalysis) {
         const _gate = requireWriteAuth('dhis2_query', method, { path: args.path });
         if (_gate) return _gate;
@@ -263,6 +267,42 @@ async function executeToolCall(name, args) {
     const opts = {};
     if (method !== 'GET') opts.method = method;
     if (args.body) opts.body = args.body;
+    {
+      const badParams = queryParamsShapeProblems(args.query_params);
+      if (badParams.length) {
+        return {
+          _error: `Not sent: query parameter${badParams.length > 1 ? 's' : ''} ${badParams.map(k => `"${k}"`).join(', ')} ${badParams.length > 1 ? 'are objects' : 'is an object'} with several fields. A URL takes text or a list of text, so this would reach the server as "[object Object]".`,
+          _hint: `Write each as text or a list of text: e.g. query_params:{ dimension:["ou:<uid>;LEVEL-2","pe:THIS_YEAR"], filter:"pe:THIS_YEAR" } — one dimension per list entry.`,
+          _scope: 'argument_shape',
+        };
+      }
+    }
+    // "filters" (search_metadata's argument name) as a query parameter is not
+    // DHIS2's filter= — a list read answered 400 "Collection size must be
+    // integer" five times in one program review (2026-11-17). Metadata reads
+    // only: analytics and tracker have their own grammar.
+    // A whole query string written as a KEY ({"type=optionSet&id=x": ""},
+    // program review 2026-11-17: 400): its parameters are what was meant.
+    if (args.query_params && typeof args.query_params === 'object' && !Array.isArray(args.query_params)) {
+      const qp = {};
+      let merged = false;
+      for (const [k, v] of Object.entries(args.query_params)) {
+        if (/[=&]/.test(k) && (v === '' || v == null)) {
+          for (const [k2, v2] of new URLSearchParams(k.replace(/^\?/, ''))) {
+            if (qp[k2] === undefined) qp[k2] = v2;
+            else qp[k2] = [].concat(qp[k2], v2);
+          }
+          merged = true;
+        } else if (qp[k] === undefined) qp[k] = v;
+      }
+      if (merged) args.query_params = qp;
+    }
+    if (method === 'GET' && args.query_params && typeof args.query_params === 'object' && !Array.isArray(args.query_params)
+        && 'filters' in args.query_params && !('filter' in args.query_params)
+        && !/^\/?(?:api\/(?:\d+\/)?)?(?:analytics|tracker|events|enrollments|trackedEntityInstances|dataStore|userDataStore|sqlViews)\b/i.test(String(args.path || ''))) {
+      const { filters, ...rest } = args.query_params;
+      args.query_params = { ...rest, filter: filters };
+    }
     let safePath = appendQueryParamsToPath(args.path, args.query_params);
 
     // Guard: endpoints models guess for data no Web API endpoint returns. A
@@ -305,9 +345,58 @@ async function executeToolCall(name, args) {
           _scope: 'known_endpoint_guidance',
         };
       }
+      // "notificationTemplates" is three collections in DHIS2 (404 on its own;
+      // program review, 2026-11-17).
+      // One template by id: identifiableObjects says which of the three it is.
+      const _nt = _gp.match(/^notificationTemplates\/([A-Za-z][A-Za-z0-9]{10})(\/.*)?$/i);
+      if (_nt) {
+        const io = await safeDhis2Fetch(`identifiableObjects/${_nt[1]}?fields=id,href`);
+        const realType = io && !io._error && (String(io.href || '').match(/\/api\/(?:\d+\/)?([A-Za-z]+)\/[A-Za-z][A-Za-z0-9]{10}$/) || [])[1];
+        if (realType) {
+          safePath = safePath.replace(/^(\/?(?:api\/(?:\d+\/)?)?)notificationTemplates/i, `$1${realType}`);
+        } else {
+          return { _error: `Not sent: there is no "notificationTemplates" endpoint, and ${_nt[1]} is not a known object on this server.`, _hint: 'Program templates: programNotificationTemplates/<id>; data set: dataSetNotificationTemplates/<id>; validation: validationNotificationTemplates/<id>.', _scope: 'known_endpoint_guidance' };
+        }
+      }
+      if (/^notificationTemplates(?:\.json)?\/?$/i.test(_gp)) {
+        return {
+          _error: 'Not sent: there is no "notificationTemplates" endpoint (404). DHIS2 keeps three kinds apart.',
+          _hint: 'programNotificationTemplates (program and stage messages; manage_program_notifications(action="list", program_id) lists a program\'s), dataSetNotificationTemplates (data set completion), validationNotificationTemplates (validation rule violations).',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
+      // Today's date has no endpoint of its own (systemDate → 404, guessed twice
+      // on 2026-11-17); the date is answered here, the server's clock is in
+      // system/info.
+      if (/^(?:systemDate|system\/date|serverDate|currentDate|date|today|time)(?:\.json)?\/?$/i.test(_gp)) {
+        const t = new Date();
+        const today = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+        return {
+          today, year: t.getFullYear(),
+          _note: `DHIS2 has no "${_gp}" endpoint, so it was not called: today is ${today} on the user's computer. The server's own clock is serverDate in system/info. For periods relative to today use keywords (THIS_YEAR, LAST_12_MONTHS, THIS_MONTH) rather than computed dates.`,
+        };
+      }
+      // A program's attributes and a stage's data elements live INSIDE the
+      // program / stage: GET programTrackedEntityAttributes and
+      // programStageDataElements are 404 (verified 2.42.7), and so is the
+      // guessed programAttributes (program review, 2026-11-17).
+      if (/^(?:programAttributes|programTrackedEntityAttributes|programStageDataElements|programStageElements|stageDataElements|stageElements)(?:\.json)?\/?$/i.test(_gp)) {
+        let _decoded = String(safePath);
+        try { _decoded = decodeURIComponent(_decoded); } catch { /* raw */ }
+        const pidQ = (_decoded.match(/(?:program(?:\.id)?(?::eq:|=))([A-Za-z][A-Za-z0-9]{10})/) || [])[1] || ctx.programId || '<programUid>';
+        const stageQ = (_decoded.match(/(?:programStage(?:\.id)?(?::eq:|=))([A-Za-z][A-Za-z0-9]{10})/) || [])[1] || '<stageUid>';
+        return {
+          _error: `Not sent: there is no "${_gp}" endpoint (404) — program attributes and stage data elements are read through their program or stage.`,
+          _hint: /stage/i.test(_gp)
+            ? `programStages/${stageQ}?fields=programStageDataElements[compulsory,dataElement[id,displayName,valueType,optionSet[id,displayName]]] — or get_program_info(info_type="structure", program_id) for every stage at once.`
+            : `programs/${pidQ}?fields=programTrackedEntityAttributes[mandatory,searchable,displayInList,trackedEntityAttribute[id,displayName,valueType,unique,optionSet[id,displayName]]] — or get_program_info(info_type="structure", program_id).`,
+          _scope: 'known_endpoint_guidance',
+        };
+      }
       // Reporting Completeness replay (2026-11-10): GET periods?periodType=Monthly&… → 404.
-      // DHIS2 has no periods resource (verified 2.42.5, 2.42.7, 2.43.2).
-      if (/^periods?(?:\.json)?\/?$/i.test(_gp)) {
+      // DHIS2 has no periods resource (verified 2.42.5, 2.42.7, 2.43.2), and no
+      // relativePeriods one either (404 on 2.42.7, same app card 2026-11-17).
+      if (/^(?:[A-Za-z]+\/)?(?:periods?|relativePeriods?)(?:\.json)?\/?$/i.test(_gp)) {
         return {
           _error: `Not sent: there is no "${_gp}" endpoint (404). Period ids are built, not fetched.`,
           _hint: 'ISO period ids by period type: Daily 20251031, Weekly 2025W44, Monthly 202510, BiMonthly 202505B, Quarterly 2025Q4, SixMonthly 2025S2, SixMonthlyApril 2025AprilS1, Yearly 2025, FinancialApril 2025April, FinancialJuly 2025July, FinancialOct 2025Oct. A data set\'s periodType is on dataSets/<id>. In analytics, relative keywords (LAST_12_MONTHS, THIS_YEAR, LAST_4_QUARTERS, LAST_52_WEEKS) need no ids, and each answer\'s metaData.items names its periods. periodTypes lists the types.',
@@ -455,6 +544,35 @@ async function executeToolCall(name, args) {
           opts._backup_block = bulkBackup.block;
         }
       }
+    }
+
+    // ── Program rule condition checker: GET → the POST it must be ──
+    // POST programRules/condition/description?programId=<uid> with the
+    // condition as text/plain; a GET is a 405 and a JSON body {condition} is
+    // not read (verified 2.42.7, 2026-11-17: two 405s in a read-only review).
+    // programRules/<ruleId>/condition/description (a 405 too) means "check THIS
+    // rule's condition": its condition and program are read first.
+    const _ruleDesc = safePath.match(/^programRules\/([A-Za-z][A-Za-z0-9]{10})\/condition\/description(?:\b|\?|$)/);
+    if (/^programRules\/condition\/description(\b|\?|$)/.test(safePath) || _ruleDesc) {
+      const qs = new URLSearchParams((safePath.split('?')[1] || ''));
+      let ruleCond = '', rulePid = '';
+      if (_ruleDesc) {
+        const rule = await safeDhis2Fetch(`programRules/${_ruleDesc[1]}?fields=id,condition,program[id]`);
+        if (rule?._error) return rule;
+        ruleCond = String(rule?.condition || ''); rulePid = rule?.program?.id || '';
+      }
+      const cond = ruleCond || (typeof args.body === 'string' ? args.body : null) || qs.get('condition')
+        || (args.body && typeof args.body === 'object' ? String(args.body.condition || '') : '');
+      const pid = rulePid || qs.get('programId') || qs.get('program') || args.program_id || ctx.programId || dhis2.programMetadata?.id || '';
+      if (!cond || !pid) {
+        return {
+          _error: `Not sent: the rule-condition checker needs the ${!cond ? 'condition text' : 'program (programId)'}.`,
+          _hint: 'manage_program_rules(action="audit", program_id) checks every rule condition of a program at once. For one condition: dhis2_query POST programRules/condition/description?programId=<uid> with the condition as the body.',
+          _scope: 'known_endpoint_guidance',
+        };
+      }
+      const out = await validateProgramRuleCondition(cond, pid);
+      return { ...out, _validated: { kind: 'program rule condition', condition: cond, program_id: pid }, ...(method === 'GET' ? { _query_corrected: 'This checker is POST-only (a GET is a 405): it was sent as POST with the condition as the body.' } : {}) };
     }
 
     // ── PI expression/filter validator: heal GET → the POST it must be ──
@@ -798,12 +916,19 @@ async function executeToolCall(name, args) {
       let target = null;
       if (ownFieldsOnly) target = null;
       else if (ANALYTICS_OBJECT_TOOL[resource]) target = resource;
-      else if (method === 'POST' && resource === 'dashboards' && !/^dashboards\/[A-Za-z][A-Za-z0-9]{10}\//.test(safePath)) target = 'dashboards';
+      else if (method === 'POST' && resource === 'dashboards' && !/^dashboards\/[^/?]+\//.test(safePath)) target = 'dashboards';
+      // Dashboard tiles have no write endpoint of their own: POST dashboardItems
+      // answers a 500 (2.42.7, Malaria thread 2026-11-17).
+      else if (resource === 'dashboardItems') target = 'dashboards';
       else if (method === 'POST' && resource === 'metadata' && !/importStrategy=DELETE/i.test(safePath)) {
         try {
           const parsedMeta = typeof args.body === 'string' ? JSON.parse(args.body) : args.body;
-          target = Object.keys(ANALYTICS_OBJECT_TOOL).concat('dashboards')
-            .find(k => parsedMeta && Array.isArray(parsedMeta[k]) && parsedMeta[k].length) || null;
+          // A list, or one object / objects keyed by id: models send all three
+          // (the keyed form reached DHIS2 as a 500 in the same thread).
+          const present = (v) => (Array.isArray(v) ? v.length > 0 : !!v && typeof v === 'object' && Object.keys(v).length > 0);
+          target = Object.keys(ANALYTICS_OBJECT_TOOL).concat('dashboards', 'dashboardItems')
+            .find(k => parsedMeta && present(parsedMeta[k])) || null;
+          if (target === 'dashboardItems') target = 'dashboards';
         } catch { /* non-JSON body — other guards decide */ }
       }
       if (target) {
@@ -830,7 +955,9 @@ async function executeToolCall(name, args) {
     // PUT dashboards/{id}/items/{itemId} and the append endpoint
     // dashboards/{id}/items/content are left alone.)
     if (method === 'PUT' || method === 'PATCH' || method === 'POST') {
-      const dashItemMatch = safePath.match(/^dashboards\/([A-Za-z][A-Za-z0-9]{10})(\b|\/|\?|$)/);
+      // Any id segment: a made-up 12-character id ("malariaTTR01") is still a
+      // whole-dashboard write (Malaria thread 2026-11-17: PUT answered 404).
+      const dashItemMatch = safePath.match(/^dashboards\/([A-Za-z0-9_-]+)(\/|\?|$)/);
       const isContentAppend = /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/content(\b|\?|$)/.test(safePath);
       const isItemLevel = /^dashboards\/[A-Za-z][A-Za-z0-9]{10}\/items\/[A-Za-z][A-Za-z0-9]{10}/.test(safePath);
       if ((method === 'PUT' || method === 'PATCH') && dashItemMatch && !isContentAppend && !isItemLevel) {
@@ -988,6 +1115,47 @@ async function executeToolCall(name, args) {
 
     const queryNotes = []; // corrections made to the query, returned with its result
     if (method === 'GET') {
+      const pdeHeal = healProgramDataElementsQuery(safePath, ctx.programId || dhis2.programMetadata?.id || null);
+      if (pdeHeal.refusal) return pdeHeal.refusal;
+      if (pdeHeal.healed) {
+        console.log(`[dhis2_query] programDataElements given its program parameter → ${pdeHeal.path}`);
+        safePath = pdeHeal.path;
+        queryNotes.push(pdeHeal.note);
+      }
+      // GET sharing?type=<type>&id=<uid>: "uid=" is a 400 and a plural type a 409
+      // (verified 2.42.7; program review 2026-11-17).
+      if (/^sharing(?:\.json)?\?/.test(safePath)) {
+        const sp = new URLSearchParams(safePath.slice(safePath.indexOf('?') + 1));
+        let changed = false;
+        if (!sp.get('id') && sp.get('uid')) { sp.set('id', sp.get('uid')); sp.delete('uid'); changed = true; }
+        const t = sp.get('type');
+        if (t && typeof resolveSchemaType === 'function') {
+          const st = await resolveSchemaType(t);
+          if (st && st.name && st.name !== t) { sp.set('type', st.name); changed = true; }
+        }
+        if (changed) {
+          safePath = `${safePath.slice(0, safePath.indexOf('?'))}?${sp.toString()}`;
+          queryNotes.push('Query corrected: the sharing endpoint takes type=<singular type>&id=<uid>.');
+        }
+        if (!sp.get('id')) {
+          const plural = (sp.get('type') && typeof resolveSchemaType === 'function' ? (await resolveSchemaType(sp.get('type')))?.plural : null) || '<collection>';
+          return {
+            _error: 'Not sent: the sharing endpoint reads ONE object (type=<type>&id=<uid>); without id it is a 400.',
+            _hint: `For the sharing of many objects at once: ${plural}?fields=id,displayName,sharing[public,owner,users,userGroups]&filter=id:in:[<uid>,<uid>].`,
+            _scope: 'known_endpoint_guidance',
+          };
+        }
+      }
+      const colHeal = await healCollectionPath(safePath);
+      if (colHeal.healed) {
+        console.log(`[dhis2_query] Collection name corrected → ${colHeal.path}`);
+        safePath = colHeal.path;
+        queryNotes.push(colHeal.note);
+      }
+      if (typeof precheckFilterAgainstSchema === 'function') {
+        const filterProblem = await precheckFilterAgainstSchema(safePath);
+        if (filterProblem) return filterProblem;
+      }
       const layoutHeal = healAnalyticsTableLayout(safePath);
       if (layoutHeal.healed) {
         console.log(`[dhis2_query] Table-layout parameters dropped → ${layoutHeal.path}`);
@@ -1011,6 +1179,11 @@ async function executeToolCall(name, args) {
       // `dimension=dx:<uid>` on an event/enrollment analytics endpoint is a
       // guaranteed 409 whose message names an internal SQL column. Heal it to
       // the bare-UID form the endpoint actually takes.
+      const prefixHeal = healRepeatedDimensionPrefix(safePath);
+      if (prefixHeal.healed) {
+        console.log(`[dhis2_query] Repeated dimension prefix removed → ${prefixHeal.path}`);
+        safePath = prefixHeal.path;
+      }
       // analytics/event|enrollment → the plural resource DHIS2 actually serves.
       const pluralHeal = healAnalyticsResourcePlural(safePath);
       if (pluralHeal.healed) {
@@ -1123,8 +1296,26 @@ async function executeToolCall(name, args) {
         console.log(`[dhis2_query] Merged repeated dx dimensions → ${dupHeal.path}`);
         safePath = dupHeal.path;
       }
+      const statusDim = analyticsStatusDimensionRefusal(safePath);
+      if (statusDim) return statusDim;
+      const bareDe = await healBareDataElementItems(safePath);
+      if (bareDe.refusal) return bareDe.refusal;
+      if (bareDe.healed) {
+        console.log(`[dhis2_query] Data element given its stage → ${bareDe.path}`);
+        safePath = bareDe.path;
+        queryNotes.push(bareDe.note);
+      }
       const multiStage = eventAnalyticsMultiStageRefusal(safePath);
       if (multiStage) return multiStage;
+      const peOuHeal = healAnalyticsPeriodAndOrgUnitParams(safePath);
+      if (peOuHeal.refusal) return peOuHeal.refusal;
+      const ouLevel = await analyticsOrgUnitLevelRefusal(peOuHeal.path || safePath);
+      if (ouLevel) return ouLevel;
+      if (peOuHeal.healed) {
+        console.log(`[dhis2_query] Analytics periods / org unit completed → ${peOuHeal.path}`);
+        safePath = peOuHeal.path;
+        queryNotes.push(...peOuHeal.notes);
+      }
       const dateHeal = healAnalyticsPeriodAndDates(safePath);
       if (dateHeal.healed) {
         console.log(`[dhis2_query] Dropped startDate/endDate next to a period → ${dateHeal.path}`);
@@ -1441,33 +1632,57 @@ async function executeToolCall(name, args) {
       _error: 'No program in context for event analytics.',
       _hint: 'Do NOT guess a program UID. Use manage_program_indicators(action="discover") for cross-program indicator questions, or search_metadata(object_type="programs", name_filter="<keyword>") to pick a specific program first.',
     };
-    const ou = args.ou_override || orgUnitId;
-    if (!ou) return { _error: 'No org unit in context.', _hint: 'Pass ou_override or ask the user to select an org unit. Do NOT guess a UID.' };
-    const includeChildren = args.ou_mode === 'DESCENDANTS';
-    const ouDim = includeChildren ? `ou:${ou};CHILDREN` : `ou:${ou}`;
+    // No org unit selected: the user's own org units, as count_records does
+    // (a program review got "No org unit in context" and then guessed).
+    const notes = [];
+    let ou = String(args.ou_override || orgUnitId || '').trim();
+    if (!ou) { ou = 'USER_ORGUNIT'; notes.push('No org unit was selected, so this covers the user\'s own org units (USER_ORGUNIT); pass ou_override for another scope.'); }
+    // "One row per child unit". DHIS2 ignores a ";CHILDREN" suffix and answers
+    // the parent's total alone (verified 2.42.7): the children are the next
+    // LEVEL under the unit, or USER_ORGUNIT_CHILDREN for the user's own.
+    let wantChildren = args.ou_mode === 'DESCENDANTS';
+    if (/;CHILDREN$/i.test(ou)) { wantChildren = true; ou = ou.replace(/;CHILDREN$/i, ''); }
+    let ouDim = `ou:${ou}`;
+    if (wantChildren) {
+      if (/^USER_ORGUNIT$/i.test(ou)) ouDim = 'ou:USER_ORGUNIT_CHILDREN';
+      else if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(ou)) {
+        const unit = await safeDhis2Fetch(`organisationUnits/${ou}?fields=id,level`);
+        if (unit && !unit._error && Number(unit.level) > 0) ouDim = `ou:${ou};LEVEL-${Number(unit.level) + 1}`;
+      }
+    }
 
     const type = args.aggregate_type;
+    // A period and dates together answer a different window than the period
+    // alone (LAST_5_YEARS: 3 rows with the old 2015–2030 default dates, 2
+    // without; verified 2.42.7), so dates go only where no period is given.
+    const usePeriod = !!String(args.period || '').trim();
     const startDate = args.date_range?.start || '2015-01-01';
     const endDate = args.date_range?.end || '2030-12-31';
+    const dateParams = usePeriod ? '' : `&startDate=${startDate}&endDate=${endDate}`;
+    // A program indicator written with a prefix ("pi:<uid>" — pi is DHIS2's
+    // ENROLLMENT id dimension, so a 409) is passed bare; the router below sends
+    // program indicators to /analytics.
+    const unprefix = (d) => String(d || '').replace(/^(?:pi|dx|pind|programIndicator):(?=[A-Za-z][A-Za-z0-9]{10}$)/i, '');
+    const breakdown = args.breakdown_dimension ? unprefix(args.breakdown_dimension) : '';
 
     let path;
     if (type === 'aggregate') {
       path = `analytics/events/aggregate/${pid}?dimension=${ouDim}`;
-      if (args.period) path += `&dimension=pe:${args.period}`;
+      if (usePeriod) path += `&dimension=pe:${args.period}`;
       if (args.stage_id) path += `&stage=${args.stage_id}`;
-      if (args.breakdown_dimension) path += `&dimension=${args.breakdown_dimension}`;
-      path += `&startDate=${startDate}&endDate=${endDate}`;
+      if (breakdown) path += `&dimension=${breakdown}`;
+      path += dateParams;
     } else {
       // query type
       path = `analytics/events/query/${pid}?dimension=${ouDim}`;
-      if (args.period) path += `&dimension=pe:${args.period}`;
+      if (usePeriod) path += `&dimension=pe:${args.period}`;
       if (args.stage_id) path += `&stage=${args.stage_id}`;
       if (args.value_dimensions?.length) {
         for (const dim of args.value_dimensions) {
-          path += `&dimension=${dim}`;
+          path += `&dimension=${unprefix(dim)}`;
         }
       }
-      if (args.breakdown_dimension) path += `&dimension=${args.breakdown_dimension}`;
+      if (breakdown) path += `&dimension=${breakdown}`;
       if (args.event_filters?.length) {
         for (const f of args.event_filters) {
           if (!f?.dimension || !f?.operator) continue;
@@ -1475,8 +1690,23 @@ async function executeToolCall(name, args) {
           path += `&filter=${encodeURIComponent(expr)}`;
         }
       }
-      path += `&startDate=${startDate}&endDate=${endDate}`;
+      path += dateParams;
       path += `&pageSize=${args.page_size || 100}`;
+    }
+    {
+      const statusDim = analyticsStatusDimensionRefusal(path);
+      if (statusDim) return statusDim;
+      const bareDe = await healBareDataElementItems(path);
+      if (bareDe.refusal) return bareDe.refusal;
+      if (bareDe.healed) { path = bareDe.path; notes.push(bareDe.note); }
+    }
+    if (type === 'aggregate') {
+      const piRoute = await routeProgramIndicatorAnalytics(path);
+      if (piRoute.refusal) return piRoute.refusal;
+      if (piRoute.routed) { path = piRoute.path; if (piRoute.note) notes.push(piRoute.note); notes.push('Program indicators are read from /analytics as data items.'); }
+      const peOu = healAnalyticsPeriodAndOrgUnitParams(path);
+      if (peOu.refusal) return peOu.refusal;
+      if (peOu.healed) { path = peOu.path; notes.push(...peOu.notes); }
     }
 
     const result = await safeDhis2Fetch(path);
@@ -1489,6 +1719,7 @@ async function executeToolCall(name, args) {
         if (val.name) result._dimensionNames[key] = val.name;
       }
     }
+    if (notes.length && result && typeof result === 'object' && !Array.isArray(result)) result._query_corrected = notes.join(' ');
 
     return result;
   }
@@ -1926,6 +2157,14 @@ async function executeToolCall(name, args) {
         noteMissingNamedTarget(type, nameFilter);
         resp._hint = `No ${type} match "${nameFilter}" on this instance. If the user asked for this object BY NAME, it does NOT exist — STOP, tell the user, list the closest existing names, and ask how to proceed. NEVER silently substitute a similar object and build the user's request on it. (Only if the user explicitly asked you to CREATE this object is an empty result here expected — then proceed with creation.)`;
       }
+    }
+    // Org units: name the server's levels. Level numbers mean different things
+    // on each server (District is 2 on Sierra Leone, 3 elsewhere); a model that
+    // looked up "districts" at level 3 built a Chiefdom map, then rebuilt it
+    // (Malaria thread 2026-11-17).
+    if (type === 'organisationUnits' && resp && !resp._error && Array.isArray(resp[type]) && resp[type].length) {
+      const levels = await orgUnitLevelNames();
+      if (levels.length) resp._levels = levels.map(l => `level ${l.level} = ${l.name}`).join(', ');
     }
     return resp;
   }
@@ -5194,12 +5433,29 @@ async function periodsMissThisYearWarning(dataIds, periods) {
 // then build each visualization (overall row, layout, root-scope checks).
 // → { newVisualizations, inlineVizIdByIndex, layoutNotes, inlineSpecs,
 //     inlineInfo (what each shows, for tile sizing) } or { _error }.
+// data_items / periods / org_units of a visualization spec as lists: "A,B" or
+// "A;B" text → [A, B]; one value → [it]. The dispatcher already repairs the
+// shapes a provider mangles (normalizeArgsToSchema); this keeps a direct caller
+// from iterating a text character by character or crashing on an object.
+function normalizeVizSpecLists(spec) {
+  if (!spec || typeof spec !== 'object') return spec;
+  for (const k of ['data_items', 'periods', 'org_units']) {
+    const v = spec[k];
+    if (v == null || Array.isArray(v)) continue;
+    if (typeof v === 'string') spec[k] = v.split(/[,;]/).map(x => x.trim()).filter(Boolean);
+    else if (typeof v === 'number') spec[k] = [String(v)];
+    else spec[k] = [];
+  }
+  return spec;
+}
+
 async function prepareInlineVisualizations(items) {
   const inlineSpecs = [];
   const allDataItems = [];
   for (let i = 0; i < items.length; i++) {
     const it = items[i] || {};
-    if (it.new_visualization && typeof it.new_visualization === 'object') {
+    if (it.new_visualization && typeof it.new_visualization === 'object' && !Array.isArray(it.new_visualization)) {
+      normalizeVizSpecLists(it.new_visualization);
       inlineSpecs.push({ index: i, spec: it.new_visualization });
       for (const u of (it.new_visualization.data_items || [])) allDataItems.push(u);
     }
@@ -5217,6 +5473,8 @@ async function prepareInlineVisualizations(items) {
   const inlineInfo = {};
   const layoutNotes = [];
   for (const { index, spec } of inlineSpecs) {
+    const levelRefusal = await orgLevelMismatchRefusal(spec.name, spec.org_units, null, 'Visualization');
+    if (levelRefusal) return { ...levelRefusal, _error: `Item ${index + 1} (new_visualization): ${levelRefusal._error}` };
     const levelWarning = await orgLevelNameWarning(spec.name, spec.org_units);
     if (levelWarning) layoutNotes.push(`"${spec.name}": ${levelWarning}`);
     const catProblem = await resolveVizCategoryDimensions(spec, typeMap);
@@ -5248,27 +5506,59 @@ function clampDashboardDescription(text) {
   return `${cut.slice(0, end > 120 ? end : 254).trimEnd()}…`;
 }
 
+// The server's org-unit levels, [{ level, name }] in level order (cached for
+// the turn; [] when they cannot be read).
+async function orgUnitLevelNames() {
+  if (!Array.isArray(dhis2.orgLevelNames)) {
+    const r = await safeDhis2Fetch('organisationUnitLevels?fields=level,displayName&paging=false');
+    if (r?._error || !Array.isArray(r?.organisationUnitLevels)) return [];
+    dhis2.orgLevelNames = r.organisationUnitLevels.map(l => ({ level: Number(l.level), name: String(l.displayName || '') }))
+      .filter(l => l.level && l.name).sort((a, b) => a.level - b.level);
+  }
+  return dhis2.orgLevelNames;
+}
+
 // A title naming one org-unit level on an object built at another: "by district"
 // at level 3, where level 3 is Chiefdom (Malaria replay, 2026-11-03: the wrong map
 // and table were only noticed later and rebuilt). Null when they agree, when the
 // title names no level, or when the levels cannot be read.
-async function orgLevelNameWarning(title, orgUnits, level) {
+async function orgLevelMismatch(title, orgUnits, level) {
   const list = Array.isArray(orgUnits) ? orgUnits : orgUnits ? [orgUnits] : [];
   const chosen = [...new Set([...(Number(level) > 0 ? [Number(level)] : []), ...list.map(o => Number((String(o).match(/^LEVEL-(\d+)$/i) || [])[1])).filter(Boolean)])];
   if (!chosen.length) return null;
-  if (!dhis2.orgLevelNames) {
-    const r = await safeDhis2Fetch('organisationUnitLevels?fields=level,displayName&paging=false');
-    if (r?._error || !Array.isArray(r?.organisationUnitLevels)) return null;
-    dhis2.orgLevelNames = r.organisationUnitLevels.map(l => ({ level: Number(l.level), name: String(l.displayName || '') })).filter(l => l.level && l.name);
-  }
-  const t = String(title || '');
-  const named = dhis2.orgLevelNames.filter(l => {
+  if (!(await orgUnitLevelNames()).length) return null;
+  const mentions = (text, l) => {
     const stem = l.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/y$/i, '(?:y|ie)');
-    return new RegExp(`\\b${stem}s?\\b`, 'i').test(t);
-  });
+    return new RegExp(`\\b${stem}s?\\b`, 'i').test(String(text || ''));
+  };
+  const named = dhis2.orgLevelNames.filter(l => mentions(title, l));
   if (!named.length || named.some(l => chosen.includes(l.level))) return null;
-  const actual = dhis2.orgLevelNames.filter(l => chosen.includes(l.level)).map(l => `"${l.name}"`).join(', ');
-  return `The title says "${named[0].name}", but this was built at org-unit level ${chosen.join(', ')}${actual ? ` (${actual})` : ''}. "${named[0].name}" is level ${named[0].level} on this server. Check which one the user asked for: rebuild it at level ${named[0].level} if the title is right.`;
+  const actual = dhis2.orgLevelNames.filter(l => chosen.includes(l.level));
+  return { named: named[0], chosen, actual, mentions };
+}
+async function orgLevelNameWarning(title, orgUnits, level) {
+  const m = await orgLevelMismatch(title, orgUnits, level);
+  if (!m) return null;
+  const actual = m.actual.map(l => `"${l.name}"`).join(', ');
+  return `The title says "${m.named.name}", but this was built at org-unit level ${m.chosen.join(', ')}${actual ? ` (${actual})` : ''}. "${m.named.name}" is level ${m.named.level} on this server. Check which one the user asked for: rebuild it at level ${m.named.level} if the title is right.`;
+}
+// The same mismatch caught BEFORE saving, when the user's own message settles
+// it: it names the title's level ("district") and none of the levels chosen.
+// The Malaria thread (2026-11-17) built a "by district" map at level 3
+// (Chiefdom on Sierra Leone), then deleted and rebuilt it. When the message
+// names the chosen level too, or names neither, the object is saved and the
+// warning above still says so.
+async function orgLevelMismatchRefusal(title, orgUnits, level, what) {
+  const m = await orgLevelMismatch(title, orgUnits, level);
+  if (!m) return null;
+  const said = typeof lastUserText === 'string' ? lastUserText : '';
+  if (!m.mentions(said, m.named) || m.actual.some(l => m.mentions(said, l))) return null;
+  const actual = m.actual.map(l => `${l.level} = ${l.name}`).join(', ');
+  return {
+    _error: `Not created: ${what} "${title}" names ${m.named.name.toLowerCase()}s, which the user asked for, but it would be built at org-unit level ${m.chosen.join(', ')}${actual ? ` (${actual})` : ''}. On this server ${m.named.name} is level ${m.named.level}.`,
+    _hint: `Send it again at level ${m.named.level}${what === 'Map' ? ` (org_unit_level: ${m.named.level})` : ` (org_units: [<parent uid>, "LEVEL-${m.named.level}"])`}. Levels here: ${dhis2.orgLevelNames.map(l => `${l.level} = ${l.name}`).join(', ')}.`,
+    _scope: 'org_level_mismatch',
+  };
 }
 
 // A text tile's bold is *x* and its italic _x_: **x** shows as bold with a
@@ -6241,6 +6531,8 @@ async function executeManageMaps(args) {
     if (built._error) return built;
     const rootScope = await singleRootScopeRefusal(spec.org_units, `Map "${built.map.name}"`);
     if (rootScope) return rootScope;
+    const levelRefusal = await orgLevelMismatchRefusal(built.map.name, spec.org_units, spec.org_unit_level, 'Map');
+    if (levelRefusal) return levelRefusal;
     const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
     if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
     const newId = resp?.response?.uid || built.map.id;
@@ -6331,6 +6623,183 @@ async function checkDashboardAppItem(appKey) {
   return { app };
 }
 
+// A GET of a metadata collection under a name DHIS2 does not have — orgUnits,
+// organizationUnits, dataElement (singular), dataelements — is a 404 (Malaria
+// thread 2026-11-17: GET orgUnits). The server's own schema list says which
+// collection was meant; only one unambiguous match is rewritten, and a real
+// collection name or a known non-collection endpoint is never touched.
+const NOT_A_COLLECTION_RE = /^(?:analytics|system|me|tracker|dataStore|userDataStore|metadata|schemas|resources|dataValueSets|dataValues|dataEntry|audits|sharing|identifiableObjects|dimensions|periodTypes|apps|appHub|resourceTables|maintenance|dataAnalysis|outlierDetection|dataIntegrity|svg|files|staticContent|loginConfig|locales|i18n|auth|account|ping|query|validation|events|enrollments|trackedEntityInstances|relationships|completeDataSetRegistrations|dataApprovals|minMaxValues|lockExceptions|messageConversations|dataStatistics|userSettings|systemSettings|configuration)$/;
+async function healCollectionPath(path) {
+  let p = String(path || '');
+  // The signed-in user is /me ("users/me" is a 405, "currentUser" a 404).
+  const me = p.match(/^\/?(?:users?\/me|currentUser|current-user)(?=[/?]|$)/i);
+  if (me) return { path: `me${p.slice(me[0].length)}`, healed: true, note: `Path corrected: the signed-in user is "me" ("${me[0].replace(/^\//, '')}" does not exist).` };
+  const q = p.indexOf('?');
+  const pathOnly = (q < 0 ? p : p.slice(0, q)).replace(/^\/+/, '');
+  const rest = q < 0 ? '' : p.slice(q);
+  const segs = pathOnly.split('/');
+  const first = segs[0];
+  if (!/^[A-Za-z]+$/.test(first) || NOT_A_COLLECTION_RE.test(first) || typeof getSchemaIndex !== 'function') return { path: p, healed: false };
+  const idx = await getSchemaIndex();
+  if (!idx) return { path: p, healed: false };
+  const entries = [...new Set(idx.values())];
+  if (entries.some(e => e.plural === first || e.name === e.plural && e.name === first)) return { path: p, healed: false };
+  const squash = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '').replace(/organization/g, 'organisation').replace(/^orgunit/, 'organisationunit');
+  const w = squash(first);
+  const hits = [...new Set(entries.filter(e => squash(e.plural) === w || squash(e.name) === w).map(e => e.plural))];
+  if (hits.length !== 1 || hits[0] === first) return { path: p, healed: false };
+  return { path: [hits[0], ...segs.slice(1)].join('/') + rest, healed: true, note: `Path corrected: DHIS2 has no "${first}" collection (404); the request went to "${hits[0]}".` };
+}
+
+// The expression / condition checkers: POST-only, the text as the body, and
+// they save nothing (a validation answer).
+const EXPRESSION_DESCRIPTION_RE = /^(?:programRules\/condition|programIndicators\/(?:expression|filter)|indicators\/expression|validationRules\/expression|predictors\/expression)\/description\/?(?:\?|$)/i;
+
+// GET programDataElements answers 400 unless the program is given as its own
+// parameter (?program=<uid>); a filter=program.id:eq:<uid> is a 400 too
+// (verified 2.42.7, 2026-11-17: four 400s in one program review). → { path,
+// healed, note } or { refusal } when no program is known.
+function healProgramDataElementsQuery(path, contextProgramId) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  const base = (q < 0 ? p : p.slice(0, q)).replace(/^\/+/, '');
+  if (!/^programDataElements(?:\.json)?$/.test(base)) return { path: p, healed: false };
+  const params = new URLSearchParams(q < 0 ? '' : p.slice(q + 1));
+  if (params.get('program')) return { path: p, healed: false };
+  let pid = null;
+  for (const f of params.getAll('filter')) {
+    const m = f.match(/^program(?:\.id)?:(?:eq|in):\[?([A-Za-z][A-Za-z0-9]{10})\]?$/);
+    if (m) { pid = m[1]; params.delete('filter'); for (const g of params.getAll('filter')) if (g !== f) params.append('filter', g); break; }
+  }
+  pid = pid || contextProgramId;
+  if (!pid) {
+    return { refusal: {
+      _error: 'Not sent: GET programDataElements needs the program as its own parameter (program=<uid>); without it DHIS2 answers 400.',
+      _hint: 'Send programDataElements?program=<programUid>&fields=… — or get_program_info(info_type="structure", program_id) for every stage and data element at once.',
+      _scope: 'known_endpoint_guidance',
+    } };
+  }
+  const rest = [...params.entries()].filter(([k, v]) => !(k === 'filter' && /^program(?:\.id)?:/.test(v)));
+  const out = `${base}?program=${pid}${rest.length ? '&' + rest.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : ''}`;
+  return { path: out, healed: true, note: `Query corrected: programDataElements takes the program as program=${pid} (a filter, or none, is a 400).` };
+}
+
+// ou:<unit>;LEVEL-n where the unit lies BELOW level n (a chiefdom with
+// LEVEL-2 = districts): 409 "Organisation unit or organisation unit level is
+// not valid". A unit AT level n answers itself (verified 2.42.7, 2026-11-17).
+// The ANC plugin run sent a chiefdom with LEVEL-2 and then tried ten other
+// combinations. One read of the units' levels names the fix instead.
+async function analyticsOrgUnitLevelRefusal(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q < 0 || !/^analytics\b/.test(p)) return null;
+  for (const x of p.slice(q + 1).split('&')) {
+    const m = x.match(/^(?:dimension|filter)=(.*)$/i);
+    if (!m) continue;
+    let v = m[1];
+    try { v = decodeURIComponent(v); } catch { /* raw */ }
+    if (!/^ou:/i.test(v)) continue;
+    const items = v.slice(3).split(';').map(t => t.trim());
+    const levels = items.map(t => Number((t.match(/^LEVEL-(\d{1,2})$/i) || [])[1])).filter(Boolean);
+    const uids = items.filter(t => /^[A-Za-z][A-Za-z0-9]{10}$/.test(t));
+    if (!levels.length || !uids.length) continue;
+    const r = await safeDhis2Fetch(`organisationUnits?filter=id:in:[${uids.join(',')}]&fields=id,displayName,level&paging=false`);
+    const n = Math.min(...levels);
+    const deeper = (r?.organisationUnits || []).filter(u => Number(u.level) > n);
+    if (!deeper.length) continue;
+    const names = await orgUnitLevelNames();
+    const lvName = (l) => (names.find(x => x.level === Number(l)) || {}).name;
+    return {
+      _error: `Not sent: LEVEL-${n}${lvName(n) ? ` (${lvName(n)})` : ''} must be at or below every org unit listed with it, but ${deeper.map(u => `${u.displayName} (${u.id}) is level ${u.level}${lvName(u.level) ? ` (${lvName(u.level)})` : ''}`).join(', ')} — DHIS2 answers 409 "Organisation unit or organisation unit level is not valid".`,
+      _hint: `Take a boundary at level ${n} or above: ou:USER_ORGUNIT;LEVEL-${n}, or the national root's id with LEVEL-${n}.${names.length ? ` Levels here: ${names.map(l => `${l.level} = ${l.name}`).join(', ')}.` : ''}`,
+      _scope: 'analytics_ou_level',
+    };
+  }
+  return null;
+}
+
+// A data element given bare (no "<stageUid>.") where the endpoint needs its
+// stage: enrollment analytics always, event analytics when no stage= is sent
+// (program review, 2026-11-17: analytics/enrollments/aggregate?dimension=<de>
+// → 409). One read of the program's stages says which stage holds it; a data
+// element in several stages is refused with them listed.
+async function healBareDataElementItems(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  const m = p.match(/^analytics\/(events|enrollments)\/(?:aggregate|query)\/([A-Za-z][A-Za-z0-9]{10})/);
+  if (q < 0 || !m) return { path: p, healed: false };
+  const parts = p.slice(q + 1).split('&');
+  if (m[1] === 'events' && parts.some(x => /^stage=/i.test(x))) return { path: p, healed: false };
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const bareOf = (x) => { const mm = x.match(/^(dimension|filter)=(.*)$/i); if (!mm) return null; const v = dec(mm[2]); const b = v.match(/^([A-Za-z][A-Za-z0-9]{10})((?::).*)?$/); return b && !/^(?:dx|pe|ou|co|ao)$/i.test(b[1]) ? { key: mm[1], uid: b[1], rest: b[2] || '' } : null; };
+  const bare = parts.map(bareOf).filter(Boolean);
+  if (!bare.length) return { path: p, healed: false };
+  const st = await safeDhis2Fetch(`programStages?filter=program.id:eq:${m[2]}&fields=id,displayName,programStageDataElements[dataElement[id]]&paging=false`);
+  if (!st || st._error || !Array.isArray(st.programStages)) return { path: p, healed: false };
+  const stagesOf = new Map();
+  for (const sg of st.programStages) for (const psde of sg.programStageDataElements || []) {
+    const id = psde?.dataElement?.id; if (!id) continue;
+    if (!stagesOf.has(id)) stagesOf.set(id, []);
+    stagesOf.get(id).push(sg);
+  }
+  const multi = bare.filter(b => (stagesOf.get(b.uid) || []).length > 1);
+  if (multi.length) {
+    return { refusal: {
+      _error: `Not sent: ${multi.map(b => b.uid).join(', ')} ${multi.length > 1 ? 'are' : 'is'} in several stages, so the query must say which: "<stageUid>.<dataElementUid>".`,
+      _hint: multi.map(b => `${b.uid}: ${(stagesOf.get(b.uid) || []).map(sg => `${sg.id} (${sg.displayName})`).join(' or ')}`).join('; '),
+      _scope: 'known_endpoint_guidance',
+    } };
+  }
+  let healed = false;
+  const out = parts.map(x => {
+    const b = bareOf(x);
+    const one = b && (stagesOf.get(b.uid) || [])[0];
+    if (!one) return x;
+    healed = true;
+    return `${b.key}=${one.id}.${b.uid}${b.rest}`;
+  });
+  return healed ? { path: `${p.slice(0, q)}?${out.join('&')}`, healed, note: 'Query corrected: a data element is named with its stage here ("<stageUid>.<dataElementUid>"); the stage holding it was added.' } : { path: p, healed: false };
+}
+
+// ── Dashboard filter bar ──
+// Every dashboard offers period, org-unit and every other dimension as filters
+// unless restrictFilters is set; then only allowedFilters are offered (the
+// Dashboard app's "Filter settings"). Verified 2.42.7 (2026-11-17): a metadata
+// import with restrictFilters:true, allowedFilters:["pe","ou"] saves and reads
+// back as sent. A model asked to "add period and location filters" went
+// looking for this in schemas and burned its discovery budget (same thread).
+const DASH_FILTER_ALIASES = { pe: 'pe', period: 'pe', periods: 'pe', time: 'pe', date: 'pe', ou: 'ou', orgunit: 'ou', 'org unit': 'ou', 'org units': 'ou', 'organisation unit': 'ou', 'organization unit': 'ou', location: 'ou', locations: 'ou', place: 'ou' };
+async function dashboardFilterSettings(list) {
+  if (list === undefined || list === null) return null;
+  const raw = Array.isArray(list) ? list : [list];
+  const out = [];
+  const unknown = [];
+  const uids = [];
+  for (const x of raw) {
+    const t = String(x ?? '').trim();
+    if (!t) continue;
+    const alias = DASH_FILTER_ALIASES[t.toLowerCase()];
+    if (alias) { if (!out.includes(alias)) out.push(alias); continue; }
+    if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(t)) { if (!out.includes(t)) { out.push(t); uids.push(t); } continue; }
+    unknown.push(t);
+  }
+  if (unknown.length) return { _error: `allowed_filters: ${unknown.map(u => `"${u}"`).join(', ')} is not a dimension. Use "pe" (period), "ou" (org unit) or a dimension UID (a category, org-unit group set …).` };
+  for (const id of uids) {
+    const r = await safeDhis2Fetch(`dimensions/${id}?fields=id,displayName`);
+    if (r?._error || !r?.id) return { _error: `allowed_filters: "${id}" is not a dimension on this server (dimensions/${id} did not answer). Use "pe", "ou" or a category / group-set UID from search_metadata.` };
+  }
+  return { restrictFilters: out.length > 0, allowedFilters: out };
+}
+// What the filter bar of a saved dashboard offers, for the result.
+function dashboardFilterBarNote(settings) {
+  const restricted = settings && settings.restrictFilters;
+  const names = restricted ? settings.allowedFilters.map(f => (f === 'pe' ? 'Period' : f === 'ou' ? 'Organisation unit' : f)) : null;
+  return {
+    offers: restricted ? names : ['Period', 'Organisation unit', 'every other dimension'],
+    note: `${restricted ? `The filter bar offers only ${names.join(' and ')}.` : 'The filter bar offers Period and Organisation unit (location), and every other dimension — no setting was needed.'} A filter re-queries single values, charts, pivot tables and maps; line-list tiles do not follow it (they show "Filters are not applied to line list dashboard items" with a button to show their saved rows), and text tiles do not change.`,
+  };
+}
+
 async function executeManageDashboards(args) {
   const action = args?.action;
   if (!action) {
@@ -6406,15 +6875,18 @@ async function executeManageDashboards(args) {
     const _gate = requireWriteAuth('manage_dashboards', 'create_visualization');
     if (_gate) return _gate;
     const spec = args.visualization;
-    if (!spec || typeof spec !== 'object') {
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
       return { _error: 'visualization object required for create_visualization', _hint: 'Pass visualization:{ name, vis_type, data_items:[…], periods:[…], org_units:[…] }.' };
     }
+    normalizeVizSpecLists(spec);
     const { typeMap, unresolved } = await resolveDataItemTypes(spec.data_items);
     if (unresolved.length) {
       return { _error: `These data_items UIDs do not exist as an indicator, data element or program indicator: ${unresolved.join(', ')}.`, _hint: 'Resolve the correct UIDs with search_metadata first; never invent UIDs. A reporting figure is "<dataSetUid>.REPORTING_RATE" (also REPORTING_RATE_ON_TIME, ACTUAL_REPORTS, ACTUAL_REPORTS_ON_TIME, EXPECTED_REPORTS); one disaggregation of a data element is "<dataElementUid>.<categoryOptionComboUid>".' };
     }
     const catProblem = await resolveVizCategoryDimensions(spec, typeMap);
     if (catProblem) return catProblem;
+    const levelRefusal = await orgLevelMismatchRefusal(spec.name, spec.org_units, null, 'Visualization');
+    if (levelRefusal) return levelRefusal;
     const levelWarning = await orgLevelNameWarning(spec.name, spec.org_units);
     const overall = await applyOverallRow(spec);
     if (overall?._error) return overall;
@@ -6466,7 +6938,7 @@ async function executeManageDashboards(args) {
       if (same) {
         return {
           _error: `Not created: a dashboard named "${same.name}" already exists (${same.id}). create_dashboard always makes a NEW dashboard, so this would leave two with the same name.`,
-          _hint: `Change the existing one in place: add_items (insert_after_item_id / insert_before_item_id put new tiles at a place in the order), arrange (order: [tile ids] to reorder, items:[{ item_id, size }] to resize), remove_item, update — get lists its tiles in reading order. Only when the user asked for a separate, second dashboard: use a different name.`,
+          _hint: `If the user asked to change, extend or reorder THIS dashboard: change it in place — add_items (insert_after_item_id / insert_before_item_id put new tiles at a place in the order), arrange (order: [tile ids] to reorder, items:[{ item_id, size }] to resize), remove_item, update; get lists its tiles in reading order. If the user asked to CREATE a dashboard and did not know this one exists, it is someone's existing work: do not change it or its charts, maps and line lists unasked. Tell the user it exists (with its link), and ask whether to update it or create a new one under another name. Build the other pieces of the request only if they do not depend on the answer.`,
           _existing_dashboard: { id: same.id, name: same.name, dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${same.id}` },
           _scope: 'dashboard_name_exists',
         };
@@ -6539,6 +7011,9 @@ async function executeManageDashboards(args) {
     const dashId = generateDhis2Uid();
     const dashObj = { id: dashId, name: String(dash.name).trim(), dashboardItems };
     if (dash.description) dashObj.description = clampDashboardDescription(dash.description);
+    const filterSettings = await dashboardFilterSettings(dash.allowed_filters);
+    if (filterSettings?._error) return filterSettings;
+    if (filterSettings?.restrictFilters) Object.assign(dashObj, filterSettings);
 
     const payload = {};
     if (newVisualizations.length) payload.visualizations = newVisualizations;
@@ -6583,6 +7058,7 @@ async function executeManageDashboards(args) {
       // /dhis-web-dashboard to the global-shell /apps/dashboard and keeps #/id).
       dashboard_url: `${dhis2.baseUrl}/dhis-web-dashboard/#/${dashId}`,
       dashboard: { id: dashId, name: dashObj.name },
+      filter_bar: dashboardFilterBarNote(filterSettings),
       items: dashboardItems.length,
       new_visualizations: newVisualizations.map(v => ({ id: v.id, name: v.name, type: v.type })),
       ...(layoutNotes.length ? { _layout_corrected: layoutNotes } : {}),
@@ -6863,7 +7339,9 @@ async function executeManageDashboards(args) {
     const dId = args.dashboard_id || args.object_id;
     if (!dId) return { _error: 'dashboard_id required for update' };
     const d = args.dashboard;
-    if (!d || typeof d !== 'object') return { _error: 'dashboard object required for update', _hint: 'Pass dashboard:{ name?, description? }. To add/remove tiles use add_items / remove_item.' };
+    if (!d || typeof d !== 'object') return { _error: 'dashboard object required for update', _hint: 'Pass dashboard:{ name?, description?, allowed_filters? }. To add/remove tiles use add_items / remove_item.' };
+    const filterSettings = await dashboardFilterSettings(d.allowed_filters);
+    if (filterSettings?._error) return filterSettings;
     const owner = await safeDhis2Fetch(`dashboards/${dId}?fields=:owner`);
     if (owner?._status === 404) return { _error: `dashboard with id "${dId}" does not exist (404).` };
     if (owner?._error) return { _error: `Could not load dashboard ${dId}: ${owner._error}` };
@@ -6877,10 +7355,11 @@ async function executeManageDashboards(args) {
     const applied = {};
     if (d.name !== undefined) { owner.name = String(d.name); applied.name = owner.name; }
     if (d.description !== undefined) { owner.description = clampDashboardDescription(d.description); applied.description = owner.description; }
-    if (Object.keys(applied).length === 0) return { _error: 'dashboard supplied no recognized own-fields to update.', _hint: 'Recognized: name, description. For tiles use add_items / remove_item.', backup: backup.block };
+    if (filterSettings) { owner.restrictFilters = filterSettings.restrictFilters; owner.allowedFilters = filterSettings.allowedFilters; applied.allowed_filters = filterSettings.restrictFilters ? filterSettings.allowedFilters : 'every dimension'; }
+    if (Object.keys(applied).length === 0) return { _error: 'dashboard supplied no recognized own-fields to update.', _hint: 'Recognized: name, description, allowed_filters. For tiles use add_items / remove_item.', backup: backup.block };
     const result = await postMetadataPayload({ dashboards: [owner] }, false);
     if (!result.success) return { _error: result._error || 'update failed.', phase: result.phase, errors: result.errors, backup: backup.block };
-    return { success: true, action: 'update', dashboard_id: dId, dashboard_name: dashName, applied, backup: backup.block };
+    return { success: true, action: 'update', dashboard_id: dId, dashboard_name: dashName, applied, ...(filterSettings ? { filter_bar: dashboardFilterBarNote(filterSettings) } : {}), backup: backup.block };
   }
 
   // ── delete (whole dashboard; snapshots first — fully restorable) ───────────

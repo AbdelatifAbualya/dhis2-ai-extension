@@ -7635,6 +7635,34 @@ function piRuntimeErrorHint(pi) {
 // Aggregate values only — never patient rows. Skipped when the program's
 // analytics tables predate it (every query would fail for a reason that is not
 // the indicator's fault). Only SQL / expression failures count as broken.
+// Program indicators (of ids) that read a data element or attribute created
+// after the last analytics run → Map(indicatorId → that field's id). Empty
+// when nothing can be read.
+async function piFieldsNewerThanAnalytics(ids) {
+  const out = new Map();
+  const info = await safeDhis2Fetch('system/info?fields=lastAnalyticsTableSuccess');
+  const lastRun = String(info?.lastAnalyticsTableSuccess || '');
+  if (!lastRun || !ids.length) return out;
+  const pis = await safeDhis2Fetch(`programIndicators?filter=id:in:[${ids.join(',')}]&fields=id,expression,filter&paging=false`);
+  const reads = new Map();
+  for (const pi of pis?.programIndicators || []) {
+    const text = `${pi.expression || ''} ${pi.filter || ''}`;
+    const des = [...text.matchAll(/#\{[A-Za-z][A-Za-z0-9]{10}\.([A-Za-z][A-Za-z0-9]{10})\}/g)].map(m => m[1]);
+    const teas = [...text.matchAll(/A\{([A-Za-z][A-Za-z0-9]{10})\}/g)].map(m => m[1]);
+    reads.set(pi.id, { des, teas });
+  }
+  const allDes = [...new Set([...reads.values()].flatMap(r => r.des))];
+  const allTeas = [...new Set([...reads.values()].flatMap(r => r.teas))];
+  const created = new Map();
+  if (allDes.length) for (const o of (await safeDhis2Fetch(`dataElements?filter=id:in:[${allDes.join(',')}]&fields=id,created&paging=false`))?.dataElements || []) created.set(o.id, String(o.created || ''));
+  if (allTeas.length) for (const o of (await safeDhis2Fetch(`trackedEntityAttributes?filter=id:in:[${allTeas.join(',')}]&fields=id,created&paging=false`))?.trackedEntityAttributes || []) created.set(o.id, String(o.created || ''));
+  for (const [id, r] of reads) {
+    const newer = [...r.des, ...r.teas].find(f => (created.get(f) || '') > lastRun);
+    if (newer) out.set(id, newer);
+  }
+  return out;
+}
+
 async function piRuntimeAnalyticsCheck(programId, ids) {
   ids = [...new Set((ids || []).filter(Boolean))];
   if (!ids.length) return null;
@@ -7662,6 +7690,17 @@ async function piRuntimeAnalyticsCheck(programId, ids) {
   const broken = [];
   const skipped = [];
   const needsRebuild = [];
+  // A field created after the last analytics run has no column in the tables
+  // yet: a query of an indicator that reads it is a sure 409 "column … does
+  // not exist". Known from metadata (created vs lastAnalyticsTableSuccess), so
+  // those indicators are reported without sending it (TB card 2026-11-17: five
+  // such 409s after new data elements were added to a live program).
+  const totalChecked = ids.length;
+  try {
+    const fresh = await piFieldsNewerThanAnalytics(ids);
+    for (const [id, field] of fresh) needsRebuild.push({ id, data_element: field });
+    if (fresh.size) ids = ids.filter(id => !fresh.has(id));
+  } catch { /* probe as usual */ }
   for (let i = 0; i < ids.length; i += 50) {
     const chunk = ids.slice(i, i + 50);
     const r = await query(chunk);
@@ -7718,7 +7757,7 @@ async function piRuntimeAnalyticsCheck(programId, ids) {
   const noDataCheck = noDataIds.length ? await dataCheckForResult({ indicators: noDataIds }) : null;
   return {
     ok: broken.length === 0,
-    checked: ids.length,
+    checked: totalChecked,
     ...(noDataCheck && (noDataCheck.report_lines || []).length ? { why_no_data: { fields_without_values: noDataCheck.fields_without_values, fields_rarely_filled: noDataCheck.fields_rarely_filled, analytics_tables: noDataCheck.analytics_tables, report_lines: noDataCheck.report_lines, _note: noDataCheck._note } } : {}),
     query: `aggregate analytics, org unit USER_ORGUNIT, periods ${PERIOD.replace(';', ' + ')}, and THIS_YEAR alone for any without a value`,
     with_data: ids.filter(id => withData.has(id)),
@@ -9373,6 +9412,27 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       });
     }
 
+    // "Which indicators cannot be calculated?" is answered by running each
+    // structurally valid indicator through the query a chart issues — the
+    // same check that runs after creating one. Without it a model reviewing a
+    // program probed analytics by hand for 20+ calls and several 409s (Child
+    // Programme review, 2026-11-17). Capped; the structurally broken ones are
+    // already listed and not re-asked.
+    let runtimeCheck = null;
+    const brokenIds = new Set(issues.map(i => i.id));
+    const runnable = allIndicators.filter(pi => !brokenIds.has(pi.id)).map(pi => pi.id);
+    if (deep && runnable.length && runnable.length <= 60) {
+      try { runtimeCheck = await piRuntimeAnalyticsCheck(programId, runnable); } catch { runtimeCheck = null; }
+    }
+    const nameOf = (id) => (allIndicators.find(pi => pi.id === id) || {}).name || id;
+    const calculable = runtimeCheck && !runtimeCheck.skipped ? {
+      computes_with_data: (runtimeCheck.with_data || []).map(nameOf),
+      computes_no_data_yet: (runtimeCheck.no_data || []).map(nameOf),
+      cannot_be_calculated: [...issues.map(i => `${i.name}: ${(i.issues || []).join('; ').slice(0, 200)}`), ...(runtimeCheck.broken || []).map(b => `${nameOf(b.id)}: ${b.error}`)],
+      needs_full_analytics_run: (runtimeCheck.needs_full_analytics_run || []).map(b => nameOf(b.id)),
+      _note: 'Each valid indicator was run through the aggregate analytics query a chart uses (all org units of the user, this year and the last five). This answers which indicators cannot be calculated: do not re-check them with your own analytics queries.',
+    } : null;
+
     const serverValidatedNote = deep
       ? (allIndicators.length > 600
         ? 'server validation skipped (program has >600 indicators — pass deep:false or use bulk_fix after local audit)'
@@ -9391,6 +9451,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
       server_validation: serverValidatedNote,
       issues: issues.slice(0, 250),
       _has_more_issues: issues.length > 250,
+      ...(calculable ? { calculable } : runtimeCheck && runtimeCheck.skipped ? { calculable: { skipped: runtimeCheck.reason } } : {}),
       ...(fetchErrors.length ? { _fetch_errors: fetchErrors } : {}),
       ...(stageFixHints.length > 0 ? { _stage_fix_hints: stageFixHints } : {}),
       _fix_hint: issues.length === 0 ? undefined
