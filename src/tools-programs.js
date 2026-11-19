@@ -1337,6 +1337,16 @@ function validateAndHealProgramInput(args) {
     // genuinely new one the builder infers a type from the name (inferValueType)
     // — blocking here contradicted the tool's own manual (live 2026-07-18).
     if (!nonEmpty(a.value_type)) heals.push(`attribute "${a.name}" has no value_type — will reuse the existing attribute of that name, or infer the type from the name if new`);
+    // A place to put on a map ("home location", "GPS", "coordinates") saved as
+    // TEXT can never be mapped: Community Care and Referral's "Home location"
+    // was TEXT, so the requested home-location map was impossible (2026-11-18).
+    // An address stays text; only a location / position / coordinates becomes
+    // COORDINATE.
+    if (String(a.value_type || '').toUpperCase() === 'TEXT' && !a.option_set
+        && /\b(?:location|gps|coordinates?|geo.?location|lat(?:itude)?\s*\/?\s*long?(?:itude)?|position)\b/i.test(a.name) && !/address|description|details|notes?|name|facility/i.test(a.name)) {
+      a.value_type = 'COORDINATE';
+      heals.push(`attribute "${a.name}" is a place for a map, so it was made COORDINATE (TEXT cannot be mapped); an address stays text`);
+    }
     if (a.option_set && typeof a.option_set === 'object') {
       if (!nonEmpty(a.option_set.name)) { a.option_set.name = a.name; heals.push(`named the option set for attribute "${a.name}"`); }
       if (!Array.isArray(a.option_set.options) || !a.option_set.options.filter(nonEmpty).length) issues.push(`option set for attribute "${a.name}" has no options`);
@@ -2864,7 +2874,7 @@ async function applyRequestedAttributeUniqueness(programId, attrs, toolArgs) {
   for (const t of (resp.trackedEntityAttributes || [])) {
     if (t.unique === true) continue;
     const [progs, tets] = await Promise.all([
-      safeDhis2Fetch(`programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:eq:${t.id}&filter=id:ne:${programId}&fields=displayName&paging=false`),
+      safeDhis2Fetch(`programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:eq:${t.id}&filter=id:ne:${programId}&fields=displayName&paging=false`, { noTruncate: true }),
       safeDhis2Fetch(`trackedEntityTypes?filter=trackedEntityTypeAttributes.trackedEntityAttribute.id:eq:${t.id}&fields=displayName&paging=false`),
     ]);
     if (progs?._error || tets?._error) { out.not_applied.push({ attribute: t.displayName, id: t.id, reason: 'could not check which programs use it' }); continue; }
@@ -2970,7 +2980,7 @@ async function addStageToProgram(args, defaultCatComboId) {
   // on that stage while the program itself looks correctly shared. That is the
   // "I can't add a new enrollment / none of the stages appear" failure reported
   // live 2026-07-25 — three of four stages had been added with add_stage.
-  const progResp = await safeDhis2Fetch(`programs/${args.program_id}?fields=id,name,shortName,sharing,programStages[id,sortOrder]`);
+  const progResp = await safeDhis2Fetch(`programs/${args.program_id}?fields=id,name,shortName,sharing,programStages[id,sortOrder]`, { noTruncate: true });
   if (progResp._error) return { _error: `Could not load program ${args.program_id}: ${progResp._error}` };
   const existingStageCount = progResp?.programStages?.length || 0;
 
@@ -3253,8 +3263,7 @@ async function addDataElementsToExistingStage(args, defaultCatComboId) {
   // tool used to cause. We read them here so we can send them back untouched
   // (and route the new DE into the right section below).
   const stageResp = await safeDhis2Fetch(
-    `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
-  );
+    `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`, { noTruncate: true });
   if (stageResp._error) return { _error: `Could not load stage ${args.stage_id}: ${stageResp._error}` };
   if (!stageResp.name) return { _error: `Stage ${args.stage_id} is missing required 'name' field` };
   if (!stageResp.program?.id) return { _error: `Stage ${args.stage_id} has no associated program` };
@@ -3552,8 +3561,7 @@ async function executeManageMetadata(args) {
     // the object, so omitting them would delete every section and revert the
     // form to DEFAULT (same data-loss bug the add path had).
     const stageResp = await safeDhis2Fetch(
-      `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id,name],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`
-    );
+      `programStages/${args.stage_id}?fields=id,name,program[id],sortOrder,repeatable,formType,programStageSections[id,name,sortOrder,dataElements[id]],programStageDataElements[id,dataElement[id,name],compulsory,allowProvidedElsewhere,sortOrder,displayInReports,allowFutureDate,renderOptionsAsRadio,skipSynchronization,skipAnalytics]`, { noTruncate: true });
     if (stageResp._error) return { _error: `Could not load stage ${args.stage_id}: ${stageResp._error}` };
     if (!stageResp.name || !stageResp.program?.id) return { _error: `Stage ${args.stage_id} is missing required 'name' or program reference` };
     const rmSections = stageResp.programStageSections || [];
@@ -4031,7 +4039,7 @@ async function executeManageMetadata(args) {
     const cascadeStages = args.object_type === 'programs' && args.cascade_to_stages !== false;
     let stageIds = [];
     if (cascadeStages) {
-      const stResp = await safeDhis2Fetch(`programs/${args.object_id}?fields=programStages[id,name]`);
+      const stResp = await safeDhis2Fetch(`programs/${args.object_id}?fields=programStages[id,name]`, { noTruncate: true });
       if (!stResp?._error) stageIds = (stResp.programStages || []).map(st => ({ id: st.id, name: st.name }));
     }
 
@@ -4177,8 +4185,7 @@ async function executeManageMetadata(args) {
 
     // 1. Fetch the full program — we need the complete object back to PUT it.
     const progResp = await safeDhis2Fetch(
-      `programs/${progId}?fields=:owner,programTrackedEntityAttributes[:owner,trackedEntityAttribute[id,name]]`
-    );
+      `programs/${progId}?fields=:owner,programTrackedEntityAttributes[:owner,trackedEntityAttribute[id,name]]`, { noTruncate: true });
     if (progResp?._error) return { _error: `Could not load program ${progId}: ${progResp._error}` };
     if (!progResp?.id) return { _error: `Program ${progId} not found.` };
 
@@ -4290,8 +4297,7 @@ async function executeManageMetadata(args) {
 
     // 6. Verify.
     const verifyResp = await safeDhis2Fetch(
-      `programs/${progId}?fields=id,name,programTrackedEntityAttributes[trackedEntityAttribute[id,displayName],searchable,displayInList,mandatory,sortOrder]`
-    );
+      `programs/${progId}?fields=id,name,programTrackedEntityAttributes[trackedEntityAttribute[id,displayName],searchable,displayInList,mandatory,sortOrder]`, { noTruncate: true });
     const verifiedPtas = verifyResp?.programTrackedEntityAttributes || [];
 
     return {
@@ -4611,8 +4617,7 @@ async function checkMetadataReferences(objectType, objectId) {
   if (objectType === 'dataElements') {
     // Check program stages containing this DE
     const stagesResp = await safeDhis2Fetch(
-      `programStages?filter=programStageDataElements.dataElement.id:eq:${id}&fields=id,name,program[id,name]&paging=false`
-    );
+      `programStages?filter=programStageDataElements.dataElement.id:eq:${id}&fields=id,name,program[id,name]&paging=false`, { noTruncate: true });
     if (!stagesResp._error && stagesResp.programStages?.length) {
       refs.program_stages = stagesResp.programStages.map(ps => ({
         stage_id: ps.id,
@@ -4685,8 +4690,7 @@ async function checkMetadataReferences(objectType, objectId) {
 
   if (objectType === 'trackedEntityAttributes') {
     const ptaResp = await safeDhis2Fetch(
-      `programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:eq:${id}&fields=id,name&paging=false`
-    );
+      `programs?filter=programTrackedEntityAttributes.trackedEntityAttribute.id:eq:${id}&fields=id,name&paging=false`, { noTruncate: true });
     if (!ptaResp._error && ptaResp.programs?.length) {
       refs.programs_using_this = ptaResp.programs.map(p => ({ id: p.id, name: p.name }));
     }
@@ -4787,8 +4791,7 @@ async function addProgramRules(args) {
   // PSDE id+compulsory included so HIDEALLFIELDS sugar can flip compulsory→false on
   // hidden DEs (DHIS2 New Tracker Capture refuses to visually hide a compulsory DE).
   const progResp = await safeDhis2Fetch(
-    `programs/${args.program_id}?fields=id,programStages[id,displayName,sortOrder,programStageDataElements[id,compulsory,dataElement[id,displayName,optionSet[id]]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,optionSet[id]]]`
-  );
+    `programs/${args.program_id}?fields=id,programStages[id,displayName,sortOrder,programStageDataElements[id,compulsory,dataElement[id,displayName,optionSet[id]]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,optionSet[id]]]`, { noTruncate: true });
   if (progResp._error) {
     return {
       _error: `Could not load program ${args.program_id}: ${progResp._error}`,
@@ -5858,7 +5861,7 @@ async function executeManageProgramRules(args, ctxProgramId) {
     const tokenRewrites = [];
     if (args.rule.condition !== undefined || (merged.actions || []).some(a => a.data)) {
       const [progStructResp, prvResp] = await Promise.all([
-        safeDhis2Fetch(`programs/${pid}?fields=programStages%5Bid,programStageDataElements%5BdataElement%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D%5D,programTrackedEntityAttributes%5BtrackedEntityAttribute%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D`),
+        safeDhis2Fetch(`programs/${pid}?fields=programStages%5Bid,programStageDataElements%5BdataElement%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D%5D,programTrackedEntityAttributes%5BtrackedEntityAttribute%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D`, { noTruncate: true }),
         safeDhis2Fetch(`programRuleVariables?filter=program.id:eq:${pid}&fields=id,name&pageSize=200`),
       ]);
       if (!progStructResp._error && !prvResp._error) {
@@ -7462,6 +7465,20 @@ function piAnalyticsRuntimeTraps(pi, stageById, apiMinor) {
     }
   }
 
+  // A text field (an option code) compared with a bare number passes the
+  // expression check but fails in analytics with SQL 42883 (text = integer):
+  // RMNCH "Pregnancy outcome" (codes '1','0','2') written as == 0 (2026-11-18).
+  // The meaning is the code, so it is quoted.
+  if (stageById) {
+    const types = new Map();
+    for (const st of stageById.values()) for (const psde of (st.programStageDataElements || [])) if (psde?.dataElement?.id) types.set(psde.dataElement.id, psde.dataElement.valueType);
+    const numRe = /(#\{[A-Za-z][A-Za-z0-9]{10}\.([A-Za-z][A-Za-z0-9]{10})\}\s*(?:==|!=)\s*)(-?\d+(?:\.\d+)?)(?![\d.'"])/g;
+    for (const field of ['filter', 'expression']) {
+      const before = String(pi[field] || '');
+      const after = before.replace(numRe, (all, lhs, de, num) => (/^(?:TEXT|LONG_TEXT|LETTER)$/.test(types.get(de) || '') ? `${lhs}'${num}'` : all));
+      if (after !== before) { corrections.push({ field, from: before, to: after, reason: 'A text field (option code) compared with a bare number fails in analytics (SQL 42883, text = integer); the code is quoted. Same meaning.' }); pi[field] = after; }
+    }
+  }
   if (stageById) {
     const deById = new Map();
     for (const st of stageById.values()) {
@@ -7598,7 +7615,7 @@ function sharingWasRequested(args) {
 // each affected object, returns how many were flagged.
 async function annotateProgramIndicatorProblems(pis, programId) {
   if (!Array.isArray(pis) || !pis.length || !programId) return 0;
-  const prog = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+  const prog = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`, { noTruncate: true });
   const stageById = (!prog?._error && Array.isArray(prog?.programStages)) ? new Map(prog.programStages.map(st => [st.id, st])) : null;
   let flagged = 0;
   for (const pi of pis) {
@@ -8056,7 +8073,7 @@ async function resolveRuleActionTargetNames(pid, actions) {
     (a.data_element_name && !a.data_element_id) ||
     (a.tracked_entity_attribute_name && !a.tei_attribute_id)));
   if (!needs) return { unresolved: [] };
-  const prog = await safeDhis2Fetch(`programs/${pid}?fields=programStages[programStageDataElements[dataElement[id,displayName]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName]]`);
+  const prog = await safeDhis2Fetch(`programs/${pid}?fields=programStages[programStageDataElements[dataElement[id,displayName]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName]]`, { noTruncate: true });
   if (!prog || prog._error) return { unresolved: [], _fetchError: prog && prog._error };
   const deByName = new Map(), deBySan = new Map();
   for (const ps of (prog.programStages || [])) for (const psde of (ps.programStageDataElements || [])) {
@@ -8140,8 +8157,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   // PSDE id+compulsory included so HIDEALLFIELDS sugar can flip compulsory→false on
   // hidden DEs (DHIS2 New Tracker Capture refuses to visually hide a compulsory DE).
   const progResp = await safeDhis2Fetch(
-    `programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[id,compulsory,dataElement[id,displayName,valueType,optionSet[id]]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,valueType,optionSet[id]]],programRuleVariables[id,name,programRuleVariableSourceType,valueType,useCodeForOptionSet,dataElement[id,displayName],trackedEntityAttribute[id,displayName],programStage[id]]`
-  );
+    `programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[id,compulsory,dataElement[id,displayName,valueType,optionSet[id]]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,valueType,optionSet[id]]],programRuleVariables[id,name,programRuleVariableSourceType,valueType,useCodeForOptionSet,dataElement[id,displayName],trackedEntityAttribute[id,displayName],programStage[id]]`, { noTruncate: true });
   if (progResp._error) {
     return { success: false, _error: `Could not load program ${programId}: ${progResp._error}`, phase: 'preflight' };
   }
@@ -9126,9 +9142,18 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     if (!programId) return { _error: 'program_id required for list' };
     const page = Math.max(1, parseInt(args.page) || 1);
     const resp = await safeDhis2Fetch(
-      `programIndicators?filter=program.id:eq:${programId}&fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals&pageSize=50&page=${page}&order=name:asc`
+      `programIndicators?filter=program.id:eq:${programId}&fields=id,name,shortName,description,expression,filter,analyticsType,aggregationType,decimals,categoryCombo[id,displayName]&pageSize=50&page=${page}&order=name:asc`
     );
     if (resp._error) return resp;
+    // Split by a category combination: a record that fits no option (no age, no
+    // sex …) is not in the total either. The demo "Inpatient cases" was reused
+    // as "total cases" and lost 3 records (Inpatient Outcomes, 2026-11-18).
+    let splitCount = 0;
+    for (const pi of resp.programIndicators || []) {
+      const cc = pi.categoryCombo;
+      if (cc && cc.displayName && cc.displayName !== 'default') { pi.split_by = cc.displayName; splitCount++; }
+      delete pi.categoryCombo;
+    }
     const total = resp.pager?.total ?? 0;
     const pageCount = resp.pager?.pageCount ?? 1;
     // Existing indicators are REUSED by later steps of a build. Flag the ones
@@ -9139,6 +9164,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
     const flagged = await annotateProgramIndicatorProblems(resp.programIndicators, programId);
     return {
       ...resp,
+      ...(splitCount ? { _split_note: `${splitCount} indicator(s) carry split_by: they are broken down by that category combination, and a record that fits none of its options (e.g. no age or no sex recorded) is left out of their TOTAL too. For "all records" (total cases, all deaths) use an indicator without split_by, or create one (V{event_count} / V{enrollment_count} with the filter you need).` } : {}),
       ...(flagged ? { _flagged: `${flagged} indicator(s) carry a _problem: they fail in analytics or count something other than their name says. Do NOT reuse them as they are — fix them (manage_program_indicators update, keeping what they measure) or create correct ones, and tell the user.` } : {}),
       _page: page,
       _has_more: page < pageCount,
@@ -9624,7 +9650,7 @@ async function executeManageProgramIndicators(args, ctxProgramId) {
         }
         if (!lintErr && pid) {
           if (!stageMaps.has(pid)) {
-            const pr = await safeDhis2Fetch(`programs/${pid}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+            const pr = await safeDhis2Fetch(`programs/${pid}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`, { noTruncate: true });
             stageMaps.set(pid, (!pr?._error && Array.isArray(pr?.programStages)) ? new Map(pr.programStages.map(st => [st.id, st])) : null);
           }
           const tr = piAnalyticsRuntimeTraps(pi, stageMaps.get(pid), Number(dhis2.apiVersion) || 0);
@@ -9941,7 +9967,7 @@ async function _prepareProgramIndicatorObject(programId, indicatorId, indicator,
     // The structure also feeds the analytics-runtime trap check below (DE value
     // types, stage names), so an unscoped V{event_count} needs it too.
     if (!stageById && (refs.length || /V\{event_count\}/.test(pi.expression))) {
-      const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+      const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`, { noTruncate: true });
       if (!progResp?._error && Array.isArray(progResp?.programStages)) {
         stageById = new Map(progResp.programStages.map(st => [st.id, st]));
       }
@@ -10128,10 +10154,94 @@ async function _buildAndPostProgramIndicator(programId, indicatorId, indicator, 
 // Invalid indicators are SKIPPED (never disable the tool) and reported under failed[]
 // so the model can fix just those, not re-run the whole batch. Program structure +
 // default category combo are fetched ONCE and shared across the batch.
+// "Women with 4+ ANC visits" as d2:count(#{repeatAnc.someDe}) >= 3 counted only
+// the visits where that one field was filled: 1 pregnancy instead of 666 (WHO
+// RMNCH, 2026-11-18). For each d2:count / d2:countIfValue over a stage field,
+// measure how many of the stage's visits hold a value (counts only) and, when
+// many do not, name the stage's most-filled field to count instead.
+// An indicator about VISITS (name says visit / contact / attendance / follow-up)
+// that counts them with d2:count(#{stage.de}) or tests one with
+// d2:hasValue(#{stage.de}) only sees the visits where that one field is filled.
+// "Women with 4 or more ANC visits" used a field filled on 5 of 9,945 visits and
+// showed 0 instead of 795; the warning was ignored (WHO RMNCH, Haiku, 2026-11-18).
+// Before saving, such a field (filled on < 50% of the stage's visits) is replaced
+// by the stage's most-filled field (≥ 95%): the meaning — "a visit happened" — is
+// kept, and the change is reported.
+async function piHealSparseVisitCounts(indicators, programId) {
+  const out = [];
+  const best = new Map();
+  for (const ind of (indicators || []).slice(0, 30)) {
+    if (!/visit|contact|attend|appointment|session|follow.?up|consult/i.test(String(ind.name || ''))) continue;
+    for (const field of ['expression', 'filter']) {
+      const text = String(ind[field] || '');
+      // Only "a visit happened" forms: d2:count(#{s.de}) and d2:hasValue(#{s.de}). Never
+      // d2:countIfValue (it counts one VALUE of that field), and never hasValue when the
+      // indicator is about that field being recorded ("visits with BP recorded").
+      const aboutTheField = /\b(?:with|recorded|given|measured|tested|done|result|positive|negative|filled|completed?)\b/i.test(String(ind.name || ''));
+      const refs = [...text.matchAll(/d2:(count|hasValue)\(\s*#\{([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})\}\s*\)/g)];
+      let next = text;
+      for (const [call, fn, stageId, deId] of refs) {
+        if (fn === 'hasValue' && aboutTheField && !/\b(?:\d+|one|two|three|four|five|six|eight)\s*\+?\s*(?:or more\s+)?(?:\w+\s+){0,2}(?:visits?|contacts?)\b/i.test(String(ind.name || ''))) continue;
+        const cov = await dataCheckFieldCoverage({ kind: 'de', programId, stageId, id: deId });
+        if (!cov || !cov.total || cov.with_values / cov.total >= 0.5) continue;
+        if (!best.has(stageId)) {
+          const st = await safeDhis2Fetch(`programStages/${stageId}?fields=programStageDataElements[compulsory,dataElement[id,displayName]]`, { noTruncate: true });
+          const des = (st?.programStageDataElements || []).map((x) => ({ id: x.dataElement.id, name: x.dataElement.displayName, compulsory: !!x.compulsory }));
+          let top = null;
+          for (const d of [...des.filter((x) => x.compulsory), ...des.filter((x) => !x.compulsory)].slice(0, 10)) {
+            const c = await dataCheckFieldCoverage({ kind: 'de', programId, stageId, id: d.id });
+            if (c && c.total && (!top || c.with_values > top.with_values)) top = { ...d, with_values: c.with_values, total: c.total };
+          }
+          best.set(stageId, top);
+        }
+        const top = best.get(stageId);
+        if (!top || top.id === deId || top.with_values / top.total < 0.95) continue;
+        next = next.split(call).join(call.replace(`#{${stageId}.${deId}}`, `#{${stageId}.${top.id}}`));
+        out.push({ indicator: ind.name, field, replaced: `#{${stageId}.${deId}} (filled on ${cov.with_values} of ${cov.total} visits)`, with: `#{${stageId}.${top.id}} "${top.name}" (filled on ${top.with_values} of ${top.total})`, reason: 'counting visits through a rarely filled field misses most visits' });
+      }
+      if (next !== text) ind[field] = next;
+    }
+  }
+  return out;
+}
+
+async function piSparseCountWarnings(pis, programId) {
+  const out = [];
+  const stageCache = new Map();
+  for (const p of (pis || []).slice(0, 12)) {
+    const text = `${p.expression || ''} ${p.filter || ''}`;
+    for (const m of text.matchAll(/d2:count(?:IfValue)?\(\s*#\{([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})\}/g)) {
+      const [, stageId, deId] = m;
+      const cov = await dataCheckFieldCoverage({ kind: 'de', programId, stageId, id: deId });
+      if (!cov || cov.state === 'unknown' || !cov.total || cov.with_values / cov.total >= 0.9) continue;
+      if (!stageCache.has(stageId)) stageCache.set(stageId, await safeDhis2Fetch(`programStages/${stageId}?fields=displayName,programStageDataElements[compulsory,dataElement[id,displayName]]`, { noTruncate: true }));
+      const st = stageCache.get(stageId) || {};
+      const des = (st.programStageDataElements || []).map((x) => ({ id: x.dataElement.id, name: x.dataElement.displayName, compulsory: !!x.compulsory }));
+      const candidates = [...des.filter((d) => d.compulsory), ...des.filter((d) => !d.compulsory)].filter((d) => d.id !== deId).slice(0, 8);
+      let best = null;
+      for (const d of candidates) {
+        const c = await dataCheckFieldCoverage({ kind: 'de', programId, stageId, id: d.id });
+        if (c && c.total && (!best || c.with_values > best.with_values)) best = { ...d, with_values: c.with_values, total: c.total };
+      }
+      const name = (des.find((d) => d.id === deId) || {}).name || deId;
+      out.push({
+        indicator: p.name,
+        counts: `d2:count(#{${stageId}.${deId}})`,
+        field: name,
+        stage: st.displayName || stageId,
+        visits_with_value: cov.with_values,
+        visits: cov.total,
+        ...(best && best.with_values > cov.with_values ? { count_instead: `#{${stageId}.${best.id}}`, count_instead_field: best.name, count_instead_filled_on: `${best.with_values} of ${best.total}` } : {}),
+      });
+    }
+  }
+  return out;
+}
+
 async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun) {
   const catComboId = (await safeDhis2Fetch('categoryCombos?filter=name:eq:default&fields=id&pageSize=1'))?.categoryCombos?.[0]?.id || 'bjDvmb4bfuf';
   let progStagesById = null;
-  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programType,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`);
+  const progResp = await safeDhis2Fetch(`programs/${programId}?fields=id,programType,programStages[id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]]`, { noTruncate: true });
   if (!progResp?._error && Array.isArray(progResp?.programStages)) {
     progStagesById = new Map(progResp.programStages.map(st => [st.id, st]));
   }
@@ -10139,6 +10249,9 @@ async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun
 
   // Validate/build every indicator with bounded concurrency (a 40-PI batch would
   // otherwise fire 80 description POSTs at once). Preserve input order for reporting.
+  // Visits counted through a field that is rarely filled (see piHealSparseVisitCounts).
+  let sparseHeals = [];
+  try { sparseHeals = await piHealSparseVisitCounts(indicators, programId); } catch { sparseHeals = []; }
   const prepared = new Array(indicators.length);
   const CONC = 6;
   let cursor = 0;
@@ -10179,6 +10292,7 @@ async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun
       would_create: validPis.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
       ...(failed.length ? { failed } : {}),
       ...(autoCorrected.length ? { auto_corrected: autoCorrected } : {}),
+    ...(sparseHeals.length ? { visit_counts_corrected: sparseHeals } : {}),
       ...(validAdvisories.length ? { precedence_advisories: validAdvisories } : {}),
     };
   }
@@ -10274,11 +10388,16 @@ async function _buildAndPostProgramIndicatorsBatch(programId, indicators, dryRun
     }
   }
 
+  let sparseCounts = [];
+  try { sparseCounts = await piSparseCountWarnings(working, programId); } catch { sparseCounts = []; }
+
   return {
     success: true,
     action: 'create',
     created_count: working.length,
     created: working.map(p => ({ id: p.id, name: p.name, analyticsType: p.analyticsType, aggregationType: p.aggregationType })),
+    ...(sparseHeals.length ? { visit_counts_corrected: sparseHeals, _visit_count_note: 'Visits were counted through a field filled on few visits; the stage\'s most-filled field was used instead (same meaning: a visit happened). Mention it.' } : {}),
+    ...(sparseCounts.length ? { count_undercounts_visits: sparseCounts, _count_note: 'd2:count(#{stage.de}) counts only the visits where that data element has a value. Each listed indicator undercounts visits: update it (manage_program_indicators update) to count the suggested data element, which is filled on (almost) every visit.' } : {}),
     // Flat UID list so the caller chains straight into visualization/map/dashboard data_items.
     program_indicator_ids: working.map(p => p.id),
     ...(failed.length ? { failed_count: failed.length, failed } : {}),
@@ -10653,8 +10772,7 @@ async function executeArchitectMetadata(args) {
             // verify skip every rule check.
             const [prog, rulesResp, prvsResp] = await Promise.all([
               safeDhis2Fetch(
-                `programs/${args.verify_program_id}?fields=id,name,programType,programStages[id,name,sortOrder,programStageDataElements[dataElement[id,name,valueType,optionSet[id,name]]]],trackedEntityType[id,name],organisationUnits[id,name]`
-              ),
+                `programs/${args.verify_program_id}?fields=id,name,programType,programStages[id,name,sortOrder,programStageDataElements[dataElement[id,name,valueType,optionSet[id,name]]]],trackedEntityType[id,name],organisationUnits[id,name]`, { noTruncate: true }),
               safeDhis2Fetch(
                 `programRules?filter=program.id:eq:${args.verify_program_id}&fields=id,name,condition,programRuleActions[id,programRuleActionType,content,data,dataElement[id,name],programStage[id]]&paging=false`
               ),
@@ -10808,8 +10926,7 @@ async function executeArchitectMetadata(args) {
             `programRuleActions[id,programRuleActionType,content,data,location,` +
               `dataElement[id,name],trackedEntityAttribute[id,name],programStage[id,name],` +
               `programStageSection[id,name],option[id,name],optionGroup[id,name]]],` +
-          `programIndicators[id,name,expression,filter,analyticsType]`
-        );
+          `programIndicators[id,name,expression,filter,analyticsType]`, { noTruncate: true });
 
         if (!prog || prog._error) {
           return { _error: `Failed to fetch program "${pid}": ${prog?._error || 'not found'}` };
@@ -10894,3 +11011,449 @@ async function executeArchitectMetadata(args) {
   }
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// manage_test_data — clearly fictional tracker records for testing a program.
+// "Create 100 fictional people with 120 care episodes … so the dashboard, app and
+// plugin can be tested" (2026-11-18): by hand a small model wrote tracker payloads
+// one batch at a time, hit a unique-value clash and gave up, and it cannot read the
+// records back on a cloud model. This builds them from the program's own metadata
+// (value types, option codes, stage order, repeatable stages), imports them in
+// batches (atomicMode=OBJECT), keeps a manifest so a re-run reuses its work, and
+// answers with counts only (no record values reach the model).
+// ══════════════════════════════════════════════════════════════════════════════
+const TEST_DATA_NS = 'dhis2-ai-extension-testdata';
+const TD_FIRST = ['Amal', 'Basel', 'Carmen', 'Dawit', 'Esra', 'Farid', 'Grace', 'Hana', 'Ibrahim', 'Joy', 'Karim', 'Lina', 'Musa', 'Nadia', 'Omar', 'Priya', 'Rami', 'Sara', 'Tariq', 'Yara'];
+const TD_LAST = ['Testa', 'Sample', 'Fiction', 'Demo', 'Example', 'Mock', 'Placeholder', 'Trial'];
+
+function tdRandom(seed) {
+  let s = (Number(seed) >>> 0) || 0x9e3779b9;
+  return () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; };
+}
+const tdIso = (d) => new Date(d).toISOString().slice(0, 10);
+const tdAddDays = (iso, n) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return tdIso(d); };
+
+// Order of a date field inside one visit: when it happens relative to the visit.
+function tdDateRank(name) {
+  const n = String(name || '').toLowerCase();
+  const order = [
+    [/onset|symptom.*start|start.*symptom|since|last menstrual|lmp/, 0],
+    [/request|ordered|referral date|refer.*date|sent date|send date/, 1],
+    [/collect|sample|specimen/, 2],
+    [/admission|admit|start date|starting|initiat|commenc/, 2],
+    [/result|review|report|verified|validated|read date/, 4],
+    [/accept|receiv/, 4],
+    [/arrival|arriv/, 5],
+    [/discharge|end date|stop|closure|close|completion|outcome date|exit/, 6],
+    [/appointment|next|due|follow.?up date|return date|scheduled/, 7],
+  ];
+  const hit = order.find(([re]) => re.test(n));
+  return hit ? hit[1] : 3;
+}
+
+function tdValue(rnd, el, ctx) {
+  const vt = el.valueType;
+  const name = String(el.displayName || '').toLowerCase();
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  const between = (lo, hi, dec = 0) => { const v = lo + rnd() * (hi - lo); return dec ? v.toFixed(dec) : String(Math.round(v)); };
+  const codes = (el.optionSet?.options || []).map((o) => o.code).filter((c) => c != null && c !== '');
+  if (codes.length) {
+    const usable = codes.filter((c) => !/^other$/i.test(c)) .length ? codes.filter((c) => !/^other$/i.test(c)) : codes;
+    // Statuses that rules usually tie to a reason (cancelled, stopped, rejected) stay rare.
+    const calm = usable.filter((c) => !/cancel|stop|reject|declin|discontinu|died|death|dead|lost/i.test(c));
+    const pool = calm.length && rnd() < 0.85 ? calm : usable;
+    if (vt === 'MULTI_TEXT') return [...new Set([pick(pool), pick(pool)])].join(',');
+    return pick(pool);
+  }
+  switch (vt) {
+    case 'BOOLEAN': return rnd() < 0.3 ? 'true' : 'false';
+    case 'TRUE_ONLY': return rnd() < 0.3 ? 'true' : null;
+    case 'PHONE_NUMBER': return `+000 555 ${String(1000 + Math.floor(rnd() * 8999))}`;
+    case 'EMAIL': return `zz.test.${ctx.seq}@example.org`;
+    case 'URL': return 'https://example.org/test';
+    case 'PERCENTAGE': return between(0, 100);
+    case 'LETTER': return pick(['A', 'B', 'C']);
+    case 'TIME': return `${String(8 + Math.floor(rnd() * 9)).padStart(2, '0')}:${pick(['00', '15', '30', '45'])}`;
+    case 'LONG_TEXT': return 'Fictional test note (generated test record).';
+    case 'ORGANISATION_UNIT': return /receiv|destination|referred to|to facility|transfer to/.test(name) ? ctx.otherFacility : ctx.facility;
+    case 'COORDINATE': return ctx.point ? JSON.stringify([+(ctx.point[0] + (rnd() - 0.5) * 0.08).toFixed(5), +(ctx.point[1] + (rnd() - 0.5) * 0.08).toFixed(5)]) : null;
+    case 'AGE': case 'DATE': case 'DATETIME': {
+      if (/birth|dob/.test(name)) return tdAddDays(ctx.today, -Math.round(365 * (1 + rnd() * 85)));
+      return null; // dated by the visit (tdFillDates)
+    }
+    case 'INTEGER': case 'INTEGER_POSITIVE': case 'INTEGER_ZERO_OR_POSITIVE': case 'NUMBER': case 'INTEGER_NEGATIVE': case 'UNIT_INTERVAL': {
+      if (vt === 'UNIT_INTERVAL') return between(0, 1, 2);
+      const ranges = [[/weight/, 40, 100, 1], [/height|length cm/, 140, 190, 0], [/temp/, 36, 39.5, 1], [/systolic/, 100, 160, 0], [/diastolic/, 60, 100, 0], [/pulse|heart rate/, 60, 110, 0], [/resp/, 12, 24, 0], [/sat|spo2|oxygen/, 90, 100, 0], [/glucose|sugar/, 4, 12, 1], [/h(a)?emoglobin|hb\b/, 8, 15, 1], [/\bage\b/, 1, 90, 0], [/dose|quantity|tablets/, 1, 3, 0], [/days|stay|duration|length/, 1, 14, 0], [/score|scale|pain/, 0, 10, 0], [/count|number of/, 0, 6, 0]];
+      const r = ranges.find(([re]) => re.test(name));
+      let v = r ? between(r[1], r[2], vt === 'NUMBER' ? r[3] : 0) : between(1, 50);
+      if (vt === 'INTEGER_NEGATIVE') v = String(-Math.abs(parseInt(v, 10) || 1));
+      return v;
+    }
+    case 'TEXT': default: {
+      if (vt && !/^(TEXT|USERNAME)$/.test(vt)) return null; // FILE_RESOURCE, IMAGE, REFERENCE … are left empty
+      if (/other|specify|details|explain/.test(name)) return null; // only with an "Other" answer, which is never picked
+      if (/full name|patient name|client name|^name$/.test(name)) return `${ctx.prefix} ${pick(TD_FIRST)} ${pick(TD_LAST)}`;
+      if (/first name|given name/.test(name)) return `${ctx.prefix} ${pick(TD_FIRST)}`;
+      if (/last name|surname|family name/.test(name)) return pick(TD_LAST);
+      if (/address|street|village|residence|home/.test(name)) return `${1 + Math.floor(rnd() * 99)} Test Street, Testville`;
+      if (/clinician|staff|reviewer|provider|nurse|doctor|responsible/.test(name)) return `${ctx.prefix} Clinician ${1 + Math.floor(rnd() * 9)}`;
+      if (/number|id\b|identifier|code/.test(name)) return `ZZT-${ctx.seq}-${Math.floor(rnd() * 9000 + 1000)}`;
+      return 'Test value';
+    }
+  }
+}
+
+// Visit dates in a believable order (onset ≤ request ≤ visit ≤ result ≤ next
+// appointment); nothing already done is dated after today.
+function tdFillDates(rnd, des, eventDate, today) {
+  const dates = des.filter((d) => /^(DATE|DATETIME|AGE)$/.test(d.valueType) && !/birth|dob/.test(String(d.displayName || '').toLowerCase()));
+  const out = {};
+  for (const d of dates) {
+    const rank = tdDateRank(d.displayName);
+    let day;
+    if (rank === 0) day = tdAddDays(eventDate, -(5 + Math.floor(rnd() * 10)));
+    else if (rank < 3) day = tdAddDays(eventDate, rank - 3); // request -2, collection/admission -1
+    else if (rank === 3) day = eventDate;
+    else if (rank < 7) { day = tdAddDays(eventDate, (rank - 3) * 2); if (day > today) day = today; }
+    else day = tdAddDays(eventDate, 7 + Math.floor(rnd() * 28)); // an appointment may be in the future
+    out[d.id] = d.valueType === 'DATETIME' ? `${day}T10:00:00.000` : day;
+  }
+  return out;
+}
+
+async function tdProgram(pid) {
+  return safeDhis2Fetch(`programs/${pid}?fields=id,displayName,programType,onlyEnrollOnce,trackedEntityType[id],organisationUnits[id,displayName,geometry,parent[geometry]],programTrackedEntityAttributes[mandatory,trackedEntityAttribute[id,displayName,valueType,unique,generated,optionSet[options[code]]]],programStages[id,displayName,repeatable,sortOrder,programStageDataElements[compulsory,dataElement[id,displayName,valueType,optionSet[options[code]]]]]`, { noTruncate: true });
+}
+
+// Counts of the program's live records (people, episodes, visits, appointments).
+async function tdSummary(prog) {
+  const pid = prog.id;
+  const enrollments = []; const events = [];
+  for (let page = 1; page <= 200; page++) {
+    const r = await safeDhis2Fetch(`tracker/enrollments?program=${pid}&ouMode=ALL&fields=enrollment,trackedEntity,status,orgUnit,enrolledAt&page=${page}&pageSize=1000&totalPages=true`, { noTruncate: true });
+    if (!r || r._error) return { _error: `Could not count enrollments: ${r && r._error}` };
+    enrollments.push(...(r.enrollments || r.instances || []));
+    if (page >= (r.pager?.pageCount || 1)) break;
+  }
+  for (let page = 1; page <= 500; page++) {
+    const r = await safeDhis2Fetch(`tracker/events?program=${pid}&ouMode=ALL&fields=programStage,status,occurredAt,scheduledAt,orgUnit,enrollment&page=${page}&pageSize=1000&totalPages=true`, { noTruncate: true });
+    if (!r || r._error) return { _error: `Could not count events: ${r && r._error}` };
+    events.push(...(r.events || r.instances || []));
+    if (page >= (r.pager?.pageCount || 1)) break;
+  }
+  const today = tdIso(Date.now());
+  const ouName = new Map((prog.organisationUnits || []).map((o) => [o.id, o.displayName]));
+  const stageName = new Map((prog.programStages || []).map((s) => [s.id, s.displayName]));
+  const tally = (list, key) => list.reduce((m, x) => { const k = key(x); m[k] = (m[k] || 0) + 1; return m; }, {});
+  const byStage = {};
+  for (const e of events) {
+    const k = stageName.get(e.programStage) || e.programStage;
+    byStage[k] = byStage[k] || { recorded: 0, scheduled_past_due: 0, scheduled_future: 0, skipped: 0 };
+    if (e.status === 'SCHEDULE' || e.status === 'OVERDUE') byStage[k][(e.scheduledAt || '').slice(0, 10) < today ? 'scheduled_past_due' : 'scheduled_future']++;
+    else if (e.status === 'SKIPPED') byStage[k].skipped++;
+    else byStage[k].recorded++;
+  }
+  const perEnrollment = tally(events.filter((e) => e.status === 'ACTIVE' || e.status === 'COMPLETED'), (e) => e.enrollment);
+  const dates = enrollments.map((e) => String(e.enrolledAt || '').slice(0, 10)).filter(Boolean).sort();
+  return {
+    people: new Set(enrollments.map((e) => e.trackedEntity)).size,
+    episodes: enrollments.length,
+    episodes_by_status: tally(enrollments, (e) => e.status),
+    episodes_by_facility: tally(enrollments, (e) => ouName.get(e.orgUnit) || e.orgUnit),
+    visits_recorded: Object.values(byStage).reduce((s, x) => s + x.recorded, 0),
+    visits_by_stage: byStage,
+    people_with_more_than_one_episode: Object.values(tally(enrollments, (e) => e.trackedEntity)).filter((n) => n > 1).length,
+    episodes_without_any_visit: enrollments.filter((e) => !perEnrollment[e.enrollment]).length,
+    enrolled_from: dates[0] || null,
+    enrolled_to: dates[dates.length - 1] || null,
+    source: 'live tracker records (counts only; analytics tables may lag until the next analytics run)',
+  };
+}
+
+function tdGroupErrors(report) {
+  const errs = report?.validationReport?.errorReports || report?._body?.validationReport?.errorReports || [];
+  const grouped = {};
+  for (const e of errs) {
+    const msg = String(e.message || e.errorCode || '').replace(/`[A-Za-z][A-Za-z0-9]{10}`/g, '<id>').replace(/\b[A-Za-z][A-Za-z0-9]{10}\b/g, '<id>').slice(0, 160);
+    const k = `${e.errorCode || ''} ${msg}`.trim();
+    grouped[k] = (grouped[k] || 0) + 1;
+  }
+  return { count: errs.length, by_reason: grouped, uids: new Set(errs.map((e) => e.uid).filter(Boolean)) };
+}
+
+async function executeManageTestData(args) {
+  const action = String(args.action || '');
+  if (!['generate', 'summary', 'test_invalid', 'delete'].includes(action)) return { _error: 'action must be generate, summary, test_invalid or delete.' };
+  const pid = String(args.program_id || '').trim();
+  if (!/^[A-Za-z][A-Za-z0-9]{10}$/.test(pid)) return { _error: 'program_id (the tracker program UID) is required.' };
+  const prog = await tdProgram(pid);
+  if (!prog || prog._error || !prog.id) return { _error: `Program ${pid} not found.` };
+  if (prog.programType !== 'WITH_REGISTRATION') return { _error: `"${prog.displayName}" is an event program: test records are generated for tracker programs (with registration) only.` };
+  const manifestPath = `dataStore/${TEST_DATA_NS}/${pid}`;
+  // Looked up by listing (a missing key would be a 404 on every first run).
+  const namespaces = await safeDhis2Fetch('dataStore', { noTruncate: true });
+  const keys = Array.isArray(namespaces) && namespaces.includes(TEST_DATA_NS) ? await safeDhis2Fetch(`dataStore/${TEST_DATA_NS}`, { noTruncate: true }) : [];
+  const existing = Array.isArray(keys) && keys.includes(pid) ? await safeDhis2Fetch(manifestPath, { noTruncate: true }) : null;
+  const manifest = existing && !existing._error && existing.runs ? existing : null;
+
+  if (action === 'summary') {
+    const s = await tdSummary(prog);
+    return s._error ? s : { success: true, program: prog.displayName, baseline: s, generated_by_this_tool: manifest ? manifest.runs.reduce((n, r) => n + (r.trackedEntities || []).length, 0) : 0 };
+  }
+
+  const gate = requireWriteAuth('manage_test_data', action, { program_id: pid });
+  if (gate) return gate;
+
+  if (action === 'delete') {
+    if (!manifest) return { success: true, deleted: 0, _note: 'No records generated by this tool are recorded for this program; nothing was deleted (records entered by people are never touched).' };
+    const ids = manifest.runs.flatMap((r) => r.trackedEntities || []);
+    let deleted = 0;
+    for (let i = 0; i < ids.length; i += 50) {
+      const r = await safeDhis2Fetch('tracker?async=false&importStrategy=DELETE&atomicMode=OBJECT', { method: 'POST', body: { trackedEntities: ids.slice(i, i + 50).map((t) => ({ trackedEntity: t })) } });
+      deleted += Number(r?.stats?.deleted || 0);
+    }
+    await safeDhis2Fetch(manifestPath, { method: 'DELETE' });
+    return { success: true, deleted_people: deleted, _note: 'Only the records this tool generated were deleted (DHIS2 keeps them soft-deleted until the maintenance job removes them).' };
+  }
+
+  const tetId = prog.trackedEntityType?.id;
+  const teas = (prog.programTrackedEntityAttributes || []).map((p) => ({ ...p.trackedEntityAttribute, mandatory: !!p.mandatory }));
+  const stages = (prog.programStages || []).slice().sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
+  const allOus = (prog.organisationUnits || []);
+  const wanted = Array.isArray(args.facilities) && args.facilities.length ? args.facilities.map(String) : null;
+  const facilities = (wanted ? allOus.filter((o) => wanted.includes(o.id)) : allOus).slice(0, Math.max(1, Math.min(Number(args.facility_count) || 6, 50)));
+  if (!facilities.length) return { _error: `"${prog.displayName}" is assigned to none of the requested facilities. Assign it first (create_metadata / manage_metadata), then generate.` };
+  const pointOf = (o) => { const g = o.geometry?.type === 'Point' ? o.geometry : null; return g ? g.coordinates : null; };
+  const today = tdIso(Date.now());
+
+  if (action === 'test_invalid') {
+    const f = facilities[0].id;
+    const uniq = teas.find((a) => a.unique);
+    const optionDe = stages.flatMap((s) => (s.programStageDataElements || []).map((p) => ({ stage: s.id, de: p.dataElement }))).find((x) => (x.de.optionSet?.options || []).length);
+    const mand = teas.find((a) => a.mandatory);
+    const base = (over = {}) => ({ trackedEntity: generateDhis2Uid(), trackedEntityType: tetId, orgUnit: f, attributes: teas.filter((a) => a.mandatory).map((a) => ({ attribute: a.id, value: tdValue(tdRandom(7), a, { prefix: 'ZZ TEST', today, seq: 1, facility: f, otherFacility: f }) || '1' })).filter((x) => x.value != null), ...over });
+    const cases = [
+      ['a visit dated before its enrollment', base({ enrollments: [{ enrollment: generateDhis2Uid(), program: pid, orgUnit: f, enrolledAt: tdAddDays(today, -10), occurredAt: tdAddDays(today, -10), events: [{ event: generateDhis2Uid(), program: pid, programStage: stages[0]?.id, orgUnit: f, status: 'COMPLETED', occurredAt: tdAddDays(today, -40) }] }] })],
+      ['a completed visit dated in the future', base({ enrollments: [{ enrollment: generateDhis2Uid(), program: pid, orgUnit: f, enrolledAt: tdAddDays(today, -5), occurredAt: tdAddDays(today, -5), events: [{ event: generateDhis2Uid(), program: pid, programStage: stages[0]?.id, orgUnit: f, status: 'COMPLETED', occurredAt: tdAddDays(today, 20) }] }] })],
+      ...(optionDe ? [['an answer that is not one of the field\'s options', base({ enrollments: [{ enrollment: generateDhis2Uid(), program: pid, orgUnit: f, enrolledAt: tdAddDays(today, -5), occurredAt: tdAddDays(today, -5), events: [{ event: generateDhis2Uid(), program: pid, programStage: optionDe.stage, orgUnit: f, status: 'COMPLETED', occurredAt: tdAddDays(today, -3), dataValues: [{ dataElement: optionDe.de.id, value: 'NOT_AN_OPTION_CODE' }] }] }] })]] : []),
+      ...(mand ? [['a person without a required attribute', base({ attributes: [], enrollments: [{ enrollment: generateDhis2Uid(), program: pid, orgUnit: f, enrolledAt: tdAddDays(today, -5), occurredAt: tdAddDays(today, -5) }] })]] : []),
+      ['a date after today as the enrollment date', base({ enrollments: [{ enrollment: generateDhis2Uid(), program: pid, orgUnit: f, enrolledAt: tdAddDays(today, 30), occurredAt: tdAddDays(today, 30) }] })],
+    ];
+    if (uniq && manifest && manifest.uniqueSample) cases.push(['a duplicate unique value', base({ attributes: [...base().attributes.filter((a) => a.attribute !== uniq.id), { attribute: uniq.id, value: manifest.uniqueSample }], enrollments: [] })]);
+    const outcome = [];
+    for (const [label, te] of cases) {
+      const r = await safeDhis2Fetch('tracker?async=false&importStrategy=CREATE&atomicMode=ALL&importMode=VALIDATE', { method: 'POST', body: { trackedEntities: [te] } });
+      const g = tdGroupErrors(r && r._body ? r._body : r);
+      outcome.push({ case: label, rejected_by_dhis2: g.count > 0 || !!(r && r._error), reasons: Object.keys(g.by_reason).slice(0, 3) });
+    }
+    return { success: true, mode: 'VALIDATE — nothing was saved', results: outcome, _note: 'Checks done in the Capture form only (program rules that hide fields or show warnings, "Other" explanations, alerts) are not run by a server import; verify those in Capture.' };
+  }
+
+  // ── generate ──
+  // The import runs the program's rules: fields a rule CALCULATES stay empty (the
+  // server fills them; a different value is E1307) and fields a rule makes
+  // REQUIRED are always filled (E1301).
+  const ruleActs = await safeDhis2Fetch(`programRuleActions?filter=programRule.program.id:eq:${pid}&fields=programRuleActionType,dataElement[id],trackedEntityAttribute[id]&paging=false`, { noTruncate: true });
+  const assigned = new Set(); const required = new Set();
+  for (const a of (ruleActs && ruleActs.programRuleActions) || []) {
+    const id = a.dataElement?.id || a.trackedEntityAttribute?.id;
+    if (!id) continue;
+    if (a.programRuleActionType === 'ASSIGN') assigned.add(id);
+    if (a.programRuleActionType === 'SETMANDATORYFIELD') required.add(id);
+  }
+  if (manifest && !args.add_more) {
+    const s = await tdSummary(prog);
+    return { success: true, reused: true, _note: 'Test records generated earlier for this program are already there, so nothing new was created (pass add_more:true to add more, or action:"delete" first to start over).', baseline: s._error ? undefined : s };
+  }
+  const people = Math.max(1, Math.min(Number(args.people) || 20, 1000));
+  let episodes = Math.max(people, Math.min(Number(args.episodes) || people, 2000));
+  const notes = [];
+  if (prog.onlyEnrollOnce && episodes > people) { episodes = people; notes.push('The program allows one enrollment per person, so each person has one episode.'); }
+  const monthsBack = Math.max(1, Math.min(Number(args.months_back) || 12, 60));
+  const missingShare = Math.max(0, Math.min(Number(args.missing_optional_share ?? 0.15), 0.6));
+  const noLocationShare = Math.max(0, Math.min(Number(args.without_location_share ?? 0.15), 1));
+  const completedShare = Math.max(0, Math.min(Number(args.completed_share ?? 0.5), 1));
+  const missedShare = Math.max(0, Math.min(Number(args.missed_appointment_share ?? 0.15), 1));
+  const crossShare = Math.max(0, Math.min(Number(args.other_facility_share ?? 0.15), 1));
+  const [repMin, repMax] = Array.isArray(args.repeat_visits) && args.repeat_visits.length === 2 ? args.repeat_visits.map((n) => Math.max(0, Math.min(Number(n) || 0, 20))) : [1, 3];
+  const seed = Number(args.seed) || (Date.now() % 1e9);
+  const rnd = tdRandom(seed);
+  const prefix = String(args.name_prefix || 'ZZ TEST').slice(0, 20);
+  const runTag = Number(seed).toString(36).slice(-4).toUpperCase();
+
+  // Unique values: the attribute's own generator when it has one, else a run tag.
+  const uniqueValues = {};
+  for (const a of teas.filter((x) => x.unique)) {
+    if (a.generated) {
+      const r = await safeDhis2Fetch(`trackedEntityAttributes/${a.id}/generateAndReserve?numberToReserve=${people}`, { noTruncate: true });
+      uniqueValues[a.id] = Array.isArray(r) ? r.map((x) => x.value) : null;
+    }
+    if (!uniqueValues[a.id]) uniqueValues[a.id] = Array.from({ length: people }, (_, i) => (/^(INTEGER|NUMBER)/.test(a.valueType) ? String(900000000 + Math.floor(seed % 90000) * 100 + i) : `${prefix.replace(/\s+/g, '')}-${runTag}-${String(i + 1).padStart(4, '0')}`));
+  }
+
+  const span = monthsBack * 30;
+  const tes = [];
+  const episodesOf = Array.from({ length: people }, () => 1);
+  for (let k = people; k < episodes; k++) episodesOf[Math.floor(rnd() * people)]++;
+  let seq = 0;
+  for (let i = 0; i < people; i++) {
+    const fac = facilities[i % facilities.length];
+    const point = rnd() < noLocationShare ? null : (pointOf(fac) || pointOf(fac.parent || {}) || null);
+    const ctx = { prefix, today, seq: ++seq, facility: fac.id, otherFacility: facilities[(i + 1) % facilities.length].id, point };
+    const attributes = [];
+    for (const a of teas) {
+      if (a.unique) { attributes.push({ attribute: a.id, value: uniqueValues[a.id][i] }); continue; }
+      if (assigned.has(a.id)) continue;
+      if (!a.mandatory && !required.has(a.id) && rnd() < missingShare) continue;
+      const v = tdValue(rnd, a, ctx);
+      if (v != null && v !== '') attributes.push({ attribute: a.id, value: v });
+    }
+    const n = episodesOf[i];
+    const enrollments = [];
+    // Episodes of one person follow each other: every one but the last is closed.
+    let cursor = tdAddDays(today, -span + Math.floor(rnd() * Math.max(1, span / (n + 1))));
+    for (let e = 0; e < n; e++) {
+      const enrolledAt = cursor > tdAddDays(today, -3) ? tdAddDays(today, -3) : cursor;
+      const last = e === n - 1;
+      const completed = !last || rnd() < completedShare;
+      const encFac = rnd() < crossShare ? facilities[(i + 2) % facilities.length] : fac;
+      const events = [];
+      let day = enrolledAt;
+      const closingStage = stages.length > 1 && !stages[stages.length - 1].repeatable ? stages[stages.length - 1] : null;
+      for (const st of stages) {
+        if (st === closingStage && !completed) continue;
+        const des = (st.programStageDataElements || []).map((p) => ({ ...p.dataElement, compulsory: !!p.compulsory }));
+        const count = st === stages[0] || st === closingStage ? 1 : (st.repeatable ? repMin + Math.floor(rnd() * (repMax - repMin + 1)) : (rnd() < 0.8 ? 1 : 0));
+        for (let v = 0; v < count; v++) {
+          day = tdAddDays(day, st === stages[0] && v === 0 ? 0 : 3 + Math.floor(rnd() * 25));
+          if (day > today) break;
+          const evFac = rnd() < crossShare ? ctx.otherFacility : encFac.id;
+          const dated = tdFillDates(rnd, des, day, today);
+          const dataValues = [];
+          let chosen = '';
+          for (const d of des) {
+            const isClosing = st === closingStage;
+            if (assigned.has(d.id)) continue;
+            if (!d.compulsory && !required.has(d.id) && !isClosing && rnd() < missingShare) continue;
+            const value = dated[d.id] !== undefined ? dated[d.id] : tdValue(rnd, d, { ...ctx, facility: evFac });
+            if (value == null || value === '') continue;
+            dataValues.push({ dataElement: d.id, value });
+            chosen += ` ${value}`;
+          }
+          // A cancelled / stopped / rejected answer comes with its reason.
+          if (/cancel|stop|reject|declin|discontinu/i.test(chosen)) {
+            for (const d of des) if (/reason/i.test(d.displayName) && /^(TEXT|LONG_TEXT)$/.test(d.valueType) && !d.optionSet && !dataValues.some((x) => x.dataElement === d.id)) dataValues.push({ dataElement: d.id, value: 'Fictional reason (test record).' });
+          }
+          events.push({ event: generateDhis2Uid(), program: prog.id, programStage: st.id, orgUnit: evFac, status: 'COMPLETED', occurredAt: day, ...(point && rnd() < 0.5 ? { geometry: { type: 'Point', coordinates: [point[0], point[1]] } } : {}), dataValues });
+        }
+      }
+      // Appointments: a missed one (past due) or a future one on a repeatable stage.
+      const repeatStage = stages.find((s) => s.repeatable && s !== stages[0]);
+      if (repeatStage && !completed) {
+        if (rnd() < missedShare) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, -(3 + Math.floor(rnd() * 20))) });
+        else if (rnd() < 0.5) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, 5 + Math.floor(rnd() * 25)) });
+      }
+      enrollments.push({ enrollment: generateDhis2Uid(), program: prog.id, orgUnit: encFac.id, status: completed ? 'COMPLETED' : 'ACTIVE', enrolledAt, occurredAt: enrolledAt, events });
+      cursor = tdAddDays(day > enrolledAt ? day : enrolledAt, 10 + Math.floor(rnd() * 40));
+    }
+    tes.push({ trackedEntity: generateDhis2Uid(), trackedEntityType: tetId, orgUnit: fac.id, attributes, enrollments, ...(point && teas.length === 0 ? {} : {}) });
+  }
+
+  let created = { trackedEntities: 0, enrollments: 0, events: 0 };
+  const rejected = {};
+  const createdTes = [];
+  // Validate each batch first and repair what the program's rules reject: a
+  // calculated field gets the server's value, a required field gets a value, a
+  // visit a rule still refuses is cut to its required fields and finally left
+  // out. Every repair is counted.
+  const deMeta = new Map();
+  for (const st of stages) for (const p of (st.programStageDataElements || [])) deMeta.set(p.dataElement.id, { ...p.dataElement, compulsory: !!p.compulsory });
+  const repairs = { calculated_value_used: 0, required_value_added: 0, visits_simplified: 0, visits_left_out: 0, people_left_out: 0 };
+  const simplified = new Set();
+  const eventsOf = (batch) => { const m = new Map(); for (const t of batch) for (const e of t.enrollments) for (const ev of e.events) m.set(ev.event, { ev, enr: e, te: t }); return m; };
+  async function repairBatch(batch) {
+    for (let pass = 0; pass < 4; pass++) {
+      const v = await safeDhis2Fetch('tracker?async=false&importStrategy=CREATE&atomicMode=OBJECT&importMode=VALIDATE', { method: 'POST', body: { trackedEntities: batch } });
+      const errs = (v && (v._body || v))?.validationReport?.errorReports || [];
+      if (!errs.length) return batch;
+      const evMap = eventsOf(batch);
+      const dropEvents = new Set(); const dropTes = new Set();
+      for (const e of errs) {
+        const hit = evMap.get(e.uid);
+        if (e.errorCode === 'E1307' && hit && Array.isArray(e.args) && e.args.length >= 3) {
+          const dv = hit.ev.dataValues.find((x) => x.dataElement === e.args[1]);
+          if (dv) dv.value = String(e.args[2]); else hit.ev.dataValues.push({ dataElement: e.args[1], value: String(e.args[2]) });
+          repairs.calculated_value_used++;
+        } else if (e.errorCode === 'E1301' && hit && Array.isArray(e.args) && e.args.length >= 2 && deMeta.get(e.args[1])) {
+          const meta = deMeta.get(e.args[1]);
+          const val = tdFillDates(rnd, [meta], hit.ev.occurredAt || today, today)[meta.id] || tdValue(rnd, meta, { prefix, today, seq: 0, facility: hit.ev.orgUnit, otherFacility: hit.ev.orgUnit, point: null }) || (meta.optionSet ? null : 'Test value');
+          if (val != null && !hit.ev.dataValues.some((x) => x.dataElement === meta.id)) { hit.ev.dataValues.push({ dataElement: meta.id, value: val }); repairs.required_value_added++; }
+          else dropEvents.add(hit.ev.event);
+        } else if (hit) {
+          if (simplified.has(hit.ev.event)) dropEvents.add(hit.ev.event);
+          else {
+            simplified.add(hit.ev.event);
+            const des = [...deMeta.values()].filter((d) => hit.ev.dataValues.some((x) => x.dataElement === d.id));
+            const keep = hit.ev.dataValues.filter((x) => { const d = deMeta.get(x.dataElement); return d && (d.compulsory || required.has(d.id)); });
+            const dates = tdFillDates(rnd, des, hit.ev.occurredAt || today, today);
+            for (const x of keep) if (dates[x.dataElement]) x.value = dates[x.dataElement];
+            hit.ev.dataValues = keep;
+            repairs.visits_simplified++;
+          }
+        } else if (e.trackerType === 'TRACKED_ENTITY' || e.trackerType === 'ENROLLMENT') {
+          dropTes.add(e.uid);
+        }
+      }
+      for (const t of batch) for (const en of t.enrollments) {
+        const before = en.events.length;
+        en.events = en.events.filter((ev) => !dropEvents.has(ev.event));
+        repairs.visits_left_out += before - en.events.length;
+      }
+      const keepTes = batch.filter((t) => !dropTes.has(t.trackedEntity) && !t.enrollments.some((en) => dropTes.has(en.enrollment)));
+      repairs.people_left_out += batch.length - keepTes.length;
+      batch = keepTes;
+      if (!batch.length) return batch;
+    }
+    return batch;
+  }
+  if (args.dry_run) {
+    let people = 0; let eps = 0; let visits = 0;
+    for (let b = 0; b < tes.length; b += 25) {
+      const batch = await repairBatch(tes.slice(b, b + 25));
+      people += batch.length; eps += batch.reduce((n, t) => n + t.enrollments.length, 0); visits += batch.reduce((n, t) => n + t.enrollments.reduce((x, e) => x + e.events.length, 0), 0);
+    }
+    return { success: true, mode: 'VALIDATE — nothing was saved', would_create: { people, episodes: eps, visits }, rule_repairs: repairs };
+  }
+  for (let b = 0; b < tes.length; b += 25) {
+    const batch = await repairBatch(tes.slice(b, b + 25));
+    if (!batch.length) continue;
+    const r = await safeDhis2Fetch('tracker?async=false&importStrategy=CREATE&atomicMode=OBJECT', { method: 'POST', body: { trackedEntities: batch } });
+    const body = r && r._body ? r._body : r;
+    const g = tdGroupErrors(body);
+    for (const [k, v] of Object.entries(g.by_reason)) rejected[k] = (rejected[k] || 0) + v;
+    const typeMap = body?.bundleReport?.typeReportMap || {};
+    created.trackedEntities += Number(typeMap.TRACKED_ENTITY?.stats?.created || 0);
+    created.enrollments += Number(typeMap.ENROLLMENT?.stats?.created || 0);
+    created.events += Number(typeMap.EVENT?.stats?.created || 0);
+    for (const t of batch) if (!g.uids.has(t.trackedEntity)) createdTes.push(t.trackedEntity);
+    if (r && r._error && !Object.keys(typeMap).length && !g.count) return { _error: `Import failed: ${r._error}`, created_before_failure: created };
+  }
+  const runs = [...(manifest?.runs || []), { at: new Date().toISOString(), seed, people, episodes, trackedEntities: createdTes }];
+  const firstUnique = teas.find((a) => a.unique);
+  await safeDhis2Fetch(manifestPath, { method: manifest ? 'PUT' : 'POST', body: { program: pid, runs, uniqueSample: firstUnique ? uniqueValues[firstUnique.id][0] : null } });
+  const baseline = await tdSummary(prog);
+  return {
+    success: true,
+    program: prog.displayName,
+    created,
+    rule_repairs: repairs,
+    _rules_note: 'The import ran the program\'s rules: calculated fields took the server\'s value, rule-required fields were filled, and visits a rule still refused were simplified or left out (counts in rule_repairs).',
+    ...(Object.keys(rejected).length ? { rejected_by_dhis2: rejected, _rejected_note: 'DHIS2 refused these objects (the import runs the program\'s rules); the rest were saved. Say so; do not hide it.' } : {}),
+    facilities: facilities.map((o) => o.displayName),
+    names_start_with: prefix,
+    seed,
+    baseline: baseline._error ? undefined : baseline,
+    ...(notes.length ? { _notes: notes } : {}),
+    _next: 'These are live records: analytics (dashboards, maps, line lists) show them after the next analytics run. Use action:"summary" for the baseline totals, action:"test_invalid" to show what DHIS2 rejects (nothing saved), action:"delete" to remove only these records.',
+  };
+}

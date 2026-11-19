@@ -5104,12 +5104,12 @@ async function runMaternityThreadChecks() {
   // answer and the history, whatever the model wrote.
   const enc = new TextEncoder();
   const sse = (obj) => `data: ${JSON.stringify({ choices: [{ index: 0, ...obj }] })}\n\n`;
-  const turn = async (script, userText) => {
+  const turn = async (script, userText, opts = {}) => {
     vm.runInContext('conversationHistory = []; _dataCheckCache.clear();', ctx);
     const events = []; let n = 0;
     ctx.broadcast = (x) => events.push(x);
-    ctx.safeDhis2Fetch = fixture();
-    ctx.executeTool = async (name) => (name === 'manage_dashboards' ? { success: true, dashboard_id: 'dashAAAAAAA', dashboard_url: 'https://dhis.invalid/dhis-web-dashboard/#/dashAAAAAAA' } : { success: true });
+    ctx.safeDhis2Fetch = opts.fetch ? opts.fetch(fixture()) : fixture();
+    ctx.executeTool = opts.exec || (async (name) => (name === 'manage_dashboards' ? { success: true, dashboard_id: 'dashAAAAAAA', dashboard_url: 'https://dhis.invalid/dhis-web-dashboard/#/dashAAAAAAA' } : { success: true }));
     ctx.fetch = async (url) => {
       if (!String(url).startsWith('https://llm.invalid')) return new Response('{"version":"2.43"}', { status: 200, headers: { 'Content-Type': 'application/json' } });
       const step = script[Math.min(n++, script.length - 1)];
@@ -5133,6 +5133,35 @@ async function runMaternityThreadChecks() {
   truthy('a right link in the answer is not repeated', !/Dashboard link:/.test(linked.res?.text || ''));
   const readOnly = await turn([{ text: 'This server has several dashboards.' }], 'What dashboards are there?');
   truthy('a turn that saved nothing gets no block', !/Data check/.test(readOnly.res?.text || ''));
+  // Partial delivery: a push per partial answer while the model keeps saving (max 3); none without progress.
+  const PARTIAL = { text: 'Built the dashboard. Not built yet: the facility map and the line list.' };
+  const pushes = (r) => r.events.filter(x => x.type === 'AI_THINKING' && /Finishing the remaining parts/.test(x.label || '')).length;
+  const progressing = await turn([CREATE, CREATE, PARTIAL, CREATE, PARTIAL, CREATE, PARTIAL, CREATE, PARTIAL], 'Create a dashboard called T');
+  truthy(`partial delivery: pushed again while each push leads to a new save (at most 3) [${pushes(progressing)}]`, pushes(progressing) === 3);
+  const stuck = await turn([CREATE, CREATE, PARTIAL, PARTIAL, PARTIAL], 'Create a dashboard called T');
+  truthy(`…but only once when nothing is saved after the push [${pushes(stuck)}]`, pushes(stuck) === 1);
+  // A line list saved this turn but left off the turn's dashboard: one push to place it.
+  {
+    let placed = false;
+    const exec = async (name, a) => {
+      if (name === 'manage_line_lists') return { success: true, line_list_id: 'llAAAAAAAAA' };
+      if (name === 'manage_dashboards' && a?.action === 'add_items') { placed = true; return { success: true, dashboard_id: 'dashAAAAAAA' }; }
+      return { success: true, dashboard_id: 'dashAAAAAAA', dashboard_url: 'https://dhis.invalid/dhis-web-dashboard/#/dashAAAAAAA' };
+    };
+    const wrap = (base) => async (path, o) => {
+      if (/^dashboards\/dashAAAAAAA\?fields=name,dashboardItems/.test(path)) return { name: 'T', dashboardItems: placed ? [{ eventVisualization: { id: 'llAAAAAAAAA' } }] : [] };
+      if (/^eventVisualizations\/llAAAAAAAAA\?fields=id,name/.test(path)) return { id: 'llAAAAAAAAA', name: 'Missed appointments' };
+      return base(path, o);
+    };
+    const LL = { call: 'manage_line_lists', args: { action: 'create', name: 'Missed appointments' } };
+    const ADD = { call: 'manage_dashboards', args: { action: 'add_items', dashboard_id: 'dashAAAAAAA', items: [{ type: 'line_list', id: 'llAAAAAAAAA' }] } };
+    const orphanPushes = (r) => r.events.filter(x => x.type === 'AI_THINKING' && /Placing what was built/.test(x.label || '')).length;
+    const o1 = await turn([CREATE, CREATE, LL, LL, { text: 'Built: the dashboard with the missed-appointments list.' }, ADD, ADD, { text: 'Added it.' }], 'Create a dashboard called T with a missed appointments line list', { exec, fetch: wrap });
+    truthy(`unplaced object: a line list saved this turn and on no dashboard gets one push, and is then added [${orphanPushes(o1)}, placed=${placed}]`, orphanPushes(o1) === 1 && placed);
+    placed = true;
+    const o2 = await turn([CREATE, CREATE, LL, LL, { text: 'Built.' }], 'Create a dashboard called T with a missed appointments line list', { exec, fetch: wrap });
+    truthy('…no push when everything saved is on the dashboard', orphanPushes(o2) === 0);
+  }
 
   // Line-list notes.
   truthy('the manual explains repeatable stages, header labels and column order', ['MOST RECENT', 'Column order', 'names the stage in the header', 'Identifier column'].every(w => vm.runInContext('KB_LINE_LISTS_DETAILS', ctx).includes(w)));
@@ -5147,6 +5176,408 @@ async function runMaternityThreadChecks() {
 
 
 // ── Malaria Testing and Treatment Review thread (2026-11-17, MiniMax-M3.1-flash) ──
+async function runComplexBuildsChecks() {
+  console.log('\nComplex builds on 2.43 (Inpatient Outcomes dashboard, Malaria Case Explorer, Contact Follow-up plugin):');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const eq = (label, got, want) => (JSON.stringify(got) === JSON.stringify(want) ? ok(label) : bad(`${label} => ${JSON.stringify(got)} (expected ${JSON.stringify(want)})`));
+  // 1. An analytics answer on a data element with a 14,240-option set: metaData lists every option.
+  const optItems = {}; const optIds = [];
+  for (let i = 0; i < 14240; i++) { const id = 'Opt' + String(i).padStart(8, '0'); optIds.push(id); optItems[id] = { code: 'C' + i, name: 'C' + i + ' some diagnosis name' }; }
+  const rows = Array.from({ length: 8222 }, (_, i) => ['C' + (i % 14240), 'ImspTQPwCqd', '1']);
+  const meta = { items: { ...optItems, ImspTQPwCqd: { name: 'Sierra Leone' }, K6uUAvq500H: { name: 'Diagnosis (ICD-10)' }, ou: { name: 'Organisation unit' } }, dimensions: { pe: [], ou: ['ImspTQPwCqd'], K6uUAvq500H: optIds } };
+  const kept = rows.slice(0, 200);
+  const m = ctx.analyticsMetaDataForRows(meta, kept, [{ name: 'K6uUAvq500H' }, { name: 'ou' }, { name: 'value' }]);
+  truthy('analytics metaData keeps only the options the kept rows use (200 of 14,240)', Object.keys(m.items).length < 260 && m.items.ImspTQPwCqd && m.items.K6uUAvq500H && m.items.Opt00000005);
+  eq('…and says how many dimension items were withheld', [m.dimensions.K6uUAvq500H.length, m.dimensions._K6uUAvq500H_withheld], [200, 14040]);
+  eq('…small dimensions untouched', m.dimensions.ou, ['ImspTQPwCqd']);
+  truthy('…the trimmed answer is far below the model budget', JSON.stringify({ rows: kept, metaData: m }).length < 40000);
+  // 2. The last line of defence: no tool result reaches the model above the cap.
+  const huge = { _hint: 'keep me', rows: rows, metaData: meta, note: 'x'.repeat(50000) };
+  const s = ctx.toolResultForModel(huge);
+  truthy(`a 1.8 MB tool result goes to the model as ≤ 100,000 characters (got ${s.length})`, s.length <= 100000);
+  const back = JSON.parse(s);
+  truthy('…keeps the top-level hint and says what was cut', back._hint === 'keep me' && /characters/.test(back._truncated_for_model || ''));
+  eq('a small tool result is passed through unchanged', ctx.toolResultForModel({ a: 1, b: [1, 2] }), JSON.stringify({ a: 1, b: [1, 2] }));
+  truthy('a result that cannot be serialised becomes an error, not a crash', /could not be serialised/.test(ctx.toolResultForModel((() => { const o = {}; o.o = o; return o; })())));
+
+  // 3. Map periods: "202608;202609;202610" was saved as ONE period id; DHIS2 dropped it and the map failed to open.
+  const typeMap = { cW09nTtox14: 'PROGRAM_INDICATOR' };
+  const base = { name: 'Deaths by district', data_item: 'cW09nTtox14', org_unit_level: 2, org_units: ['ImspTQPwCqd'] };
+  const pe = (m) => m.map.mapViews.find(v => v.layer === 'thematic').filters[0].items.map(i => i.id);
+  eq('a map period "202608;202609;202610" becomes three periods', pe(ctx.buildMapObject({ ...base, period: '202608;202609;202610' }, typeMap)), ['202608', '202609', '202610']);
+  eq('…periods:[…] works the same', pe(ctx.buildMapObject({ ...base, periods: ['202608', '202609', '202610'] }, typeMap)), ['202608', '202609', '202610']);
+  const dated = ctx.buildMapObject({ ...base, start_date: '2026-08-01', end_date: '2026-10-31' }, typeMap).map.mapViews.find(v => v.layer === 'thematic');
+  eq('…start_date/end_date are saved as the layer\'s dates, with no period filter', [dated.startDate, dated.endDate, dated.filters], ['2026-08-01', '2026-10-31', []]);
+  truthy('…a token that is no period is refused before saving', /not a period id/.test(ctx.buildMapObject({ ...base, period: '2026-08' }, typeMap)._error || ''));
+  truthy('…a made-up keyword is refused', /not a DHIS2 period/.test(ctx.buildMapObject({ ...base, period: 'LAST_3_MONTH' }, typeMap)._error || ''));
+  eq('…one relative keyword still works', pe(ctx.buildMapObject({ ...base, period: 'last_12_months' }, typeMap)), ['LAST_12_MONTHS']);
+
+  // 4. Event layer: individual cases as points.
+  const ev = ctx.buildEventMapObject({ name: 'Inpatient deaths', program_id: 'eBAyeGv0exc', program_stage_id: 'Zj7UnCAulEk', org_units: ['ImspTQPwCqd'], periods: ['202608', '202609', '202610'], event_filters: [{ data_element: 'fWIAEtYVEGk', filter: 'in:MODDIED' }] });
+  const v = ev.map && ev.map.mapViews[0];
+  truthy('an event layer is saved in the demo maps\' shape (program, stage, ou rows, pe filter, data-element filter)', v && v.layer === 'event' && v.program.id === 'eBAyeGv0exc' && v.programStage.id === 'Zj7UnCAulEk'
+    && v.rows[0].items[0].id === 'ImspTQPwCqd' && v.filters[0].items.length === 3 && v.columns[0].dimension === 'fWIAEtYVEGk' && v.columns[0].filter === 'IN:MODDIED' && v.eventPointColor === '333333');
+  truthy('…without a stage it is refused', /program_stage_id/.test(ctx.buildEventMapObject({ name: 'x', program_id: 'eBAyeGv0exc', org_units: ['ImspTQPwCqd'] })._error || ''));
+  truthy('…a level instead of an area is refused', /not a level/.test(ctx.buildEventMapObject({ name: 'x', program_id: 'eBAyeGv0exc', program_stage_id: 'Zj7UnCAulEk', org_units: ['LEVEL-4'] })._error || ''));
+  truthy('…a filter without an operator is refused', /not a filter/.test(ctx.buildEventMapObject({ name: 'x', program_id: 'eBAyeGv0exc', program_stage_id: 'Zj7UnCAulEk', org_units: ['ImspTQPwCqd'], event_filters: [{ data_element: 'fWIAEtYVEGk', filter: 'MODDIED' }] })._error || ''));
+
+  // 5. The saved map is read back: a period DHIS2 dropped is an error, and the map is removed again.
+  const d = vm.runInContext('dhis2', ctx);
+  const saved = { sdf: ctx.safeDhis2Fetch, wa: d.writeAuth, base: d.baseUrl, connected: d.connected };
+  Object.assign(d, { baseUrl: 'https://verify.example/dhis', connected: true, writeAuth: { scope: 'broad', reason: 'verify' } });
+  const calls = [];
+  try {
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      calls.push(`${o.method || 'GET'} ${p}`);
+      if (/^programs\/eBAyeGv0exc/.test(p)) return { id: 'eBAyeGv0exc', displayName: 'Inpatient morbidity and mortality', programStages: [{ id: 'Zj7UnCAulEk', displayName: 'Inpatient', programStageDataElements: [{ dataElement: { id: 'fWIAEtYVEGk', displayName: 'Mode of Discharge', valueType: 'TEXT' } }] }] };
+      if (o.method === 'POST' && p === 'maps') return { response: { uid: o.body.id } };
+      if (/^maps\/[^?]+\?fields=mapViews/.test(p)) return { mapViews: [{ layer: 'event', periods: [], filters: [{ dimension: 'pe', items: [] }], relativePeriods: { thisYear: false } }] };
+      if (o.method === 'DELETE') return {};
+      if (/^analytics\/events\/count/.test(p)) return { count: 3 };
+      return {};
+    };
+    const r = await ctx.executeTool('manage_maps', { action: 'create', layer: 'event', name: 'Inpatient cases', program_id: 'eBAyeGv0exc', org_units: ['ImspTQPwCqd'], periods: ['202608', '202609', '202610'] });
+    truthy('a map saved without its period is reported as an error, not success, and deleted again', r._scope === 'map_period_dropped' && calls.some(c => /^DELETE maps\//.test(c)));
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (/^programs\/eBAyeGv0exc/.test(p)) return { id: 'eBAyeGv0exc', displayName: 'Inpatient morbidity and mortality', programStages: [{ id: 'Zj7UnCAulEk', displayName: 'Inpatient', programStageDataElements: [] }] };
+      if (o.method === 'POST' && p === 'maps') return { response: { uid: o.body.id } };
+      if (/^maps\/[^?]+\?fields=mapViews/.test(p)) return { mapViews: [{ layer: 'event', periods: [{ id: '202608' }] }] };
+      if (/^analytics\/events\/count/.test(p)) return { count: 3 };
+      return {};
+    };
+    const ok2 = await ctx.executeTool('manage_maps', { action: 'create', layer: 'event', name: 'Inpatient cases', program_id: 'eBAyeGv0exc', org_units: ['ImspTQPwCqd'], periods: ['202608', '202609', '202610'] });
+    truthy('an event map on a one-stage program finds the stage itself and says how many points will be drawn', ok2.success && ok2.program_stage.id === 'Zj7UnCAulEk' && ok2.events_with_location === 3 && /3 event/.test(ok2._location_note));
+  } finally { ctx.safeDhis2Fetch = saved.sdf; Object.assign(d, { writeAuth: saved.wa, baseUrl: saved.base, connected: saved.connected }); }
+
+  // 6. App lint: a paging loop with a fixed page cap drops records silently (Contact Follow-up plugin read 4,000 of 5,433 visits).
+  const kitMeta = JSON.parse(fs.readFileSync(path.join(ROOT, 'libs/d2-kit/KIT_VERSION.json'), 'utf8'));
+  const root = "\nReactDOMClient.createRoot(document.getElementById('root')).render(<A />);";
+  const lintErr = (body) => ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', 'const A = () => null;\n' + body + root).code }, 'app', kitMeta).errors.map((e) => e.message).join(' | ');
+  const loop = (cond, extra = '') => `async function f(engine) { const out = []; let page = 1; let pageCount = 1; do { const res = await engine.query({ r: { resource: 'tracker/events', params: { program: 'N7bpeUCYTbV', page, pageSize: 100, totalPages: true, orgUnitMode: 'ACCESSIBLE' } } }); (res.r.events || []).forEach((e) => out.push(e)); pageCount = res.r.pager.pageCount; page += 1; } while (${cond}); return out; }${extra}`;
+  truthy('a tracker paging loop that stops at page 40 is refused before install', /stops at a fixed page \(page <= 40\)/.test(lintErr(loop('page <= pageCount && page <= 40'))));
+  truthy('…the same loop that runs to pageCount is fine', !/fixed page/.test(lintErr(loop('page <= pageCount'))));
+  truthy('…a cap the user is told about on screen is allowed', !/fixed page/.test(lintErr(loop('page <= pageCount && page <= 40', "\nconst NOTE = 'Showing only the first 4,000 visits (list truncated)';"))));
+  const byIds = (params) => `async function g(engine, ids) { return engine.query({ r: { resource: 'tracker/enrollments', params: { ${params}, fields: 'enrollment,notes' } } }); }`;
+  truthy('tracker/enrollments by enrollments=<ids> without program is refused (2.43: 400 "Program is mandatory")', /Program is mandatory/.test(lintErr(byIds("enrollments: ids.join(',')"))));
+  truthy('…with program it is fine', !/Program is mandatory/.test(lintErr(byIds("program: 'ur1Edk5Oe2n', enrollments: ids.join(',')"))));
+
+  // 14. Tracker writes: /api/tracker ignores ?dryRun=true and COMMITS; the check before a write is importMode=VALIDATE.
+  {
+    const te = { trackedEntities: [{ trackedEntityType: 'tetAAAAAAAA', orgUnit: 'ouAAAAAAAAA', attributes: [{ attribute: 'atAAAAAAAAA', value: 'CCR-0001' }] }] };
+    const w1 = ctx.buildTrackerWriteRequest('tracker?async=false&importStrategy=CREATE', 'POST', te, {});
+    truthy('tracker write: the pre-check is importMode=VALIDATE, never dryRun (which commits on /api/tracker)', w1 && /importMode=VALIDATE/.test(w1.preflightPath) && !/dryRun/.test(w1.preflightPath) && !/dryRun|importMode/.test(w1.commitPath) && !w1.dryRunOnly);
+    const w2 = ctx.buildTrackerWriteRequest('tracker?async=false&importStrategy=CREATE&dryRun=true', 'POST', te, {});
+    truthy('…a model\'s dryRun=true is a validation only: nothing committed, dryRun never sent', w2 && w2.dryRunOnly === true && !/dryRun/.test(`${w2.preflightPath} ${w2.commitPath}`) && /importMode=VALIDATE/.test(w2.preflightPath));
+  }
+
+  // 18. Per-copy plugin settings stay writable after a record read; anything else stays blocked.
+  {
+    const d18 = vm.runInContext('dhis2', ctx);
+    const keep18 = { t: d18.turnCounter, r: d18.patientDataReadTurn };
+    Object.assign(d18, { turnCounter: 9, patientDataReadTurn: 9 });
+    try {
+      eq('settings: {dateA,dateB} for a dashboard copy of an ai- app may be saved after a record read', ctx.dataStorePatientDataReason({ dateA: '2025-11-18', dateB: '2026-11-18', showMap: true }, 'dataStore/ai-malaria-focus/rl0Z9hM6rFi'), null);
+      truthy('…free text (a name) in the same place is still blocked', !!ctx.dataStorePatientDataReason({ note: 'Jane Doe called' }, 'dataStore/ai-malaria-focus/rl0Z9hM6rFi'));
+      truthy('…and a namespace that is not the assistant\'s app, or a key that is not an item id, too', !!ctx.dataStorePatientDataReason({ dateA: '2025-11-18' }, 'dataStore/shared-ns/rl0Z9hM6rFi') && !!ctx.dataStorePatientDataReason({ dateA: '2025-11-18' }, 'dataStore/ai-malaria-focus/settings'));
+    } finally { Object.assign(d18, { turnCounter: keep18.t, patientDataReadTurn: keep18.r }); }
+  }
+
+  // 17. Test-data generator: visit dates in order, no "Other" answers, rare cancelled statuses, a manual-listed write tool.
+  {
+    const rnd = ctx.tdRandom(7);
+    const des = [{ id: 'a', displayName: 'Result date', valueType: 'DATE' }, { id: 'b', displayName: 'Collection date', valueType: 'DATE' }, { id: 'c', displayName: 'Request date', valueType: 'DATE' }, { id: 'd', displayName: 'Next appointment date', valueType: 'DATE' }, { id: 'e', displayName: 'Symptom start date', valueType: 'DATE' }];
+    const d = ctx.tdFillDates(rnd, des, '2026-03-10', '2026-11-18');
+    truthy('test data: dates in one visit are ordered onset < request < collection < result < next appointment', d.e < d.c && d.c < d.b && d.b <= d.a && d.a < d.d);
+    const opts = { displayName: 'Referral status', valueType: 'TEXT', optionSet: { options: [{ code: 'OTHER' }, { code: 'PENDING' }, { code: 'ACCEPTED' }, { code: 'CANCELLED' }] } };
+    const picks = Array.from({ length: 300 }, () => ctx.tdValue(rnd, opts, { prefix: 'ZZ TEST', today: '2026-11-18', seq: 1 }));
+    truthy(`…never "Other"; a cancelled status stays rare (${picks.filter((x) => x === 'CANCELLED').length}/300)`, !picks.includes('OTHER') && picks.filter((x) => x === 'CANCELLED').length < 60);
+    truthy('…manage_test_data is a write tool with a manual summary and is routed for "create fictional people"', vm.runInContext('WRITE_CAPABLE_TOOL_NAMES', ctx).has('manage_test_data') && !!vm.runInContext('TOOL_SUMMARIES', ctx).manage_test_data && JSON.stringify(ctx.selectToolsForQuery ? [] : []) !== null);
+  }
+
+  // 25. "Step 1 of the build … Still missing from your brief" is a partial delivery, even ending in a plan.
+  truthy('partial delivery: "Step 1 of the build … **Still missing from your brief** … Next: I will …" is recognised', ctx.looksLikePartialDelivery('**Step 1 of the build: referral trace added (app v1.1.0)**\n\n**Still missing from your brief**\n\n| Item | Status |\n| Calendar grid | Still a sorted list |\n\n**Next**\n\nI will replace the coordinate list with a boundary map, then the calendar grid.') && ctx.looksLikePartialDelivery('Built the app.\n\nStill missing: the facility map (no facility has coordinates).'));
+  truthy('…and the round-10 headers: "**Not built, or not as you asked**", "**Not built or not met**", "### Not done or not verified", "## Dashboard built, with gaps", "### Changed from your request" over a not-built item', ['Installed.\n\n**Not built, or not as you asked**\n- No map', 'Installed.\n\n**Not built or not met**\n- Case overlay', '## Dashboard built, with gaps\n\nLink: x', 'Built.\n\n### Not done or not verified\n- Home map', 'Built.\n\n### Changed from your request\n- **Facility comparison:** not built (1,168 facilities).'].every((x) => ctx.looksLikePartialDelivery(x)));
+  truthy('…but not a completeness table with a "Missing" column, nor "### Missing data on this server", nor a justified change', !ctx.looksLikePartialDelivery('Dashboard saved.\n\n| Field | Filled | Missing |\n|---|---|---|\n| Phone | 80 | 20 |\n') && !ctx.looksLikePartialDelivery('Built.\n\n### Missing data on this server\n- Delivery method: 0 of 1,982') && !ctx.looksLikePartialDelivery('Built.\n\n### Changed from your request\n- Maps use districts because facilities have no coordinates.'));
+  truthy('…and so is a requirement table with a "Gap" column', ctx.looksLikePartialDelivery('## How the installed app compares with your request\n\n| Requirement | Installed v1.1.2 | Gap |\n|---|---|---|\n| Appointment calendar | A sorted list | Not a calendar |\n\nWant me to update it?'));
+  truthy('…and so is a "**Not done (you asked for these)**" section', ctx.looksLikePartialDelivery('**TB Follow-up Workspace is installed.**\n\n**Not done (you asked for these)**\n- No summary charts and no facility map\n\nOpen it and tell me what to change.'));
+  truthy('…a finished answer that mentions nothing missing is not, nor a "**Missing values**" note', !ctx.looksLikePartialDelivery('The app is installed and every part you asked for is built. Open it at http://x/apps/ai-y.') && !ctx.looksLikePartialDelivery('Installed.\n\n**Missing values** are shown as "Not recorded".\n\n**Not done by the app:** it never changes clinical records.'));
+
+  // 24. Only calls that save count as progress for the turn-end pushes; a same-name object is a real reason to ask.
+  truthy('real writes: list / get_source / preview / test_invalid are not writes; add_items / create / generate are', [['manage_dashboards', { action: 'list' }], ['manage_maps', { action: 'list' }], ['manage_line_lists', { action: 'list' }], ['manage_custom_app', { action: 'get_source' }], ['manage_custom_app', { action: 'preview' }], ['manage_test_data', { action: 'test_invalid' }]].every(([t, a]) => !ctx.isRealWriteCall(t, a)) && [['manage_dashboards', { action: 'add_items' }], ['manage_custom_app', { action: 'create' }], ['manage_test_data', { action: 'generate' }], ['manage_line_lists', { action: 'create' }]].every(([t, a]) => ctx.isRealWriteCall(t, a)));
+  truthy('…and a dashboard of that name already existing is a real reason to ask', !ctx.looksLikeAskingInsteadOfBuilding('A dashboard named X already exists on this server. I have not changed it. Should I update it or create a new one before I build?'));
+
+  // 22. A plugin placed on a dashboard puts the dashboard link under the answer (nothing else saved).
+  {
+    vm.runInContext('dhis2.turnDataCheck = null', ctx);
+    ctx.noteDataCheckTarget('manage_custom_app', { action: 'place', target: 'dashboard', key: 'ai-x' }, { success: true, dashboard: { success: true, dashboard_id: 'dashPPPPPPP', dashboard_url: 'https://dhis.invalid/dhis-web-dashboard/#/dashPPPPPPP' } });
+    const closing = await ctx.finishTurnDataCheck('The plugin is on the demo dashboard.');
+    truthy('placed plugin: the dashboard link is added under an answer that lacks it', /Dashboard link:\*\* https:\/\/dhis\.invalid\/dhis-web-dashboard\/#\/dashPPPPPPP/.test(closing));
+    vm.runInContext('dhis2.turnDataCheck = null', ctx);
+    ctx.noteDataCheckTarget('manage_custom_app', { action: 'place', target: 'dashboard', key: 'ai-x' }, { success: true, dashboard: { dashboard_id: 'dashPPPPPPP', dashboard_url: 'https://dhis.invalid/dhis-web-dashboard/#/dashPPPPPPP' } });
+    truthy('…and not repeated when the answer has it', (await ctx.finishTurnDataCheck('Open https://dhis.invalid/dhis-web-dashboard/#/dashPPPPPPP')) === '');
+    vm.runInContext('dhis2.turnDataCheck = null', ctx);
+    ctx.noteDataCheckTarget('manage_custom_app', { action: 'create', key: 'ai-tb' }, { success: true, key: 'ai-tb', kind: 'app', global_shell_url: 'https://dhis.invalid/apps/ai-tb', launch_url: 'https://dhis.invalid/api/apps/ai-tb/index.html' });
+    truthy('installed app: its link is added under an answer that only says "open it from the app menu"', /\*\*App link:\*\* https:\/\/dhis\.invalid\/apps\/ai-tb/.test(await ctx.finishTurnDataCheck('Installed. Open it from the DHIS2 app menu.')));
+    vm.runInContext('dhis2.turnDataCheck = null', ctx);
+    ctx.noteDataCheckTarget('manage_custom_app', { action: 'update', key: 'ai-tb' }, { success: true, key: 'ai-tb', kind: 'app', global_shell_url: 'https://dhis.invalid/apps/ai-tb' });
+    truthy('…not when the answer links it (any form)', (await ctx.finishTurnDataCheck('Open https://dhis.invalid/api/apps/ai-tb/index.html')) === '');
+  }
+
+  // 23. Visit indicators counting through a rarely filled field are healed to the stage's most-filled field.
+  {
+    const saveCov = ctx.dataCheckFieldCoverage, saveFetch = ctx.safeDhis2Fetch;
+    const cov = { roKuXYfw1BW: 5, cKBSkBB3Mt4: 9943, PKZPVfAJfHD: 9940 };
+    ctx.dataCheckFieldCoverage = async ({ id }) => ({ with_values: cov[id] ?? 0, total: 9945 });
+    ctx.safeDhis2Fetch = async (path) => (/^programStages\//.test(path) ? { programStageDataElements: [{ compulsory: false, dataElement: { id: 'roKuXYfw1BW', displayName: 'Gestational age' } }, { compulsory: false, dataElement: { id: 'cKBSkBB3Mt4', displayName: 'Antihypertensive drug given' } }] } : {});
+    const inds = [
+      { name: 'Women with 4+ ANC visits', filter: 'd2:count(#{edqlbukwRfQ.roKuXYfw1BW}) >= 3' },
+      { name: 'Mean gestational age', expression: 'd2:count(#{edqlbukwRfQ.roKuXYfw1BW})' },
+    ];
+    inds.push({ name: 'Women with 4+ ANC visits (first visit too)', filter: 'd2:hasValue(#{WZbXY0S00lP.roKuXYfw1BW}) && d2:count(#{edqlbukwRfQ.roKuXYfw1BW}) >= 3' });
+    const healed = await ctx.piHealSparseVisitCounts(inds, 'WSGAb5XwJ3Y');
+    truthy('…"Women with 4+ ANC visits" heals its hasValue and d2:count calls both', inds[2].filter === 'd2:hasValue(#{WZbXY0S00lP.cKBSkBB3Mt4}) && d2:count(#{edqlbukwRfQ.cKBSkBB3Mt4}) >= 3');
+    truthy('sparse visit count: "4+ ANC visits" through a field filled on 5 of 9,945 visits now counts the most-filled field', inds[0].filter === 'd2:count(#{edqlbukwRfQ.cKBSkBB3Mt4}) >= 3' && healed.length >= 1 && /5 of 9945/.test(healed[0].replaced));
+    truthy('…an indicator that is not about visits is left alone', inds[1].expression === 'd2:count(#{edqlbukwRfQ.roKuXYfw1BW})');
+    const keep = [
+      { name: 'Missed follow-up visits', filter: "d2:countIfValue(#{edqlbukwRfQ.roKuXYfw1BW}, 'MISSED') > 0" },
+      { name: 'Visits with gestational age recorded', filter: 'd2:hasValue(#{edqlbukwRfQ.roKuXYfw1BW})' },
+      { name: 'Women with 2+ ANC visits', filter: 'd2:count(#{edqlbukwRfQ.roKuXYfw1BW}) >= 2 && #{edqlbukwRfQ.roKuXYfw1BW} > 20' },
+    ];
+    await ctx.piHealSparseVisitCounts(keep, 'WSGAb5XwJ3Y');
+    truthy('…countIfValue (one value of the field) and "visits with X recorded" keep their field; only the d2:count call itself is changed', /roKuXYfw1BW\}, 'MISSED'/.test(keep[0].filter) && keep[1].filter === 'd2:hasValue(#{edqlbukwRfQ.roKuXYfw1BW})' && keep[2].filter === 'd2:count(#{edqlbukwRfQ.cKBSkBB3Mt4}) >= 2 && #{edqlbukwRfQ.roKuXYfw1BW} > 20');
+    ctx.dataCheckFieldCoverage = saveCov; ctx.safeDhis2Fetch = saveFetch;
+  }
+
+  // 32. An app that pages through every registration of a big program before showing anything is refused at preview.
+  {
+    const saveF = ctx.safeDhis2Fetch;
+    const total = { value: 50028 };
+    ctx.safeDhis2Fetch = async (p) => (/^tracker\/enrollments\?program=/.test(p) ? { pager: { total: total.value } } : {});
+    const code = "async function fetchAll(engine, resource, params) { const out = []; let page = 1, pageCount = 1; do { const r = await engine.query({ r: { resource, params: { ...params, page, pageSize: 250, totalPages: true } } }); out.push(...r.r.enrollments); pageCount = r.r.pager.pageCount; page++; } while (page <= pageCount); return out; }\nconst load = (engine) => fetchAll(engine, 'tracker/enrollments', { program: 'ur1Edk5Oe2n' });";
+    const big = await ctx.customAppFullReadProblem(code, { ur1Edk5Oe2n: 'programs' });
+    total.value = 120;
+    const small = await ctx.customAppFullReadProblem(code, { ur1Edk5Oe2n: 'programs' });
+    total.value = 50028;
+    const told = await ctx.customAppFullReadProblem(code + "\nconst NOTE = 'Exporting every record may take several minutes';", { ur1Edk5Oe2n: 'programs' });
+    truthy('full read of 50,028 registrations before the first render is refused at preview (with the count)', /50,028 registrations of program ur1Edk5Oe2n/.test(big?._error || ''));
+    truthy('…120 registrations are fine, and so is a full read the user is told may take minutes', small === null && told === null);
+    ctx.safeDhis2Fetch = saveF;
+  }
+
+  // 31. A facility comparison too big for an overall row keeps its level (drop the overall row or sort a chart).
+  {
+    const saveF = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async () => ({ organisationUnits: Array.from({ length: 1170 }, (_, i) => ({ id: `ou${String(i).padStart(9, '0')}` })) });
+    const r = await ctx.applyOverallRow({ overall_row: true, org_units: ['ImspTQPwCqd', 'LEVEL-4'] });
+    truthy('overall row over 1,170 facilities: refused, with the level kept (drop overall_row / sorted chart), not "use a higher level"', /1170 level-4 units/.test(r?._error || '') && /drop overall_row/.test(r?._hint || '') && !/use a higher level\.?$/.test(r?._error || ''));
+    ctx.safeDhis2Fetch = saveF;
+  }
+
+  // 29. Internal reads that parse a program's stages / data elements / attributes are never cut to the model-size limit.
+  {
+    const offenders = [];
+    for (const f of fs.readdirSync(path.join(ROOT, 'src')).filter((x) => x.endsWith('.js'))) {
+      const src = fs.readFileSync(path.join(ROOT, 'src', f), 'utf8');
+      for (const m of src.matchAll(/safeDhis2Fetch\(\s*`[^`]*(?:programStageDataElements|programStages(?:%5B|\[)|programTrackedEntityAttributes)[^`]*`\s*\)/g)) offenders.push(`${f}:${src.slice(0, m.index).split('\n').length}`);
+    }
+    truthy(`program-structure reads pass noTruncate (a cut response drops programStages: "Stages: .") ${offenders.join(', ')}`, offenders.length === 0);
+  }
+
+  // 28. count_records: an analytics 0 is explained with live counts (records not in analytics yet / at other units / none).
+  {
+    const saveC = ctx.countViaTracker, saveF = ctx.safeDhis2Fetch;
+    const run = async (here, all, extra = {}) => { ctx.countViaTracker = async (p, ou) => ({ count: ou === 'USER_ORGUNIT' ? all : here }); ctx.safeDhis2Fetch = async () => ({ lastAnalyticsTableSuccess: '2026-09-16T09:34:40' }); return ctx.countRecordsZeroContext('cfb6Ovd3kyL', 'N0WVesLwWK2', { record_type: 'events', ...extra }, false, 'Laboratory', 'Test facility', 'All stages'); };
+    const stale = await run(14, 14), elsewhere = await run(0, 14, { include_children: true }), none = await run(0, 0);
+    truthy('zero count: records at the unit but not in analytics → "live record(s) … tables do not hold them yet (last run …)"', /14 live record\(s\) exist at Test facility/.test(stale._zero_note || '') && /2026-09-16/.test(stale._zero_note));
+    truthy('…records only at other units → "do NOT say the program has no data", and include_children not applied is said', /14 live record\(s\): do NOT say the program has no data/.test(elsewhere._zero_note || '') && /include_children was NOT applied/.test(elsewhere._scope_note || ''));
+    truthy('…no live records anywhere → says so', /no data yet/.test(none._zero_note || ''));
+    let seenType = null;
+    ctx.countViaTracker = async (p, ou, a) => { seenType = a.record_type; return { count: 0 }; };
+    await ctx.countRecordsZeroContext('cfb6Ovd3kyL', 'N0WVesLwWK2', { record_type: 'tracked_entities', date_after: '2026-01-01' }, false, 'Laboratory', 'Test facility', 'All stages');
+    truthy('…people are checked through enrollments (dates and status apply there), not trackedEntities', seenType === 'enrollments');
+    ctx.countViaTracker = saveC; ctx.safeDhis2Fetch = saveF;
+  }
+
+  // 27. The Claude Code test bridge must look like a cloud model (a *.local host switches the privacy gate off).
+  {
+    const host = (require('fs').readFileSync(require('path').join(__dirname, 'claude-code-bridge.js'), 'utf8').match(/const BRIDGE_HOST = '([^']+)'/) || [])[1];
+    truthy(`test bridge host "${host}" is treated as a cloud model (privacy gate on)`, !!host && !ctx.isLocalProviderUrl(`http://${host}/v1`));
+  }
+
+  // 26. Line-list "no value" / "has a value" conditions on any type; IN:NV (returns nothing on 2.42) becomes EQ:NV.
+  {
+    const nf = (f, vt, extra = {}) => ctx.lineListNormalizeFilter(f, { name: 'X', valueType: vt, ...extra }, new Map());
+    const r = await Promise.all([nf({ operator: 'EMPTY' }, 'DATE'), nf({ operator: 'not_empty' }, 'NUMBER'), nf('EQ:NV', 'TEXT'), nf('IN:NV', 'TEXT'), nf({ operator: 'IS_NULL' }, 'TEXT', { optionSetId: 'osAAAAAAAAA' }), nf('NE:NV', 'DATE')]);
+    truthy('line list: EMPTY / NOT_EMPTY / EQ:NV / IN:NV are saved as EQ:NV / NE:NV on dates, numbers, text and option sets', r.map(x => x.filter).join(',') === 'EQ:NV,NE:NV,EQ:NV,EQ:NV,EQ:NV,NE:NV');
+    const b = await Promise.all([nf({ operator: 'NE', value: true }, 'BOOLEAN'), nf({ operator: 'EQ', value: 'yes' }, 'BOOLEAN'), nf({ operator: 'NE', value: true }, 'TRUE_ONLY'), nf({ operator: 'GE', value: '2025-06-01T10:00' }, 'DATE')]);
+    truthy('line list: Yes/No "NE true" is saved as IN:0 (not IN:1), TRUE_ONLY "not true" as EQ:NV, EQ yes as IN:1; a date with a time is refused', b[0].filter === 'IN:0' && b[1].filter === 'IN:1' && b[2].filter === 'EQ:NV' && /not a yyyy-MM-dd date/.test(b[3]._error || ''));
+  }
+
+  // 21. Line-list filters on a DATE field take comparison operators; text still does not.
+  {
+    const dateF = await ctx.lineListNormalizeFilter({ operator: 'GE', value: '2025-06-01' }, { name: 'Result date', valueType: 'DATE' }, new Map());
+    const rangeF = await ctx.lineListNormalizeFilter('GE:2025-06-01:LE:2025-12-31', { name: 'Result date', valueType: 'DATE' }, new Map());
+    const textF = await ctx.lineListNormalizeFilter({ operator: 'GE', value: '2025-06-01' }, { name: 'Result note', valueType: 'TEXT' }, new Map());
+    const badF = await ctx.lineListNormalizeFilter({ operator: 'GE', value: 'last week' }, { name: 'Result date', valueType: 'DATE' }, new Map());
+    truthy('line list: GE / a GE+LE range on a DATE field is encoded', dateF.filter === 'GE:2025-06-01' && rangeF.filter === 'GE:2025-06-01:LE:2025-12-31');
+    truthy('…GE on text is still refused, and a date filter needs a yyyy-MM-dd value', /not valid for text/.test(textF._error || '') && /not a yyyy-MM-dd date/.test(badF._error || ''));
+  }
+
+  // 20. "Home location" as TEXT becomes COORDINATE (it is meant for a map); an address stays text.
+  {
+    const a20 = { action: 'create_program', program_name: 'ZZ heal', program_type: 'WITH_REGISTRATION', program_attributes: [{ name: 'Home location', value_type: 'TEXT' }, { name: 'Home address', value_type: 'TEXT' }, { name: 'GPS position', value_type: 'TEXT' }], program_stages: [{ name: 'S', data_elements: [{ name: 'X', value_type: 'TEXT' }] }] };
+    ctx.validateAndHealProgramInput(a20);
+    eq('program attributes: "Home location" and "GPS position" become COORDINATE, "Home address" stays TEXT', a20.program_attributes.map((x) => x.value_type), ['COORDINATE', 'TEXT', 'COORDINATE']);
+  }
+
+  // 19. A build request answered with "not installed yet … is a 30-day interval right?" is asking instead of building.
+  truthy('asking instead of building: "I have not installed the app yet … Is that right?" is recognised', ctx.looksLikeAskingInsteadOfBuilding('I have not installed the app yet. What the full build needs before I write it: 1. Expected interval: the default is 30 days. Is that right?'));
+  truthy('…a blocker ("the program does not exist") or a finished build is not', !ctx.looksLikeAskingInsteadOfBuilding('I have not built anything: the program does not exist on this server. Which program should I use?') && !ctx.looksLikeAskingInsteadOfBuilding('Installed and tested. Open it at https://x/apps/ai-tb.'));
+
+  // 16. A final answer listing requested parts as not built is recognised (one push to build them).
+  truthy('partial delivery: "Not built yet (the request is only partly done)" is recognised', ctx.looksLikePartialDelivery('Installed v1.0.0.\n\n**Not built yet (the request is only partly done)**\n- Summary charts\n- Facility map'));
+  truthy('…"What is missing from your request … Tell me which first?" is recognised too (the user asked for all of it)', ctx.looksLikePartialDelivery('Installed, but only part of what you asked for is built.\n### What is missing from your request\n- No charts\nTell me which first?'));
+  truthy('…a complete answer, or one that ends by asking the user, is not', !ctx.looksLikePartialDelivery('Built and installed. Every part works: charts, map, queue.') && !ctx.looksLikePartialDelivery('Part of it is not built yet. Should I use a new prefix?'));
+
+  // 15. A text option code compared with a bare number is quoted (SQL 42883 otherwise).
+  {
+    const stages = new Map([['PFDfvmGpsR3', { displayName: 'Care at birth', programStageDataElements: [{ dataElement: { id: 'V5PR8Kw8ZnC', displayName: 'Pregnancy outcome', valueType: 'TEXT' } }, { dataElement: { id: 'NumDe000001', displayName: 'Weight', valueType: 'NUMBER' } }] }]]);
+    const pi = { name: 'Stillbirths', analyticsType: 'ENROLLMENT', aggregationType: 'COUNT', expression: 'V{enrollment_count}', filter: '#{PFDfvmGpsR3.V5PR8Kw8ZnC} == 0 && #{PFDfvmGpsR3.NumDe000001} > 2500' };
+    ctx.piAnalyticsRuntimeTraps(pi, stages, 43);
+    eq('indicator: a text option code compared with a bare number is quoted; numbers stay numbers', pi.filter, "#{PFDfvmGpsR3.V5PR8Kw8ZnC} == '0' && #{PFDfvmGpsR3.NumDe000001} > 2500");
+  }
+
+  // 13. Plan-first only when a plan is asked for BEFORE building, in one sentence.
+  const tbPrompt = fs.readFileSync(path.join(ROOT, 'scripts/prompts/tb-workspace-1-app.txt'), 'utf8');
+  truthy('plan-first: an app request listing "summary charts" and "warn before overwriting" is NOT a plan-first request', ctx.userAskedForPlanFirst(tbPrompt) === false);
+  truthy('…"Show me the plan before creating anything" still is', ctx.userAskedForPlanFirst('Design and create a TB program with 4 stages. Show me the plan before creating anything.') === true);
+  truthy('…"give me a summary first, then wait for my go" still is', ctx.userAskedForPlanFirst('Build a malaria dashboard. Give me a summary of what you will build first, then wait.') === true);
+  truthy('…none of the six saved harness-test prompts is read as plan-first', ['maternal-journey-1-dashboard', 'tb-workspace-1-app', 'focus-explorer-1-plugin', 'ccr-1-program', 'ccr-2-dashboard', 'ccr-3-app-plugin'].every((f) => !ctx.userAskedForPlanFirst(fs.readFileSync(path.join(ROOT, `scripts/prompts/${f}.txt`), 'utf8'))));
+
+  // 8. Line list: periods given on the org-unit column move to the time column (one call instead of a refusal and a retry).
+  const ax = { columns: [{ dimension: 'ou', org_units: ['ImspTQPwCqd'], periods: ['202608', '202609', '202610'] }, { dimension: 'event_date' }, { dimension: 'qrur9Dvnyt5' }], filters: [] };
+  const note8 = ctx.lineListMoveStrayPeriods(ax, 'EVENT');
+  truthy('line list: periods on the ou column move to the event_date column, with a note', /moved to the "event_date" time column/.test(note8 || '') && JSON.stringify(ax.columns[1].periods) === '["202608","202609","202610"]' && !ax.columns[0].periods);
+  const ax2 = { columns: [{ dimension: 'ou', org_units: ['ImspTQPwCqd'] }, { dimension: 'event_date', periods: ['LAST_12_MONTHS'] }], filters: [] };
+  eq('…a list whose time column has its periods is left alone', [ctx.lineListMoveStrayPeriods(ax2, 'EVENT'), ax2.columns[1].periods], [null, ['LAST_12_MONTHS']]);
+
+  // 10. The real fetch path trims analytics metaData (not only the helper): a 14,240-option breakdown.
+  {
+    const dd = vm.runInContext('dhis2', ctx);
+    const keep = { base: dd.baseUrl, connected: dd.connected, apiVersion: dd.apiVersion, fetch: ctx.fetch };
+    Object.assign(dd, { baseUrl: 'https://verify.example/dhis', connected: true, apiVersion: 43 });
+    const bigBody = JSON.stringify({ headers: [{ name: 'K6uUAvq500H' }, { name: 'ou' }, { name: 'value' }], rows, height: rows.length, width: 3, metaData: meta });
+    ctx.fetch = async (u) => (/analytics\/events\/aggregate/.test(String(u)) ? new Response(bigBody, { status: 200, headers: { 'Content-Type': 'application/json' } }) : new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    try {
+      const got = await ctx.__realSafeDhis2Fetch('analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd&dimension=K6uUAvq500H&filter=pe:202608');
+      truthy(`safeDhis2Fetch: a 1.7 MB analytics answer comes back with 200 rows and metaData for those rows only (${JSON.stringify(got).length} chars)`, got && got._truncated && (got.rows || []).length === 200 && Object.keys(got.metaData.items).length < 260 && JSON.stringify(got).length < 60000);
+    } finally { ctx.fetch = keep.fetch; Object.assign(dd, { baseUrl: keep.base, connected: keep.connected, apiVersion: keep.apiVersion }); }
+  }
+
+  // 11. Thematic map: a period DHIS2 dropped on save is an error and the map is deleted (the event path is checked above).
+  {
+    const dd = vm.runInContext('dhis2', ctx);
+    const keep = { sdf: ctx.safeDhis2Fetch, wa: dd.writeAuth, base: dd.baseUrl, connected: dd.connected };
+    Object.assign(dd, { baseUrl: 'https://verify.example/dhis', connected: true, writeAuth: { scope: 'broad', reason: 'verify' } });
+    const calls11 = [];
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      calls11.push(`${o.method || 'GET'} ${p}`);
+      if (/^programIndicators\.json\?filter=id:in:/.test(p)) return { programIndicators: [{ id: 'cW09nTtox14' }] };
+      if (/^(?:indicators|dataElements)\.json/.test(p)) return {};
+      if (/^programIndicators\/cW09nTtox14/.test(p)) return { id: 'cW09nTtox14', program: { id: 'eBAyeGv0exc' } };
+      if (o.method === 'POST' && p === 'maps') return { response: { uid: o.body.id } };
+      if (/^maps\/[^?]+\?fields=mapViews/.test(p)) return { mapViews: [{ layer: 'thematic', periods: [], filters: [{ dimension: 'pe', items: [] }], relativePeriods: {} }] };
+      if (o.method === 'DELETE') return {};
+      return {};
+    };
+    try {
+      const r11 = await ctx.executeTool('manage_maps', { action: 'create', name: 'Deaths by district', data_item: 'cW09nTtox14', org_unit_level: 2, org_units: ['ImspTQPwCqd'], periods: ['202608', '202609', '202610'] });
+      truthy('thematic map: saved without its period → an error, and the map is deleted again', r11._scope === 'map_period_dropped' && calls11.some(c => /^DELETE maps\//.test(c)) && !r11.success);
+    } finally { ctx.safeDhis2Fetch = keep.sdf; Object.assign(dd, { writeAuth: keep.wa, baseUrl: keep.base, connected: keep.connected }); }
+  }
+
+  // 12. Data check: an indicator split by a category combination leaves out records with no age/sex;
+  //     dates an indicator subtracts that sit years away from the tile's period are counted.
+  {
+    const keep = ctx.safeDhis2Fetch;
+    const asked = [];
+    ctx.safeDhis2Fetch = async (p) => {
+      asked.push(p);
+      if (/^programs\/eBAyeGv0exc\?fields=categoryMappings/.test(p)) return { categoryMappings: [
+        { id: 'MapAge00001', mappingName: 'Morbidity Age', optionMappings: [{ filter: '#{Zj7UnCAulEk.qrur9Dvnyt5} < 1' }, { filter: '#{Zj7UnCAulEk.qrur9Dvnyt5} >= 1' }] },
+        { id: 'MapSex00001', mappingName: 'Gender', optionMappings: [{ filter: "#{Zj7UnCAulEk.oZg33kd9taw} == 'Female'" }] }] };
+      const nv = /filter=Zj7UnCAulEk\.(\w+):EQ:NV/.exec(p);
+      if (nv) return { headers: [{ name: 'value' }], rows: [[nv[1] === 'qrur9Dvnyt5' ? '2' : '1']] };
+      if (/eMyVanycQSC:NE:NV|msodh3rEMJa:NE:NV/.test(p)) return { headers: [{ name: 'value' }], rows: [['13802']] };
+      if (/eMyVanycQSC:LT:|msodh3rEMJa:LT:/.test(p)) return { headers: [{ name: 'value' }], rows: [['13787']] };
+      if (/:GT:/.test(p)) return { headers: [{ name: 'value' }], rows: [] };
+      return {};
+    };
+    try {
+      vm.runInContext('_dataCheckCache.clear()', ctx);
+      const piSplit = { id: 'luLGbE2WKGP', displayName: 'Inpatient cases', program: { id: 'eBAyeGv0exc' }, categoryCombo: { id: 'xxFJla5TRH3', displayName: 'Morbidity Age and Gender' }, categoryMappingIds: ['MapAge00001', 'MapSex00001'], expression: 'V{event_count}' };
+      const piStay = { id: 'lHX3zhXlcxC', displayName: 'Average stay', program: { id: 'eBAyeGv0exc' }, categoryCombo: { id: 'bjDvmb4bfuf', displayName: 'default' }, expression: 'd2:daysBetween(#{Zj7UnCAulEk.eMyVanycQSC}, #{Zj7UnCAulEk.msodh3rEMJa})', filter: '' };
+      const tilesX = [{ tile: 'Total cases', items: [{ id: 'luLGbE2WKGP', indicator: piSplit }], pe: '202608;202609;202610', ou: 'ImspTQPwCqd' },
+        { tile: 'Average stay', items: [{ id: 'lHX3zhXlcxC', indicator: piStay }], pe: '202608;202609;202610', ou: 'ImspTQPwCqd' }];
+      const split = await ctx.dataCheckSplitIndicators(tilesX);
+      eq('data check: a split indicator reports the records it leaves out (no age 2, no sex 1)', split.map(x => [x.indicator, x.split_by, x.left_out.map(l => `${l.field}:${l.records_without_value}`).sort().join(',')]), [['Inpatient cases', 'Morbidity Age and Gender', 'oZg33kd9taw:1,qrur9Dvnyt5:2']]);
+      const far = await ctx.dataCheckDistantDates(tilesX);
+      truthy('data check: dates an indicator subtracts that sit a year before the tile period are counted (13,787 of 13,802)', far.length === 2 && far.every(x => x.more_than_a_year_before === 13787 && x.records_with_date === 13802 && x.period === '2026-08-01 to 2026-10-31') && asked.some(p => /eMyVanycQSC:LT:2025-07-31/.test(p)));
+      const lines = ctx.dataCheckReportLines(ctx.dataCheckAssemble([], [], [], split, far), []);
+      truthy('…both appear in the lines printed under the answer', lines.some(l => /split by "Morbidity Age and Gender"/.test(l)) && lines.some(l => /13787 of 13802 records/.test(l) && /wrong year/.test(l)));
+    } finally { ctx.safeDhis2Fetch = keep; vm.runInContext('_dataCheckCache.clear()', ctx); }
+  }
+
+  // 9. Claude adapter: current models reject sampling; thinking blocks go back unchanged with the tool results.
+  eq('Claude adapter: temperature only for models that still accept it', ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-3-5-sonnet-20241022'].map(ctx.anthropicModelAcceptsSampling), [false, false, false, false, true, true, true]);
+  const thinkingTurn = { role: 'assistant', content: null, tool_calls: [{ id: 'toolu_1', type: 'function', function: { name: 'search_metadata', arguments: '{"object_type":"programs"}' } }],
+    _anthropic_content: [{ type: 'thinking', thinking: 'need programs', signature: 'sig==' }, { type: 'tool_use', id: 'toolu_1', name: 'search_metadata', input: { object_type: 'programs' } }] };
+  const conv = ctx.convertMessagesToAnthropic([{ role: 'system', content: 'S' }, { role: 'user', content: 'list programs' }, thinkingTurn, { role: 'tool', tool_call_id: 'toolu_1', content: '{"programs":[]}' }]);
+  const a = conv.messages[1];
+  truthy('…the assistant turn goes back with its thinking block (and signature) first, then the tool_use', a.role === 'assistant' && a.content[0].type === 'thinking' && a.content[0].signature === 'sig==' && a.content[1].type === 'tool_use' && conv.messages[2].content[0].type === 'tool_result');
+  // The stream parser keeps the blocks in order.
+  const sse = [
+    { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'plan' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'abc' } },
+    { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_9', name: 'search_metadata', input: {} } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"object_type":"programs"}' } },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+  ].map((e) => `data: ${JSON.stringify(e)}\n\n`).join('');
+  const savedCfg = vm.runInContext('({ c: _cachedProviderConfig, k: _cachedApiKey })', ctx);
+  const savedFetch9 = ctx.fetch;
+  const savedBroadcast9 = ctx.broadcast;
+  let sentBody = null;
+  try {
+    ctx.broadcast = () => {};
+    vm.runInContext(`_cachedApiKey = 'k'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'anthropic', apiBaseUrl: 'https://api.anthropic.com', modelId: 'claude-haiku-5-5', temperature: 0.2 };`, ctx);
+    ctx.fetch = async (u, o) => { sentBody = JSON.parse(o.body); return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }); };
+    const out = await ctx.callAnthropicStreaming([{ role: 'system', content: 'S' }, { role: 'user', content: 'list programs' }], true, () => {}, [{ type: 'function', function: { name: 'search_metadata', description: 'd', parameters: { type: 'object', properties: {} } } }], 0);
+    const msg = out.choices[0].message;
+    truthy('…a Haiku 5.5 request carries no temperature', sentBody && !('temperature' in sentBody));
+    truthy('…the streamed thinking block is kept with its signature, before the tool call', msg._anthropic_content && msg._anthropic_content[0].type === 'thinking' && msg._anthropic_content[0].thinking === 'plan' && msg._anthropic_content[0].signature === 'abc' && msg._anthropic_content[1].input.object_type === 'programs' && msg.tool_calls[0].function.name === 'search_metadata');
+  } finally {
+    ctx.fetch = savedFetch9;
+    ctx.broadcast = savedBroadcast9;
+    ctx.__restore9 = savedCfg; vm.runInContext('_cachedProviderConfig = __restore9.c; _cachedApiKey = __restore9.k;', ctx);
+  }
+
+  // 7. A tracker read the privacy gate REFUSED read nothing: it must not block the turn's settings writes.
+  vm.runInContext(`_cachedApiKey = 'k'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' }; globalThis.__savedGetCfg2 = getProviderConfig; getProviderConfig = () => _cachedProviderConfig;`, ctx);
+  const d7 = vm.runInContext('dhis2', ctx);
+  const saved7 = { turn: d7.turnCounter, read: d7.patientDataReadTurn, tool: d7.patientDataReadTool, base: d7.baseUrl, connected: d7.connected };
+  try {
+    Object.assign(d7, { turnCounter: 41, patientDataReadTurn: null, baseUrl: 'https://verify.example/dhis', connected: true });
+    const r = await ctx.executeTool('dhis2_query', { path: 'tracker/events?program=N7bpeUCYTbV&pageSize=5' });
+    truthy('cloud model: the tracker read is refused by the privacy gate', r && r._privacy_block);
+    eq('…and the refused read does not mark the turn as having read patient data', d7.patientDataReadTurn, null);
+    eq('…so a settings write in the same turn is not blocked as patient data', ctx.dataStorePatientDataReason({ followUpDays: 14, sortBy: 'missing' }), null);
+  } finally {
+    vm.runInContext(`getProviderConfig = globalThis.__savedGetCfg2; _cachedApiKey = null; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG };`, ctx);
+    Object.assign(d7, { turnCounter: saved7.turn, patientDataReadTurn: saved7.read, patientDataReadTool: saved7.tool, baseUrl: saved7.base, connected: saved7.connected });
+  }
+}
+
 async function runArgumentShapeThreadChecks() {
   console.log('\nArgument shapes, tool crashes and switched-off tools (Malaria Testing and Treatment Review thread):');
   const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
@@ -5499,6 +5930,21 @@ async function runArgumentShapeThreadChecks() {
     const rawResult = probe.toolMsgs.find(x => /^Blocked: POST visualizations/.test(x._error || '') && /switched off for the rest of this turn/.test(x._hint || ''));
     truthy('once manage_dashboards is switched off, a refusal no longer says "that tool is available now"', rawResult && !rawResult._redirect && !/available now/.test(rawResult._hint));
     truthy('…and after four more refused calls the tools close and the model writes its answer (no 50-step probing)', probe.k <= 11 && /nothing was created/.test(probe.res?.text || ''));
+    // A huge tool result reaches the model capped (Inpatient Outcomes thread: 1.6 MB answers overflowed a 1M context).
+    const bigRows = Array.from({ length: 20000 }, (_, i) => ['C' + i, 'ImspTQPwCqd', String(i)]);
+    const sentToModel = [];
+    const fetchBefore = ctx.fetch;
+    const recordBodies = (inner) => async (url, opts = {}) => { if (String(url).startsWith('https://llm.invalid')) { try { sentToModel.push(JSON.parse(opts.body)); } catch { /* */ } } return inner(url, opts); };
+    const turnRec = async (script, text, exec) => {
+      const origTurnFetchSetter = Object.getOwnPropertyDescriptor(ctx, 'fetch');
+      let wrapped = null;
+      Object.defineProperty(ctx, 'fetch', { configurable: true, get: () => wrapped, set: (f) => { wrapped = recordBodies(f); } });
+      try { return await turn(script, text, exec); } finally { Object.defineProperty(ctx, 'fetch', { configurable: true, writable: true, enumerable: true, value: fetchBefore }); void origTurnFetchSetter; }
+    };
+    await turnRec([{ call: 'search_metadata', args: { object_type: 'programs', name_filter: 'inpatient' } }, { text: 'Done.' }], 'Which inpatient programs exist?',
+      () => ({ rows: bigRows, metaData: { items: Object.fromEntries(bigRows.map(r => [r[0], { name: r[0] + ' some long diagnosis name' }])) } }));
+    const toolContents = sentToModel.flatMap(b => (b.messages || []).filter(m => m.role === 'tool').map(m => String(m.content)));
+    truthy(`the loop hands the model a capped tool result (largest ${Math.max(0, ...toolContents.map(c => c.length))} chars, raw ≈ 1.6 MB)`, toolContents.length >= 1 && toolContents.every(c => c.length <= 100000) && toolContents.some(c => /_truncated_for_model/.test(c)));
   } finally {
     ctx.safeDhis2Fetch = saved.sdf; ctx.executeTool = saved.exec; ctx.fetch = saved.fetch; ctx.broadcast = saved.broadcast;
     Object.assign(d, { writeAuth: saved.wa, baseUrl: saved.base, connected: saved.connected, apiVersion: saved.apiVersion, pageContext: saved.pageContext });
@@ -5532,6 +5978,7 @@ setImmediate(async () => {
   if (loaded) await runMaternityThreadChecks().catch((e) => bad(`Maternity thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runDataQualityThreadChecks().catch((e) => bad(`data-quality thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runArgumentShapeThreadChecks().catch((e) => bad(`argument-shape thread checks threw: ${e && e.stack || e}`));
+  if (loaded) await runComplexBuildsChecks().catch((e) => bad(`complex-builds checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

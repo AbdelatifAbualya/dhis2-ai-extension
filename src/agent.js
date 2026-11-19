@@ -665,6 +665,12 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   let streamDropsThisTurn = 0; // all drops this turn, against STREAM_DROP_TURN_LIMIT
   let streamDropNudge = null; // transient "send it smaller" message, removed once a reply arrives
   let unfinishedTextNudges = 0; // text-only replies that are provably not a finished answer (cut by token limit / announcement-only)
+  let partialDeliveryPushes = 0; // pushes when the final answer lists requested parts as not built (max 3, each after progress)
+  let writesAtLastPartialPush = -1; // writeCountThisTurn when the last such push was sent
+  let wroteThisTurn = false; // a write tool succeeded this turn (not a preview / list / read)
+  let writeCountThisTurn = 0;
+  let orphanNudged = false; // one push per turn when objects saved this turn are on none of its dashboards
+  let askedInsteadNudged = false; // one push per turn when a build request ends with questions and nothing built
   let anyToolCallThisTurn = false; // at least one tool call was emitted this turn (marks the turn as mid-task)
 
   // ── Mechanical circuit breaker for deterministic retry loops ────────────────
@@ -1311,6 +1317,8 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
 
         lastToolName = tc.function.name;
         const isToolSuccess = !toolResult._error && toolResult.success !== false;
+        // A real write this turn (not a preview, list or read): for the "built nothing, asked instead" push.
+        if (isToolSuccess && !toolResult._tool_manual && isRealWriteCall(tc.function.name, args)) { wroteThisTurn = true; writeCountThisTurn++; }
         // Build a structured details payload so the panel can show the user
         // EXACTLY why a call failed (full _error sentence, _hint, _scope,
         // _origin_server, refused descriptor, history) instead of just an
@@ -1349,7 +1357,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
         messages.push({
           role: 'tool',
           tool_call_id: tc.id,
-          content: JSON.stringify(toolResult),
+          // Never a raw dump: one 1.6 MB analytics answer overflowed a
+          // 1M-token context and killed the turn (Inpatient thread 2026-11-17).
+          content: toolResultForModel(toolResult),
         });
       }
     } else {
@@ -1457,8 +1467,63 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
         continue;
       }
 
+      // d) An explicit build request ended with nothing built and questions the
+      //    request already answers ("is a 30-day interval right?"): TB workspace
+      //    with Haiku, 2026-11-18 — a skeleton preview, then four questions. One
+      //    push per turn to pick sensible defaults, say them, and build.
+      if (anyToolCallThisTurn && !wroteThisTurn && !askedInsteadNudged && dhis2.writeAuth && dhis2.writeAuth.scope === 'broad' && !dhis2.writeAuth.planFirst
+          && looksLikeAskingInsteadOfBuilding(text) && i < 46) {
+        askedInsteadNudged = true;
+        console.warn('[AgenticLoop] Build request ended with questions and nothing built — asking the model to build with defaults');
+        broadcast({ type: 'AI_THINKING', iteration: i + 1, label: 'Building with sensible defaults' });
+        messages.push({
+          role: 'system',
+          content: 'The user asked you to build this, and nothing has been created yet. Do not ask them to confirm details their request already covers or that have an obvious default: choose sensible defaults, state them in your final answer, and build it now (for an app: a complete preview, then create — the full feature set requested, not a skeleton). Ask only about something you truly cannot decide, after building everything else.',
+        });
+        continue;
+      }
+
+      // c) A final answer that lists parts of the request as not built yet,
+      //    with tools still available: Haiku shipped "TB Follow-up Workspace"
+      //    v1 and listed "Not built yet: summary charts, facility map, chart
+      //    filtering, review queue page" (2026-11-18). A push to build them or
+      //    name exactly what blocks each part; never on a read-only turn. Up to
+      //    3 pushes, and a later one only if the model saved something since
+      //    the previous push (Care Coordination Workspace: after one push Haiku
+      //    built 4 more versions and a dashboard tile, then stopped with three
+      //    parts still missing) — no progress, no further push.
+      if (anyToolCallThisTurn && partialDeliveryPushes < 3 && writeCountThisTurn > writesAtLastPartialPush && dhis2.writeAuth && dhis2.writeAuth.scope !== 'read_only'
+          && looksLikePartialDelivery(text) && i < 46) {
+        partialDeliveryPushes++;
+        writesAtLastPartialPush = writeCountThisTurn;
+        console.warn('[AgenticLoop] Final answer lists requested parts as not built — asking the model to build them');
+        broadcast({ type: 'AI_THINKING', iteration: i + 1, label: 'Finishing the remaining parts' });
+        messages.push({
+          role: 'system',
+          content: 'Your answer lists parts of the user\'s request as not built yet, and the tools are still available. Build those parts now (for an app or plugin: manage_custom_app update with the complete files; for a dashboard: add_items), then answer. Leave a part out only if something specific blocks it, and then name the blocker for that part. Do not ask the user to re-request what they already asked for.',
+        });
+        continue;
+      }
+
       // What the saved work really shows, measured now that it is finished. It does
       // not depend on the model having read or repeated a tool's warning.
+      // e) Something saved this turn is on none of the turn's dashboards: one push
+      //    to add it or say why it stays off (and not describe it as on them).
+      if (!orphanNudged && dhis2.writeAuth && dhis2.writeAuth.scope !== 'read_only' && i < 46) {
+        const orphans = await turnOrphanObjects().catch(() => []);
+        if (orphans.length) {
+          orphanNudged = true;
+          const [{ dashboards: dn }, ...objs] = orphans;
+          console.warn(`[AgenticLoop] ${objs.length} object(s) saved this turn are not on the dashboard — asking the model to place them`);
+          broadcast({ type: 'AI_THINKING', iteration: i + 1, label: 'Placing what was built on the dashboard' });
+          messages.push({
+            role: 'system',
+            content: `These were saved this turn but are not on the dashboard${dn.length > 1 ? 's' : ''} ${dn.map((x) => `"${x}"`).join(', ')}: ${objs.map((o) => `${o.kind} "${o.name}" (${o.id})`).join('; ')}. Add the ones the user asked for (manage_dashboards add_items with their ids), delete leftovers from failed attempts that a later object replaced, and do not describe anything as on the dashboard unless it is.`,
+          });
+          continue;
+        }
+      }
+
       const closing = await finishTurnDataCheck(text).catch(() => '');
       if (closing && text.trim()) {
         text += closing;

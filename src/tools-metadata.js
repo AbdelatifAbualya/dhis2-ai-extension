@@ -84,7 +84,27 @@ async function fetchStageDetails(stageId) {
 // body carries tracker record fields (a tracked entity / enrollment / event id
 // or its values), or this turn already read patient-level data.
 const DATASTORE_PATIENT_KEY_RE = /^(?:trackedEntit(?:y|ies|yId|yInstances?|yInstanceId)|teis?|teiIds?|enrollments?|enrollmentIds?|events?|eventIds?|dataValues|attributeValues)$/i;
-function dataStorePatientDataReason(body) {
+// Per-copy plugin settings after the turn read records: a write to one of the
+// assistant's own app namespaces (ai-…), keyed by a dashboard item id, whose body
+// is a small flat object of settings — booleans, numbers, dates and short codes,
+// no names or free text — cannot carry patient data. Malaria focus plugin
+// (2026-11-18): {"dateA":"2025-11-18","dateB":"2026-11-18"} for each copy was
+// refused because the plugin's design read had touched records.
+function dataStoreSettingsOnly(path, body) {
+  const m = /^dataStore\/(ai-[a-z0-9-]+)\/([A-Za-z][A-Za-z0-9]{10})(?:\?|$)/.exec(String(path || ''));
+  if (!m) return false;
+  let o = body;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return false; } }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+  const entries = Object.entries(o);
+  if (!entries.length || entries.length > 30) return false;
+  return entries.every(([k, v]) => /^[A-Za-z][A-Za-z0-9_]{0,40}$/.test(k) && !DATASTORE_PATIENT_KEY_RE.test(k)
+    && (v === null || typeof v === 'boolean' || typeof v === 'number'
+      || (typeof v === 'string' && v.length <= 40 && /^(?:\d{4}-\d{2}-\d{2}(?:T[\d:.]+Z?)?|[A-Za-z0-9_:.;-]*)$/.test(v))
+      || (Array.isArray(v) && v.length <= 20 && v.every((x) => typeof x === 'number' || (typeof x === 'string' && x.length <= 40 && /^[A-Za-z0-9_:.;-]*$/.test(x))))));
+}
+
+function dataStorePatientDataReason(body, path) {
   let parsed = body;
   if (typeof body === 'string') { try { parsed = JSON.parse(body); } catch { parsed = null; } }
   let seen = 0;
@@ -100,6 +120,7 @@ function dataStorePatientDataReason(body) {
   };
   const inBody = walk(parsed, 0);
   if (inBody) return inBody;
+  if (path && dataStoreSettingsOnly(path, body)) return null;
   if (dhis2.patientDataReadTurn != null && dhis2.patientDataReadTurn === (dhis2.turnCounter || 0)) return `this turn already read patient-level data (${dhis2.patientDataReadTool || 'a tracker read'})`;
   return null;
 }
@@ -117,6 +138,40 @@ function sumAnalyticsValueColumn(result) {
     if (!isNaN(v)) total += v;
   }
   return total;
+}
+
+// An analytics count of 0 is ambiguous: no records, records at other units, or
+// analytics tables that do not hold them yet. Laboratory dashboard (2026-11-19):
+// the page unit was a leaf with nothing entered at it, include_children was not
+// applied, and the program's 14 events were not in the analytics tables yet, so
+// the model told the user "the program has no data at all". Live tracker counts
+// (counts only) at the unit and across all of the user's units say which it is.
+async function countRecordsZeroContext(pid, ouid, args, includeChildren, progName, ouName, stageName) {
+  const out = {};
+  if (args.include_children === true && !includeChildren) {
+    out._scope_note = 'include_children was NOT applied: counts stay at the selected unit unless the user asks for a wider area. To count elsewhere pass ou_override (a unit id, or leave both out for all of the user\'s units).';
+  }
+  if (args.filters?.length) return out;
+  // People are counted through enrollments (the analytics count is enrollment-based
+  // too): tracker/trackedEntities ignores these dates and has no status parameter, so a
+  // zero inside a date window would be "explained" with records outside it.
+  const base = { record_type: args.record_type === 'tracked_entities' ? 'enrollments' : args.record_type, stage_id: args.stage_id, status: args.status, date_after: args.date_after, date_before: args.date_before };
+  const here = /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(ouid || '')) ? await countViaTracker(pid, ouid, { ...base, include_children: includeChildren }, progName, ouName, stageName) : null;
+  const all = await countViaTracker(pid, 'USER_ORGUNIT', base, progName, "all of the user's org units", stageName);
+  const liveHere = here && !here._error ? Number(here.count) || 0 : null;
+  const liveAll = all && !all._error ? Number(all.count) || 0 : null;
+  if (liveHere == null && liveAll == null) return out;
+  let lastRun = null;
+  try { const si = await safeDhis2Fetch('system/info?fields=lastAnalyticsTableSuccess', { noTruncate: true }); lastRun = si?.lastAnalyticsTableSuccess || null; } catch { /* optional */ }
+  out.live_records = { at_this_unit: liveHere, across_all_your_org_units: liveAll };
+  if (liveHere) {
+    out._zero_note = `Analytics counts 0 here, but ${liveHere} live record(s) exist at ${ouName}: the analytics tables do not hold them yet (last run ${lastRun || 'unknown'}). Report ${liveHere} as the live count, and say tiles and charts show 0 until an Analytics Tables run finishes. Never say there is no data.`;
+  } else if (liveAll) {
+    out._zero_note = `0 at ${ouName} — nothing is entered at that unit${includeChildren ? ' or below it' : ''}. Across all of the user's org units there are ${liveAll} live record(s): do NOT say the program has no data. Count at the units that hold them (ou_override with a parent unit, or leave both out for all of the user's units)${lastRun ? `; analytics last ran ${lastRun}, so analytics may also lag` : ''}.`;
+  } else {
+    out._zero_note = 'No live records of this program anywhere the user can reach (all of their org units) — the program has no data yet.';
+  }
+  return out;
 }
 
 async function executeTool(name, args) {
@@ -144,8 +199,13 @@ async function executeTool(name, args) {
   }
   // Remember that this turn has seen patient data (whether or not learning
   // memory is on) — dataStore writes are refused for the rest of the turn.
+  // A read the privacy gate refused, or one that failed, returned no record: it
+  // must not count. Contact Follow-up plugin (2026-11-17): one refused
+  // tracker read marked the turn, and the two per-copy settings writes the user
+  // asked for were then blocked as "this turn already read patient-level data".
+  const nothingRead = !result || typeof result !== 'object' || result._privacy_block || result._error;
   try {
-    if (typeof memoryCallTouchesPatientData === 'function' && memoryCallTouchesPatientData(name, args, result)) {
+    if (!nothingRead && typeof memoryCallTouchesPatientData === 'function' && memoryCallTouchesPatientData(name, args, result)) {
       dhis2.patientDataReadTurn = dhis2.turnCounter || 0;
       dhis2.patientDataReadTool = name;
     }
@@ -479,7 +539,7 @@ async function executeToolCall(name, args) {
     // the body carries tracker record fields, or this turn already read
     // patient-level data (the memory module's per-turn taint).
     if ((method === 'POST' || method === 'PUT' || method === 'PATCH') && /^(?:dataStore|userDataStore)(?:\/|\?|$)/i.test(safePath)) {
-      const why = dataStorePatientDataReason(args.body);
+      const why = dataStorePatientDataReason(args.body, safePath);
       if (why) {
         return {
           _error: `Blocked: ${method} ${safePath.split('?')[0]} — ${why}. Patient data is never written to the dataStore: it would bypass the program's org-unit access, sharing, ownership and audit.`,
@@ -1552,8 +1612,11 @@ async function executeToolCall(name, args) {
         };
       }
 
+      const enCount = sumAnalyticsValueColumn(result);
+      const enZero = enCount === 0 ? await countRecordsZeroContext(pid, ouid, args, includeChildren, progName, ouName, stageName).catch(() => ({})) : (args.include_children === true && !includeChildren ? { _scope_note: 'include_children was NOT applied: counts stay at the selected unit unless the user asks for a wider area; pass ou_override to count elsewhere.' } : {});
       return {
-        count: sumAnalyticsValueColumn(result),
+        count: enCount,
+        ...enZero,
         record_type: args.record_type,
         program: { id: pid, name: progName },
         org_unit: { id: ouid, name: ouName },
@@ -1607,8 +1670,11 @@ async function executeToolCall(name, args) {
         };
       }
 
+      const evCount = sumAnalyticsValueColumn(result);
+      const evZero = evCount === 0 ? await countRecordsZeroContext(pid, ouid, args, includeChildren, progName, ouName, stageName).catch(() => ({})) : (args.include_children === true && !includeChildren ? { _scope_note: 'include_children was NOT applied: counts stay at the selected unit unless the user asks for a wider area; pass ou_override to count elsewhere.' } : {});
       return {
-        count: sumAnalyticsValueColumn(result),
+        count: evCount,
+        ...evZero,
         record_type: args.record_type,
         program: { id: pid, name: progName },
         org_unit: { id: ouid, name: ouName },
@@ -3208,6 +3274,10 @@ async function executeToolCall(name, args) {
   // ── SQL views (src/tools-sqlviews.js) ──
   if (name === 'manage_sql_views') {
     return await executeManageSqlViews(args);
+  }
+  // ── fictional test records (src/tools-programs.js) ──
+  if (name === 'manage_test_data') {
+    return await executeManageTestData(args);
   }
 
   return { _error: `Unhandled tool route: ${name}` };
@@ -5480,7 +5550,7 @@ async function prepareInlineVisualizations(items) {
     const catProblem = await resolveVizCategoryDimensions(spec, typeMap);
     if (catProblem) return { ...catProblem, _error: `Item ${index + 1} (new_visualization "${spec.name || ''}"): ${catProblem._error}` };
     const overall = await applyOverallRow(spec);
-    if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}` };
+    if (overall?._error) return { _error: `Item ${index + 1} (new_visualization): ${overall._error}`, ...(overall._hint ? { _hint: overall._hint } : {}) };
     if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
     const built = buildVisualizationObject(spec, typeMap);
     if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
@@ -5885,7 +5955,12 @@ async function applyOverallRow(spec) {
   const r = await safeDhis2Fetch(`organisationUnits?filter=path:like:${bounds[0]}&filter=level:eq:${lvl[1]}&fields=id&order=name:asc&paging=false`);
   const kids = (r?.organisationUnits || []).map(o => o.id).filter(id => id !== bounds[0]);
   if (r?._error || !kids.length) return { _error: `overall_row: no level-${lvl[1]} org units found under ${bounds[0]}${r?._error ? ` (${r._error})` : ''}.` };
-  if (kids.length > 300) return { _error: `overall_row: ${kids.length} level-${lvl[1]} units under ${bounds[0]} — too many explicit rows; use a higher level.` };
+  // "Use a higher level" read as "compare districts instead", so a requested facility
+  // comparison was dropped (Maternal Care Journey, 2026-11-19, 1,168 facilities).
+  if (kids.length > 300) return {
+    _error: `overall_row: ${kids.length} level-${lvl[1]} units under ${bounds[0]} — too many to list as explicit rows next to an overall row.`,
+    _hint: `Keep the comparison at level ${lvl[1]} the user asked for: drop overall_row and keep org_units [${bounds[0]}, "LEVEL-${lvl[1]}"] (a table of every unit that stays current; put the overall total in its own single-value tile), or a column chart on LEVEL-${lvl[1]} with sort:"desc" so the leaders come first. Use a higher level only if the user asked for that level.`,
+  };
   spec.org_units = [bounds[0], ...kids];
   return { note: `Overall row added: the parent org unit is its own row, computed by DHIS2 from all records (not a sum or average of the ${kids.length} rows below it). The ${kids.length} level-${lvl[1]} units are saved explicitly, so a unit added later needs the table updated.` };
 }
@@ -6257,6 +6332,108 @@ function mapBasemapNote(basemap) {
     ? 'On this server (plain http) no keyless basemap loads, because OSM Detailed is blocked by its redirect to https: tell the user the background will show that text until an admin adds a basemap with a key (Maintenance, external map layers) and makes it the default.'
     : 'Unless the user asked for OSM Light by name, use "openStreetMap" (OSM Detailed), which needs no key.'}`;
 }
+// Periods of a map layer. "202608;202609;202610" used to be saved as ONE period
+// id: DHIS2 dropped it without an error, the map had no period and the Maps app
+// failed on it ("Cannot read properties of undefined (reading 'slice')"), while
+// the tool reported success (Inpatient Outcomes thread, 2026-11-17). Verified on
+// 2.43.2.1: several fixed periods in the pe filter, or startDate/endDate, are
+// saved and drawn as one total for the span.
+const MAP_FIXED_PERIOD_RE = /^\d{4}(?:\d{2}(?:\d{2})?|W\d{1,2}|BiW\d{1,2}|0[1-6]B|Q[1-4]|S[12]|AprilS[12]|NovS[12]|April|July|Oct|Nov|Sep)?$/;
+const MAP_ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function mapPeriodSpec(spec) {
+  const start = String(spec.start_date || '').trim();
+  const end = String(spec.end_date || '').trim();
+  if (start || end) {
+    if (!MAP_ISO_DATE_RE.test(start) || !MAP_ISO_DATE_RE.test(end) || start > end) {
+      return { _error: `start_date and end_date must both be dates (YYYY-MM-DD) with start_date on or before end_date — got "${start}" and "${end}".` };
+    }
+    return { startDate: start, endDate: end, label: `${start} to ${end}` };
+  }
+  const raw = Array.isArray(spec.periods) && spec.periods.length ? spec.periods : [spec.period || 'LAST_12_MONTHS'];
+  let tokens = [...new Set(raw.flatMap((x) => String(x).split(/[;,\s]+/)).map((x) => x.trim()).filter(Boolean))];
+  const yearFix = namedYearPeriods(tokens);
+  if (yearFix) tokens = yearFix.periods;
+  tokens = tokens.map((t) => (VIZ_REL_PERIOD_FLAG[t.toUpperCase()] ? t.toUpperCase() : t));
+  const unknown = unknownPeriodKeywords(tokens);
+  if (unknown.length) return { _error: `${unknown.join(', ')} is not a DHIS2 period, so this map would show an error.`, _hint: PERIOD_KEYWORD_HINT };
+  const bad = tokens.filter((t) => !VIZ_REL_PERIOD_FLAG[t] && !MAP_FIXED_PERIOD_RE.test(t));
+  if (bad.length) return { _error: `${bad.map((b) => `"${b}"`).join(', ')} is not a period id. Give one period per entry: a relative keyword (LAST_12_MONTHS) or a fixed id (202608, 2026Q3, 2026), or start_date + end_date for any span.`, _hint: PERIOD_KEYWORD_HINT };
+  return { periods: tokens, label: tokens.join(', ') };
+}
+function mapPeriodFields(pe) {
+  return pe.startDate ? { startDate: pe.startDate, endDate: pe.endDate, filters: [] } : { filters: [{ dimension: 'pe', items: pe.periods.map((id) => ({ id })) }] };
+}
+// Read back what DHIS2 kept: a period it does not know is dropped without an
+// error. Returns null when every data layer has its period.
+async function mapSavedPeriodProblem(mapId) {
+  const m = await safeDhis2Fetch(`maps/${mapId}?fields=mapViews[layer,startDate,endDate,periods[id],relativePeriods,filters[dimension,items[id]]]`, { noTruncate: true });
+  if (!m || m._error || !Array.isArray(m.mapViews)) return null; // could not read: do not guess
+  const missing = m.mapViews.filter((v) => v.layer === 'thematic' || v.layer === 'event').filter((v) => {
+    const fixed = (v.periods || []).length || ((v.filters || []).find((f) => f.dimension === 'pe')?.items || []).length;
+    const rel = v.relativePeriods && Object.values(v.relativePeriods).some((x) => x === true);
+    return !fixed && !rel && !v.startDate;
+  });
+  return missing.length ? `${missing.length} layer(s) were saved without a period` : null;
+}
+
+// An EVENT layer: one point per event (a case) where the event has a location —
+// the event's own location, or a COORDINATE data element (coordinate_field).
+// Shape verified from the demo event maps on 2.43.2.1 ("Malaria: Cases <5y
+// female Pujehun this year events"): program + programStage, ou in rows +
+// organisationUnits, the period as a pe filter or startDate/endDate, data
+// element filters as columns { dimension: <de>, filter: "IN:…" }.
+const MAP_EVENT_FILTER_RE = /^(?:EQ|NE|GT|GE|LT|LE|IN|LIKE|NLIKE|ILIKE|NILIKE|SW|EW|NV)(?::|$)/i;
+function buildEventMapObject(spec) {
+  const name = String(spec.name || '').trim();
+  if (!name) return { _error: 'map name is required.' };
+  if (!/^[A-Za-z][A-Za-z0-9]{10}$/.test(String(spec.program_id || ''))) return { _error: 'An event layer needs program_id (the program whose events are drawn).' };
+  if (!/^[A-Za-z][A-Za-z0-9]{10}$/.test(String(spec.program_stage_id || ''))) return { _error: 'An event layer needs program_stage_id (the stage whose events are drawn).' };
+  const pe = mapPeriodSpec(spec);
+  if (pe._error) return pe;
+  const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : (spec.org_units ? [spec.org_units] : [])).map((o) => String(o).trim()).filter(Boolean);
+  if (!orgUnits.length) return { _error: 'An event layer needs org_units: the area whose events are drawn (a country/district UID, or USER_ORGUNIT).' };
+  const ouFlags = {}; const organisationUnits = []; const ouItems = [];
+  for (const o of orgUnits) {
+    const up = o.toUpperCase();
+    if (VIZ_REL_OU[up]) { ouFlags[VIZ_REL_OU[up]] = true; ouItems.push({ id: up }); } else if (/^LEVEL-\d+$/.test(up)) {
+      return { _error: `${o}: an event layer draws events, not org units — pass the area (e.g. the country UID), not a level.` };
+    } else { organisationUnits.push({ id: o }); ouItems.push({ id: o }); }
+  }
+  const columns = [];
+  for (const f of (Array.isArray(spec.event_filters) ? spec.event_filters : [])) {
+    const de = String(f && (f.data_element || f.dataElement || f.dimension) || '').trim();
+    const flt = String(f && f.filter || '').trim();
+    if (!/^[A-Za-z][A-Za-z0-9]{10}$/.test(de)) return { _error: `event_filters: "${de}" is not a data element UID.` };
+    if (flt && !MAP_EVENT_FILTER_RE.test(flt)) return { _error: `event_filters: "${flt}" is not a filter. Use OPERATOR:value, e.g. "IN:MODDIED", "LT:5", "EQ:Female".` };
+    columns.push({ dimension: de, items: [], ...(flt ? { filter: flt.replace(/^([a-z]+)/, (m) => m.toUpperCase()) } : {}) });
+  }
+  const color = String(spec.point_color || '#333333').trim();
+  if (!/^#?[0-9a-f]{6}$/i.test(color)) return { _error: `point_color "${color}" is not a hex colour like "#333333".` };
+  const statuses = ['ACTIVE', 'COMPLETED', 'SCHEDULE', 'OVERDUE', 'SKIPPED'];
+  const status = spec.event_status ? String(spec.event_status).toUpperCase() : null;
+  if (status && !statuses.includes(status)) return { _error: `event_status must be one of ${statuses.join(', ')}.` };
+  const mapView = {
+    id: generateDhis2Uid(),
+    layer: 'event',
+    program: { id: spec.program_id },
+    programStage: { id: spec.program_stage_id },
+    ...mapPeriodFields(pe),
+    rows: [{ dimension: 'ou', items: ouItems }],
+    columns,
+    organisationUnits,
+    organisationUnitSelectionMode: 'DESCENDANTS',
+    ...ouFlags,
+    eventClustering: spec.clustering !== false,
+    eventPointColor: color.replace(/^#/, ''),
+    eventPointRadius: Number(spec.point_radius) > 0 ? Math.round(Number(spec.point_radius)) : 6,
+    opacity: spec.opacity != null ? Number(spec.opacity) : 0.95,
+    ...(status ? { eventStatus: status } : {}),
+    ...(spec.coordinate_field ? { eventCoordinateField: String(spec.coordinate_field) } : {}),
+    hidden: false,
+  };
+  return { map: { id: generateDhis2Uid(), name, basemap: normalizeMapBasemap(spec.basemap) || MAP_DEFAULT_BASEMAP, mapViews: [mapView] }, periodLabel: pe.label };
+}
+
 function buildMapObject(spec, typeMap) {
   if (!spec || typeof spec !== 'object') return { _error: 'map spec object is required.' };
   const name = String(spec.name || '').trim();
@@ -6268,10 +6445,8 @@ function buildMapObject(spec, typeMap) {
   const ddiKey = VIZ_DDI_KEY[t];
   if (!ddiKey && t !== 'REPORTING_RATE' && t !== 'DATA_ELEMENT_OPERAND') return { _error: `Data item "${item}" has unsupported type ${t} for a map.` };
 
-  let period = String(spec.period || (Array.isArray(spec.periods) ? spec.periods[0] : '') || 'LAST_12_MONTHS').trim();
-  const yearFix = namedYearPeriods([period]);
-  if (yearFix && yearFix.periods.length === 1) period = yearFix.periods[0];
-  if (unknownPeriodKeywords([period]).length) return { _error: `${period} is not a DHIS2 period, so this map would show an error.`, _hint: PERIOD_KEYWORD_HINT };
+  const pe = mapPeriodSpec(spec);
+  if (pe._error) return pe;
   const orgUnits = (Array.isArray(spec.org_units) ? spec.org_units : (spec.org_units ? [spec.org_units] : [])).map(o => String(o).trim()).filter(Boolean);
   const level = spec.org_unit_level != null ? Number(spec.org_unit_level) : null;
 
@@ -6310,7 +6485,7 @@ function buildMapObject(spec, typeMap) {
     hideTitle: false,
     columns: [{ dimension: 'dx', items: [{ id: item, dimensionItemType: t }] }],
     rows: [{ dimension: 'ou', items: ouItems }],
-    filters: [{ dimension: 'pe', items: [{ id: period }] }],
+    ...mapPeriodFields(pe),
     organisationUnitSelectionMode: 'SELECTED',
     organisationUnitLevels,
     organisationUnits,
@@ -6463,6 +6638,66 @@ async function diagnoseDashboardSaveRefusal(result, existingItems) {
   } catch { return {}; }
 }
 
+// manage_maps create with layer:"event" — individual events as points.
+async function createEventMap(spec) {
+  const pid = String(spec.program_id || '').trim();
+  if (!/^[A-Za-z][A-Za-z0-9]{10}$/.test(pid)) return { _error: 'An event layer needs program_id (the program whose events are drawn).' };
+  const prog = await safeDhis2Fetch(`programs/${pid}?fields=id,displayName,programStages[id,displayName,featureType,programStageDataElements[dataElement[id,displayName,valueType]]]`, { noTruncate: true });
+  if (!prog || prog._error || !prog.id) return { _error: `Program ${pid} not found.`, _scope: 'unresolved_data_item' };
+  const stages = prog.programStages || [];
+  let stageId = String(spec.program_stage_id || '').trim();
+  if (!stageId && stages.length === 1) stageId = stages[0].id;
+  const stage = stages.find((x) => x.id === stageId);
+  if (!stage) return { _error: stageId ? `Stage ${stageId} is not a stage of "${prog.displayName}".` : `"${prog.displayName}" has ${stages.length} stages: pass program_stage_id.`, _hint: `Stages: ${stages.map((x) => `${x.displayName} (${x.id})`).join(', ')}.` };
+  const stageDes = new Map((stage.programStageDataElements || []).map((x) => [x.dataElement.id, x.dataElement]));
+  if (spec.coordinate_field) {
+    const de = stageDes.get(String(spec.coordinate_field));
+    if (!de || de.valueType !== 'COORDINATE') return { _error: `coordinate_field ${spec.coordinate_field} is not a COORDINATE data element of stage "${stage.displayName}".`, _hint: `Coordinate fields here: ${[...stageDes.values()].filter((d) => d.valueType === 'COORDINATE').map((d) => `${d.displayName} (${d.id})`).join(', ') || 'none — leave coordinate_field out to use the event location'}.` };
+  }
+  for (const f of (Array.isArray(spec.event_filters) ? spec.event_filters : [])) {
+    const de = String(f && (f.data_element || f.dataElement || f.dimension) || '');
+    if (de && !stageDes.has(de)) return { _error: `event_filters: ${de} is not a data element of stage "${stage.displayName}".` };
+  }
+  const built = buildEventMapObject({ ...spec, program_stage_id: stage.id });
+  if (built._error) return built;
+  const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
+  if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _attempted_map_id: built.map.id };
+  const newId = resp?.response?.uid || built.map.id;
+  const periodProblem = await mapSavedPeriodProblem(newId);
+  if (periodProblem) {
+    await safeDhis2Fetch(`maps/${newId}`, { method: 'DELETE' });
+    return { _error: `Map not kept: DHIS2 saved it without its period (${periodProblem}). It was deleted again.`, _scope: 'map_period_dropped' };
+  }
+  // How many events can be drawn: the Maps app's own count (a number and a box,
+  // no record is read).
+  const view = built.map.mapViews[0];
+  const ouParam = view.rows[0].items.map((i) => i.id).join(';');
+  const timeParam = view.startDate ? `startDate=${view.startDate}&endDate=${view.endDate}` : `dimension=pe:${view.filters[0].items.map((i) => i.id).join(';')}`;
+  const counted = await safeDhis2Fetch(`analytics/events/count/${pid}?stage=${stage.id}&${timeParam}&dimension=ou:${ouParam}${spec.coordinate_field ? `&coordinateField=${spec.coordinate_field}` : ''}`, { noTruncate: true });
+  const located = counted && !counted._error && Number.isFinite(Number(counted.count)) ? Number(counted.count) : null;
+  const filtered = (view.columns || []).some((c) => c.filter);
+  return {
+    success: true,
+    map_id: newId,
+    name: built.map.name,
+    layer: 'event',
+    basemap: built.map.basemap,
+    program: { id: pid, name: prog.displayName },
+    program_stage: { id: stage.id, name: stage.displayName },
+    period: built.periodLabel,
+    location_source: spec.coordinate_field ? `data element ${stageDes.get(String(spec.coordinate_field)).displayName}` : 'the event location',
+    clustering: view.eventClustering,
+    ...(view.columns.length ? { event_filters: view.columns.map((c) => `${stageDes.get(c.dimension)?.displayName || c.dimension} ${c.filter || '(shown)'}`) } : {}),
+    ...(located !== null ? {
+      events_with_location: located,
+      _location_note: located === 0
+        ? 'No event in this period and area has a location, so this layer draws NOTHING. Say so plainly; offer a facility map (thematic, level 4) instead.'
+        : `${filtered ? 'At most ' : ''}${located} event(s) in this period and area have a location${spec.coordinate_field ? ' in that field' : ''}; only those are drawn. Tell the user how many points they will see.`,
+    } : {}),
+    _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]).`,
+  };
+}
+
 async function executeManageMaps(args) {
   const action = args.action;
   if (!action) return { _error: 'action required', _hint: 'One of: list, get, create, delete.' };
@@ -6487,6 +6722,7 @@ async function executeManageMaps(args) {
     const _gate = requireWriteAuth('manage_maps', 'create');
     if (_gate) return _gate;
     const spec = args.map || args;
+    if (/^event/i.test(String(spec.layer || spec.layer_type || ''))) return createEventMap(spec);
     // Resolve the data item's type (+ existence) exactly like create_visualization.
     const itemId = String(spec.data_item || (Array.isArray(spec.data_items) ? spec.data_items[0] : '') || '').trim();
     if (!itemId) return { _error: 'data_item (one indicator / data element / program indicator UID) is required.' };
@@ -6538,7 +6774,15 @@ async function executeManageMaps(args) {
     const newId = resp?.response?.uid || built.map.id;
     const thematic = built.map.mapViews.find(v => v.layer === 'thematic');
     const boundary = built.map.mapViews.find(v => v.layer === 'boundary');
-    const periodWarning = await periodsMissThisYearWarning([itemId], [thematic.filters[0].items[0].id]);
+    const savedPeriods = thematic.startDate ? [] : thematic.filters[0].items.map((i) => i.id);
+    const periodWarning = savedPeriods.length ? await periodsMissThisYearWarning([itemId], savedPeriods) : null;
+    // DHIS2 drops a period it does not know without an error: read back what was
+    // kept, and never report a map without a period as a success.
+    const periodProblem = await mapSavedPeriodProblem(newId);
+    if (periodProblem) {
+      await safeDhis2Fetch(`maps/${newId}`, { method: 'DELETE' });
+      return { _error: `Map not kept: DHIS2 saved it without its period (${periodProblem}), so it would fail to open. It was deleted again.`, _hint: 'Pass period as one id or a list of ids (["202608","202609","202610"]), or start_date + end_date (YYYY-MM-DD) for a span.', _scope: 'map_period_dropped' };
+    }
     const boundaryWarning = await mapNoBoundariesWarning(itemId, thematic);
     const levelNameWarning = await orgLevelNameWarning(built.map.name, spec.org_units, spec.org_unit_level);
     const basemapNote = mapBasemapNote(built.map.basemap);
@@ -6554,7 +6798,7 @@ async function executeManageMaps(args) {
       thematic_map_type: thematic.thematicMapType,
       data_item: itemId,
       org_unit_levels: thematic.organisationUnitLevels,
-      period: thematic.filters[0].items[0].id,
+      period: thematic.startDate ? `${thematic.startDate} to ${thematic.endDate}` : savedPeriods.join(';'),
       legend_set: spec.legend_set_id || null,
       ...(boundary ? { boundary_layer: `level ${boundary.organisationUnitLevels[0]} outlines, beneath the data layer` } : {}),
       ...(thematic.noDataColor ? { no_data_color: thematic.noDataColor } : {}),
@@ -6734,7 +6978,7 @@ async function healBareDataElementItems(path) {
   const bareOf = (x) => { const mm = x.match(/^(dimension|filter)=(.*)$/i); if (!mm) return null; const v = dec(mm[2]); const b = v.match(/^([A-Za-z][A-Za-z0-9]{10})((?::).*)?$/); return b && !/^(?:dx|pe|ou|co|ao)$/i.test(b[1]) ? { key: mm[1], uid: b[1], rest: b[2] || '' } : null; };
   const bare = parts.map(bareOf).filter(Boolean);
   if (!bare.length) return { path: p, healed: false };
-  const st = await safeDhis2Fetch(`programStages?filter=program.id:eq:${m[2]}&fields=id,displayName,programStageDataElements[dataElement[id]]&paging=false`);
+  const st = await safeDhis2Fetch(`programStages?filter=program.id:eq:${m[2]}&fields=id,displayName,programStageDataElements[dataElement[id]]&paging=false`, { noTruncate: true });
   if (!st || st._error || !Array.isArray(st.programStages)) return { path: p, healed: false };
   const stagesOf = new Map();
   for (const sg of st.programStages) for (const psde of sg.programStageDataElements || []) {
@@ -9398,8 +9642,7 @@ async function getCustomForm(args) {
     };
   }
   const ps = await safeDhis2Fetch(
-    `programStages/${target.id}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name,style,htmlCode],programStageDataElements~size`
-  );
+    `programStages/${target.id}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name,style,htmlCode],programStageDataElements~size`, { noTruncate: true });
   if (ps?._error) return { _error: `Could not load program stage ${target.id}: ${ps._error}` };
   const html = ps.dataEntryForm?.htmlCode || '';
   return {
@@ -9429,8 +9672,7 @@ async function previewCustomFormHtml(args) {
     built = await buildDatasetFormGroups(target.id);
   } else {
     const ps = await safeDhis2Fetch(
-      `programStages/${target.id}?fields=id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]`
-    );
+      `programStages/${target.id}?fields=id,displayName,programStageDataElements[dataElement[id,displayName,valueType]]`, { noTruncate: true });
     if (ps?._error) return { _error: `Could not load program stage ${target.id}: ${ps._error}` };
     built = buildStageFormGroups(ps.id, ps.displayName, ps.programStageDataElements);
   }
@@ -9530,8 +9772,7 @@ async function setStageCustomForm(args) {
 
   // Meta for html-building + the program reference we must re-attach on PUT.
   const meta = await safeDhis2Fetch(
-    `programStages/${stageId}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name],programStageDataElements[dataElement[id,displayName,valueType]]`
-  );
+    `programStages/${stageId}?fields=id,displayName,formType,program[id,displayName,programType],dataEntryForm[id,name],programStageDataElements[dataElement[id,displayName,valueType]]`, { noTruncate: true });
   if (meta?._error) return { _error: `Could not load program stage ${stageId}: ${meta._error}` };
   if (!meta.program?.id) return { _error: `Program stage ${stageId} has no resolvable program — cannot safely PUT it.` };
   const stageName = meta.displayName || stageId;

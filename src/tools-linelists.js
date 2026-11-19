@@ -73,6 +73,11 @@ const LINE_LIST_NUMERIC_VALUE_TYPES = new Set([
 ]);
 const LINE_LIST_NUMERIC_OPS = new Set(['EQ', 'NE', 'GT', 'GE', 'LT', 'LE', 'IN']);
 const LINE_LIST_TEXT_OPS = new Set(['EQ', 'NE', 'IN', 'LIKE', 'NLIKE']);
+// Date fields compare like numbers: "GE:2025-06-01:LE:2025-12-31" (verified on 2.42.5.1:
+// a DATE data element's GE filter returned 132 of 149 events, the range 130). They were
+// treated as text, so "results after a date" was refused (CCR dashboard, Haiku, 2026-11-18).
+const LINE_LIST_DATE_VALUE_TYPES = new Set(['DATE', 'DATETIME', 'AGE']);
+const LINE_LIST_DATE_OPS = new Set(['EQ', 'NE', 'GT', 'GE', 'LT', 'LE']);
 
 function lineListCanonOp(op) {
   const map = {
@@ -81,25 +86,33 @@ function lineListCanonOp(op) {
     'GT': 'GT', '>': 'GT', 'GE': 'GE', '>=': 'GE',
     'LT': 'LT', '<': 'LT', 'LE': 'LE', '<=': 'LE',
     'IN': 'IN', 'LIKE': 'LIKE', 'CONTAINS': 'LIKE', 'NLIKE': 'NLIKE', 'NOT_CONTAINS': 'NLIKE',
+    // "No value" / "has a value": saved as EQ:NV / NE:NV (Line Listing's "is empty" /
+    // "is not empty"). Verified on 2.42.5.1: a closure date EQ:NV → 51 of 120
+    // enrollments, NE:NV → 69 (IN:NV wrongly returns 0, so it is never used).
+    'EMPTY': 'EMPTY', 'IS_EMPTY': 'EMPTY', 'NULL': 'EMPTY', 'IS_NULL': 'EMPTY', 'NV': 'EMPTY', 'NO_VALUE': 'EMPTY', 'MISSING': 'EMPTY', 'BLANK': 'EMPTY',
+    'NOT_EMPTY': 'NOT_EMPTY', 'IS_NOT_EMPTY': 'NOT_EMPTY', 'NOT_NULL': 'NOT_EMPTY', 'IS_NOT_NULL': 'NOT_EMPTY', 'HAS_VALUE': 'NOT_EMPTY', 'NNV': 'NOT_EMPTY', 'PRESENT': 'NOT_EMPTY',
   };
   return map[String(op || '').trim().toUpperCase()] || null;
 }
 
 // ── Program context loader ───────────────────────────────────────────────────
 // Two reads: the program (stages + PSDEs + TEAs) and its program indicators.
+// Both are read WHOLE (noTruncate): over 80 KB the model-size cut drops nested
+// lists, and a Laboratory program with 8 stages and 362 data elements came back
+// with no stages ("Stage not found … Stages: .", 2026-11-19).
 // Everything create/update resolves against comes from here — the model can
 // never smuggle an invented UID into a saved line list.
 async function loadLineListProgramContext(programId) {
   const progResp = await safeDhis2Fetch(
     `programs/${programId}?fields=id,displayName,programType,trackedEntityType%5Bid,displayName%5D,`
     + `programStages%5Bid,displayName,repeatable,programStageDataElements%5BdataElement%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D%5D,`
-    + `programTrackedEntityAttributes%5BtrackedEntityAttribute%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D`
-  );
+    + `programTrackedEntityAttributes%5BtrackedEntityAttribute%5Bid,displayName,valueType,optionSet%5Bid%5D%5D%5D`, { noTruncate: true });
   if (progResp?._status === 404) return { _error: `Program "${programId}" does not exist (404).`, _hint: 'Resolve the program UID with search_metadata(object_type="programs") first.' };
   if (progResp?._error) return { _error: `Could not load program ${programId}: ${progResp._error}` };
 
   const piResp = await safeDhis2Fetch(
-    `programIndicators?filter=program.id:eq:${programId}&fields=id,displayName,analyticsType,aggregationType,expression,filter&pageSize=200`
+    `programIndicators?filter=program.id:eq:${programId}&fields=id,displayName,analyticsType,aggregationType,expression,filter&pageSize=200`,
+    { noTruncate: true }
   );
   if (piResp?._error) return { _error: `Could not load program indicators for ${programId}: ${piResp._error}` };
 
@@ -171,6 +184,7 @@ async function lineListNormalizeFilter(rawFilter, target, optionCache) {
     const parts = rawFilter.split(':');
     for (let i = 0; i < parts.length; i += 2) {
       const op = lineListCanonOp(parts[i]);
+      if (op === 'EMPTY' || op === 'NOT_EMPTY') { pairs.push({ op, value: 'NV' }); i -= 1; continue; }
       if (!op || parts[i + 1] === undefined) {
         return { _error: `Unparseable filter "${rawFilter}" on "${target.name}". Use "OP:value" pairs (e.g. "GT:50", "IN:CODE_A;CODE_B") or the object form { operator, value | values }.` };
       }
@@ -180,7 +194,8 @@ async function lineListNormalizeFilter(rawFilter, target, optionCache) {
     const conditions = Array.isArray(rawFilter.conditions) ? rawFilter.conditions : [rawFilter];
     for (const c of conditions) {
       const op = lineListCanonOp(c.operator || c.op);
-      if (!op) return { _error: `Unknown filter operator "${c.operator || c.op}" on "${target.name}". Supported: EQ, NE, GT, GE, LT, LE, IN, LIKE, NLIKE.` };
+      if (!op) return { _error: `Unknown filter operator "${c.operator || c.op}" on "${target.name}". Supported: EQ, NE, GT, GE, LT, LE, IN, LIKE, NLIKE, EMPTY (no value), NOT_EMPTY (has a value).` };
+      if (op === 'EMPTY' || op === 'NOT_EMPTY') { pairs.push({ op, value: 'NV' }); continue; }
       const values = Array.isArray(c.values) ? c.values : (c.value !== undefined ? [c.value] : []);
       if (!values.length) return { _error: `Filter on "${target.name}" has operator ${op} but no value/values.` };
       pairs.push({ op, value: values.map(v => String(v)).join(';') });
@@ -196,6 +211,12 @@ async function lineListNormalizeFilter(rawFilter, target, optionCache) {
 
   const out = [];
   for (const { op, value } of pairs) {
+    // No value / has a value, any type: "EQ:NV" / "NE:NV" (also when written as EQ/NE with the value NV).
+    if (op === 'EMPTY' || op === 'NOT_EMPTY' || ((op === 'EQ' || op === 'NE') && String(value).trim().toUpperCase() === 'NV')) {
+      out.push(op === 'EMPTY' || op === 'EQ' ? 'EQ:NV' : 'NE:NV');
+      continue;
+    }
+    if (op === 'IN' && String(value).trim().toUpperCase() === 'NV') { out.push('EQ:NV'); continue; } // IN:NV returns nothing on 2.42
     if (isOptionSet) {
       if (op !== 'IN' && op !== 'EQ' && op !== 'NE') {
         return { _error: `"${target.name}" is an option-set dimension — filter it with IN (one or more option codes), not ${op}.` };
@@ -219,11 +240,24 @@ async function lineListNormalizeFilter(rawFilter, target, optionCache) {
         return null;
       });
       if (mapped.includes(null)) return { _error: `"${target.name}" is ${vt} — filter values must be true/false (analytics stores them as 1/0).` };
+      if (op === 'NE') {
+        // "not Yes" is the other value (it was saved as IN:1, the opposite). A TRUE_ONLY
+        // field stores only 1, so "not true" is "no value".
+        if (vt === 'TRUE_ONLY') { out.push(mapped.every((v) => v === '1') ? 'EQ:NV' : 'IN:1'); continue; }
+        out.push(`IN:${[...new Set(mapped.map((v) => (v === '1' ? '0' : '1')))].join(';')}`);
+        continue;
+      }
       out.push(`IN:${mapped.join(';')}`);
     } else if (isNumeric) {
       if (!LINE_LIST_NUMERIC_OPS.has(op)) return { _error: `Operator ${op} is not valid for numeric "${target.name}". Use EQ, NE, GT, GE, LT, LE or IN.` };
       const bad = String(value).split(';').find(v => v.trim() === '' || isNaN(Number(v)));
       if (bad !== undefined) return { _error: `Filter value "${bad}" on numeric "${target.name}" is not a number.` };
+      out.push(`${op}:${value}`);
+    } else if (LINE_LIST_DATE_VALUE_TYPES.has(vt)) {
+      if (!LINE_LIST_DATE_OPS.has(op)) return { _error: `Operator ${op} is not valid for the date "${target.name}". Use EQ, NE, GT, GE, LT or LE with a yyyy-MM-dd date.` };
+      // Dates only (yyyy-MM-dd): a time carries ":" and the saved "OP:value" form splits on it.
+      const bad = String(value).split(';').find(v => !/^\d{4}-\d{2}-\d{2}$/.test(v.trim()));
+      if (bad !== undefined) return { _error: `Filter value "${bad}" on the date "${target.name}" is not a yyyy-MM-dd date.` };
       out.push(`${op}:${value}`);
     } else {
       if (!LINE_LIST_TEXT_OPS.has(op)) return { _error: `Operator ${op} is not valid for text "${target.name}". Use EQ, NE, IN, LIKE or NLIKE.` };
@@ -861,6 +895,35 @@ function lineListMergeScopeFilters(columns, filters) {
 }
 
 // ── Spec → payload assembly shared by create and update ─────────────────────
+// periods[] given on a column that is not a time dimension (the org-unit
+// column, most often) while the time column has none: the request is plain, so
+// the periods move to the time column instead of a refusal and a second call
+// (Inpatient Outcomes thread 2026-11-18: {dimension:"ou", org_units, periods}
+// next to {dimension:"event_date"}). Returns a note for the result, or null.
+function lineListMoveStrayPeriods(axes, outputType) {
+  const timeDims = LINE_LIST_TIME_DIMENSIONS[outputType] || {};
+  const isTime = (e) => {
+    const tok = String((typeof e === 'string' ? e : e && e.dimension) || '').trim();
+    const lower = tok.toLowerCase();
+    return Object.entries(timeDims).some(([canonical, aliases]) => canonical === tok || aliases.includes(lower));
+  };
+  const all = [...(axes.columns || []), ...(axes.filters || [])];
+  const hasPeriods = (e) => e && typeof e === 'object' && Array.isArray(e.periods) && e.periods.length;
+  const stray = all.filter((e) => hasPeriods(e) && !isTime(e));
+  if (!stray.length) return null;
+  const at = (list) => (list || []).findIndex((e) => isTime(e) && !hasPeriods(e) && !(e && typeof e === 'object' && Array.isArray(e.items) && e.items.length));
+  for (const key of ['columns', 'filters']) {
+    const k = at(axes[key]);
+    if (k < 0) continue;
+    const target = axes[key][k];
+    const periods = stray[0].periods;
+    axes[key][k] = { ...(typeof target === 'string' ? { dimension: target } : target), periods };
+    for (const e of stray) delete e.periods;
+    return `periods [${periods.join(', ')}] were given on the "${stray[0].dimension}" entry and were moved to the "${axes[key][k].dimension}" time column, where a line list keeps its period.`;
+  }
+  return null;
+}
+
 async function lineListBuildFromSpec(args, { requireName }) {
   const outputTypeRaw = String(args.output_type || args.input_type || 'EVENT').trim().toUpperCase().replace(/\s+/g, '_');
   const outputType = LINE_LIST_OUTPUT_TYPES[outputTypeRaw];
@@ -924,6 +987,7 @@ async function lineListBuildFromSpec(args, { requireName }) {
   };
 
   const axes = lineListMergeScopeFilters(args.columns, args.filters);
+  const strayPeriodNote = lineListMoveStrayPeriods(axes, outputType);
   const colRes = await resolveAxis(axes.columns, 'column');
   if (colRes._error) return colRes;
   const filtRes = await resolveAxis(axes.filters, 'filter');
@@ -1028,6 +1092,7 @@ async function lineListBuildFromSpec(args, { requireName }) {
   const probe = lineListBuildProbePath(outputType, programId, ctx.trackedEntityType?.id, columns, allDims);
 
   const warnings = [];
+  if (strayPeriodNote) warnings.push(strayPeriodNote);
   if (legend && legend._warning) warnings.push(legend._warning);
   for (const d of allDims) {
     if (d.kind !== 'pi') continue;

@@ -1,0 +1,11 @@
+Create a dashboard plugin called “Malaria Focus Response Explorer” using the malaria focus investigation program.
+
+Let me choose two dates and compare how each focus changed: its classification, testing results, response activities, and recorded coverage. Show a map, summary numbers, a comparison table, and a timeline when I select a focus.
+
+Use the latest information available at each chosen date. Count each focus once even if it has many investigations or responses, and show when its information is old or incomplete. Keep recorded response effectiveness separate from changes in testing results.
+
+Show investigation points and response boundaries wherever real locations exist. Overlay malaria cases where their locations are available, but do not assume nearby cases belong to a focus. Avoid double-counting people or households across repeated responses; explain when a reliable unique total cannot be calculated.
+
+Make the plugin follow dashboard filters, support export and printing, and keep its settings after reloading. Add two copies to a demonstration dashboard with different settings and confirm that changing one does not affect the other.
+
+Build, install, test, and share the result.

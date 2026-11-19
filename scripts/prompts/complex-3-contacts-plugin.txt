@@ -1,0 +1,7 @@
+Create a dashboard plugin called “Contact Follow-up” using the Ebola contact follow-up program.
+
+Show a calendar-style table with one contact enrollment per row and 21 follow-up days across the columns. Clearly distinguish seen, not seen, missing visits, and future days. For this analysis, assume daily follow-up starts the day after enrollment and label that assumption.
+
+Include summary numbers, a daily trend, and facilities with the most missing follow-up. Clicking a day should show its visits. Handle multiple visits on the same day without counting the contact twice.
+
+Make it respond to dashboard location and period filters. Add it twice to a demonstration dashboard with different settings, and make sure each copy keeps its own settings after reloading.

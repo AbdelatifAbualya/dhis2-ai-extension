@@ -221,6 +221,20 @@ function show(r) { return JSON.stringify(r === undefined ? null : r).slice(0, 30
       });
       check('missing time dimension refused', r._error && /time dimension/i.test(r._error), show(r));
 
+      // periods given on the org-unit column (a common model slip) move to the
+      // event_date column: saved in one call, with a note (2.8.46).
+      r = await t('manage_line_lists', {
+        action: 'create', name: `ZZ LL periods moved ${RUN_STARTED}`, output_type: 'EVENT', program_id: TB, program_stage_id: ST_SCREEN,
+        columns: [{ dimension: 'ou', org_units: ['USER_ORGUNIT'], periods: ['LAST_12_MONTHS'] }, { dimension: 'event_date' }, { dimension: 'GeneXpert Result' }],
+      });
+      {
+        const id = r.line_list_id;
+        const saved = id ? await t('dhis2_query', { path: `eventVisualizations/${id}?fields=columns[dimension,items[id]]` }) : null;
+        const time = (saved?.columns || []).find((c) => c.dimension === 'eventDate');
+        check('periods on the ou column are moved to event_date (saved, with a note)', !!id && time && time.items.some((i) => i.id === 'LAST_12_MONTHS') && /moved to the "event_date" time column/.test((r.warnings || []).join(" ")), show(r));
+        if (id) await t('manage_line_lists', { action: 'delete', line_list_id: id, skip_backup: false });
+      }
+
       r = await t('manage_line_lists', {
         action: 'create', name: 'XNEG bad sort', output_type: 'EVENT', program_id: TB, program_stage_id: ST_SCREEN,
         columns: [

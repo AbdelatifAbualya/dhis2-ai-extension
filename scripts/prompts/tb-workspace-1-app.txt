@@ -1,0 +1,11 @@
+Build an app called “TB Follow-up Workspace” using the TB program.
+
+Give me a searchable patient list, summary charts, a facility map, and a detailed timeline combining TB visits, lab monitoring, and repeated sputum tests. Selecting a facility or chart category should filter the list, and opening a patient should show their full history.
+
+Help me find missing follow-up, changing sputum results, conflicting records, and incomplete testing information. Let me set the expected follow-up interval and an “as of” date so I can review the situation at an earlier point in time.
+
+Keep separate treatment enrollments separate. Handle multiple tests on the same day, visits at different facilities, and patients with no follow-up records. Distinguish a test being recorded from an actual result being available.
+
+Add a review queue where I can mark an issue as reviewed and leave a note without changing the clinical records. Save my work across reloads and warn before overwriting another reviewer’s changes.
+
+Include filters, full filtered export, and links to the original records. Build, install, and test the app.

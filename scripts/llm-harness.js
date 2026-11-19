@@ -11,7 +11,10 @@
  *
  * Model/provider come from env (NOTHING model-specific is hardcoded):
  *   LLM_API_KEY      provider API key
- *   LLM_BASE_URL     e.g. https://api.fireworks.ai/inference/v1
+ *   LLM_BASE_URL     e.g. https://api.fireworks.ai/inference/v1, or
+ *                    http://claude-code.bridge.invalid/v1 for a Claude model on the
+ *                    user's Claude subscription via Claude Code (claude-code-bridge.js;
+ *                    LLM_MODEL=haiku|sonnet|opus, LLM_API_KEY any non-empty text)
  *   LLM_MODEL        e.g. accounts/fireworks/models/minimax-m3
  *   LLM_THINK        "1" if the model streams <think>…</think> blocks
  *   LLM_MAX_TOKENS   optional, default 16384
@@ -49,6 +52,7 @@ const LLMLOG = [];   // provider calls: { status }
 const events = [];   // broadcast events (AI_TOOL_CALL / AI_TOOL_DONE / …)
 
 const realFetch = global.fetch;
+const bridge = require('./claude-code-bridge');
 // chrome.runtime.getURL(p) → EXT_ORIGIN + p, served from disk like the browser
 // serves an extension's own files (manage_custom_app reads its runtime kit).
 const EXT_ORIGIN = 'chrome-extension://llm-harness/';
@@ -67,6 +71,15 @@ async function shimFetch(url, opts = {}) {
     ? { ...opts, headers: Object.assign({}, opts.headers || {}, { Authorization: AUTH }) }
     : opts;
   let resp;
+  // A Claude model on the user's own Claude subscription, through Claude Code's
+  // headless mode (scripts/claude-code-bridge.js): LLM_BASE_URL=http://claude-code.bridge.invalid/v1
+  if (!isDhis2 && bridge.isBridgeUrl(u)) {
+    let body = {};
+    try { body = JSON.parse((opts && opts.body) || '{}'); } catch { body = {}; }
+    resp = await bridge.handleChatCompletion(body);
+    LLMLOG.push({ url: u.replace(/\?.*$/, ''), status: resp.status });
+    return resp;
+  }
   try {
     resp = await realFetch(u, finalOpts);
   } catch (e) {

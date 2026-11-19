@@ -1,0 +1,15 @@
+Using the “Community Care and Referral” program created earlier, build a dashboard called “Care Journey and Service Performance”.
+
+Show people, care episodes, visits, admissions, and referrals as separate totals. Include referral completion, time to arrival, lab turnaround, missed appointments, average hospital stay, and episode outcomes.
+
+Add monthly trends, comparisons with the previous period, facility rankings, referral status charts, lab turnaround by test type, and an age-and-sex breakdown. Show which parts of the care journey are incomplete.
+
+Include three maps: referral completion by district, service activity by facility, and home locations where recorded. Clearly distinguish where a person lives from where care was provided.
+
+Add separate line-list tables for overdue referrals, pending lab results, missed appointments, current admissions, and closed episodes with unresolved needs. Include useful dates, facilities, statuses, and links to the original records.
+
+Let me filter by location and period. Explain whether each measure uses enrollment date, activity date, or appointment date. Keep journeys that cross reporting periods together where needed. Do not count repeated visits as new people, treat missing outcomes as successful, or count future appointments as missed.
+
+Calculate percentages from the correct totals, show their denominators, and display N/A when a percentage cannot be calculated. Keep records without coordinates in the other totals.
+
+Build and save the dashboard using native DHIS2 reporting tools where supported. Refresh analytics, compare the results with the fictional test records, and share the dashboard and verification results.

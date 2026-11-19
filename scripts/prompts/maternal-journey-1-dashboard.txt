@@ -1,0 +1,11 @@
+Create a dashboard called “Maternal Care Journey” using the WHO RMNCH Tracker.
+
+Show how women move from their first antenatal visit through repeat visits, delivery, and postpartum care. Include total pregnancies, women with four or more antenatal visits, delivery methods, pregnancy outcomes, and postpartum visits within two days of delivery.
+
+Add monthly trends, comparisons between facilities, a district map of care completion, and a facility map showing delivery numbers. Include line lists of incomplete care journeys, recorded maternal near-misses, and deliveries without postpartum follow-up.
+
+Let me compare two periods and filter by location. Count each pregnancy once even when it has many visits, and keep separate pregnancies for the same woman separate. Do not label someone as missing care when it is still too early for that care.
+
+Allow journeys to cross reporting periods. Show missing information clearly, explain the dates and denominators used, and make sure the charts, maps, and lists agree.
+
+Build and save everything, check the results, and share the dashboard.

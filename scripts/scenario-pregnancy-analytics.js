@@ -22,8 +22,10 @@
 const { load, API, summarize } = require('./live-harness');
 
 const PROGRAM_NAME = 'Integrated Pregnancy, Delivery and Postnatal Care Tracker';
-// Stage + DE UIDs (read live 2026-07-19; the scenario re-verifies the program by name).
-const S = {
+// Stage + DE UIDs: the 2026-07-19 ids below are only a fallback. The program on
+// 8081 was rebuilt since, so they are re-resolved by stage / data-element NAME
+// from the live program before anything is created (resolveIdsByName).
+let S = {
   reg: 'FIPs4MVhcok', gaFirst: 'npYTHMLdHdU', risk: 'bicgF8cFlIi',
   anc: 'eLbsatQYt3r', contactNo: 'PTVf4IV9qa8',
   lab: 'jJjqV8lrvBW', syphRes: 'iO3IfET8qlR', syphTx: 'UgBlxzAzuA0',
@@ -61,6 +63,32 @@ function buildIndicators() {
   ];
 }
 
+// stage key → stage-name pattern; DE key → [stage key, DE-name pattern]
+const STAGE_NAMES = { reg: /registration|first anc/i, anc: /routine anc|anc follow/i, lab: /laboratory/i, del: /delivery/i, pnc: /postnatal/i };
+const DE_NAMES = {
+  gaFirst: ['reg', /gestational age at first/i], risk: ['reg', /risk classification/i], contactNo: ['anc', /anc contact number/i],
+  syphRes: ['lab', /syphilis test result/i], syphTx: ['lab', /syphilis treatment/i], gaDel: ['del', /gestational age at delivery/i],
+  mode: ['del', /mode of delivery/i], nbOutcome: ['del', /newborn outcome/i], bw: ['del', /^birth weight/i], pncTiming: ['pnc', /postnatal contact timing/i],
+};
+async function resolveIdsByName(ctx, programId, die) {
+  const prog = await ctx.executeTool('dhis2_query', { path: `programs/${programId}?fields=programStages[id,name,programStageDataElements[dataElement[id,name]]]` });
+  const stages = (prog && prog.programStages) || [];
+  const next = {};
+  for (const [k, re] of Object.entries(STAGE_NAMES)) {
+    const st = stages.find((x) => re.test(x.name) && !Object.values(next).includes(x.id));
+    if (!st) die('resolve-ids', `no stage matching ${re} in ${stages.map((x) => x.name).join(', ')}`);
+    next[k] = st.id;
+  }
+  for (const [k, [sk, re]] of Object.entries(DE_NAMES)) {
+    const st = stages.find((x) => x.id === next[sk]);
+    const de = (st.programStageDataElements || []).map((p) => p.dataElement).find((d) => re.test(d.name));
+    if (!de) die('resolve-ids', `no data element matching ${re} in stage "${st.name}"`);
+    next[k] = de.id;
+  }
+  S = next;
+  console.log(`✓ stage and data element ids resolved by name (${Object.keys(next).length})`);
+}
+
 (async () => {
   const ctx = load({ appType: 'Dashboard' });
   const created = { pis: [], viz: [], maps: [], legends: [], dashboards: [] };
@@ -73,6 +101,7 @@ function buildIndicators() {
     const prog = (search.programs || search.results || []).find(p => (p.displayName || p.name) === PROGRAM_NAME) || (search.programs || [])[0];
     if (!prog?.id) die('discover', `program "${PROGRAM_NAME}" not found — ${JSON.stringify(search).slice(0, 200)}`);
     const programId = prog.id;
+    await resolveIdsByName(ctx, programId, die);
     console.log(`✓ program ${programId}`);
     const info = await ctx.executeTool('get_program_info', { info_type: 'stage_details', program_id: programId });
     if (info?._error) die('get_program_info', info._error);
