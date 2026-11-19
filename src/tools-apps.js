@@ -591,6 +591,35 @@ function customAppDeclares(bare, name) {
 // Static checks that catch the runtime errors a generated app would otherwise
 // only show as a blank page: undeclared components / hooks, names the kit does
 // not export, a missing DataProvider / render root / plugin handshake.
+  // Reading EVERY page of a big program's registrations before showing anything:
+  // TB Follow-up Workspace (Haiku, 2026-11-18 and -19) paged through all 50,028
+  // TB enrollments (200 requests of 250) and then their visits, so the app showed a
+  // spinner for minutes — twice, although the manual says to show the first page
+  // at once. Measured against the server: the live enrollment count of each
+  // program the code names (counts only).
+async function customAppFullReadProblem(allCompiled, found) {
+    const fullRead = /\b(?:while|for)\s*\([^)]*\bpageCount\b|\}\s*while\s*\([^)]*\bpageCount\b/.test(allCompiled)
+      && /['"`]tracker\/(?:enrollments|trackedEntities)['"`]/.test(allCompiled);
+    const said = /['"`][^'"`\n]*\b(?:may take (?:a while|several minutes|minutes)|can take (?:a while|several minutes|minutes)|loading all \d|this will read all)\b[^'"`\n]*['"`]/i.test(allCompiled);
+    const progs = Object.entries(found || {}).filter(([, t]) => t === 'programs').map(([id]) => id).slice(0, 3);
+    if (fullRead && !said && progs.length) {
+      let biggest = null;
+      for (const id of progs) {
+        const r = await safeDhis2Fetch(`tracker/enrollments?program=${id}&orgUnitMode=ACCESSIBLE&pageSize=1&totalPages=true&fields=enrollment`, { noTruncate: true });
+        const n = Number(r?.pager?.total ?? r?._pagerInfo?.total);
+        if (Number.isFinite(n) && (!biggest || n > biggest.n)) biggest = { id, n };
+      }
+      if (biggest && biggest.n > 10000) {
+        return {
+          _error: `The code would read every page of ${biggest.n.toLocaleString('en-US')} registrations of program ${biggest.id} (and their visits) before showing anything — minutes of spinner on this server.`,
+          problems: [{ message: `A paging loop to pager.pageCount over tracker/enrollments or tracker/trackedEntities reads all ${biggest.n.toLocaleString('en-US')} registrations. Show the first page at once (pageSize 50, totalPages:true; pager.total gives the count to show), load other pages on demand (next/previous or "load more"), search and filter on the server, and fetch visits only for the rows on screen. Counts and charts come from analytics or pager.total, never from a full read. A full read is fine only behind an explicit export button whose label says it may take a while.` }],
+          _hint: 'Fix the loading and resend the preview. Do not raise the page size instead: the problem is reading every record before the first render.',
+        };
+      }
+    }
+  return null;
+}
+
 function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
   const errors = [];
   const warnings = [];
@@ -910,6 +939,36 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
     if (/\bpageCount\b/.test(allCode) && !/\btotalPages\b/.test(allCode)) {
       errors.push({ message: 'tracker/* lists return no pager.pageCount (or total) unless the request sends totalPages: true — this loop stops after the first page and silently drops records. Add totalPages: true to the tracker params (and loop to pager.pageCount).' });
     }
+  }
+  // tracker/enrollments fetched by enrollments=<ids> with no program: 2.43 answers
+  // 400 E1003 "Program is mandatory" (2.42 accepted it). TB Follow-up Workspace
+  // (2026-11-19) loaded review notes that way and every load after the list failed.
+  for (const [file, v] of Object.entries(views)) {
+    for (const m of v.code.matchAll(/['"`]tracker\/enrollments\b/g)) {
+      const win = v.code.slice(m.index, m.index + 500);
+      if (/\benrollments\s*[:=]/.test(win) && !/\bprogram\b/.test(win)) {
+        errors.push({ file, line: lineAt(v.code, m.index), message: 'tracker/enrollments fetched by enrollments=<ids> without program: DHIS2 2.43 answers 400 "Program is mandatory" (E1003). Send program with it.' });
+      }
+    }
+  }
+  // A paging loop that also stops at a fixed page number drops every record past
+  // it without a word. Contact Follow-up plugin (2026-11-17): `while (page <=
+  // pageCount && page <= 40)` with pageSize 100 read 4,000 of 5,433 visits, so
+  // contacts with visits showed 21 missing days, and the two copies on the
+  // dashboard (different date windows → a different 4,000) disagreed.
+  for (const [file, v] of Object.entries(views)) {
+    for (const m of v.code.matchAll(/\b(?:while|for)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g)) {
+      const cond = m[1];
+      if (!/\b(?:pageCount|pager|nextPage|hasMore|more)\b/.test(cond)) continue;
+      const cap = cond.match(/\b(?:page|pages|p|i|n|guard|count)\w*\s*(<=?)\s*(\d{1,5})\b/);
+      if (!cap) continue;
+      // Allowed only when the cap is said on screen ("showing only the first …", "list truncated").
+      const surfaced = /['"`][^'"`\n]*\b(?:truncated|capped|only the first|partial list|more records than shown)\b[^'"`\n]*['"`]/i.test(v.code);
+      if (surfaced) continue;
+      errors.push({ file, line: lineAt(v.code, m.index), message: `This paging loop also stops at a fixed page (${cap[0].trim()}): every record past it is dropped with no message, so counts, totals and "missing" flags come out wrong. Loop until pager.pageCount (tracker lists: send totalPages: true), or, if a cap is truly needed, show the user "first N of <pager.total>" and take counts from pager.total or analytics, never from the capped list.` });
+    }
+  }
+  if (/['"`]tracker\//.test(allCode)) {
     // orgUnit without orgUnitMode = SELECTED: only records entered AT that
     // unit. Live 2026-11-01 (2.42.7) a case explorer sent orgUnit=<country>
     // and showed 0 of 100,332 events for "All locations" and every district.
@@ -1942,7 +2001,12 @@ async function prepareCustomAppBuild(spec, opts = {}) {
         : `The code would fail at runtime: ${lint.errors.length} problem(s).`,
       problems: lint.errors,
       warnings: lint.warnings.length ? lint.warnings : undefined,
-      _hint: 'Fix each listed problem and resend. Destructure every component/hook from its kit global: const { Card, DataTable } = D2UI; const { useDataQuery } = D2Runtime; const { useState } = React;',
+      // Haiku read this as a trade-off and stopped to ask the user (Malaria focus
+      // plugin, 2026-11-18). It is not one: the standard design keeps every
+      // requirement, so say it plainly.
+      _hint: patientWrite
+        ? `This is not a choice to put to the user: the standard design keeps every requirement. Build kind "app_and_plugin": plugin.jsx reads its settings (dataStore of D2_APP_CONFIG.namespace, key = dashboardItemId) and the records, and NEVER writes; app.jsx reads no records and holds the settings form — it lists this plugin's copies (dashboards?filter=dashboardItems.appKey:eq:<key>&fields=id,displayName,dashboardItems[id,appKey]) and saves each copy's settings under its item id. Settings stay per copy and survive reloads. After placing the copies you may also save each copy's starting settings with dhis2_query POST dataStore/<key>/<dashboardItemId> (settings only, never record values).`
+        : 'Fix each listed problem and resend. Destructure every component/hook from its kit global: const { Card, DataTable } = D2UI; const { useDataQuery } = D2Runtime; const { useState } = React;',
     };
   }
 
@@ -1954,6 +2018,11 @@ async function prepareCustomAppBuild(spec, opts = {}) {
       found_uids: uidCheck.found,
       _hint: `Never invent UIDs. Look the real ones up (search_metadata, get_program_info, dhis2_query) and resend. If an object exists but is not shared with this user it also shows as unknown. If these ids came from this same server earlier in the conversation, say so to the user rather than replacing them with name lookups.`,
     };
+  }
+
+  {
+    const fullReadProblem = await customAppFullReadProblem(allCompiled, uidCheck.found || {});
+    if (fullReadProblem) return fullReadProblem;
   }
 
   // Program-indicator VALUES come from /api/analytics with dx: — the event /

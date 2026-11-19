@@ -1,0 +1,9 @@
+Create a dashboard called “Inpatient Outcomes” using the Inpatient morbidity and mortality program.
+
+Show total cases, deaths, death percentage, and average hospital stay. Include monthly trends, the most common diagnoses, and an age-and-sex breakdown.
+
+Add three maps: deaths by district, case numbers by facility, and individual cases wherever their locations are available. Include separate line lists for all cases and deaths.
+
+Start with August–October 2026 and let me filter by location and period. Handle missing information and invalid dates sensibly, and clearly explain which dates the charts use. Make sure the maps, charts, and tables agree.
+
+Build and save the dashboard, check the results, and give me its link.

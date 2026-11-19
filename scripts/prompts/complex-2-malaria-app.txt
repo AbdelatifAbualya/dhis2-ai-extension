@@ -1,0 +1,9 @@
+Build an app called “Malaria Case Explorer” using the malaria diagnosis, treatment, and investigation program.
+
+I want to follow each case from diagnosis through investigation, household visits, and outcome. Show summary charts, a searchable case table, a facility map, and a timeline when I open a case.
+
+Help me find positive cases that have not been investigated, cases without outcomes, and incomplete or inconsistent records. Keep treatment information from different visits separate.
+
+Let me filter by location, dates, test result, and case status, and export all matching cases. Cases with missing visits should still appear.
+
+Make the app work with the existing data, install it, verify its counts, and give me the link.

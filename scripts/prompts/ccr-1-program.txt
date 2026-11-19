@@ -1,0 +1,27 @@
+Create a new DHIS2 Tracker program called “Community Care and Referral”.
+
+Register each person once, allow separate care episodes over time, and keep each episode’s records together. Include a unique patient number, name, birth date, sex, phone, address, home location, contact preference, emergency contact, and disability information.
+
+Create these stages, using at least 80 meaningful data elements across them, organised into clear sections:
+
+1. Initial assessment: reason for attendance, symptoms, symptom start, medical history, allergies, current medicines, measurements, priority, clinician, and care plan.
+
+2. Lab testing, repeatable: test name, sample number, request, collection and result dates, sample condition, result type, numeric or written result, units, abnormal flag, and reviewer.
+
+3. Referral, repeatable: reason, urgency, sending and receiving facilities, referral date, appointment date, transport, acceptance, arrival, status, outcome, and rejection or cancellation reason.
+
+4. Treatment, repeatable: medicine or treatment, reason, dose, unit, route, frequency, start and end dates, status, side effects, and reason for stopping.
+
+5. Follow-up, repeatable: symptoms, measurements, progress, adherence, side effects, actions, next appointment, attendance, and clinician.
+
+6. Admission and discharge, repeatable: facility, ward, admission and discharge dates, diagnosis, procedures, complications, discharge condition, destination, and length of stay.
+
+7. Episode closure: closure date, outcome, final assessment, unresolved needs, follow-up arrangements, and responsible staff member.
+
+Add rules and validation checks throughout. Show relevant questions only, require explanations for “Other”, calculate age and length of stay, and distinguish blank answers from zero or No. Require result fields appropriate to the selected test type. Prevent impossible date sequences, require reasons for cancelled referrals and stopped treatment, and require an outcome before completing an episode. Allow future appointments but prevent future dates for activities recorded as already performed. Show an alert when a result is marked abnormal.
+
+Apply rules to the correct visit, including when editing an older repeated visit. Clearly distinguish warnings from errors that prevent saving or completion. Explain any requested check that standard Tracker cannot enforce.
+
+Assign the program to suitable existing facilities. Create 100 clearly fictional people with 120 care episodes across six facilities over the last 18 months. Include repeated visits, referrals between facilities, completed and ongoing episodes, missed appointments, missing optional information, and some missing locations. Test invalid records separately without leaving them saved.
+
+Verify the forms and rules in Capture, prepare useful reporting indicators, and provide a short guide and baseline totals. Reuse your own work if this prompt is run again.

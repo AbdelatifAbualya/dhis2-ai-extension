@@ -526,6 +526,13 @@ function convertMessagesToAnthropic(messages) {
 
     // Convert assistant messages with tool_calls → Anthropic content blocks
     if (msg.role === 'assistant') {
+      // A reply that came from Claude keeps its own content blocks: thinking
+      // blocks (with their signature) must go back unchanged with the tool
+      // results, or a thinking model refuses the next request of the loop.
+      if (Array.isArray(msg._anthropic_content) && msg._anthropic_content.length) {
+        converted.push({ role: 'assistant', content: msg._anthropic_content.map((b) => ({ ...b })) });
+        continue;
+      }
       const contentBlocks = [];
       if (msg.content) {
         contentBlocks.push({ type: 'text', text: msg.content });
@@ -594,6 +601,14 @@ function convertMessagesToAnthropic(messages) {
   return { system: systemText, messages: merged };
 }
 
+// Sampling parameters (temperature, top_p, top_k) are accepted by Claude 3.x and
+// the 4.0–4.6 generation only; later models return a 400 for a non-default value.
+function anthropicModelAcceptsSampling(modelId) {
+  const id = String(modelId || '').toLowerCase().replace(/^anthropic\./, '');
+  if (/^claude-3/.test(id)) return true;
+  return /^claude-(?:opus|sonnet|haiku)-4(?:-[0-6])?(?:-\d{8})?(?:@\d{8})?$/.test(id) || /^claude-(?:opus|sonnet|haiku)-4-[0-6](?:-\d{8})?$/.test(id);
+}
+
 async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = TOOLS, iteration = 0) {
   const key = _cachedApiKey;
   if (!key) throw new Error('No API key configured. Open settings to add your Anthropic API key.');
@@ -610,9 +625,12 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
     model: cfg.modelId,
     messages: anthropicMessages,
     max_tokens: effectiveMaxTokens(cfg),
-    temperature: cfg.temperature,
     stream: true,
   };
+  // Claude 4.7 and later (Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable …) answer a
+  // non-default temperature with a 400; only older models get one.
+  if (anthropicModelAcceptsSampling(cfg.modelId) && cfg.temperature != null && Number.isFinite(Number(cfg.temperature))) body.temperature = Number(cfg.temperature);
+  if (cfg.effort && /^(?:low|medium|high|xhigh|max)$/.test(String(cfg.effort))) body.output_config = { effort: String(cfg.effort) };
   if (system) body.system = system;
   if (useTools && tools.length > 0) {
     body.tools = convertToolsToAnthropic(tools);
@@ -637,6 +655,7 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
   let fullContent = '';
   let finishReason = null;
   const toolCallMap = {}; // index → { id, name, arguments }
+  const blocks = {};      // index → the Anthropic content block as streamed (sent back unchanged)
   let hasToolCalls = false;
   let streamStartedForText = false;
   // Think block filtering for extended thinking models
@@ -675,6 +694,10 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
       switch (event.type) {
         case 'content_block_start': {
           const block = event.content_block;
+          if (block?.type === 'thinking') blocks[event.index] = { type: 'thinking', thinking: block.thinking || '', signature: block.signature || '' };
+          else if (block?.type === 'redacted_thinking') blocks[event.index] = { type: 'redacted_thinking', data: block.data };
+          else if (block?.type === 'text') blocks[event.index] = { type: 'text', text: block.text || '' };
+          else if (block?.type === 'tool_use') blocks[event.index] = { type: 'tool_use', id: block.id, name: block.name, _json: '' };
           if (block?.type === 'tool_use') {
             hasToolCalls = true;
             toolCallMap[event.index] = {
@@ -687,6 +710,13 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
         }
         case 'content_block_delta': {
           const delta = event.delta;
+          const kept = blocks[event.index];
+          if (kept) {
+            if (delta?.type === 'text_delta' && kept.type === 'text') kept.text += delta.text || '';
+            else if (delta?.type === 'input_json_delta' && kept.type === 'tool_use') kept._json += delta.partial_json || '';
+            else if (delta?.type === 'thinking_delta' && kept.type === 'thinking') kept.thinking += delta.thinking || '';
+            else if (delta?.type === 'signature_delta' && kept.type === 'thinking') kept.signature = (kept.signature || '') + (delta.signature || '');
+          }
           if (delta?.type === 'text_delta' && delta.text) {
             if (thinkFilterDone) {
               if (!streamStartedForText) { streamStartedForText = true; onTextChunk(null); }
@@ -720,7 +750,7 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
             if (toolArgTokenCount % 80 === 0) {
               broadcast({ type: 'AI_THINKING', iteration: iteration + 1, label: `Composing action… (~${toolArgTokenCount} tokens)` });
             }
-          } else if (delta?.type === 'thinking' && delta.thinking) {
+          } else if ((delta?.type === 'thinking_delta' || delta?.type === 'thinking') && delta.thinking) {
             // Anthropic extended thinking — skip (it's internal reasoning)
             thinkTokenCount++;
             if (thinkTokenCount === 1) {
@@ -757,6 +787,17 @@ async function callAnthropicStreaming(messages, useTools, onTextChunk, tools = T
 
   // Normalize to OpenAI format for the agentic loop
   const message = { role: 'assistant', content: fullContent || null };
+  // The reply exactly as Claude sent it, for the next request of this loop.
+  // Only needed (and only kept) when it carries thinking.
+  const ordered = Object.keys(blocks).map(Number).sort((a, b) => a - b).map((i) => blocks[i]);
+  if (ordered.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking')) {
+    message._anthropic_content = ordered.map((b) => {
+      if (b.type !== 'tool_use') return b;
+      let input = {};
+      try { input = b._json ? JSON.parse(b._json) : {}; } catch { input = {}; }
+      return { type: 'tool_use', id: b.id, name: b.name, input };
+    }).filter((b) => !(b.type === 'text' && !b.text));
+  }
   if (hasToolCalls) {
     const tcList = Object.values(toolCallMap).map(tc => {
       try { JSON.parse(tc.function.arguments); } catch { tc.function.arguments = '{}'; }

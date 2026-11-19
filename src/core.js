@@ -1834,6 +1834,7 @@ const DISCOVERY_ACTIONS = {
   manage_backups: new Set(['list', 'get']),
   manage_custom_app: new Set(['list', 'get_source', 'preview', 'placements']),
   manage_sql_views: new Set(['list', 'get', 'describe', 'run']),
+  manage_test_data: new Set(['summary']),
 };
 function isDiscoveryCall(toolName, args) {
   if (DISCOVERY_ONLY_TOOLS.has(toolName)) return true;
@@ -1848,8 +1849,19 @@ function isDiscoveryCall(toolName, args) {
 // to see first (TB program design, 2026-11-17).
 function userAskedForPlanFirst(text) {
   const t = String(text || '');
-  const showFirst = /\b(?:show|give|send|tell|present|walk)\s+me\b[^.?!]{0,40}\b(?:plan|design|summary|preview|mapping|proposal|outline|draft|overview)\b/i.test(t)
-    && /\b(?:before|first|prior\s+to|then\s+wait)\b/i.test(t);
+  // The request for a plan and its "before / first" must be in the same sentence,
+  // and a plan word that names a FEATURE ("summary charts", "overview table") is
+  // not a request for a plan. "Give me a searchable patient list, summary charts …
+  // warn before overwriting …" made a whole app request read-only (TB workspace,
+  // 2026-11-18).
+  const FEATURE_NOUN = /^\s+(?:charts?|tables?|numbers?|tiles?|cards?|statistics|stats|views?|pages?|panels?|sections?|reports?|counts?|figures?|metrics?|cards?|graphs?|maps?|lists?)\b/i;
+  const sentences = t.split(/(?<=[.?!])\s+|\n+/);
+  const showFirst = sentences.some((sen) => {
+    const m = /\b(?:show|give|send|tell|present|walk)\s+me\b[^.?!]{0,40}?\b(plan|design|summary|preview|mapping|proposal|outline|draft|overview)\b/i.exec(sen);
+    if (!m) return false;
+    if (FEATURE_NOUN.test(sen.slice(m.index + m[0].length))) return false;
+    return /\b(?:before|first|prior\s+to|then\s+wait|until\s+I\s+(?:approve|confirm|agree|say))\b/i.test(sen);
+  });
   const notYet = /\b(?:don'?t|do\s+not)\s+(?:create|change|install|place|build|make|apply|save|import)\s+anything\s+yet\b/i.test(t);
   return showFirst || notYet;
 }
@@ -2115,6 +2127,67 @@ function hasUidShape(v) {
 //   • otherwise look for future-intent phrasing near the end: a sentence
 //     starting with an action gerund ("Creating…", "Now adding…") or an
 //     explicit first-person promise ("I'll create…", "let me add…").
+// A final answer that says requested parts were not built (a section "Not built
+// yet", "only partly done", "still to do"). Not when it ends by asking the user.
+function looksLikePartialDelivery(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  // An explicit list of what is missing FROM THE REQUEST counts even when the
+  // answer ends by asking which to build first: the user already asked for all of
+  // it (TB workspace, 2026-11-18: "What is missing from your request … Tell me
+  // which first").
+  // Care Coordination Workspace (2026-11-19): "Step 1 of the build … Still missing
+  // from your brief | Item | Status … Next: I will replace …".
+  if (/\b(?:what is missing from (?:your|the) (?:request|brief)|(?:still )?missing from (?:your|the) (?:request|brief|prompt|spec(?:ification)?)|only (?:a )?part of what you asked(?: for)? is built|not everything you asked for is built|gaps against (?:your|the) (?:request|brief)|what is not done|partly built, not finished|step \d+ of the build|first (?:step|part|stage) of the build)\b/i.test(t)) return true;
+  if (/(?:^|\n)\s*(?:#+\s*|\*\*)?still missing\b/i.test(t)) return true;
+  // A requirement-by-requirement table with a gap column (Care Coordination
+  // Workspace rerun, 2026-11-19: "| Requirement | Installed v1.1.2 | Gap |").
+  // ("Missing" is not one: a completeness table has a Missing column.)
+  if (/(?:^|\n)\s*\|[^\n]*\|\s*(?:gaps?|not (?:built|done)(?: yet)?|still to (?:do|build))\s*\|\s*(?:\n|$)/i.test(t)) return true;
+  // A section header (a whole-line bold phrase or a # heading) naming unbuilt
+  // parts: "**Not done (you asked for these)**", "**Not built, or not as you
+  // asked**", "**Not built or not met**", "### Not done or not verified",
+  // "## Dashboard built, with gaps", "### Changed from your request" over a
+  // "not built" item (Haiku rounds, 2026-11-19). A bold lead-in followed by
+  // text on the same line ("**Not done by the app:** it never …") is not one.
+  for (const line of t.split('\n')) {
+    const m = line.match(/^\s*(?:#{1,4}\s+(.+)|\*\*(.+?)\*\*\s*:?\s*)$/);
+    if (!m) continue;
+    const h = String(m[1] || m[2] || '').replace(/\*\*/g, '').trim().toLowerCase();
+    if (/^(?:not (?:yet )?(?:built|done|met|implemented|included|finished|verified)|what is (?:missing|not)|parts? not built|still missing|missing from (?:your|the) (?:request|brief))\b/.test(h)) return true;
+    if (/\bwith gaps\b|\bgaps against\b/.test(h)) return true;
+    if (/^(?:what )?changed from (?:your|the) request\b/.test(h) && /\bnot built\b/i.test(t)) return true;
+  }
+  if (/\?\s*$/.test(t.slice(-300))) return false;
+  return /\b(?:not (?:built|done|implemented|included|added|finished|created) yet|only partly (?:done|built)|(?:the request is )?(?:only )?partially (?:done|built|complete(?:d)?)|still to (?:do|build)|parts? (?:i )?(?:did not|didn't|have not|haven't) (?:build|built|add|added|do|done)|remaining (?:parts|items|features) (?:to build|not built))\b/i.test(t);
+}
+
+// Did this call SAVE something? A write-capable tool whose action only reads
+// (list, get, preview, audit …) is not a write. isDiscoveryCall misses some list
+// actions (manage_dashboards / manage_maps / manage_line_lists list), and the
+// turn-end pushes must not take a list for progress.
+const READ_ONLY_ACTION_RE = /^(?:list|get|get_[a-z_]+|preview|search|summary|audit|verify|discover|placements|rank_ou|status|read|describe|check|check_[a-z_]+|validate|test_invalid|info|history|diff|layout|show|find|lookup|inspect)$/i;
+function isRealWriteCall(toolName, args) {
+  if (!WRITE_CAPABLE_TOOL_NAMES.has(toolName)) return false;
+  if (isDiscoveryCall(toolName, args)) return false;
+  const action = String(args?.action || '').trim();
+  if (action && READ_ONLY_ACTION_RE.test(action)) return false;
+  return true;
+}
+
+// A final answer that built nothing yet and asks the user to confirm details:
+// "I have not installed the app yet … What the full build needs before I write
+// it: 1. … Is that right?". Questions or "before I build" with no blocker named.
+function looksLikeAskingInsteadOfBuilding(text) {
+  const t = String(text || '');
+  const notBuilt = /\b(?:have not|haven't|did not|didn't|not yet)\s+(?:installed|built|created|written|made)\b|\bbefore I (?:write|build|create|install)\b|\bonce you (?:confirm|answer|agree)\b|\bonly a skeleton\b/i.test(t);
+  const asks = (t.match(/\?/g) || []).length >= 1 || /\b(?:confirm|is that (?:right|ok|acceptable)|do you want|should I)\b/i.test(t);
+  // A real reason to ask: a named object missing, a permission, or a same-name
+  // object already there (update it or make a new one is the user's call).
+  const blocker = /\b(?:does not exist|not found on|no such program|refused by|permission|not authori[sz]ed|cannot be (?:created|built) because|already exists?|exists already)\b/i.test(t);
+  return notBuilt && asks && !blocker;
+}
+
 function looksLikeUnfinishedAnnouncement(text) {
   const t = String(text || '').trim();
   if (!t || t.length > 2000) return false;
@@ -3764,7 +3837,7 @@ async function analyticsCacheMismatch(cleanPath, data) {
   const stage = (qs.match(/(?:^|&)stage=([A-Za-z][A-Za-z0-9]{10})(?:&|$)/) || [])[1];
   if (!other && stage && !items[stage]) {
     if (!_programStageIdsCache.has(pid)) {
-      const r = await safeDhis2Fetch(`programs/${pid}?fields=programStages[id]`);
+      const r = await safeDhis2Fetch(`programs/${pid}?fields=programStages[id]`, { noTruncate: true });
       _programStageIdsCache.set(pid, new Set(((r && !r._error && r.programStages) || []).map((st) => st.id)));
     }
     const id = [..._programStageIdsCache.get(pid)].find((st) => st !== stage && items[st]);
@@ -4237,10 +4310,16 @@ async function safeDhis2Fetch(path, options = {}) {
       if (data.rows) {
         truncated.headers = data.headers;
         truncated.rows = data.rows.slice(0, 200);
-        truncated.metaData = data.metaData;
+        // metaData can be the big part: a dimension on a data element with a
+        // large option set lists EVERY option in metaData.items/dimensions
+        // (ICD-10, 14,240 options = 1.6 MB with 200 rows kept) and that alone
+        // overflowed a 1M-token context (Inpatient thread, 2026-11-17). Keep
+        // only the entries the kept rows and headers refer to.
+        truncated.metaData = analyticsMetaDataForRows(data.metaData, truncated.rows, data.headers);
         truncated.height = data.height;
         truncated.width = data.width;
         truncated._totalRows = data.rows.length;
+        truncated._note = `Large response: first 200 of ${data.rows.length} rows (metaData trimmed to those rows). For a "top N", sort and cap on the server (event aggregate: sortOrder=DESC&limit=N; /analytics: a smaller dimension), or filter to fewer items.`;
       } else if (data.trackedEntities) {
         truncated.trackedEntities = data.trackedEntities.slice(0, 50);
         truncated._totalEntities = data.trackedEntities.length;
@@ -4273,6 +4352,99 @@ async function safeDhis2Fetch(path, options = {}) {
   } catch (err) {
     return { _error: `Fetch failed: ${err.message}`, _url: fullUrl };
   }
+}
+
+// metaData of an analytics grid, cut down to what `rows` and `headers` use:
+// items keyed by a value that appears in a kept row or a header name (plus the
+// fixed keys such as 'pe', 'ou', 'dx'), dimensions lists limited to the values
+// present. ouHierarchy / ouNameHierarchy are kept only for org units in rows.
+function analyticsMetaDataForRows(metaData, rows, headers) {
+  if (!metaData || typeof metaData !== 'object') return metaData;
+  const used = new Set();
+  for (const r of rows || []) for (const c of r || []) if (c !== null && c !== undefined) used.add(String(c));
+  for (const h of headers || []) if (h && h.name) used.add(String(h.name));
+  // Items of a BIG dimension (> 50 entries, e.g. every option of an option
+  // set) are kept only when a kept row uses them — by id or, for options, by
+  // code (rows carry option codes, items are keyed by option uid). Everything
+  // else (program, stage, pe, ou, dx entries) is kept as is.
+  const allItems = (metaData.items && typeof metaData.items === 'object') ? metaData.items : {};
+  const isUsed = (id) => used.has(String(id)) || (allItems[id] && allItems[id].code !== undefined && used.has(String(allItems[id].code)));
+  const bigDimIds = new Set();
+  for (const dv of Object.values(metaData.dimensions || {})) if (Array.isArray(dv) && dv.length > 50) dv.forEach((x) => bigDimIds.add(String(x)));
+  const out = {};
+  for (const [k, v] of Object.entries(metaData)) {
+    if (k === 'items' && v && typeof v === 'object') {
+      const items = {};
+      for (const [ik, iv] of Object.entries(v)) if (!bigDimIds.has(ik) || isUsed(ik)) items[ik] = iv;
+      out.items = items;
+    } else if (k === 'dimensions' && v && typeof v === 'object') {
+      const dims = {};
+      for (const [dk, dv] of Object.entries(v)) {
+        if (!Array.isArray(dv) || dv.length <= 50) { dims[dk] = dv; continue; }
+        const kept = dv.filter(isUsed);
+        dims[dk] = kept;
+        dims[`_${dk}_withheld`] = dv.length - kept.length;
+      }
+      out.dimensions = dims;
+    } else if ((k === 'ouHierarchy' || k === 'ouNameHierarchy') && v && typeof v === 'object' && Object.keys(v).length > 50) {
+      const h = {};
+      for (const [hk, hv] of Object.entries(v)) if (used.has(hk)) h[hk] = hv;
+      out[k] = h;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// Last line of defence for the model's context: any tool result is cut to
+// MODEL_TOOL_RESULT_MAX_CHARS before it becomes a tool message. Arrays are
+// sliced, objects with many keys thinned, long strings shortened, step by step
+// until it fits, and the result says what was withheld. Keys starting with "_"
+// (errors, hints, notes) at the top level are always kept.
+const MODEL_TOOL_RESULT_MAX_CHARS = 100000;
+function toolResultForModel(result, maxChars = MODEL_TOOL_RESULT_MAX_CHARS) {
+  let text;
+  try { text = JSON.stringify(result); } catch (e) { return JSON.stringify({ _error: `Tool result could not be serialised: ${e.message}` }); }
+  if (text === undefined) return 'null';
+  if (text.length <= maxChars) return text;
+  const shrink = (v, arrMax, keyMax, strMax, top) => {
+    if (typeof v === 'string') return v.length > strMax ? `${v.slice(0, strMax)}… [${v.length - strMax} more chars]` : v;
+    if (Array.isArray(v)) {
+      const out = v.slice(0, arrMax).map((x) => shrink(x, arrMax, keyMax, strMax, false));
+      if (v.length > arrMax) out.push(`… ${v.length - arrMax} more item(s) withheld`);
+      return out;
+    }
+    if (v && typeof v === 'object') {
+      const out = {};
+      const keys = Object.keys(v);
+      let n = 0;
+      for (const k of keys) {
+        if (top && k.startsWith('_')) { out[k] = shrink(v[k], Math.max(arrMax, 20), keyMax, Math.max(strMax, 2000), false); continue; }
+        if (n >= keyMax) continue;
+        out[k] = shrink(v[k], arrMax, keyMax, strMax, false);
+        n++;
+      }
+      const withheld = keys.filter((k) => !(k in out)).length;
+      if (withheld) out[top ? '_keys_withheld' : '…'] = `${withheld} more key(s) withheld`;
+      return out;
+    }
+    return v;
+  };
+  const steps = [[200, 400, 4000], [100, 200, 2000], [50, 100, 1000], [20, 50, 500], [10, 25, 300], [5, 12, 200]];
+  for (const [arrMax, keyMax, strMax] of steps) {
+    const cut = shrink(result, arrMax, keyMax, strMax, true);
+    if (cut && typeof cut === 'object' && !Array.isArray(cut)) {
+      cut._truncated_for_model = `This result was ${text.length} characters; lists were cut to ${arrMax} items and objects to ${keyMax} keys to fit. Ask for less (filter, fields, a smaller dimension, sortOrder+limit) if the withheld part matters.`;
+    }
+    const s = JSON.stringify(cut);
+    if (s.length <= maxChars) return s;
+  }
+  return JSON.stringify({
+    _truncated_for_model: `This result was ${text.length} characters, too large to send. Only the start is shown. Ask for less: filter, fields, a smaller dimension, or sortOrder+limit.`,
+    _error: result && result._error ? String(result._error).slice(0, 2000) : undefined,
+    preview: text.slice(0, Math.max(1000, maxChars - 2000)),
+  });
 }
 
 // ── Capture metadata freshness ──────────────────────────────────────────────
@@ -4884,9 +5056,16 @@ function buildTrackerWriteRequest(path, method, body, ctx) {
   if (!commitParams.has('importStrategy')) commitParams.set('importStrategy', importStrategy);
   commitParams.set('async', 'false');
 
-  const dryRunOnly = commitParams.get('dryRun') === 'true';
+  // /api/tracker has no dryRun parameter: it IGNORES ?dryRun=true and commits
+  // (verified 2.42.5.1, 2026-11-18: the "preflight" created the records, then the
+  // real import failed on its own duplicates and the tool reported "nothing was
+  // saved"). A check without saving is importMode=VALIDATE; a model's dryRun=true
+  // means the same, and dryRun never reaches the server.
+  const dryRunOnly = commitParams.get('dryRun') === 'true' || String(commitParams.get('importMode') || '').toUpperCase() === 'VALIDATE';
+  commitParams.delete('dryRun');
+  if (String(commitParams.get('importMode') || '').toUpperCase() === 'VALIDATE') commitParams.delete('importMode');
   const preflightParams = new URLSearchParams(commitParams);
-  preflightParams.set('dryRun', 'true');
+  preflightParams.set('importMode', 'VALIDATE');
 
   return {
     originalPath: clean,
@@ -5766,7 +5945,7 @@ async function healBareStageDimension(path) {
   const bare = parts.filter(x => /^dimension=/i.test(x) && /^[A-Za-z][A-Za-z0-9]{10}$/.test(dec(x.slice(x.indexOf('=') + 1))));
   if (!bare.length) return { path: p };
   if (!_programStageIdsCache.has(pid)) {
-    const r = await safeDhis2Fetch(`programs/${pid}?fields=programStages[id]`);
+    const r = await safeDhis2Fetch(`programs/${pid}?fields=programStages[id]`, { noTruncate: true });
     _programStageIdsCache.set(pid, new Set(((r && !r._error && r.programStages) || []).map(s => s.id)));
   }
   const stageIds = _programStageIdsCache.get(pid);

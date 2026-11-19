@@ -112,7 +112,7 @@ function dataCheckAnalyticsState(programId) {
 }
 
 // ── Reading what a saved object asks for ─────────────────────────────────────
-const DATA_CHECK_DX_FIELDS = 'dataDimensionItemType,programIndicator[id,displayName,expression,filter,aggregationType,program[id]],indicator[id,displayName],dataElement[id,displayName],reportingRate[id,dimensionItem,displayName],dataElementOperand[id,dimensionItem,displayName]';
+const DATA_CHECK_DX_FIELDS = 'dataDimensionItemType,programIndicator[id,displayName,expression,filter,aggregationType,analyticsType,program[id],categoryCombo[id,displayName],categoryMappingIds],indicator[id,displayName],dataElement[id,displayName],reportingRate[id,dimensionItem,displayName],dataElementOperand[id,dimensionItem,displayName]';
 const DATA_CHECK_SAVED_FIELDS = `periods[id],relativePeriods,organisationUnits[id],organisationUnitLevels,userOrganisationUnit,userOrganisationUnitChildren,userOrganisationUnitGrandChildren,dataDimensionItems[${DATA_CHECK_DX_FIELDS}]`;
 
 function dataCheckOuDimension(saved) {
@@ -179,7 +179,111 @@ async function dataCheckAggregateTile(tile, saved) {
     state: !emptyItems.length ? 'ok' : emptyItems.length === items.length ? 'empty' : 'partly_empty',
     empty_items: emptyItems.map(i => ({ id: i.id, name: i.name })),
     items,
+    pe,
+    ou,
   };
+}
+
+// Date fields an indicator subtracts (d2:daysBetween and kin) that sit far from
+// the record's own period: data entered with the wrong year. Inpatient Outcomes
+// thread (2026-11-18): admission/discharge dates were in 2021 on records of
+// Aug–Oct 2026; the length-of-stay tile still came out at 14 days and nothing
+// said the dates were five years off, and a remote model cannot see them (no
+// patient rows). Counts the records in the tile's period and places whose date
+// is more than a year before its start or after its end. Counts only.
+async function dataCheckDistantDates(tiles) {
+  const jobs = new Map();
+  for (const t of tiles) {
+    for (const i of t.items || []) {
+      const pi = i.indicator;
+      if (!pi || !pi.program?.id || !t.pe || !t.ou) continue;
+      const text = `${pi.expression || ''} ${pi.filter || ''}`;
+      for (const call of text.matchAll(/d2:(?:days|weeks|months|years|minutes)Between\s*\(([^()]*)\)/gi)) {
+        for (const r of call[1].matchAll(/#\{([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})\}/g)) {
+          const key = `${pi.program.id}:${r[1]}:${r[2]}`;
+          if (!jobs.has(key)) jobs.set(key, { programId: pi.program.id, stage: r[1], de: r[2], indicator: pi.displayName || pi.id, enrollment: String(pi.analyticsType || '').toUpperCase() === 'ENROLLMENT', pe: t.pe, ou: t.ou, tiles: [] });
+          jobs.get(key).tiles.push(t.tile);
+        }
+      }
+    }
+  }
+  const out = [];
+  await dataCheckPool([...jobs.values()].slice(0, 4), async (j) => {
+    const range = typeof d2PeriodRange === 'function' ? d2PeriodRange(j.pe) : null;
+    if (!range) return;
+    const shift = (iso, days) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+    const before = shift(range.start, -366);
+    const after = shift(range.end, 366);
+    const base = j.enrollment
+      ? `analytics/enrollments/aggregate/${j.programId}?dimension=pe:${j.pe}&filter=ou:${j.ou}`
+      : `analytics/events/aggregate/${j.programId}?stage=${j.stage}&dimension=pe:${j.pe}&filter=ou:${j.ou}&outputType=EVENT`;
+    const dim = `${j.stage}.${j.de}`;
+    const [all, early, late] = await Promise.all([
+      safeDhis2Fetch(`${base}&filter=${dim}:NE:NV`),
+      safeDhis2Fetch(`${base}&filter=${dim}:LT:${before}`),
+      safeDhis2Fetch(`${base}&filter=${dim}:GT:${after}`),
+    ]);
+    if ([all, early, late].some((r) => !r || r._error)) return;
+    const n = sumAnalyticsValueColumn(all);
+    const e = sumAnalyticsValueColumn(early);
+    const l = sumAnalyticsValueColumn(late);
+    if (!e && !l) return;
+    const ctx = await dataCheckCached(`names:${j.programId}`, () => loadLineListProgramContext(j.programId));
+    out.push({ field: ctx?.des?.get(j.de)?.name || j.de, indicator: j.indicator, tiles: [...new Set(j.tiles)], records_with_date: n, more_than_a_year_before: e, more_than_a_year_after: l, period: `${range.start} to ${range.end}` });
+  });
+  return out;
+}
+
+// A program indicator with a category combination ("disaggregation") counts a
+// record only when it fits one option of every category, by the option filters
+// of the program's category mappings. A record with no value in a field those
+// filters read fits none, and drops out of the indicator's TOTAL too. Inpatient
+// Outcomes thread (2026-11-18): the demo "Inpatient cases" indicator is split by
+// "Morbidity Age and Gender", so 3 records without age or sex were missing from
+// the total-cases tile (13,799 of 13,802), and the model explained the gap
+// wrongly. Counts, per field, the records in the tile's period and places with
+// no value — a count, no patient value is read.
+async function dataCheckSplitIndicators(tiles) {
+  const byPi = new Map();
+  for (const t of tiles) {
+    for (const i of t.items || []) {
+      const pi = i.indicator;
+      const cc = pi && pi.categoryCombo;
+      if (!pi || !cc || !cc.id || cc.displayName === 'default' || !(pi.categoryMappingIds || []).length || !pi.program?.id) continue;
+      if (!byPi.has(pi.id)) byPi.set(pi.id, { pi, tiles: [], pe: t.pe, ou: t.ou });
+      byPi.get(pi.id).tiles.push(t.tile);
+    }
+  }
+  const out = [];
+  await dataCheckPool([...byPi.values()].slice(0, 6), async ({ pi, tiles: usedBy, pe, ou }) => {
+    if (!pe || !ou) return;
+    const prog = await dataCheckCached(`catmap:${pi.program.id}`, () => safeDhis2Fetch(`programs/${pi.program.id}?fields=categoryMappings[id,mappingName,optionMappings[filter]]`, { noTruncate: true }));
+    const maps = ((prog && prog.categoryMappings) || []).filter((m) => pi.categoryMappingIds.includes(m.id));
+    const refs = new Map();
+    for (const m of maps) {
+      for (const om of m.optionMappings || []) {
+        for (const r of String(om.filter || '').matchAll(/#\{([A-Za-z][A-Za-z0-9]{10})\.([A-Za-z][A-Za-z0-9]{10})\}/g)) refs.set(`${r[1]}.${r[2]}`, { stage: r[1], id: r[2], category: m.mappingName });
+        for (const r of String(om.filter || '').matchAll(/A\{([A-Za-z][A-Za-z0-9]{10})\}/g)) refs.set(r[1], { stage: null, id: r[1], category: m.mappingName });
+      }
+    }
+    if (!refs.size) return;
+    const enrollment = String(pi.analyticsType || '').toUpperCase() === 'ENROLLMENT';
+    const ctx = await dataCheckCached(`names:${pi.program.id}`, () => loadLineListProgramContext(pi.program.id));
+    const leftOut = [];
+    for (const f of refs.values()) {
+      const dim = f.stage ? `${f.stage}.${f.id}` : f.id;
+      const path = enrollment
+        ? `analytics/enrollments/aggregate/${pi.program.id}?dimension=pe:${pe}&filter=ou:${ou}&filter=${dim}:EQ:NV`
+        : `analytics/events/aggregate/${pi.program.id}?${f.stage ? `stage=${f.stage}&` : ''}dimension=pe:${pe}&filter=ou:${ou}&filter=${dim}:EQ:NV&outputType=EVENT`;
+      const r = await safeDhis2Fetch(path);
+      if (!r || r._error) continue;
+      const n = sumAnalyticsValueColumn(r);
+      const name = (f.stage ? ctx?.des?.get(f.id)?.name : ctx?.teas?.get(f.id)?.name) || f.id;
+      leftOut.push({ field: name, category: f.category, records_without_value: n });
+    }
+    out.push({ indicator: pi.displayName || pi.id, split_by: pi.categoryCombo.displayName, tiles: usedBy, left_out: leftOut });
+  });
+  return out;
 }
 
 async function dataCheckLineListTile(id) {
@@ -279,11 +383,14 @@ async function runDataCheck(targets) {
   }
 
   const analytics = await dataCheckPool([...programs], async (pid) => ({ programId: pid, ...(await dataCheckAnalyticsState(pid) || { state: 'unknown' }), program: contexts.get(pid)?.program?.name || null }));
+  let split = [];
+  let distant = [];
+  try { [split, distant] = await Promise.all([dataCheckSplitIndicators(tiles), dataCheckDistantDates(tiles)]); } catch { split = split || []; distant = distant || []; }
 
-  return dataCheckAssemble(tiles, fieldList, analytics.filter(Boolean));
+  return dataCheckAssemble(tiles, fieldList, analytics.filter(Boolean), split, distant);
 }
 
-function dataCheckAssemble(tiles, fieldList, analytics) {
+function dataCheckAssemble(tiles, fieldList, analytics, split = [], distant = []) {
   const hideNumbers = !!dhis2.metadataOnlyTurn;
   const fieldLabel = (f) => `${f.name || f.id}${f.stage ? ` (${f.stage})` : ''}`;
   const usedBy = (f) => [...f.used_by];
@@ -325,8 +432,22 @@ function dataCheckAssemble(tiles, fieldList, analytics) {
       ...(a.cache_strategy && a.cache_strategy !== 'NO_CACHE' ? { browser_cache: a.cache_strategy } : {}),
     }));
   }
+  const splitShown = split.filter((x) => x.left_out.some((l) => l.records_without_value > 0) || hideNumbers);
+  if (splitShown.length) {
+    check.indicators_leaving_out_records = splitShown.map((x) => ({
+      indicator: x.indicator, split_by: x.split_by, tiles: x.tiles,
+      left_out: x.left_out.map((l) => ({ field: l.field, ...(hideNumbers ? {} : { records_without_value: l.records_without_value }) })),
+    }));
+  }
+  if (distant.length) {
+    check.dates_far_from_period = distant.map((x) => ({
+      field: x.field, indicator: x.indicator, tiles: x.tiles, period: x.period,
+      ...(hideNumbers ? {} : { records_with_date: x.records_with_date, more_than_a_year_before: x.more_than_a_year_before, more_than_a_year_after: x.more_than_a_year_after }),
+    }));
+  }
   check.report_lines = dataCheckReportLines(check, notOk);
   if (check.report_lines.length) check._note = DATA_CHECK_MODEL_NOTE;
+  if (check.indicators_leaving_out_records) check._split_note = 'An indicator split by a category combination leaves out every record that fits no option (here: no value in the listed fields) — from its total too. If a tile is meant to count ALL records, rebuild it on an indicator without that category combination (manage_program_indicators create, e.g. expression V{event_count}), or say plainly that those records are not in it. Do not explain the gap as a timing or engine difference.';
   return check;
 }
 
@@ -369,6 +490,14 @@ function dataCheckReportLines(check, analyticsNotOk = []) {
   if ((check.single_values_true_zero || []).length) {
     const list = check.single_values_true_zero;
     lines.push(`${quoted(list)} ${verb(list)} 0: no record in ${list.length === 1 ? 'its' : 'their'} saved period and places matches. The analytics tables hold this program's records, so this is a real count of zero.`);
+  }
+  for (const x of check.indicators_leaving_out_records || []) {
+    const fieldsTxt = x.left_out.map((l) => `${l.field}${hide ? '' : ` (${l.records_without_value})`}`).join(', ');
+    lines.push(`**${x.indicator}** (on ${quoted(x.tiles.slice(0, 4))}) is split by "${x.split_by}": a record is counted only when it fits one option of each category, so records with no value in ${fieldsTxt} are left out of its total as well.`);
+  }
+  for (const x of check.dates_far_from_period || []) {
+    const count = hide ? 'Some records' : `${(x.more_than_a_year_before || 0) + (x.more_than_a_year_after || 0)} of ${x.records_with_date} records`;
+    lines.push(`**${x.field}** (used by "${x.indicator}"): ${count} in ${x.period} carry a date more than a year ${x.more_than_a_year_after && !x.more_than_a_year_before ? 'after' : x.more_than_a_year_before && !x.more_than_a_year_after ? 'before' : 'away from'} the period, so it is likely entered with the wrong year; "${x.indicator}" is still computed from it. The tiles are placed by the record's own date (event date), not by this field.`);
   }
   for (const t of check.failed_tiles || []) lines.push(`"${t.tile}" did not load in this check: ${t.error}`);
   const explained = (check.fields_without_values || []).length > 0 || analyticsNotOk.length > 0;
@@ -418,10 +547,52 @@ function noteDataCheckTarget(toolName, args, result) {
   } else if (toolName === 'manage_line_lists') {
     if (action === 'delete') st.lineLists.delete(args?.line_list_id);
     else if (action === 'create' || action === 'update') addId(st.lineLists, result.line_list_id);
+  } else if (toolName === 'manage_custom_app' && (action === 'create' || action === 'update') && result.key && result.kind !== 'plugin') {
+    // An installed app's link goes under the answer when the answer lacks it
+    // (TB Follow-up Workspace, 2026-11-19: "open it from the app menu", no link).
+    const url = result.global_shell_url || result.launch_url;
+    if (url) st.urls.set(`app:${result.key}`, url);
+  } else if (toolName === 'manage_custom_app' && action === 'place' && args?.target === 'dashboard') {
+    // A plugin placed on a dashboard: its link goes under the answer too (Malaria
+    // focus plugin, 2026-11-18: "share the result" and the answer gave no link).
+    const id = result.dashboard?.dashboard_id || result.dashboard_id || args?.dashboard_id;
+    const url = result.dashboard?.dashboard_url || (id && dhis2.baseUrl ? `${dhis2.baseUrl}/dhis-web-dashboard/#/${id}` : null);
+    if (id && url) st.urls.set(id, url);
   } else if (toolName === 'manage_program_indicators' && /^create|^update/.test(action)) {
     for (const id of Array.isArray(result.program_indicator_ids) ? result.program_indicator_ids : []) addId(st.indicators, id);
     addId(st.indicators, result.program_indicator_id);
   }
+}
+
+// Objects saved this turn that are on none of the dashboards this turn built or
+// edited. CCR dashboard (Haiku, 2026-11-18): "Missed appointments" was created
+// after a failed first try, never added, and the answer listed it as on the
+// dashboard. Only when the turn touched a dashboard; at most 12 objects.
+async function turnOrphanObjects() {
+  const st = dhis2.turnDataCheck;
+  if (!st || !st.dashboards || !st.dashboards.size) return [];
+  const made = [
+    ...[...st.visualizations].map((id) => ({ kind: 'visualization', path: 'visualizations', id })),
+    ...[...st.maps].map((id) => ({ kind: 'map', path: 'maps', id })),
+    ...[...st.lineLists].map((id) => ({ kind: 'line list', path: 'eventVisualizations', id })),
+  ].slice(0, 12);
+  if (!made.length) return [];
+  const onDash = new Set();
+  const dashNames = [];
+  for (const dashId of [...st.dashboards].slice(0, 4)) {
+    const d = await safeDhis2Fetch(`dashboards/${dashId}?fields=name,dashboardItems[visualization[id],map[id],eventVisualization[id]]`, { noTruncate: true });
+    if (!d || d._error) return []; // cannot tell: say nothing
+    dashNames.push(d.name || dashId);
+    for (const it of d.dashboardItems || []) for (const k of ['visualization', 'map', 'eventVisualization']) if (it[k]?.id) onDash.add(it[k].id);
+  }
+  const out = [];
+  for (const m of made) {
+    if (onDash.has(m.id)) continue;
+    const o = await safeDhis2Fetch(`${m.path}/${m.id}?fields=id,name`, { noTruncate: true });
+    if (!o || o._error) continue; // deleted since, or unreadable
+    out.push({ kind: m.kind, id: m.id, name: o.name || m.id });
+  }
+  return out.length ? [{ dashboards: dashNames }, ...out] : [];
 }
 
 // What goes under the model's final answer: the findings, and the dashboard link
@@ -435,11 +606,13 @@ async function finishTurnDataCheck(finalText) {
     lineLists: [...st.lineLists], indicators: [...st.indicators],
   };
   dhis2.turnDataCheck = null;
-  if (!Object.values(targets).some(list => list.length)) return '';
-  const check = await dataCheckWithin(runDataCheck(targets));
+  const anyTarget = Object.values(targets).some(list => list.length);
+  if (!anyTarget && !st.urls.size) return '';
+  const check = anyTarget ? await dataCheckWithin(runDataCheck(targets)) : null;
   const parts = [];
-  const missingLinks = [...st.urls.values()].filter(u => !String(finalText || '').includes(u));
-  if (missingLinks.length) parts.push(missingLinks.map(u => `**Dashboard link:** ${u}`).join('\n'));
+  const said = String(finalText || '');
+  const missingLinks = [...st.urls.entries()].filter(([k, u]) => !said.includes(u) && !(k.startsWith('app:') && said.includes(`/apps/${k.slice(4)}`)));
+  if (missingLinks.length) parts.push(missingLinks.map(([k, u]) => `**${k.startsWith('app:') ? 'App' : 'Dashboard'} link:** ${u}`).join('\n'));
   const lines = check?.report_lines || [];
   if (lines.length) parts.push(`**Data check** (counted by the extension after saving; no patient values were read):\n${lines.map(l => `- ${l}`).join('\n')}`);
   return parts.length ? `\n\n---\n${parts.join('\n\n')}` : '';

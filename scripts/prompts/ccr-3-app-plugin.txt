@@ -1,0 +1,13 @@
+Using “Community Care and Referral”, build an app called “Care Coordination Workspace” and a matching enrollment plugin inside Capture.
+
+The app should give staff a searchable worklist of people and care episodes, with queues for urgent referrals, pending results, missed appointments, current admissions, and unresolved care needs. Add summary charts, an appointment calendar, and a facility map. Selecting a chart, facility, or queue should filter the worklist.
+
+Opening an episode should show one timeline combining assessments, tests, treatments, referrals, follow-ups, admissions, and closure. Let me inspect every repeated record, compare measurements over time, and trace a referral from the sending facility to arrival.
+
+Allow staff to record follow-ups and update referrals using the program’s forms and validation. Keep separate episodes for the same person separate. Warn about possible duplicate records and conflicting updates without silently merging or overwriting them.
+
+The enrollment plugin should show the currently opened episode’s care summary, outstanding tasks, latest results, measurement trends, next appointment, and unresolved referrals. Include buttons that open the appropriate forms. It must update when I change person or episode and after records are saved.
+
+Use the same definitions in the app, plugin, and dashboard. Explain any difference caused by the dashboard’s last data refresh. Include filters, full filtered exports, and links that reopen the selected episode.
+
+Install both, add the plugin to this program’s Capture enrollment page, and test incomplete histories, repeated same-day visits, changes of facility, simultaneous edits, and records without locations. Share working links and the test results.
