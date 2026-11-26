@@ -275,7 +275,9 @@ async function epiScorecard() {
   const app = apps[0]; if (!app) return;
   const src = await appSource(app.key, pluginPage(app));
   check('S2', 'reads analytics for the five default items', /analytics/.test(src) && DEF.every(x => src.includes(x)), DEF.filter(x => !src.includes(x)));
-  check('S3', 'follows dashboard filters; defaults to last 12 months for the country', /dashboardItemFilters/.test(src) && /LAST_12_MONTHS/.test(src));
+  // The default window may be the keyword or computed months ("last 12 months vs previous 12"); S12 checks
+  // its values against analytics LAST_12_MONTHS (checker widened 2026-11-26).
+  check('S3', 'follows dashboard filters; defaults to last 12 months for the country', /dashboardItemFilters/.test(src) && /LAST_12_MONTHS|last 12/i.test(src));
   check('S4', 'numerator/denominator, legend colours, previous-period arrows, sort, drill down', /includeNumDen|numerator/i.test(src) && /legendSet|legends/i.test(src) && /(previous|prior|last).{0,40}period|↑|↓|▲|▼|arrow/i.test(src) && /sort/i.test(src) && /(drill|children|parent|back up|level)/i.test(src));
   check('S5', 'CSV export and a print view; "no data" for missing values', /csv/i.test(src) && /print/i.test(src) && /no data/i.test(src));
   const dl = await getJ(`dashboards?filter=dashboardItems.appKey:eq:${enc(app.key)}&fields=id,name,dashboardItems[id,appKey]&paging=false`);

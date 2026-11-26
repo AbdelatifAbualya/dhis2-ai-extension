@@ -92,6 +92,20 @@ function dataCheckAnalyticsState(programId) {
     // Only a program with records is asked about its analytics table: a program
     // created this turn has none, and the query is a sure 409 E7144 (TB program
     // build, 2026-11-17 — the one failed call of an otherwise clean turn).
+    // A program created after the last analytics run has no table yet: the query is a
+    // sure 409 E7144 even with records (Cold Chain rerun, 2026-11-26: program built and
+    // test records generated in one turn). Both times are the server's clock.
+    {
+      const [prog, info] = await Promise.all([
+        safeDhis2Fetch(`programs/${programId}?fields=created`, { noTruncate: true }),
+        safeDhis2Fetch('system/info?fields=lastAnalyticsTableSuccess', { noTruncate: true }),
+      ]);
+      const created = Date.parse(String(prog?.created || '').replace(' ', 'T'));
+      const lastRun = Date.parse(String(info?.lastAnalyticsTableSuccess || '').replace(' ', 'T'));
+      if (Number.isFinite(created) && (!info?.lastAnalyticsTableSuccess || (Number.isFinite(lastRun) && created > lastRun))) {
+        return { state: 'missing', live, last_run: info?.lastAnalyticsTableSuccess || null };
+      }
+    }
     const inTables = await safeDhis2Fetch(`analytics/events/aggregate/${programId}?dimension=pe:THIS_YEAR;LAST_5_YEARS&filter=ou:USER_ORGUNIT`);
     if (inTables?._error) {
       return /E7144|does not exist/i.test(String(inTables._error)) ? { state: 'missing', live } : { state: 'unknown' };

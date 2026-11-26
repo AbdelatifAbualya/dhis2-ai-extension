@@ -1330,7 +1330,7 @@ async function executeManageLineLists(args) {
     {
       const ouDims = [...built.columns, ...built.filters].filter(d => d && d.kind === 'ou');
       if (ouDims.length === 1) {
-        const rootScope = await singleRootScopeRefusal(ouDims[0].items, `Line list "${built.payload.name}"`);
+        const rootScope = await singleRootScopeRefusal(ouDims[0].items, `Line list "${built.payload.name}"`, [built.payload.program && built.payload.program.id].filter(Boolean));
         if (rootScope) return rootScope;
       }
     }

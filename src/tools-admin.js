@@ -192,6 +192,82 @@ async function precheckFilterAgainstSchema(safePath) {
 // API call, and the model gets the fix instead of a stack trace. Returns null
 // when the patch looks valid OR when the schema cannot be loaded (never blocks
 // on our own uncertainty).
+// ── dhis2_query POST /metadata pre-check: partial objects ─────────────────────
+// A metadata import replaces every object it names. An object that carries its id
+// and only the field to change misses the type's required fields: the 2.42 importer
+// answers HTTP 500 (programRuleVariables: "getProgram() is null", then "getName() is
+// null" — Cold Chain thread, 2026-11-26), and where it does not crash it blanks every
+// field left out. Refused before sending when any object lacks a required persisted
+// field of its type (from /api/schemas). Unknown types and unreadable schemas pass.
+const _requiredFieldsCache = new Map();
+async function requiredPersistedFields(type) {
+  const t = typeof resolveSchemaType === 'function' ? await resolveSchemaType(type) : null;
+  if (!t) return null;
+  if (_requiredFieldsCache.has(t.name)) return _requiredFieldsCache.get(t.name);
+  const resp = await safeDhis2Fetch(`schemas/${t.name}?fields=properties[name,required,persisted]`, { noTruncate: true });
+  if (!resp || resp._error || !Array.isArray(resp.properties)) return null;
+  // Only name and program: DHIS2 fills defaults for other required fields on create
+  // (categoryCombo, zeroIsSignificant, repeatable, annualized …), but never these, so a
+  // complete new object always has them and a partial update never does.
+  const req = resp.properties.filter((p) => p && p.required && p.persisted && (p.name === 'name' || p.name === 'program')).map((p) => p.name);
+  _requiredFieldsCache.set(t.name, req);
+  return req;
+}
+async function precheckMetadataImportPartial(body) {
+  let b = body;
+  if (typeof b === 'string') { try { b = JSON.parse(b); } catch { return null; } }
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return null;
+  const problems = [];
+  for (const [type, objs] of Object.entries(b)) {
+    if (!Array.isArray(objs) || !objs.length || /^(system|date)$/.test(type)) continue;
+    const req = await requiredPersistedFields(type);
+    if (!req || !req.length) continue;
+    const missing = new Map();
+    for (const o of objs) {
+      if (!o || typeof o !== 'object') continue;
+      const lack = req.filter((f) => o[f] === undefined || o[f] === null || o[f] === '');
+      if (lack.length) for (const f of lack) missing.set(f, (missing.get(f) || 0) + 1);
+    }
+    if (missing.size) problems.push({ type, objects: objs.length, missing: Object.fromEntries(missing) });
+  }
+  if (!problems.length) return null;
+  const isPrv = problems.some((p) => p.type === 'programRuleVariables');
+  return {
+    _error: `Not sent: a metadata import replaces each object it names, and ${problems.map((p) => `${p.type} (${p.objects} object${p.objects === 1 ? '' : 's'}) lack ${Object.keys(p.missing).join(', ')}`).join('; ')}. DHIS2 would answer HTTP 500 or blank the fields left out.`,
+    _hint: isPrv
+      ? 'To change rule variables\' source type use manage_program_rules(action="fix_variables", program_id): it fixes every variable the audit flags in one call. Otherwise read each object in full (fields=:owner), change it, and import the complete objects.'
+      : 'To change one or two fields of existing objects use PATCH <type>/<id> with only those fields (or the tool for that object). To import, read each object in full (fields=:owner), change it, and send the complete objects.',
+    _scope: 'partial_metadata_import',
+    _no_disable: true,
+  };
+}
+
+// ── dhis2_query PUT <type>/<id>: keep what the body leaves out ───────────────
+// A PUT replaces the whole object: every owned field the body omits is blanked. A
+// tracker program PUT with its name and a few fields lost its tracked entity type,
+// stages and org units (play 2.43.2.1, 2026-11-26), and from then on EVERY tracker
+// delete on that server failed with HTTP 500 ("Program.getTrackedEntityType() is
+// null"). The saved object is read (:owner fields) and the body laid over it, so only
+// the fields the body names change; the fields kept are reported. Paths that are not
+// metadata objects, objects that do not exist yet, and unreadable reads pass unchanged.
+const PUT_KEEP_IGNORE = new Set(['id', 'href', 'created', 'lastUpdated', 'createdBy', 'lastUpdatedBy', 'access', 'favorites', 'favorite', 'displayName', 'displayShortName', 'displayDescription', 'displayFormName', 'externalAccess', 'publicAccess', 'user', 'userAccesses', 'userGroupAccesses']);
+async function mergePartialPut(safePath, body) {
+  const m = String(safePath || '').split('?')[0].match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
+  if (!m) return null;
+  if (/^(dataStore|userDataStore|apps|systemSettings|configuration|userSettings|tracker|events|enrollments|trackedEntityInstances|dataValueSets|dataValues)$/i.test(m[1])) return null;
+  let b = body;
+  if (typeof b === 'string') { try { b = JSON.parse(b); } catch { return null; } }
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return null;
+  const t = typeof resolveSchemaType === 'function' ? await resolveSchemaType(m[1]) : null;
+  if (!t) return null;
+  const saved = await safeDhis2Fetch(`${m[1]}/${m[2]}?fields=:owner`, { noTruncate: true });
+  if (!saved || saved._error || typeof saved !== 'object' || !saved.id) return null;
+  const empty = (v) => v == null || v === '' || (Array.isArray(v) && !v.length) || (typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length);
+  const kept = Object.keys(saved).filter((k) => !PUT_KEEP_IGNORE.has(k) && !(k in b) && !empty(saved[k]));
+  if (!kept.length) return null;
+  return { body: { ...saved, ...b, id: m[2] }, kept };
+}
+
 async function precheckPatchAgainstSchema(safePath, body) {
   const m = String(safePath || '').split('?')[0].match(/^([a-zA-Z]+)\/([A-Za-z][A-Za-z0-9]{10})$/);
   if (!m) return null;
