@@ -1,0 +1,9 @@
+Using the “Integrated Pregnancy, Delivery and Postnatal Care Tracker”, build an enrollment plugin called “Pregnancy Journey Card” and add it to the program's Capture enrollment page.
+
+For the pregnancy that is open, show: the current gestational age and due date (from the last menstrual period, or from the ultrasound when the two differ by more than 7 days, saying which was used); antenatal contacts done against the WHO 8-contact schedule (12, 20, 26, 30, 34, 36, 38 and 40 weeks), which are overdue and which are not due yet; blood pressure and haemoglobin over time with the warning limits (140/90, and Hb below 11); which tests are still missing (HIV, syphilis, blood group, and an ultrasound before 24 weeks); danger signs and open referrals; the risk classification; the next appointment; and, once she has delivered, the delivery and postnatal summary.
+
+Add buttons that open the right form for the next step (a new follow-up visit, lab results, delivery or a postnatal visit). The card must update when I switch to another person or pregnancy and after I save a form, and it must keep separate pregnancies of the same woman separate.
+
+The program has very few records, so first add about 30 fictional test pregnancies at the program's facilities, covering early pregnancy, overdue contacts, missing tests, high blood pressure, anaemia, a delivered case with postnatal visits, and a woman with two pregnancies. Don't leave any test record saved that the program's rules reject.
+
+Build, install and place the plugin, test it on several of these pregnancies, and share the link and what you checked.

@@ -1,0 +1,7 @@
+In the “Integrated Pregnancy, Delivery and Postnatal Care Tracker”, build a form field plugin called “ANC Blood Pressure Check” for the Routine ANC Follow-up form, replacing the systolic and diastolic blood pressure fields.
+
+Let the midwife enter two readings taken a few minutes apart, and save the average of the two (rounded to whole numbers) into the systolic and diastolic fields. Refuse impossible values (systolic outside 60–260, diastolic outside 30–160, or a diastolic that is not lower than the systolic) and say why.
+
+Classify the result (normal; raised from 140/90; severe from 160/110) and combine it with the gestational age and the urine protein result on the same form to flag possible pre-eclampsia after 20 weeks. Show the woman's blood pressure from her previous visits in this pregnancy next to the new value. When a saved visit is opened again, show the saved values without asking for the readings again. Respect the program's own rules: show their warnings and errors and don't contradict them.
+
+It must work when creating a new visit and when editing a saved one, and stay correct if I change a reading before saving. Build, install and place it, test it in Capture on a real visit (including an impossible value and a severe reading), and tell me what you checked.

@@ -598,11 +598,21 @@ function customAppDeclares(bare, name) {
   // at once. Measured against the server: the live enrollment count of each
   // program the code names (counts only).
 async function customAppFullReadProblem(allCompiled, found) {
-    const fullRead = /\b(?:while|for)\s*\([^)]*\bpageCount\b|\}\s*while\s*\([^)]*\bpageCount\b/.test(allCompiled)
+    // Every loop form that pages to pager.pageCount: the condition in the header, a
+    // do…while, or for(;;)/while(true) with a break on pageCount — that last form let
+    // one Child Vaccination build through and refused the next (2026-11-25).
+    const fullRead = (/\b(?:while|for)\s*\([^)]*\bpageCount\b|\}\s*while\s*\([^)]*\bpageCount\b/.test(allCompiled)
+        || /\b(?:for\s*\(\s*;\s*;\s*\)|while\s*\(\s*(?:true|1)\s*\))\s*\{[\s\S]{0,1200}?\bpageCount\b/.test(allCompiled))
       && /['"`]tracker\/(?:enrollments|trackedEntities)['"`]/.test(allCompiled);
     const said = /['"`][^'"`\n]*\b(?:may take (?:a while|several minutes|minutes)|can take (?:a while|several minutes|minutes)|loading all \d|this will read all)\b[^'"`\n]*['"`]/i.test(allCompiled);
+    // A whole-population computation (each child's dose status across the country) needs
+    // every record. That is fine when the screen fills page by page: each page is handed
+    // on inside the loop (a per-page callback, or a setter that appends) and the total
+    // from pager.total is shown — the first numbers came after 6 s with 19,030 records.
+    const progressive = /(?:\b(?:while|for)\s*\([^)]*\)\s*\{|\bdo\s*\{)[\s\S]{0,1200}?(?:\bon[A-Z]\w*\s*\(|\b(?:onChunk|onPage|callback|cb)\s*\(|\bset[A-Z]\w*\s*\(\s*\(?\s*\w+\s*\)?\s*=>\s*(?:\[\s*\.\.\.|\w+\.concat\())/.test(allCompiled)
+      && /\bpager\b[\s\S]{0,40}\btotal\b|\.total\b/.test(allCompiled);
     const progs = Object.entries(found || {}).filter(([, t]) => t === 'programs').map(([id]) => id).slice(0, 3);
-    if (fullRead && !said && progs.length) {
+    if (fullRead && !said && !progressive && progs.length) {
       let biggest = null;
       for (const id of progs) {
         const r = await safeDhis2Fetch(`tracker/enrollments?program=${id}&orgUnitMode=ACCESSIBLE&pageSize=1&totalPages=true&fields=enrollment`, { noTruncate: true });
@@ -612,8 +622,8 @@ async function customAppFullReadProblem(allCompiled, found) {
       if (biggest && biggest.n > 10000) {
         return {
           _error: `The code would read every page of ${biggest.n.toLocaleString('en-US')} registrations of program ${biggest.id} (and their visits) before showing anything — minutes of spinner on this server.`,
-          problems: [{ message: `A paging loop to pager.pageCount over tracker/enrollments or tracker/trackedEntities reads all ${biggest.n.toLocaleString('en-US')} registrations. Show the first page at once (pageSize 50, totalPages:true; pager.total gives the count to show), load other pages on demand (next/previous or "load more"), search and filter on the server, and fetch visits only for the rows on screen. Counts and charts come from analytics or pager.total, never from a full read. A full read is fine only behind an explicit export button whose label says it may take a while.` }],
-          _hint: 'Fix the loading and resend the preview. Do not raise the page size instead: the problem is reading every record before the first render.',
+          problems: [{ message: `A paging loop to pager.pageCount over tracker/enrollments or tracker/trackedEntities reads all ${biggest.n.toLocaleString('en-US')} registrations before the screen shows anything. Either (a) a list: show the first page at once (pageSize 50, totalPages:true; pager.total gives the count to show), load other pages on demand, search and filter on the server, and fetch visits only for the rows on screen; or (b) when the request needs every record (a status computed per person for the whole country, a defaulter list over everyone): keep the loop but fill the screen PAGE BY PAGE — hand each page on inside the loop (onChunk(list, page, pager) or setRows(prev => [...prev, ...list])) and show "loaded X of N" from pager.total, so the first rows appear in seconds. A full read that renders only at the end is never fine; behind an export button its label must say it may take a while.` }],
+          _hint: 'Fix the loading and resend the preview; this is not a reason to stop and ask the user. Do not raise the page size instead: the problem is rendering nothing until every record is read.',
         };
       }
     }
@@ -2441,7 +2451,7 @@ function customAppResult(action, spec, built, extra) {
     ...(check && check.ran && check.verdict !== 'clean' ? { _must_fix: `The app is installed, but it FAILS when opened (runtime_check). Fix it now, in this turn: read each dhis2_message, correct the code, and call manage_custom_app(action="update", key="${s.key}", files=…), which runs this check again. Do not ask the user first and do not hand them the link as working. If it still fails after two repairs, report the exact messages.` } : {}),
     ...(check && !check.ran ? { _check_not_run: `The install check did not run: ${check.reason}. Say so, and that the app has not been opened.` } : {}),
     _not_run: check && check.ran && check.verdict === 'clean'
-      ? 'The install check opened the app with records closed: it started and DHIS2 accepted its requests. It has shown no real record and nothing was clicked apart from switching tabs, so do not say it works or is tested. Say exactly that, and give the user the 2 or 3 clicks that prove its main flow.'
+      ? 'The install check opened the app with records closed: it started and DHIS2 accepted its requests. It has shown no real record and nothing was clicked apart from switching tabs, so do not say it works or is tested. Say exactly that, and give the user the 2 or 3 clicks that prove its main flow. When the user asked for the counts the app shows, give the totals it should show from aggregate counts you can read (analytics/enrollments/aggregate or analytics/events/aggregate with the same program, period and org unit, or a program indicator), name them as expected values, and say the app\'s own figure is read on screen (the Child Vaccination app answer gave no numbers at all, 2026-11-25).'
       : 'This confirms the code compiled, its names exist and the app installed. Nothing has opened the app or clicked anything. Do not say it works, is live or is tested: say it is installed and not yet exercised, and give the user the 2 or 3 clicks that prove its main flow.',
     ...extra,
   };

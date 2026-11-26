@@ -1,0 +1,11 @@
+Create a dashboard called “Child Immunization Performance” that brings together the routine monthly immunization reports and the Child Programme tracker.
+
+From the routine reports, show BCG, Penta 3 and Measles coverage in children under one, the Penta 1 to Penta 3 and Penta 1 to Measles dropout rates, and the reporting rate and on-time reporting of the Child Health data set. Add a 12-month trend of coverage and dropout, a ranking of districts by Penta 3 coverage, and a district table showing coverage, dropout and reporting rate side by side.
+
+Add two maps: Penta 3 coverage by district using the immunization coverage colours, and facilities where the Penta 1 to Penta 3 dropout is above 10%.
+
+From the Child Programme tracker, show the number of children registered, how many received BCG at birth, the share of babies born with a low birth weight (under 2,500 g), and how many children have no postnatal visit recorded. Add line lists of low-birth-weight babies and of children registered more than 10 weeks ago with no Penta dose recorded.
+
+Let me filter by location and period. Explain which numbers come from the routine reports and which from individual records, and don't present them as the same measure. State the denominator of every percentage, explain why coverage can be above 100% instead of hiding it, and make sure the charts, maps and tables agree.
+
+Build and save everything, check the numbers against the data, and share the dashboard.

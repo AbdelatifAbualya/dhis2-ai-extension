@@ -1,0 +1,9 @@
+Build an app called “Child Vaccination Follow-up” using the Child Programme.
+
+Use the enrollment date as the child's date of birth and this schedule: BCG and OPV 0 at birth, Penta 1, 2 and 3 at 6, 10 and 14 weeks, Measles and Yellow fever at 9 months. For each child, show which doses are given, due, overdue (more than 4 weeks late) or not yet due, as of a date I choose (today by default). Leave out children registered after that date. Where the program does not record the date of every dose, say so in the app and work from what is recorded.
+
+Give me a defaulter list I can filter by district, facility, vaccine and how late the dose is; a facility summary of children due and overdue for each vaccine; a chart of doses given by month; and a map of facilities coloured by their share of overdue children. Clicking a facility on the map or a bar on a chart should filter the list.
+
+Opening a child should show a vaccination card with dose dates, weights over time and every recorded visit. Count each child once, and don't call a child overdue when they are too young for the dose.
+
+It must work for the whole country: show the first results quickly, say how many children are included, and don't leave anyone out silently. Add a full CSV export of the filtered list and links that open the child in Capture. Build, install and test the app, and tell me the counts it shows.

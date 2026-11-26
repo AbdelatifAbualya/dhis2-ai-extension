@@ -1044,6 +1044,14 @@ if (loaded) {
       ann('Two programs match "W4W". Which one should I extend?'), false);
     eq('a long final report is NOT flagged', ann('Creating summary: ' + 'x'.repeat(2100)), false);
     eq('empty text is NOT flagged', ann(''), false);
+    // Haiku, Child Vaccination app (2026-11-25): the promise sat mid-reply, before the link.
+    eq('a mid-reply "Next I\'ll run the data checks" is detected',
+      ann('The app is installed as **Child Vaccination Follow-up** (version 1.0.0). Its install check passed, but no real records were loaded, so the counts below are not yet verified. Next I\'ll run the data checks on the live program before reporting any figures.\n\nBackup and sharing: nothing was shared or changed beyond the app itself.\n\nOpen the app from the DHIS2 app menu, or at https://play.im.dhis2.org/stable-2-43-2-1/apps/ai-child-vaccination-followup.'), true);
+    eq('"I\'ll run …" in the tail is detected', ann('Saved the dashboard. I\'ll run the analytics check now.'), true);
+    eq('an offer to the user ("next I can … if you want") is NOT flagged',
+      ann('Built the dashboard with 12 tiles: https://x/#/abc. If you want, next I\'ll add a map of facilities.'), false);
+    eq('a "Next steps for you" list is NOT flagged',
+      ann('Built and installed the app.\n\nNext steps for you:\n- Open it from the app menu.\n- Click a facility to filter the list.'), false);
   }
 
   // ── Rule-action target resolution (the "Allergy Details" 409) ─────────────
@@ -1884,6 +1892,73 @@ async function runCustomAppChecks() {
           d1._scope === 'dashboard_existing_tiles_unresolvable' && /ANC map/.test(d1._diagnosis) && /list queries return nothing/.test(d1._diagnosis) && /Do not probe further/.test(d1._hint)
           && d2._scope === 'dashboard_existing_tiles_missing' && /no longer exists/.test(d2._diagnosis) && !d3._scope);
       } finally { ctx.safeDhis2Fetch = savedSdf; dd.baseUrl = savedBase; vm.runInContext('_listQueryHealth.clear();', ctx); }
+    }
+    {
+      // Child vaccination app + immunization dashboard, play 2.43.2.1 (2026-11-25): org-unit
+      // lists were fine but EVERY dataElements list answered nothing. Seven real data
+      // elements were called invented, and line lists with a data-element column saved
+      // unreadable ("Not a valid dimension") while the tool said success.
+      const dd = ctx.__dhis2(), savedSdf = ctx.safeDhis2Fetch, savedBase = dd.baseUrl;
+      dd.baseUrl = 'https://de-broken.invalid';
+      vm.runInContext('_listQueryHealth.clear();', ctx);
+      const deleted = [];
+      ctx.safeDhis2Fetch = async (p, o = {}) => {
+        if (o.method === 'DELETE') { deleted.push(p); return {}; }
+        if (p.startsWith('metadata?')) return {};
+        if (p.startsWith('me?')) return { organisationUnits: [{ id: 'ouRoot00002' }] };
+        if (p.startsWith('organisationUnits?filter=id:eq:ouRoot00002')) return { organisationUnits: [{ id: 'ouRoot00002' }] };
+        if (p.startsWith('programStages?fields=programStageDataElements')) return { programStages: [{ programStageDataElements: [{ dataElement: { id: 'deReal00001' } }] }] };
+        if (p.startsWith('dataElements?filter=id:eq:deReal00001')) return { dataElements: [] };
+        if (p.startsWith('categoryCombos?')) return { categoryCombos: [{ categoryOptionCombos: [{ id: 'cocReal0001' }] }] };
+        if (p.startsWith('categoryOptionCombos?filter=id:eq:cocReal0001')) return { categoryOptionCombos: [{ id: 'cocReal0001' }] };
+        if (p.startsWith('identifiableObjects/deReal00001')) return { id: 'deReal00001', href: 'https://de-broken.invalid/api/dataElements/deReal00001' };
+        if (p.startsWith('dataElements/deReal00001')) return { id: 'deReal00001', displayName: 'MCH Weight (g)' };
+        return { _error: 'Not found', _status: 404 };
+      };
+      try {
+        const h = await ctx.serverListQueriesBroken();
+        truthy('the list-query probe is per type: data-element lists answering nothing are found even when org-unit and option-combo lists work',
+          h.broken === true && h.types.length === 1 && h.types[0] === 'dataElements' && /deReal00001/.test(h.probe));
+        const u = await ctx.checkCustomAppUids(['deReal00001', 'madeUpCCCCC']);
+        truthy('…so a real data element in app code is confirmed by a direct read, not called invented (a made-up id still is)',
+          u.found.deReal00001 === 'dataElements' && u.unknown.length === 1 && u.unknown[0] === 'madeUpCCCCC');
+        const diag = await ctx.lineListUnreadableDiagnosis('llBroken001', 'DHIS2 API 400: Not a valid dimension: progAAAAAAA.stageAAAAAA.deReal00001');
+        truthy('a saved line list DHIS2 cannot read back is deleted and reported as not built, with the server fault named',
+          deleted.includes('eventVisualizations/llBroken001') && /cannot read it back/.test(diag._error) && /deleted again/.test(diag._error)
+          && /Server problem/.test(diag._diagnosis || '') && /MCH Weight/.test(diag._diagnosis) && /not built/.test(diag._hint) && !diag.success);
+        deleted.length = 0;
+        const kept = await ctx.lineListUnreadableDiagnosis('llBroken002', 'DHIS2 API 400: Not a valid dimension: x', { keep: true });
+        truthy('…an updated list is not deleted (the backup restores it)', !deleted.length && /still saved/.test(kept._error));
+      } finally { ctx.safeDhis2Fetch = savedSdf; dd.baseUrl = savedBase; vm.runInContext('_listQueryHealth.clear();', ctx); }
+    }
+    {
+      // "Registered more than 10 weeks ago": a date condition on a line list's time column
+      // was silently dropped and the list showed everyone (2026-11-25).
+      const rng = ctx.lineListDateFilterToRange;
+      truthy('a date condition on a time column becomes a date range (LT moves the end back a day; GE+LE both bounds; string form too); periods plus a one-sided date are refused with the range shape',
+        rng({ operator: 'LT', value: '2026-09-16' }, []).range === '1900-01-01_2026-09-15'
+        && rng({ conditions: [{ operator: 'GE', value: '2026-01-01' }, { operator: 'LE', value: '2026-03-31' }] }, ['THIS_YEAR']).range === '2026-01-01_2026-03-31'
+        && rng('GT:2026-01-31:LT:2026-03-01', []).range === '2026-02-01_2026-02-28'
+        && /ONE date range/.test(rng({ operator: 'LT', value: '2026-09-16' }, ['THIS_YEAR', 'LAST_5_YEARS'])._error || '')
+        && /ISO date/.test(rng({ operator: 'LT', value: 'ten weeks ago' }, [])._error || '')
+        && rng(null, ['THIS_YEAR']).range === null);
+      const probe = ctx.lineListBuildProbePath('ENROLLMENT', 'progAAAAAAA', null, [], [
+        { kind: 'ou', dimension: 'ou', items: ['ouRoot00001'] },
+        { kind: 'time', dimension: 'enrollmentDate', items: ['1900-01-01_2026-09-15'] }]);
+      truthy('…and the line list\'s own query sends the range as enrollmentDate=<start>_<end>, not as a period',
+        /enrollmentDate=1900-01-01_2026-09-15/.test(probe.path) && !/pe:1900/.test(probe.path) && probe.hasTime);
+    }
+    {
+      // Low-birth-weight share 3 / 11,025 = 0.027 % came back "0.0" at one decimal, and the
+      // data check said the tile showed 0 "because nothing matches" (2026-11-25).
+      const savedSdf = ctx.safeDhis2Fetch;
+      let asked = '';
+      ctx.safeDhis2Fetch = async (p) => { asked = p; return { headers: [{ name: 'dx' }, { name: 'pe' }, { name: 'value' }], rows: [['piShare0001', '2026', /skipRounding=true/.test(p) ? '0.0272' : '0.0'], ['piZero00001', '2026', '0']] }; };
+      try {
+        const t = await ctx.dataCheckAggregateTile({ tile: 'LBW share', type: 'SINGLE_VALUE' }, { dataDimensionItems: [{ programIndicator: { id: 'piShare0001', displayName: 'LBW %' } }, { programIndicator: { id: 'piZero00001', displayName: 'Zero %' } }], organisationUnits: [{ id: 'ouRoot00001' }], periods: [{ id: '2026' }] });
+        truthy('the data check reads unrounded values and counts any returned row (also a real 0) as data; a value below the displayed decimals is named',
+          /skipRounding=true/.test(asked) && t.state === 'ok' && (t.rounds_to_zero || []).length === 1 && t.rounds_to_zero[0].name === 'LBW %');
+      } finally { ctx.safeDhis2Fetch = savedSdf; }
     }
     truthy('…and so is a child keyed by the values (props, not its own state)', !once("function List({ page, q }) { const { data } = useDataQuery(Q, { variables: { page, q } }); return null; }\nfunction A() { const [q, setQ] = useState(''); const [page, setPage] = useState(1); return <List key={q + page} page={page} q={q} />; }"));
   }
@@ -3343,6 +3418,17 @@ async function runDashboardThreadChecks() {
   const r1 = ctx.piAnalyticsRuntimeTraps(healed, stageById, 43);
   truthy('V{tei_count} + SUM (SQL 42883) is healed to COUNT and reported', !r1.error && healed.aggregationType === 'COUNT' && r1.corrections.length === 1);
   truthy('…aggregation NONE (HTTP 500 / SQL 42601 in every analytics query) is refused, except a bare count variable which heals to COUNT', !!trap({ expression: 'd2:count(#{eaDHS084uMp.UXz7xuGCEhU})', analyticsType: 'ENROLLMENT', aggregationType: 'NONE' }).error && (() => { const pi = { name: 'x', filter: '', expression: 'V{enrollment_count}', analyticsType: 'ENROLLMENT', aggregationType: 'NONE' }; const r = ctx.piAnalyticsRuntimeTraps(pi, stageById, 43); return !r.error && pi.aggregationType === 'COUNT'; })());
+  {
+    // Immunization dashboard (Haiku, 2026-11-25): COUNT of d2:condition("weight < 2500", 1, 0) counted
+    // every weighed baby (live COUNT 19,021, SUM 4).
+    const lbw = { name: 'LBW', filter: '#{eaDHS084uMp.UXz7xuGCEhU} > 0', expression: 'd2:condition("#{eaDHS084uMp.UXz7xuGCEhU} > 0 && #{eaDHS084uMp.UXz7xuGCEhU} < 2500", 1, 0)', analyticsType: 'ENROLLMENT', aggregationType: 'COUNT' };
+    const pct = { name: 'LBW %', filter: '', expression: "d2:condition('#{eaDHS084uMp.UXz7xuGCEhU} < 2500', 100, 0)", analyticsType: 'EVENT', aggregationType: 'COUNT' };
+    const plain = { name: 'weighed', filter: '', expression: '#{eaDHS084uMp.UXz7xuGCEhU}', analyticsType: 'ENROLLMENT', aggregationType: 'COUNT' };
+    const a = ctx.piAnalyticsRuntimeTraps(lbw, stageById, 43); const b = ctx.piAnalyticsRuntimeTraps(pct, stageById, 43); const c = ctx.piAnalyticsRuntimeTraps(plain, stageById, 43);
+    truthy('COUNT of d2:condition(…, 1, 0) (the condition is ignored) heals to SUM, of d2:condition(…, 100, 0) to AVERAGE; a plain value under COUNT is left alone',
+      !a.error && lbw.aggregationType === 'SUM' && a.corrections.some(x => x.to === 'SUM' && /ignores the expression/.test(x.reason))
+      && !b.error && pct.aggregationType === 'AVERAGE' && plain.aggregationType === 'COUNT' && !(c.corrections || []).some(x => x.field === 'aggregation_type'));
+  }
   truthy('…V{enrollment_count} inside arithmetic with SUM is refused', !!trap({ expression: 'V{enrollment_count} * 100', analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error);
   truthy('…V{event_count} in an ENROLLMENT indicator (42703) is refused', /42703/.test(trap({ expression: 'V{event_count}', analyticsType: 'ENROLLMENT', aggregationType: 'COUNT' }).error || ''));
   truthy('…d2:countIfValue on a TEXT data element is refused on 2.43, allowed on 2.42', !!trap({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }).error && !trap({ expression: "d2:countIfValue(#{grIfo3oOf4Y.g9eOBujte1U}, '2')", analyticsType: 'ENROLLMENT', aggregationType: 'SUM' }, 42).error);
@@ -3759,6 +3845,9 @@ async function runDashboardLayoutChecks() {
   const g0 = ctx.layoutDashboardItems([{ width: 29 }], [line2], 0, {});
   truthy('size:"full" is honoured; widths on the real 60-column scale keep their half and a taller height; an asked-for half stays half alone, a guessed width 29 alone is widened',
     e.shapes[0].width === 60 && e.shapes[1].width === 30 && e.shapes[1].height === 24 && e.shapes[2].x === 30 && f.shapes[0].width === 30 && g0.shapes[0].width === 60);
+  const plug2 = ctx.layoutDashboardItems([{}, {}], [{ itemType: 'APP', name: 'Scorecard' }, { itemType: 'APP', name: 'Scorecard' }], 0, {});
+  truthy('a dashboard plugin tile defaults to full width and 32 rows (the scorecard showed 6 of 14 rows at 30 x 20); two copies stack',
+    plug2.shapes.every(sh => sh.width === 60 && sh.height >= 32) && plug2.shapes[1].y >= plug2.shapes[0].y + 32);
 
   const saved = { sdf: ctx.safeDhis2Fetch, wa: d.writeAuth, consent: d.harnessSkipBackupConsent, base: d.baseUrl };
   const posts = [];
@@ -5292,11 +5381,41 @@ async function runComplexBuildsChecks() {
     const picks = Array.from({ length: 300 }, () => ctx.tdValue(rnd, opts, { prefix: 'ZZ TEST', today: '2026-11-18', seq: 1 }));
     truthy(`…never "Other"; a cancelled status stays rare (${picks.filter((x) => x === 'CANCELLED').length}/300)`, !picks.includes('OTHER') && picks.filter((x) => x === 'CANCELLED').length < 60);
     truthy('…manage_test_data is a write tool with a manual summary and is routed for "create fictional people"', vm.runInContext('WRITE_CAPABLE_TOOL_NAMES', ctx).has('manage_test_data') && !!vm.runInContext('TOOL_SUMMARIES', ctx).manage_test_data && JSON.stringify(ctx.selectToolsForQuery ? [] : []) !== null);
+    // Pregnancy tracker (Haiku, 2026-11-25): "add about 30 fictional test pregnancies" did not route the
+    // tool, and its values tripped the program's blocking rules (5 of 29 women survived validation).
+    const intent = vm.runInContext('detectTestDataIntent', ctx);
+    truthy('…routed for "add about 30 fictional test pregnancies", "create 40 test children", "generate sample households"; not for a plain dashboard request',
+      intent('first add about 30 fictional test pregnancies at the program\'s facilities') && intent('create 40 test children') && intent('generate some sample households')
+      && !intent('Build a dashboard of pregnancies by district') && !intent('test it on several of these pregnancies'));
+    const r2 = ctx.tdRandom(3);
+    const many = (el, n = 300, c = {}) => Array.from({ length: n }, () => ctx.tdValue(r2, el, { prefix: 'ZZ TEST', today: '2026-11-18', seq: 1, ...c }));
+    const bw = many({ displayName: 'Birth weight in grams', valueType: 'INTEGER_POSITIVE' }).map(Number);
+    const ga = many({ displayName: 'Gestational age by ultrasound', valueType: 'INTEGER_POSITIVE' }).map(Number);
+    const apgar = many({ displayName: 'Five-minute Apgar score', valueType: 'INTEGER' }).map(Number);
+    const parity = many({ displayName: 'Parity', valueType: 'INTEGER_POSITIVE' }).map(Number);
+    const sys = many({ displayName: 'Systolic Blood Pressure', valueType: 'NUMBER' }).map(Number);
+    truthy('…plausible clinical values: birth weight in grams 2,600–3,900, gestational age 10–36 weeks, Apgar 7–10, a positive integer never 0; about one blood pressure in eight raised',
+      bw.every(v => v >= 2600 && v <= 3900) && ga.every(v => v >= 10 && v <= 36) && apgar.every(v => v >= 7) && parity.every(v => v >= 1)
+      && sys.filter(v => v >= 140).length > 15 && sys.filter(v => v >= 140).length < 70);
+    const anomaly = many({ displayName: 'Fetal anomaly suspected', valueType: 'BOOLEAN' });
+    const placenta = { displayName: 'Placenta location', valueType: 'TEXT', optionSet: { options: [{ code: 'NORMAL' }, { code: 'LOW_LYING' }, { code: 'PLACENTA_PREVIA' }, { code: 'SUSPECTED_ABRUPTION' }, { code: 'UNKNOWN' }] } };
+    truthy('…an alarming yes/no is rarely yes; a "normal" answer is the common one; calm mode (a refused visit drawn again) always picks normal, turns only alarming answers to no and keeps the rest',
+      anomaly.filter(x => x === 'true').length < 40 && many(placenta).filter(x => x === 'NORMAL').length > 150
+      && many(placenta, 50, { calm: true }).every(x => x === 'NORMAL') && ctx.tdValue(r2, { displayName: 'Fetal anomaly suspected', valueType: 'BOOLEAN' }, { calm: true }) === 'false'
+      && ctx.tdValue(r2, { displayName: 'Last menstrual period known', valueType: 'BOOLEAN' }, { calm: true }) === null);
+    const pd = ctx.tdFillDates(r2, [{ id: 'edd', displayName: 'Estimated due date', valueType: 'DATE' }, { id: 'lmp', displayName: 'Last menstrual period date', valueType: 'DATE' }], '2026-06-01', '2026-11-18');
+    const days = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 86400000);
+    truthy('…a pregnancy is dated from an LMP 8–28 weeks before the visit and a due date 280 days after it (5–14 days made the calculated gestational age 0 weeks)',
+      days(pd.lmp, '2026-06-01') >= 56 && days(pd.lmp, '2026-06-01') <= 196 && days(pd.lmp, pd.edd) === 280);
   }
 
   // 25. "Step 1 of the build … Still missing from your brief" is a partial delivery, even ending in a plan.
   truthy('partial delivery: "Step 1 of the build … **Still missing from your brief** … Next: I will …" is recognised', ctx.looksLikePartialDelivery('**Step 1 of the build: referral trace added (app v1.1.0)**\n\n**Still missing from your brief**\n\n| Item | Status |\n| Calendar grid | Still a sorted list |\n\n**Next**\n\nI will replace the coordinate list with a boundary map, then the calendar grid.') && ctx.looksLikePartialDelivery('Built the app.\n\nStill missing: the facility map (no facility has coordinates).'));
   truthy('…and the round-10 headers: "**Not built, or not as you asked**", "**Not built or not met**", "### Not done or not verified", "## Dashboard built, with gaps", "### Changed from your request" over a not-built item', ['Installed.\n\n**Not built, or not as you asked**\n- No map', 'Installed.\n\n**Not built or not met**\n- Case overlay', '## Dashboard built, with gaps\n\nLink: x', 'Built.\n\n### Not done or not verified\n- Home map', 'Built.\n\n### Changed from your request\n- **Facility comparison:** not built (1,168 facilities).'].every((x) => ctx.looksLikePartialDelivery(x)));
+  truthy('…and the scorecard rerun (2026-11-25): a heading "two requested parts are still not built" and bullets "**X: not built.**", even ending with "Shall I build both now?"; a "Not built by DHIS2" fact or "built" alone is not one',
+    ctx.looksLikePartialDelivery('## Immunization Scorecard: v1.1.0 installed, but two requested parts are still not built\n\nText.\n\nShall I build both now?')
+    && ctx.looksLikePartialDelivery('Installed v1.1.0.\n\n- **Numerator and denominator on hover or click: not built.** The panel shows only a note.\n- **Trend arrow: not built.**\n\nShall I build both now?')
+    && !ctx.looksLikePartialDelivery('## Immunization Scorecard: built and placed\n\n- **Settings:** saved per copy.\n\nWant me to add a third copy?'));
   truthy('…but not a completeness table with a "Missing" column, nor "### Missing data on this server", nor a justified change', !ctx.looksLikePartialDelivery('Dashboard saved.\n\n| Field | Filled | Missing |\n|---|---|---|\n| Phone | 80 | 20 |\n') && !ctx.looksLikePartialDelivery('Built.\n\n### Missing data on this server\n- Delivery method: 0 of 1,982') && !ctx.looksLikePartialDelivery('Built.\n\n### Changed from your request\n- Maps use districts because facilities have no coordinates.'));
   truthy('…and so is a requirement table with a "Gap" column', ctx.looksLikePartialDelivery('## How the installed app compares with your request\n\n| Requirement | Installed v1.1.2 | Gap |\n|---|---|---|\n| Appointment calendar | A sorted list | Not a calendar |\n\nWant me to update it?'));
   truthy('…and so is a "**Not done (you asked for these)**" section', ctx.looksLikePartialDelivery('**TB Follow-up Workspace is installed.**\n\n**Not done (you asked for these)**\n- No summary charts and no facility map\n\nOpen it and tell me what to change.'));
@@ -5361,6 +5480,16 @@ async function runComplexBuildsChecks() {
     const told = await ctx.customAppFullReadProblem(code + "\nconst NOTE = 'Exporting every record may take several minutes';", { ur1Edk5Oe2n: 'programs' });
     truthy('full read of 50,028 registrations before the first render is refused at preview (with the count)', /50,028 registrations of program ur1Edk5Oe2n/.test(big?._error || ''));
     truthy('…120 registrations are fine, and so is a full read the user is told may take minutes', small === null && told === null);
+    // Child Vaccination app (2026-11-25): for(;;) with a break on pageCount slipped through once,
+    // while the same read in a while(page <= pageCount) loop was refused twice and the model gave up.
+    const forever = "async function pages(engine, params) { let page = 1; for (;;) { const r = await engine.query({ x: { resource: 'tracker/enrollments', params: { ...params, page, pageSize: 250, totalPages: true } } }); all.push(...r.x.enrollments); if (page >= r.x.pager.pageCount) break; page += 1; } }";
+    const progressive = "async function pages(engine, params, onChunk) { let page = 1; for (;;) { const r = await engine.query({ x: { resource: 'tracker/enrollments', params: { ...params, page, pageSize: 250, totalPages: true } } }); onChunk(r.x.enrollments, page, r.x.pager); if (page >= r.x.pager.pageCount) break; page += 1; } }\nconst Total = ({ pager }) => pager.total;";
+    const appendSetter = code.replace('out.push(...r.r.enrollments);', 'setRows((prev) => [...prev, ...r.r.enrollments]);') + "\nconst shown = (pager) => `Loaded ${n} of ${pager.total}`;";
+    const f1 = await ctx.customAppFullReadProblem(forever, { ur1Edk5Oe2n: 'programs' });
+    const f2 = await ctx.customAppFullReadProblem(progressive, { ur1Edk5Oe2n: 'programs' });
+    const f3 = await ctx.customAppFullReadProblem(appendSetter, { ur1Edk5Oe2n: 'programs' });
+    truthy('…a for(;;) loop that breaks on pageCount is the same full read (refused); one that fills the screen page by page with the total shown (per-page callback or appending setter) is accepted, and the refusal names that option',
+      /50,028 registrations/.test(f1?._error || '') && /PAGE BY PAGE/.test(f1.problems[0].message) && /not a reason to stop and ask/.test(f1._hint) && f2 === null && f3 === null);
     ctx.safeDhis2Fetch = saveF;
   }
 

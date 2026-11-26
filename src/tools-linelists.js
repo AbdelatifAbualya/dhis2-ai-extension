@@ -62,6 +62,43 @@ const LINE_LIST_RELATIVE_PERIODS = new Set([
 // financial-year 2026July etc.
 const LINE_LIST_FIXED_PERIOD_RE = /^\d{4}(?:\d{2}(?:\d{2})?|W\d{1,2}|B\d?|Q[1-4]|S[1-2]|July|April|Oct|Nov)?$/;
 
+// A custom date range on a time column: "<start>_<end>" (inclusive ISO days). The
+// Line Listing app saves its start/end dates this way, and the analytics query
+// takes it as <timeField>=<start>_<end> (verified on play 2.43.2.1, 2026-11-25:
+// enrollmentDate=2021-01-01_2026-09-16 and eventDate=… both answer).
+const LINE_LIST_DATE_RANGE_RE = /^\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}$/;
+
+// "registered more than 10 weeks ago" came in as a time column with
+// filter {operator:"LT", value:"2026-09-16"} and was silently DROPPED — the saved
+// list then listed everyone (Haiku, 2026-11-25). A date condition becomes a range
+// item; one bound alone is open on the other side.
+function lineListDateFilterToRange(filter, periods) {
+  if (filter == null || filter === '') return { range: null };
+  const conds = [];
+  const push = (op, v) => { if (op != null && v != null && v !== '') conds.push([String(op).toUpperCase(), String(v).trim()]); };
+  if (typeof filter === 'string') {
+    const parts = filter.split(':');
+    for (let i = 0; i + 1 < parts.length; i += 2) push(parts[i], parts[i + 1]);
+  } else if (Array.isArray(filter.conditions)) for (const c of filter.conditions) push(c.operator, c.value);
+  else push(filter.operator, filter.value);
+  const iso = (d) => /^\d{4}-\d{2}-\d{2}/.test(d) ? d.slice(0, 10) : null;
+  const shift = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+  let start = null, end = null;
+  for (const [op, v] of conds) {
+    const d = iso(v);
+    if (!d) return { _error: `A time column's condition needs an ISO date (YYYY-MM-DD), not "${v}".` };
+    if (op === 'GE') start = d; else if (op === 'GT') start = shift(d, 1);
+    else if (op === 'LE') end = d; else if (op === 'LT') end = shift(d, -1);
+    else if (op === 'EQ') { start = d; end = d; }
+    else return { _error: `A time column's condition takes GT, GE, LT, LE or EQ with a date; "${op}" is not one.` };
+  }
+  if (!start && !end) return { range: null };
+  if ((periods || []).length && (!start || !end)) {
+    return { _error: `The time column has both periods (${periods.join(', ')}) and a one-sided date condition. Send ONE date range instead: periods:["<start>_<end>"] (e.g. "2021-01-01_${end || shift(start, 365)}").` };
+  }
+  return { range: `${start || '1900-01-01'}_${end || new Date().toISOString().slice(0, 10)}` };
+}
+
 const LINE_LIST_OU_KEYWORD_RE = /^(USER_ORGUNIT|USER_ORGUNIT_CHILDREN|USER_ORGUNIT_GRANDCHILDREN|LEVEL-\d{1,2}|OU_GROUP-[A-Za-z][A-Za-z0-9]{10})$/;
 
 const LINE_LIST_EVENT_STATUSES = new Set(['ACTIVE', 'COMPLETED', 'SCHEDULE', 'OVERDUE', 'SKIPPED', 'VISITED']);
@@ -352,13 +389,20 @@ async function lineListResolveDimension(spec, ctx, outputType, optionCache, axis
       let periods = (raw.periods || raw.items || []).map(v => String(typeof v === 'object' ? v.id : v).trim()).filter(Boolean);
       const yearFix = periods.length ? namedYearPeriods(periods) : null;
       if (yearFix) periods = yearFix.periods;
+      const asRange = lineListDateFilterToRange(raw.filter ?? raw.condition ?? null, periods);
+      if (asRange._error) return asRange;
+      if (asRange.range) periods = [asRange.range];
       if (!periods.length) return { _error: `The ${canonical} ${axis} needs periods[] — relative keywords (e.g. LAST_12_MONTHS, THIS_YEAR) and/or fixed ISO periods (e.g. 202601, 2026Q1).` };
       const norm = [];
       for (const p of periods) {
         const up = p.toUpperCase().replace(/\s+/g, '_');
         if (LINE_LIST_RELATIVE_PERIODS.has(up)) { norm.push(up); continue; }
         if (LINE_LIST_FIXED_PERIOD_RE.test(p)) { norm.push(p); continue; }
-        return { _error: `"${p}" is not a recognized period. Relative: ${[...LINE_LIST_RELATIVE_PERIODS].slice(0, 12).join(', ')}, … Fixed ISO: 202601 (month), 2026Q1 (quarter), 2026 (year), 2026W5 (week).` };
+        if (LINE_LIST_DATE_RANGE_RE.test(p)) {
+          if (p.slice(0, 10) > p.slice(11)) return { _error: `Date range "${p}" ends before it starts.` };
+          norm.push(p); continue;
+        }
+        return { _error: `"${p}" is not a recognized period. Relative: ${[...LINE_LIST_RELATIVE_PERIODS].slice(0, 12).join(', ')}, … Fixed ISO: 202601 (month), 2026Q1 (quarter), 2026 (year), 2026W5 (week). A date range: "2026-01-01_2026-09-16" (or a filter {operator:"LT", value:"2026-09-16"} on the time column).` };
       }
       return { kind: 'time', dimension: canonical, items: norm, label: canonical };
     }
@@ -630,7 +674,13 @@ function lineListBuildProbePath(outputType, programId, tetId, dims, allDims) {
   let hasTime = false;
   for (const d of allDims) {
     if (d.kind === 'ou') parts.push(`dimension=ou:${d.items.join(';')}`);
-    else if (d.kind === 'time') { hasTime = true; parts.push(`dimension=pe:${d.items.join(';')}`); }
+    else if (d.kind === 'time') {
+      hasTime = true;
+      const ranges = d.items.filter(x => LINE_LIST_DATE_RANGE_RE.test(x));
+      const pes = d.items.filter(x => !LINE_LIST_DATE_RANGE_RE.test(x));
+      if (pes.length) parts.push(`dimension=pe:${pes.join(';')}`);
+      for (const r of ranges) parts.push(`${d.dimension}=${r}`);
+    }
     else if (d.kind === 'status') {
       // Statuses are COMMA-separated query params (not dimensions) on the
       // analytics endpoints — `programStatus=ACTIVE;COMPLETED` is a 400.
@@ -838,6 +888,36 @@ function lineListSummarizeSaved(ev) {
     sorting: ev.sorting || [],
     legend: ev.legend && ev.legend.set ? { legend_set_id: ev.legend.set.id, style: ev.legend.style, strategy: ev.legend.strategy, show_key: !!ev.legend.showKey } : null,
     last_updated: ev.lastUpdated,
+  };
+}
+
+// A line list this call saved that DHIS2 cannot read back: delete it (nothing
+// else refers to it yet) and explain. When the unreadable dimension is a data
+// element that exists (read by its id) while the server's data-element list
+// queries answer nothing, it is a server fault, not the model's call.
+async function lineListUnreadableDiagnosis(newId, readError, opts = {}) {
+  let deleted = false;
+  if (!opts.keep) {
+    const del = await safeDhis2Fetch(`eventVisualizations/${newId}`, { method: 'DELETE' });
+    deleted = !(del && del._error);
+  }
+  const m = /Not a valid dimension:\s*([A-Za-z0-9.]+)/.exec(String(readError || ''));
+  const parts = m ? m[1].split('.') : [];
+  const deId = parts.length ? parts[parts.length - 1] : null;
+  let diagnosis = null;
+  if (deId && /^[A-Za-z][A-Za-z0-9]{10}$/.test(deId)) {
+    const de = await safeDhis2Fetch(`dataElements/${deId}?fields=id,displayName`, { noTruncate: true });
+    const health = typeof serverListQueriesBroken === 'function' ? await serverListQueriesBroken() : { broken: false, types: [] };
+    if (de && !de._error && de.id) {
+      diagnosis = (health.types || []).includes('dataElements')
+        ? `Server problem: data element "${de.displayName}" (${deId}) exists (read by its id), but this server's data-element list queries answer nothing (${health.probe}), so DHIS2 saves a line list's data-element columns without the data element and then cannot read the list. Every line list with a data-element column fails the same way on this server (the Line Listing app saves through the same API) until the server is fixed. Columns of org unit, dates, attributes and program indicators still save. Tell the user it is a server problem; do not retry the same list.`
+        : `DHIS2 saved the list but cannot resolve its column ${m[1]} (data element "${de.displayName}" exists). Check that the column's stage is the stage that holds this data element; do not retry the same list unchanged.`;
+    }
+  }
+  return {
+    _error: `DHIS2 saved the line list (${newId}) but cannot read it back: ${readError}. ${opts.keep ? 'It is still saved and broken: restore the backup or delete it.' : (deleted ? 'It was deleted again, so nothing broken is left on the server.' : `Deleting it failed: delete ${newId} before going on.`)}`,
+    ...(diagnosis ? { _diagnosis: diagnosis } : {}),
+    _hint: 'Do not say the list was built. Name it under "not built" with this reason.',
   };
 }
 
@@ -1292,6 +1372,18 @@ async function executeManageLineLists(args) {
     if (!newId) return { _error: 'DHIS2 accepted the POST but returned no UID.', raw_status: postResp?.status };
     if (typeof dhis2 !== 'undefined' && dhis2.knownIds) dhis2.knownIds.add(newId);
 
+    // A saved list DHIS2 cannot read back is broken everywhere (Line Listing app,
+    // dashboard tile). Play 2.43.2.1 (2026-11-25) stored every data-element column
+    // WITHOUT its data element (its dataElements list queries answered nothing),
+    // and each GET of the list then failed 400 "Not a valid dimension: <prog>.<stage>.<de>"
+    // — while the analytics probe above had passed. Never call that a success: delete
+    // what this call just made and say why.
+    const readBack = await safeDhis2Fetch(`eventVisualizations/${newId}?fields=id,name`, { noTruncate: true });
+    if (readBack && readBack._error) {
+      const unreadable = await lineListUnreadableDiagnosis(newId, readBack._error);
+      return unreadable;
+    }
+
     const warnings = [...built.warnings];
     if (staleAnalyticsWarning) warnings.push(staleAnalyticsWarning);
     if (probeRes && probeRes.row_count === 0) {
@@ -1395,6 +1487,10 @@ async function executeManageLineLists(args) {
 
     const putResp = await safeDhis2Fetch(`eventVisualizations/${llId}`, { method: 'PUT', body });
     if (putResp?._error) return { _error: `Failed to update line list: ${putResp._error}`, backup: backup.block };
+    {
+      const readBack = await safeDhis2Fetch(`eventVisualizations/${llId}?fields=id,name`, { noTruncate: true });
+      if (readBack && readBack._error) return { ...(await lineListUnreadableDiagnosis(llId, readBack._error, { keep: true })), backup: backup.block };
+    }
 
     let probeRes = null;
     if (probePath && String(args.data_check || 'warn_empty') !== 'skip') {

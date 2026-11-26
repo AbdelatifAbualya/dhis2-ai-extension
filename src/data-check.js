@@ -163,21 +163,30 @@ async function dataCheckAggregateTile(tile, saved) {
   const ou = dataCheckOuDimension(saved);
   const pe = dataCheckPeDimension(saved);
   if (!items.length || !ou || !pe) return { ...tile, state: 'not_checked', items };
-  const r = await safeDhis2Fetch(`analytics?dimension=dx:${items.map(i => i.id).join(';')}&dimension=ou:${ou}&dimension=pe:${pe}&skipMeta=true`);
+  // skipRounding: a low-birth-weight share of 3 in 11,025 (0.027 %) came back as
+  // "0.0" at the indicator's 1 decimal, and the check then said the tile showed 0
+  // "because nothing matches" (Haiku, 2026-11-25). Analytics returns a row only when
+  // something was counted, so a returned 0 is a real computed value, not "no data".
+  const r = await safeDhis2Fetch(`analytics?dimension=dx:${items.map(i => i.id).join(';')}&dimension=ou:${ou}&dimension=pe:${pe}&skipMeta=true&skipRounding=true`);
   if (r?._error) return { ...tile, state: 'failed', error: String(r._error).slice(0, 200), items };
   const headers = r?.headers || [];
   const dxCol = headers.findIndex(h => h.name === 'dx');
   const valueCol = headers.findIndex(h => h.name === 'value');
   const filled = new Set();
+  const small = new Map();
   for (const row of r?.rows || []) {
     const v = Number(row[valueCol]);
-    if (dxCol >= 0 && valueCol >= 0 && Number.isFinite(v) && v !== 0) filled.add(row[dxCol]);
+    if (dxCol >= 0 && valueCol >= 0 && Number.isFinite(v)) {
+      filled.add(row[dxCol]);
+      if (v !== 0 && Math.abs(v) < 0.05) small.set(row[dxCol], v);
+    }
   }
   const emptyItems = items.filter(i => !filled.has(i.id));
   return {
     ...tile,
     state: !emptyItems.length ? 'ok' : emptyItems.length === items.length ? 'empty' : 'partly_empty',
     empty_items: emptyItems.map(i => ({ id: i.id, name: i.name })),
+    ...(small.size ? { rounds_to_zero: items.filter(i => small.has(i.id)).map(i => ({ name: i.name, value: small.get(i.id) })) } : {}),
     items,
     pe,
     ou,
@@ -419,6 +428,7 @@ function dataCheckAssemble(tiles, fieldList, analytics, split = [], distant = []
     ...(zeroUnrecorded.length ? { single_values_showing_0_for_nothing_recorded: zeroUnrecorded } : {}),
     ...(zeroOther.length ? { single_values_showing_0_for_no_data: zeroOther } : {}),
     ...(zeroCounted.length ? { single_values_true_zero: zeroCounted } : {}),
+    ...(tiles.some(t => (t.rounds_to_zero || []).length) ? { values_rounding_to_zero: tiles.filter(t => (t.rounds_to_zero || []).length).map(t => ({ tile: t.tile, items: t.rounds_to_zero })) } : {}),
     ...(noValue.length ? { fields_without_values: noValue.map(f => ({ field: fieldLabel(f), used_by: usedBy(f), ...(f.coverage.state === 'no_records' ? { stage_has_no_records: true, stage: f.stage || null } : {}), ...(hideNumbers ? {} : { records: f.coverage.total }) })) } : {}),
     ...(few.length ? { fields_rarely_filled: few.map(f => ({ field: fieldLabel(f), used_by: usedBy(f), ...(hideNumbers ? {} : { with_values: f.coverage.with_values, records: f.coverage.total }) })) } : {}),
   };
@@ -486,6 +496,9 @@ function dataCheckReportLines(check, analyticsNotOk = []) {
     const list = check.single_values_showing_0_for_no_data;
     const why = analyticsNotOk.length ? 'only because of the analytics tables above, not because the records are missing' : 'because nothing matches their saved period and places';
     lines.push(`${quoted(list)} ${verb(list)} 0 ${why}. DHIS2 draws "no data" as 0 on a single-value tile, so read it as "no data", not as a real zero.`);
+  }
+  for (const z of check.values_rounding_to_zero || []) {
+    lines.push(`${quoted([z.tile])} may show 0 or 0.0: its value is real but below the displayed decimals (${z.items.map(i => `${i.name} = ${hide ? 'under 0.05' : Number(i.value).toPrecision(2)}`).join('; ')}). Raise the indicator's decimals or say so; it is not "no data".`);
   }
   if ((check.single_values_true_zero || []).length) {
     const list = check.single_values_true_zero;

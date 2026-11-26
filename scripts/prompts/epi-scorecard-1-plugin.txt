@@ -1,0 +1,9 @@
+Build a dashboard plugin called “Immunization Scorecard”.
+
+It should show a scorecard: one row per organisation unit one level below the dashboard's selected location, plus a total row for the selected location itself, and one column per indicator. By default use BCG, Penta 3 and Measles coverage in children under one, the Penta 1 to Penta 3 dropout rate and the Child Health data set reporting rate. Colour each cell with the indicator's own legend where it has one, and otherwise with thresholds I can set (for dropout, lower is better). Show an arrow comparing each value with the previous period.
+
+Let me sort by any column, click a row to drill down one level and go back up, and see the numerator and denominator behind a value when I hover over or click it. Show “no data” instead of 0 when a value is missing.
+
+The plugin must follow the dashboard's location and period filters, and default to the last 12 months for the whole country. Let me choose the indicators, the period type and the thresholds for each copy of the plugin, saved so they survive a reload. Add a CSV export and a print view.
+
+Add two copies to a demonstration dashboard: one with the defaults, and one showing only the dropout rates by quarter. Confirm that changing one copy does not change the other, check the numbers against DHIS2 analytics, and share the dashboard.

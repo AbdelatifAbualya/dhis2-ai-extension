@@ -7442,6 +7442,20 @@ function piAnalyticsRuntimeTraps(pi, stageById, apiMinor) {
       hint: 'Use expression "V{enrollment_count}" with aggregation_type COUNT (the population goes in filter). For a percentage use ONE indicator: expression d2:condition("<numerator condition>", 100, 0), aggregation_type AVERAGE.',
     };
   }
+  // COUNT counts every record that passes the FILTER and ignores the expression's
+  // value: "Low birth weight babies" = COUNT of d2:condition("weight < 2500", 1, 0)
+  // with filter "weight > 0" showed every weighed baby (live play 2.43.2.1,
+  // 2026-11-25: COUNT 19,021, SUM 4). SUM of the 1/0 is the number that meet the
+  // condition; AVERAGE of 100/0 is their percentage. Same meaning, so heal it.
+  const condThen = /^d2:condition\(\s*(["'])[\s\S]+\1\s*,\s*(1|100)(?:\.0+)?\s*,\s*0(?:\.0+)?\s*\)$/.exec(expr);
+  if (agg === 'COUNT' && condThen) {
+    const to = condThen[2] === '100' ? 'AVERAGE' : 'SUM';
+    corrections.push({
+      field: 'aggregation_type', from: 'COUNT', to,
+      reason: `COUNT counts every ${pi.analyticsType === 'EVENT' ? 'event' : 'enrollment'} that passes the filter and ignores the expression's value, so the condition inside d2:condition(…) never applied (live: 19,021 weighed babies instead of 4 under 2,500 g). ${to} of d2:condition(…, ${condThen[2]}, 0) gives ${to === 'SUM' ? 'the number that meet the condition' : 'the percentage that meet it'}.`,
+    });
+    pi.aggregationType = to;
+  }
 
   // "Missing" written as `#{s.de} == ''`: DHIS2 stores no empty values, so on
   // a number / Yes-No field it is an "Expression violation" (E7132) on every
@@ -11037,7 +11051,9 @@ const tdAddDays = (iso, n) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTC
 function tdDateRank(name) {
   const n = String(name || '').toLowerCase();
   const order = [
-    [/onset|symptom.*start|start.*symptom|since|last menstrual|lmp/, 0],
+    [/last menstrual|\blmp\b/, -1],
+    [/estimated due|expected (date of )?deliver|due date|\bedd\b/, 8],
+    [/onset|symptom.*start|start.*symptom|since/, 0],
     [/request|ordered|referral date|refer.*date|sent date|send date/, 1],
     [/collect|sample|specimen/, 2],
     [/admission|admit|start date|starting|initiat|commenc/, 2],
@@ -11056,18 +11072,31 @@ function tdValue(rnd, el, ctx) {
   const name = String(el.displayName || '').toLowerCase();
   const pick = (a) => a[Math.floor(rnd() * a.length)];
   const between = (lo, hi, dec = 0) => { const v = lo + rnd() * (hi - lo); return dec ? v.toFixed(dec) : String(Math.round(v)); };
+  // Clinical programs block abnormal answers with error rules (the pregnancy tracker
+  // refuses a very low birth weight, placenta previa, a suspected anomaly: 24 of 29
+  // generated women were dropped, 2026-11-25). Test records are mostly normal; with
+  // ctx.calm (a rejected visit drawn again) they are always normal.
+  const calmMode = !!ctx.calm;
+  const ALARM_RE = /cancel|stop|reject|declin|discontinu|died|death|dead|lost|severe|urgent|danger|abrupt|previa|anomal|restrict|stillbirth|haemorrh|hemorrh|eclamp|sepsis|rupture|obstruct|distress|convuls|absent|reduced|positive|pos\b|_pos|indetermin|critical|high|referr|emergency|complicat/i;
+  const NORMAL_RE = /^(normal|negative|none|no|stable|appropriate|live_?birth|one|good|exclusive|spontaneous(_vaginal)?|clean(_and_healing)?|not_applicable|routine|scheduled|low|mild|yes_?normal|healthy|complete(d)?|within_24_hours)$/i;
   const codes = (el.optionSet?.options || []).map((o) => o.code).filter((c) => c != null && c !== '');
   if (codes.length) {
     const usable = codes.filter((c) => !/^other$/i.test(c)) .length ? codes.filter((c) => !/^other$/i.test(c)) : codes;
-    // Statuses that rules usually tie to a reason (cancelled, stopped, rejected) stay rare.
-    const calm = usable.filter((c) => !/cancel|stop|reject|declin|discontinu|died|death|dead|lost/i.test(c));
-    const pool = calm.length && rnd() < 0.85 ? calm : usable;
+    // Statuses that rules usually tie to a reason (cancelled, stopped, rejected) and alarming findings stay rare.
+    const calm = usable.filter((c) => !ALARM_RE.test(c));
+    const normal = usable.filter((c) => NORMAL_RE.test(c));
+    const pool = normal.length && (calmMode || rnd() < 0.6) ? normal : (calm.length && (calmMode || rnd() < 0.85) ? calm : usable);
     if (vt === 'MULTI_TEXT') return [...new Set([pick(pool), pick(pool)])].join(',');
     return pick(pool);
   }
+  // A yes/no about a danger sign, complication or anomaly is rarely yes.
+  const alarming = /danger|anomal|complicat|haemorrh|hemorrh|bleed|convuls|jaundice|loss|stillbirth|death|abnormal|problem|resuscitat|transfus|referr|suspected|allerg|chronic|previous (caesarean|stillbirth|pregnancy loss)|side effect|fever|severe/.test(name);
   switch (vt) {
-    case 'BOOLEAN': return rnd() < 0.3 ? 'true' : 'false';
-    case 'TRUE_ONLY': return rnd() < 0.3 ? 'true' : null;
+    // Calm mode (a visit drawn again) only turns an alarming yes into no and keeps
+    // every other answer (null = keep): "LMP known" forced to no made the due date
+    // mandatory on the pregnancy tracker.
+    case 'BOOLEAN': if (calmMode) return alarming ? 'false' : null; return rnd() < (alarming ? 0.05 : 0.3) ? 'true' : 'false';
+    case 'TRUE_ONLY': if (calmMode) return null; return rnd() < (alarming ? 0.05 : 0.3) ? 'true' : null;
     case 'PHONE_NUMBER': return `+000 555 ${String(1000 + Math.floor(rnd() * 8999))}`;
     case 'EMAIL': return `zz.test.${ctx.seq}@example.org`;
     case 'URL': return 'https://example.org/test';
@@ -11083,9 +11112,23 @@ function tdValue(rnd, el, ctx) {
     }
     case 'INTEGER': case 'INTEGER_POSITIVE': case 'INTEGER_ZERO_OR_POSITIVE': case 'NUMBER': case 'INTEGER_NEGATIVE': case 'UNIT_INTERVAL': {
       if (vt === 'UNIT_INTERVAL') return between(0, 1, 2);
-      const ranges = [[/weight/, 40, 100, 1], [/height|length cm/, 140, 190, 0], [/temp/, 36, 39.5, 1], [/systolic/, 100, 160, 0], [/diastolic/, 60, 100, 0], [/pulse|heart rate/, 60, 110, 0], [/resp/, 12, 24, 0], [/sat|spo2|oxygen/, 90, 100, 0], [/glucose|sugar/, 4, 12, 1], [/h(a)?emoglobin|hb\b/, 8, 15, 1], [/\bage\b/, 1, 90, 0], [/dose|quantity|tablets/, 1, 3, 0], [/days|stay|duration|length/, 1, 14, 0], [/score|scale|pain/, 0, 10, 0], [/count|number of/, 0, 6, 0]];
+      // Unit- and subject-aware first ("Birth weight in grams" got 40–100 from the
+      // kilogram range and tripped the very-low-birth-weight rule), then general.
+      const ranges = [
+        [/weight.*\bgrams?\b|\bgrams?\b.*weight|birth ?weight|newborn weight/, 2600, 3900, 0],
+        [/gestation|weeks? of pregnancy|\bga\b/, 10, 36, 0],
+        [/apgar/, 7, 10, 0], [/gravid/, 2, 5, 0], [/parity|\bpara\b/, 0, 1, 0],
+        [/fetal heart|foetal heart|fhr/, 125, 155, 0], [/fundal/, 18, 34, 0],
+        [/blood loss|\bml\b|millilit/, 150, 400, 0], [/babies|fetuses|foetuses|multiple/, 1, 1, 0],
+        [/wellbeing|depress|epds|phq/, 2, 8, 0], [/caesarean/, 0, 1, 0],
+        [/weight/, 50, 85, 1], [/height|length cm/, 145, 185, 0], [/temp/, 36.3, 37.4, 1, 37.6, 38.6], [/systolic/, 100, 135, 0, 140, 165], [/diastolic/, 60, 85, 0, 90, 105], [/pulse|heart rate/, 65, 100, 0], [/resp/, 12, 22, 0], [/sat|spo2|oxygen/, 95, 100, 0], [/glucose|sugar/, 4, 7, 1, 7.2, 11], [/h(a)?emoglobin|hb\b/, 11.2, 14, 1, 8, 10.8], [/\bage\b/, 1, 90, 0], [/dose|quantity|tablets/, 1, 3, 0], [/days|stay|duration|length/, 1, 14, 0], [/score|scale|pain/, 0, 3, 0], [/count|number of/, 1, 6, 0]];
       const r = ranges.find(([re]) => re.test(name));
-      let v = r ? between(r[1], r[2], vt === 'NUMBER' ? r[3] : 0) : between(1, 50);
+      // About one value in eight of a vital sign or lab result is abnormal, so tests see
+      // raised blood pressure, anaemia, fever. A blocking rule refuses some of them; the
+      // repair draws those again calmly (ctx.calm), so warn-level ones remain.
+      const abnormal = r && r[4] != null && !calmMode && rnd() < 0.12;
+      let v = r ? (abnormal ? between(r[4], r[5], vt === 'NUMBER' ? r[3] : 0) : between(r[1], r[2], vt === 'NUMBER' ? r[3] : 0)) : between(1, 50);
+      if (vt === 'INTEGER_POSITIVE' && Number(v) < 1) v = '1';
       if (vt === 'INTEGER_NEGATIVE') v = String(-Math.abs(parseInt(v, 10) || 1));
       return v;
     }
@@ -11106,12 +11149,19 @@ function tdValue(rnd, el, ctx) {
 // Visit dates in a believable order (onset ≤ request ≤ visit ≤ result ≤ next
 // appointment); nothing already done is dated after today.
 function tdFillDates(rnd, des, eventDate, today) {
-  const dates = des.filter((d) => /^(DATE|DATETIME|AGE)$/.test(d.valueType) && !/birth|dob/.test(String(d.displayName || '').toLowerCase()));
+  const dates = des.filter((d) => /^(DATE|DATETIME|AGE)$/.test(d.valueType) && !/birth|dob/.test(String(d.displayName || '').toLowerCase()))
+    .sort((a, b) => tdDateRank(a.displayName) - tdDateRank(b.displayName));
   const out = {};
+  let lmp = null;
   for (const d of dates) {
     const rank = tdDateRank(d.displayName);
     let day;
-    if (rank === 0) day = tdAddDays(eventDate, -(5 + Math.floor(rnd() * 10)));
+    // A pregnancy is dated from the last menstrual period 8–28 weeks before the visit
+    // (5–14 days made the rule-calculated gestational age 0 weeks, an invalid
+    // positive integer); the due date is 40 weeks after it.
+    if (rank === -1) { lmp = tdAddDays(eventDate, -(56 + Math.floor(rnd() * 140))); day = lmp; }
+    else if (rank === 8) day = tdAddDays(lmp || tdAddDays(eventDate, -(56 + Math.floor(rnd() * 140))), 280);
+    else if (rank === 0) day = tdAddDays(eventDate, -(5 + Math.floor(rnd() * 10)));
     else if (rank < 3) day = tdAddDays(eventDate, rank - 3); // request -2, collection/admission -1
     else if (rank === 3) day = eventDate;
     else if (rank < 7) { day = tdAddDays(eventDate, (rank - 3) * 2); if (day > today) day = today; }
@@ -11320,8 +11370,13 @@ async function executeManageTestData(args) {
       const events = [];
       let day = enrolledAt;
       const closingStage = stages.length > 1 && !stages[stages.length - 1].repeatable ? stages[stages.length - 1] : null;
+      // An ongoing episode is somewhere along its journey: it stops at a random stage
+      // (an ongoing pregnancy had a delivery 80 % of the time, so "early pregnancy"
+      // never appeared, 2026-11-25). A completed one has every stage.
+      const stopAt = completed ? stages.length : 1 + Math.floor(rnd() * Math.max(1, stages.length - (closingStage ? 1 : 0)));
       for (const st of stages) {
         if (st === closingStage && !completed) continue;
+        if (stages.indexOf(st) >= stopAt) continue;
         const des = (st.programStageDataElements || []).map((p) => ({ ...p.dataElement, compulsory: !!p.compulsory }));
         const count = st === stages[0] || st === closingStage ? 1 : (st.repeatable ? repMin + Math.floor(rnd() * (repMax - repMin + 1)) : (rnd() < 0.8 ? 1 : 0));
         for (let v = 0; v < count; v++) {
@@ -11350,8 +11405,8 @@ async function executeManageTestData(args) {
       // Appointments: a missed one (past due) or a future one on a repeatable stage.
       const repeatStage = stages.find((s) => s.repeatable && s !== stages[0]);
       if (repeatStage && !completed) {
-        if (rnd() < missedShare) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, -(3 + Math.floor(rnd() * 20))) });
-        else if (rnd() < 0.5) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, 5 + Math.floor(rnd() * 25)) });
+        if (rnd() < missedShare) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, -(3 + Math.floor(rnd() * 20))), dataValues: [] });
+        else if (rnd() < 0.5) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, 5 + Math.floor(rnd() * 25)), dataValues: [] });
       }
       enrollments.push({ enrollment: generateDhis2Uid(), program: prog.id, orgUnit: encFac.id, status: completed ? 'COMPLETED' : 'ACTIVE', enrolledAt, occurredAt: enrolledAt, events });
       cursor = tdAddDays(day > enrolledAt ? day : enrolledAt, 10 + Math.floor(rnd() * 40));
@@ -11370,27 +11425,74 @@ async function executeManageTestData(args) {
   for (const st of stages) for (const p of (st.programStageDataElements || [])) deMeta.set(p.dataElement.id, { ...p.dataElement, compulsory: !!p.compulsory });
   const repairs = { calculated_value_used: 0, required_value_added: 0, visits_simplified: 0, visits_left_out: 0, people_left_out: 0 };
   const simplified = new Set();
-  const eventsOf = (batch) => { const m = new Map(); for (const t of batch) for (const e of t.enrollments) for (const ev of e.events) m.set(ev.event, { ev, enr: e, te: t }); return m; };
+  const redrawn = new Set();
+  const assignSeen = new Map();
+  // An appointment (SCHEDULE) carries no values; a rule error on one crashed the
+  // repair (hit.ev.dataValues undefined) on the pregnancy tracker (2026-11-25).
+  const eventsOf = (batch) => { const m = new Map(); for (const t of batch) for (const e of t.enrollments) for (const ev of e.events) { if (!Array.isArray(ev.dataValues)) ev.dataValues = []; m.set(ev.event, { ev, enr: e, te: t }); } return m; };
   async function repairBatch(batch) {
-    for (let pass = 0; pass < 4; pass++) {
+    for (let pass = 0; pass < 6; pass++) {
       const v = await safeDhis2Fetch('tracker?async=false&importStrategy=CREATE&atomicMode=OBJECT&importMode=VALIDATE', { method: 'POST', body: { trackedEntities: batch } });
-      const errs = (v && (v._body || v))?.validationReport?.errorReports || [];
+      // E5000 = "cannot be created because <parent> could not be created": it clears
+      // when the parent is repaired, so it never strips or drops the child.
+      const errs = ((v && (v._body || v))?.validationReport?.errorReports || []).filter((e) => e.errorCode !== 'E5000');
       if (!errs.length) return batch;
       const evMap = eventsOf(batch);
       const dropEvents = new Set(); const dropTes = new Set();
       for (const e of errs) {
         const hit = evMap.get(e.uid);
         if (e.errorCode === 'E1307' && hit && Array.isArray(e.args) && e.args.length >= 3) {
-          const dv = hit.ev.dataValues.find((x) => x.dataElement === e.args[1]);
-          if (dv) dv.value = String(e.args[2]); else hit.ev.dataValues.push({ dataElement: e.args[1], value: String(e.args[2]) });
-          repairs.calculated_value_used++;
+          // Two rules assigning DIFFERENT values to one field (a default "LOW" and a
+          // "HIGH" for a finding) can never both match: the import then accepts only an
+          // empty value ("must be empty or match"), and setting each in turn flip-flopped
+          // until the visit was refused (pregnancy tracker, 2026-11-25).
+          const key = `${hit.ev.event}:${e.args[1]}`;
+          const prev = assignSeen.get(key);
+          if (prev != null && prev !== String(e.args[2])) {
+            hit.ev.dataValues = hit.ev.dataValues.filter((x) => x.dataElement !== e.args[1]);
+            repairs.conflicting_assignments_left_empty = (repairs.conflicting_assignments_left_empty || 0) + 1;
+          } else {
+            assignSeen.set(key, String(e.args[2]));
+            const dv = hit.ev.dataValues.find((x) => x.dataElement === e.args[1]);
+            if (dv) dv.value = String(e.args[2]); else hit.ev.dataValues.push({ dataElement: e.args[1], value: String(e.args[2]) });
+            repairs.calculated_value_used++;
+          }
         } else if (e.errorCode === 'E1301' && hit && Array.isArray(e.args) && e.args.length >= 2 && deMeta.get(e.args[1])) {
           const meta = deMeta.get(e.args[1]);
           const val = tdFillDates(rnd, [meta], hit.ev.occurredAt || today, today)[meta.id] || tdValue(rnd, meta, { prefix, today, seq: 0, facility: hit.ev.orgUnit, otherFacility: hit.ev.orgUnit, point: null }) || (meta.optionSet ? null : 'Test value');
           if (val != null && !hit.ev.dataValues.some((x) => x.dataElement === meta.id)) { hit.ev.dataValues.push({ dataElement: meta.id, value: val }); repairs.required_value_added++; }
           else dropEvents.add(hit.ev.event);
         } else if (hit) {
-          if (simplified.has(hit.ev.event)) dropEvents.add(hit.ev.event);
+          if (redrawn.has(hit.ev.event) && e.errorCode === 'E1300' && !redrawn.has(hit.enr.enrollment)) {
+            // Still refused after its own re-draw: the rule reads a value from another
+            // visit (a NEWEST_EVENT_PROGRAM variable — a lab anomaly blocked every
+            // later visit), so draw the whole episode again.
+            redrawn.add(hit.enr.enrollment);
+            for (const ev of hit.enr.events) {
+              const st = stages.find((x) => x.id === ev.programStage);
+              const stDes = (st?.programStageDataElements || []).map((q) => ({ ...q.dataElement, compulsory: !!q.compulsory }));
+              for (const x of ev.dataValues || []) {
+                const d = stDes.find((m) => m.id === x.dataElement);
+                if (!d || /^(DATE|DATETIME|AGE)$/.test(d.valueType)) continue;
+                const nv = tdValue(rnd, d, { prefix, today, seq: 0, facility: ev.orgUnit, otherFacility: ev.orgUnit, point: null, calm: true });
+                if (nv != null && nv !== '') x.value = nv;
+              }
+            }
+            repairs.episodes_redrawn = (repairs.episodes_redrawn || 0) + 1;
+          } else if (!redrawn.has(hit.ev.event) && e.errorCode === 'E1300') {
+            // A rule refuses an abnormal value: draw the visit again with normal values
+            // (same dates, same required fields) before stripping it.
+            redrawn.add(hit.ev.event);
+            const st = stages.find((x) => x.id === hit.ev.programStage);
+            const stDes = (st?.programStageDataElements || []).map((p) => ({ ...p.dataElement, compulsory: !!p.compulsory }));
+            for (const x of hit.ev.dataValues) {
+              const d = stDes.find((m) => m.id === x.dataElement);
+              if (!d || /^(DATE|DATETIME|AGE)$/.test(d.valueType)) continue;
+              const nv = tdValue(rnd, d, { prefix, today, seq: 0, facility: hit.ev.orgUnit, otherFacility: hit.ev.orgUnit, point: null, calm: true });
+              if (nv != null && nv !== '') x.value = nv;
+            }
+            repairs.visits_redrawn = (repairs.visits_redrawn || 0) + 1;
+          } else if (simplified.has(hit.ev.event)) dropEvents.add(hit.ev.event);
           else {
             simplified.add(hit.ev.event);
             const des = [...deMeta.values()].filter((d) => hit.ev.dataValues.some((x) => x.dataElement === d.id));
@@ -11400,6 +11502,21 @@ async function executeManageTestData(args) {
             hit.ev.dataValues = keep;
             repairs.visits_simplified++;
           }
+        } else if (e.trackerType === 'ENROLLMENT' && e.errorCode === 'E1300' && !redrawn.has(e.uid)) {
+          // A rule on the episode (values from its visits): draw every visit again
+          // with normal values before leaving the person out.
+          redrawn.add(e.uid);
+          for (const t of batch) for (const en of t.enrollments) if (en.enrollment === e.uid) for (const ev of en.events) {
+            const st = stages.find((x) => x.id === ev.programStage);
+            const stDes = (st?.programStageDataElements || []).map((q) => ({ ...q.dataElement, compulsory: !!q.compulsory }));
+            for (const x of ev.dataValues || []) {
+              const d = stDes.find((m) => m.id === x.dataElement);
+              if (!d || /^(DATE|DATETIME|AGE)$/.test(d.valueType)) continue;
+              const nv = tdValue(rnd, d, { prefix, today, seq: 0, facility: ev.orgUnit, otherFacility: ev.orgUnit, point: null, calm: true });
+              if (nv != null && nv !== '') x.value = nv;
+            }
+          }
+          repairs.episodes_redrawn = (repairs.episodes_redrawn || 0) + 1;
         } else if (e.trackerType === 'TRACKED_ENTITY' || e.trackerType === 'ENROLLMENT') {
           dropTes.add(e.uid);
         }
