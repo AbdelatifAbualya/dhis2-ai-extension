@@ -779,7 +779,27 @@ function userWordsThisThread() {
 // Refuse an analytics object scoped to exactly ONE of the user's several root
 // org units when the user never named it — the whole hierarchy is USER_ORGUNIT.
 // `orgUnits` is the ou item list (UIDs / keywords) the tool is about to save.
-async function singleRootScopeRefusal(orgUnits, what) {
+// The top org unit(s) a program's data can sit under: the first path segment of every
+// org unit the program is assigned to. One root = the program's own hierarchy.
+async function programRootIds(programIds) {
+  const roots = new Set();
+  for (const pid of [...new Set((programIds || []).filter((x) => /^[A-Za-z][A-Za-z0-9]{10}$/.test(String(x))))].slice(0, 5)) {
+    const p = await safeDhis2Fetch(`programs/${pid}?fields=organisationUnits[path]`, { noTruncate: true });
+    if (!p || p._error || !Array.isArray(p.organisationUnits)) return null;
+    for (const ou of p.organisationUnits) { const r = String(ou.path || '').split('/').filter(Boolean)[0]; if (r) roots.add(r); }
+  }
+  return roots;
+}
+// The one user root that holds every org unit of these programs, or null.
+async function programHierarchyRoot(programIds) {
+  const roots = await userRootOrgUnits();
+  if (!roots || roots.length < 2 || !(programIds || []).length) return null;
+  const pr = await programRootIds(programIds);
+  if (!pr || pr.size !== 1) return null;
+  return roots.find((r) => pr.has(r.id)) || null;
+}
+
+async function singleRootScopeRefusal(orgUnits, what, programIds) {
   const items = (Array.isArray(orgUnits) ? orgUnits : []).map(o => String(o).trim()).filter(Boolean);
   if (items.length !== 1 || !/^[A-Za-z][A-Za-z0-9]{10}$/.test(items[0])) return null;
   const roots = await userRootOrgUnits();
@@ -788,6 +808,13 @@ async function singleRootScopeRefusal(orgUnits, what) {
   if (!root) return null;
   const said = userWordsThisThread();
   if (root.displayName && said.includes(String(root.displayName).toLowerCase())) return null;
+  // The program's own hierarchy: every org unit the program is assigned to lies under
+  // this root, so its data cannot be anywhere else. Refusing it pushed the Cold Chain
+  // maps to all three of the user's hierarchies, which drew unrelated areas (2026-11-26).
+  if ((programIds || []).length) {
+    const home = await programHierarchyRoot(programIds);
+    if (home && home.id === root.id) return null;
+  }
   return {
     _error: `${what} is scoped to "${root.displayName}" (${root.id}) only — but this user has ${roots.length} top org units (${roots.map(r => r.displayName).join(', ')}) and never asked for "${root.displayName}". Nothing was saved.`,
     _hint: `For "the whole hierarchy", "everywhere", "all org units" or "national", use org_units ["USER_ORGUNIT"] (it covers all ${roots.length}); for "facilities at level N" everywhere use ["USER_ORGUNIT", "LEVEL-N"]. Only scope to "${root.displayName}" if the user asked for it by name. Retry the same call with the corrected org units.`,

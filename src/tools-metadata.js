@@ -275,6 +275,32 @@ async function executeToolCall(name, args) {
         _hint: 'App pages are opened by the user, not queried. Deep links: Capture enrollment dashboard = <server>/dhis-web-capture/index.html#/enrollment?enrollmentId=…&programId=…&orgUnitId=…&teiId=… (2.42+ redirects it to /apps/capture#/…); Dashboard = <server>/dhis-web-dashboard/index.html#/<dashboardId>. Installed apps: manage_custom_app(action="list") or dhis2_query path "apps".',
       };
     }
+    // Tracker records are deleted by the assistant only through
+    // manage_test_data(action="delete"), which deletes nothing but records it
+    // generated and reads each one back first. The authority to delete those must
+    // never reach real records (user rule, 2026-11-26), so a raw tracker delete is
+    // refused, and so is any write to the test-data manifest the delete relies on.
+    if (method !== 'GET' && method !== 'HEAD') {
+      const _p = String(args.path || '').trim().replace(/^\/?(?:api\/)?(?:\d+\/)?/, '');
+      const _pathOnly = _p.split('?')[0];
+      const _qs = `${_p.includes('?') ? _p.slice(_p.indexOf('?')) : ''}&${JSON.stringify(args.query_params || {})}`;
+      if (/^dataStore\/dhis2-ai-extension-testdata(?:\/|$)/i.test(_pathOnly)) {
+        return {
+          _error: 'Refused: the test-data manifest (dataStore dhis2-ai-extension-testdata) is written only by manage_test_data. It lists the records that tool generated, and nothing else may change it.',
+          _hint: 'Generate test records with manage_test_data(action="generate") and delete them with manage_test_data(action="delete").',
+          _scope: 'test_data_manifest_protected',
+        };
+      }
+      const trackerDelete = (method === 'DELETE' && /^(?:tracker(?:\/|$)|(?:trackedEntityInstances|trackedEntities|enrollments|events|relationships)(?:\/|$))/i.test(_pathOnly))
+        || (method === 'POST' && /^tracker\/?$/i.test(_pathOnly) && /importStrategy["=:\s]*"?DELETE/i.test(_qs + JSON.stringify(args.body || {}).slice(0, 2000)));
+      if (trackerDelete) {
+        return {
+          _error: 'Refused: the assistant does not delete tracker records (people, enrollments, events, relationships) through dhis2_query. The only records it deletes are test records it generated itself, with manage_test_data(action="delete"), which checks each one first.',
+          _hint: 'For test records this assistant generated: manage_test_data(action="delete", program_id). Real records are deleted by a person in Capture (open the record → ⋮ → Delete), never by the assistant. Tell the user this plainly.',
+          _scope: 'tracker_delete_refused',
+        };
+      }
+    }
     // A literal undefined / null / NaN path segment is a value the model failed
     // to fill in (an unset variable or a missing id) — guaranteed 404, never a
     // real object. Refuse it before it costs a failed call.
@@ -1395,6 +1421,13 @@ async function executeToolCall(name, args) {
       const patchProblem = await precheckPatchAgainstSchema(safePath, args.body);
       if (patchProblem) return patchProblem;
     }
+    // A metadata import REPLACES each object it names: objects carrying only the
+    // field to change crash the importer (HTTP 500 "getProgram() is null", then
+    // "getName() is null" — Cold Chain thread, 2026-11-26) or blank every other field.
+    if (method === 'POST' && /^metadata(?:\.json)?$/.test(safePath.split('?')[0]) && !/importStrategy=DELETE/i.test(safePath) && typeof precheckMetadataImportPartial === 'function') {
+      const partial = await precheckMetadataImportPartial(args.body);
+      if (partial) return partial;
+    }
 
     // ── Auto-snapshot before any item-level metadata mutation routed through
     // dhis2_query. Most managed-tool callers bypass this handler entirely, so
@@ -1435,7 +1468,17 @@ async function executeToolCall(name, args) {
       }
     }
 
+    // A PUT replaces the whole object: fields the body leaves out are kept from the
+    // saved object instead of being blanked (see mergePartialPut).
+    let putKept = null;
+    if (method === 'PUT' && opts.body && typeof mergePartialPut === 'function') {
+      const merged = await mergePartialPut(safePath, opts.body);
+      if (merged) { opts.body = merged.body; putKept = merged.kept; }
+    }
     const writeResult = await safeDhis2Fetch(safePath, opts);
+    if (putKept && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult)) {
+      writeResult._fields_kept = `A PUT replaces the whole object; these fields were not in your body and were kept as saved instead of being blanked: ${putKept.slice(0, 25).join(', ')}${putKept.length > 25 ? ' …' : ''}. To change one field, PATCH is simpler.`;
+    }
     if (method === 'POST' && !writeResult?._error) noteAssistantCreatedDataStoreKey(safePath);
     // Surface the backup block alongside the write result so the model — and
     // the user — can see how to restore.
@@ -5561,7 +5604,7 @@ async function prepareInlineVisualizations(items) {
     if (overall?.note) layoutNotes.push(`"${spec.name}": ${overall.note}`);
     const built = buildVisualizationObject(spec, typeMap);
     if (built._error) return { _error: `Item ${index + 1} (new_visualization): ${built._error}` };
-    const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`);
+    const rootScope = await singleRootScopeRefusal(spec.org_units, `Item ${index + 1} (new_visualization "${built.viz.name}")`, await programsOfVizItems(built.viz));
     if (rootScope) return rootScope;
     newVisualizations.push(built.viz);
     if (built.layoutNote) layoutNotes.push(`"${built.viz.name}": ${built.layoutNote}`);
@@ -6582,6 +6625,14 @@ function buildMapObject(spec, typeMap) {
 
 // Resolve the owning program for a program-indicator data item (maps need it on
 // the layer). Returns the program UID or null.
+// The programs a visualization's program indicators belong to (for the root-scope rule).
+async function programsOfVizItems(viz) {
+  const ids = [...new Set(((viz && viz.dataDimensionItems) || []).map((d) => d && d.programIndicator && d.programIndicator.id).filter(Boolean))].slice(0, 5);
+  const out = new Set();
+  for (const id of ids) { const pid = await resolveProgramForProgramIndicator(id); if (pid) out.add(pid); }
+  return [...out];
+}
+
 async function resolveProgramForProgramIndicator(piId) {
   const resp = await safeDhis2Fetch(`programIndicators/${piId}?fields=program[id]`);
   return resp?.program?.id || null;
@@ -6592,6 +6643,33 @@ async function resolveProgramForProgramIndicator(piId) {
 // localhost:8081 the 121 NCD visits sat on units with no geometry, and the map was
 // found empty only when the user asked the model to check every tile (2026-11-02).
 // Null unless the numbers prove it; a query that cannot run says nothing.
+// The org units holding a thematic layer's data, when NONE of them can be drawn
+// ({ units, names }), else null. Unknown answers (no data yet, analytics error, a
+// server whose org-unit list queries are broken) are null: never refuse on a guess.
+async function mapUndrawableData(itemId, thematic) {
+  try {
+    if (!thematic) return null;
+    const ouItems = (thematic.rows || []).find(r => r.dimension === 'ou')?.items?.map(i => i.id) || [];
+    const period = thematic.filters?.[0]?.items?.[0]?.id;
+    if (!ouItems.length || !period) return null;
+    const data = await safeDhis2Fetch(`analytics?dimension=dx:${itemId}&dimension=ou:${ouItems.join(';')}&filter=pe:${period}&skipMeta=true`);
+    if (!data || data._error) return null;
+    const ouCol = (data.headers || []).findIndex(h => h.name === 'ou');
+    if (ouCol < 0) return null;
+    const withData = [...new Set((data.rows || []).map(r => r[ouCol]))];
+    if (!withData.length || withData.length > 500) return null;
+    if (typeof serverListQueriesBroken === 'function') { const h = await serverListQueriesBroken(); if ((h.types || []).includes('organisationUnits')) return null; }
+    const drawn = await safeDhis2Fetch(`organisationUnits?filter=id:in:[${withData.join(',')}]&filter=geometry:!null&fields=id&paging=false`);
+    if (!drawn || drawn._error || (drawn.organisationUnits || []).length) return null;
+    const names = [];
+    for (const id of withData.slice(0, 5)) {
+      const o = await safeDhis2Fetch(`organisationUnits/${id}?fields=displayName`, { noTruncate: true });
+      names.push(o && !o._error && o.displayName ? o.displayName : id);
+    }
+    return { units: withData.length, names };
+  } catch { return null; }
+}
+
 async function mapNoBoundariesWarning(itemId, thematic) {
   try {
     const ouItems = (thematic.rows || []).find(r => r.dimension === 'ou')?.items?.map(i => i.id) || [];
@@ -6774,13 +6852,42 @@ async function executeManageMaps(args) {
         spec._drawn_units = withGeo;
       }
     }
+    // A map of one program's data, scoped to "the user's org units" while the user has
+    // several top units: it draws the other hierarchies' areas too (grey, no data) — the
+    // Cold Chain maps showed Egypt water-quality districts around Cairo for Palestine
+    // data (2026-11-26). Narrow it to the program's own hierarchy.
+    let scopeNote = null;
+    if (spec.program_id) {
+      const ous = Array.isArray(spec.org_units) ? spec.org_units.map(String) : [];
+      if (!ous.length || ous.some((o) => /^USER_ORGUNIT$/i.test(o))) {
+        const home = await programHierarchyRoot([spec.program_id]);
+        if (home) {
+          spec.org_units = [...ous.filter((o) => !/^USER_ORGUNIT$/i.test(o)), home.id];
+          scopeNote = `Scoped to "${home.displayName}", the hierarchy every org unit of this program belongs to (the user's other top units hold none of its data and would only be drawn as empty areas).`;
+        }
+      }
+    }
     if (!String(spec.basemap || '').trim()) spec.basemap = await defaultMapBasemap();
     const built = buildMapObject(spec, typeMap);
     if (built._error) return built;
-    const rootScope = await singleRootScopeRefusal(spec.org_units, `Map "${built.map.name}"`);
+    const rootScope = await singleRootScopeRefusal(spec.org_units, `Map "${built.map.name}"`, spec.program_id ? [spec.program_id] : []);
     if (rootScope) return rootScope;
     const levelRefusal = await orgLevelMismatchRefusal(built.map.name, spec.org_units, spec.org_unit_level, 'Map');
     if (levelRefusal) return levelRefusal;
+    // A map that can draw none of its data is not saved: on the dashboard it shows
+    // only a basemap (or other units' grey areas), which reads as a broken map. Every
+    // org unit holding the Cold Chain data had no location (2026-11-26).
+    if (!spec.keep_empty_map) {
+      const nothing = await mapUndrawableData(itemId, built.map.mapViews.find(v => v.layer === 'thematic'));
+      if (nothing) {
+        return {
+          _error: `Map "${built.map.name}" not saved: it would draw none of its data. The ${nothing.units} org unit(s) holding the data (${nothing.names.join(', ')}${nothing.units > nothing.names.length ? ', …' : ''}) have no location (no boundary or coordinates) on this server, and neither do the areas above them at the map's level.`,
+          _hint: 'Tell the user plainly which org units need a location (Maintenance → Organisation units → coordinates or boundary). Meanwhile show the same figures as a table or chart by org unit. Only if the user wants the empty map kept anyway, resend with keep_empty_map: true.',
+          _scope: 'map_draws_no_data',
+          units_without_location: nothing.names,
+        };
+      }
+    }
     const resp = await safeDhis2Fetch('maps', { method: 'POST', body: built.map });
     if (resp?._error) return { _error: `Map create failed: ${resp._error}`, _hint: 'Check the data item, org-unit level and period. A thematic layer needs exactly one data item, at least one org-unit selection, and one period.', _attempted_map_id: built.map.id };
     const newId = resp?.response?.uid || built.map.id;
@@ -6821,6 +6928,7 @@ async function executeManageMaps(args) {
       // (Breast Health dashboard, 2026-11-10).
       ...(boundaryWarning ? { draws_no_data: true, _must_tell_user: 'Say plainly in your answer that this map shows NO data — no shaded area and no point — because every org unit that holds the data has no location on this server. "Some facilities are missing" is not true here, and do not list the map as working. Offer a table or chart by org unit instead.' } : {}),
       ...(locationCoverage ? { location_coverage: locationCoverage, ...(locationCoverage.without_location && !boundaryWarning ? { _location_note: `${locationCoverage.without_location} of ${locationCoverage.with_location + locationCoverage.without_location} level-${mapLevel} org units have no location, so their data is not drawn on this map. Tell the user.` } : {}) } : {}),
+      ...(scopeNote ? { _scope_note: scopeNote } : {}),
       _next: `Embed it on a dashboard with manage_dashboards(action="add_items", dashboard_id=..., items=[{type:"MAP", map_id:"${newId}"}]) — or reference it in a new dashboard's items.`,
     };
   }
@@ -7149,7 +7257,7 @@ async function executeManageDashboards(args) {
     const built = buildVisualizationObject(spec, typeMap);
     if (built._error) return built;
     if (overall?.note) built.overallNote = overall.note;
-    const rootScope = await singleRootScopeRefusal(spec.org_units, `Visualization "${built.viz.name}"`);
+    const rootScope = await singleRootScopeRefusal(spec.org_units, `Visualization "${built.viz.name}"`, await programsOfVizItems(built.viz));
     if (rootScope) return rootScope;
     const result = await postMetadataPayload({ visualizations: [built.viz] }, !!args.dry_run_only);
     if (!result.success) return { _error: result._error || 'Visualization create failed.', phase: result.phase, errors: result.errors };

@@ -3237,11 +3237,112 @@ async function runRuleScopeAndTetSharingChecks() {
     };
     try {
       const a = await ctx.executeTool('manage_program_rules', { action: 'audit', program_id: 'progNcd0001', deep: false });
-      truthy('audit flags a NEWEST_EVENT_PROGRAM variable read in the same repeatable form, with the PATCH that fixes it', JSON.stringify(a).includes('reads the NEWEST event of the whole enrollment') && JSON.stringify(a).includes('programRuleVariables/prvSys00001'));
+      truthy('audit flags a NEWEST_EVENT_PROGRAM variable read in the same repeatable form, pointing at fix_variables (one call), not a PATCH per variable', JSON.stringify(a).includes('reads the NEWEST event of the whole enrollment') && JSON.stringify(a).includes('prvSys00001') && JSON.stringify(a).includes('fix_variables') && !JSON.stringify(a).includes('dhis2_query(method=\\"PATCH\\"'));
       vars = [prv('DATAELEMENT_CURRENT_EVENT')];
       const b = await ctx.executeTool('manage_program_rules', { action: 'audit', program_id: 'progNcd0001', deep: false });
       truthy('…and not a CURRENT_EVENT one', !JSON.stringify(b).includes('reads the NEWEST event'));
+      // Cold Chain thread (2026-11-26): 62 PATCH calls through dhis2_query → fix_variables does them in one call.
+      vars = [prv('DATAELEMENT_NEWEST_EVENT_PROGRAM')];
+      const d4 = ctx.__dhis2(); const keep4 = { wa: d4.writeAuth, c: d4.harnessSkipBackupConsent };
+      d4.writeAuth = { scope: 'broad', reason: 'verify' }; d4.harnessSkipBackupConsent = true;
+      const patches = [];
+      const inner = ctx.safeDhis2Fetch;
+      ctx.safeDhis2Fetch = async (p, o = {}) => { if (o.method === 'PATCH') { patches.push([p, o.body]); vars = [prv('DATAELEMENT_CURRENT_EVENT')]; return {}; } return inner(p, o); };
+      try {
+        const f = await ctx.executeTool('manage_program_rules', { action: 'fix_variables', program_id: 'progNcd0001', skip_backup: true });
+        truthy('fix_variables patches every flagged variable in ONE tool call (a replace of programRuleVariableSourceType), then re-audits clean',
+          f.success === true && f.fixed === 1 && f.still_flagged === 0 && patches.length === 1 && patches[0][0] === 'programRuleVariables/prvSys00001'
+          && JSON.stringify(patches[0][1]).includes('DATAELEMENT_CURRENT_EVENT'));
+      } finally { d4.writeAuth = keep4.wa; d4.harnessSkipBackupConsent = keep4.c; }
     } finally { ctx.safeDhis2Fetch = saved4; }
+  }
+  // manage_program_rules create: references checked before any request (Cold Chain thread, 2026-11-26).
+  {
+    const savedF = ctx.safeDhis2Fetch, savedP = ctx.postMetadataPayload;
+    const d5 = ctx.__dhis2(); const keep5 = d5.writeAuth;
+    d5.writeAuth = { scope: 'broad', reason: 'verify' };
+    const stagesCold = [
+      { id: 'stgTempRd01', displayName: 'Temperature monitoring', repeatable: true, programStageDataElements: [{ dataElement: { id: 'deTempCur01', displayName: 'Current temperature', valueType: 'NUMBER' } }, { dataElement: { id: 'deTempMin01', displayName: 'Minimum temperature', valueType: 'NUMBER' } }] },
+      { id: 'aRfcBDWYYdj', displayName: 'Preventive maintenance', repeatable: true, programStageDataElements: [{ dataElement: { id: 'deMaintCs01', displayName: 'Maintenance cost', valueType: 'NUMBER' } }, { dataElement: { id: 'deUptime001', displayName: 'Uptime percentage', valueType: 'NUMBER' } }] },
+    ];
+    let posted5 = null; let sent = 0;
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p.startsWith('programs/progCold001')) return { id: 'progCold001', programStages: stagesCold, programTrackedEntityAttributes: [], programRuleVariables: [] };
+      if (p.startsWith('programRules?')) return { programRules: [] };
+      return {};
+    };
+    ctx.postMetadataPayload = async (payload) => { sent++; posted5 = payload; return { success: true }; };
+    try {
+      const ok = await ctx.executeTool('manage_program_rules', { action: 'create', program_id: 'progCold001', rules: [
+        { name: 'Cost cannot be negative', condition: 'd2:hasValue(#{maintenance_cost}) && #{maintenance_cost} < 0', program_stage_id: 'aRfcBDWYYdt', actions: [{ type: 'SHOWERROR', content: 'Negative cost' }] },
+        { name: 'Calc uptime', condition: 'd2:hasValue(#{maintenance_cost})', actions: [{ type: 'ASSIGN', target: 'Uptime percentage', data: '99' }] },
+        { name: 'Out of range', condition: 'd2:hasValue(#{current_temperature}) && #{current_temperature} < #{minimum_temperature}', program_stage_id: 'stgTempRd01', actions: [{ type: 'SHOWWARNING', content: 'Outside the device range' }] },
+      ] });
+      const rules5 = (posted5 && posted5.programRules) || [];
+      const vars5 = Object.fromEntries(((posted5 && posted5.programRuleVariables) || []).map((v) => [v.name, v.programRuleVariableSourceType]));
+      const assign = ((posted5 && posted5.programRuleActions) || []).find((a) => a.programRuleActionType === 'ASSIGN');
+      truthy('a one-character slip in a rule\'s stage id (aRfcBDWYYdt) is healed to the program\'s stage and reported; a "target" alias becomes the ASSIGN target; a stage-scoped warning with no target field reads the CURRENT event',
+        sent === 1 && rules5[0] && rules5[0].programStage && rules5[0].programStage.id === 'aRfcBDWYYdj'
+        && /aRfcBDWYYdt → aRfcBDWYYdj/.test(JSON.stringify(ok.summary && ok.summary.id_corrections))
+        && assign && assign.dataElement && assign.dataElement.id === 'deUptime001'
+        && vars5.current_temperature === 'DATAELEMENT_CURRENT_EVENT' && vars5.minimum_temperature === 'DATAELEMENT_CURRENT_EVENT' && vars5.maintenance_cost === 'DATAELEMENT_CURRENT_EVENT');
+      sent = 0;
+      const noTarget = await ctx.executeTool('manage_program_rules', { action: 'create', program_id: 'progCold001', rules: [{ name: 'Calculate days overdue', condition: 'd2:hasValue(#{maintenance_cost})', actions: [{ type: 'ASSIGN', data: 'd2:daysBetween(V{event_date}, V{current_date})' }] }] });
+      const badStage = await ctx.executeTool('manage_program_rules', { action: 'create', program_id: 'progCold001', rules: [{ name: 'Elsewhere', condition: 'd2:hasValue(#{maintenance_cost})', program_stage_id: 'zzzzzzzzzzz', actions: [{ type: 'SHOWWARNING', content: 'x' }] }] });
+      truthy('…an ASSIGN with no target and a stage that is not the program\'s are refused before any request, listing the program\'s stages',
+        sent === 0 && noTarget.nothing_created && /ASSIGN action has no target field/.test(noTarget._error) && badStage.nothing_created && /not a stage of this program/.test(badStage._error) && /aRfcBDWYYdj/.test(JSON.stringify(badStage.program_stages)));
+    } finally { ctx.safeDhis2Fetch = savedF; ctx.postMetadataPayload = savedP; d5.writeAuth = keep5; }
+  }
+  // Cold Chain dashboard (2026-11-26): maps scoped to all of the user's hierarchies drew unrelated grey areas,
+  // and maps whose data units had no location were saved anyway.
+  {
+    const savedF = ctx.safeDhis2Fetch;
+    vm.runInContext('_userRootOuCache = null', ctx);
+    ctx.safeDhis2Fetch = async (p) => {
+      if (p.startsWith('me?')) return { organisationUnits: [{ id: 'rootPal0001', displayName: 'Palestine' }, { id: 'rootEgy0001', displayName: 'MoHP Egypt' }, { id: 'rootTst0001', displayName: 'Test' }] };
+      if (p.startsWith('programs/progCold001')) return { organisationUnits: [{ path: '/rootPal0001/r2/r3/fac0000001' }, { path: '/rootPal0001/r2/r3/fac0000002' }] };
+      if (p.startsWith('programs/progMix00001')) return { organisationUnits: [{ path: '/rootPal0001/a' }, { path: '/rootEgy0001/b' }] };
+      if (p.startsWith('analytics?')) return { headers: [{ name: 'dx' }, { name: 'ou' }, { name: 'value' }], rows: [['pi', 'ouTestDst01', '12']] };
+      if (p.startsWith('organisationUnits?filter=id:in:')) return { organisationUnits: [] };
+      if (p.startsWith('organisationUnits/ouTestDst01')) return { displayName: 'Test district' };
+      return {};
+    };
+    try {
+      const ok = await ctx.singleRootScopeRefusal(['rootPal0001'], 'Map "x"', ['progCold001']);
+      const no = await ctx.singleRootScopeRefusal(['rootPal0001'], 'Map "x"', ['progMix00001']);
+      const home = await ctx.programHierarchyRoot(['progCold001']);
+      const und = await ctx.mapUndrawableData('piShare0001', { rows: [{ dimension: 'ou', items: [{ id: 'rootPal0001' }, { id: 'LEVEL-3' }] }], filters: [{ items: [{ id: 'LAST_12_MONTHS' }] }] });
+      truthy('a single top unit is allowed when every org unit of the program lies under it (and still refused for a program spread over two hierarchies); the program\'s hierarchy is found; a layer whose data units have no location is recognised, with their names',
+        ok === null && no && /never asked/.test(no._error) && home && home.id === 'rootPal0001' && und && und.units === 1 && und.names[0] === 'Test district');
+    } finally { ctx.safeDhis2Fetch = savedF; vm.runInContext('_userRootOuCache = null', ctx); }
+  }
+  // dhis2_query PUT with a partial body: a program lost its tracked entity type, stages and org units (play, 2026-11-26).
+  {
+    const savedF = ctx.safeDhis2Fetch;
+    vm.runInContext('if (typeof _adminCache !== "undefined") { _adminCache.schemaIndex = null; }', ctx);
+    ctx.safeDhis2Fetch = async (p) => {
+      if (/^schemas\?/.test(p)) return { schemas: [{ name: 'program', plural: 'programs' }] };
+      if (p.startsWith('programs/progPut0001?fields=:owner')) return { id: 'progPut0001', name: 'CCR', shortName: 'CCR', programType: 'WITH_REGISTRATION', trackedEntityType: { id: 'tetPerson01' }, programStages: [{ id: 'stg00000001' }], organisationUnits: [{ id: 'ou000000001' }], lastUpdated: 'x' };
+      return {};
+    };
+    try {
+      const m = await ctx.mergePartialPut('programs/progPut0001', { name: 'CCR renamed', organisationUnits: [] });
+      const none = await ctx.mergePartialPut('dataStore/ns/key', { a: 1 });
+      truthy('a PUT that names only some fields keeps the rest as saved (tracked entity type, stages), applies what it names (also an explicit empty list), and is reported; dataStore PUTs are untouched',
+        m && m.body.trackedEntityType.id === 'tetPerson01' && m.body.programStages.length === 1 && m.body.name === 'CCR renamed' && m.body.organisationUnits.length === 0
+        && m.kept.includes('trackedEntityType') && m.kept.includes('programStages') && !m.kept.includes('lastUpdated') && none === null);
+    } finally { ctx.safeDhis2Fetch = savedF; vm.runInContext('if (typeof _adminCache !== "undefined") { _adminCache.schemaIndex = null; if (_adminCache.schemas) _adminCache.schemas.clear(); }', ctx); }
+  }
+  // dhis2_query POST metadata with partial objects (Cold Chain thread: two HTTP 500s).
+  {
+    const savedF = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (/^schemas\/programRuleVariable/.test(p) ? { properties: [{ name: 'name', required: true, persisted: true }, { name: 'program', required: true, persisted: true }, { name: 'programRuleVariableSourceType', required: true, persisted: true }, { name: 'valueType', required: true, persisted: true }] } : /^schemas\?/.test(p) ? { schemas: [{ name: 'programRuleVariable', plural: 'programRuleVariables' }] } : {});
+    try {
+      const partial = await ctx.precheckMetadataImportPartial({ programRuleVariables: [{ id: 'KY0DqXCybLy', programRuleVariableSourceType: 'DATAELEMENT_CURRENT_EVENT', program: { id: 'O0CS8euHCXP' } }] });
+      const full = await ctx.precheckMetadataImportPartial({ programRuleVariables: [{ id: 'KY0DqXCybLy', name: 'temp', program: { id: 'O0CS8euHCXP' }, programRuleVariableSourceType: 'DATAELEMENT_CURRENT_EVENT', valueType: 'NUMBER' }] });
+      truthy('a metadata import of partial objects (an id and the one field to change) is refused before sending, pointing rule variables at fix_variables; complete objects pass',
+        partial && /lack name/.test(partial._error) && /fix_variables/.test(partial._hint) && full === null);
+    } finally { ctx.safeDhis2Fetch = savedF; vm.runInContext('typeof _requiredFieldsCache !== "undefined" && _requiredFieldsCache.clear(); if (typeof _adminCache !== "undefined") { _adminCache.schemaIndex = null; if (_adminCache.schemas) _adminCache.schemas.clear(); }', ctx); }
   }
   // search_metadata paging: never a "page" filter; say when the list is cut off.
   {
@@ -5403,10 +5504,102 @@ async function runComplexBuildsChecks() {
       anomaly.filter(x => x === 'true').length < 40 && many(placenta).filter(x => x === 'NORMAL').length > 150
       && many(placenta, 50, { calm: true }).every(x => x === 'NORMAL') && ctx.tdValue(r2, { displayName: 'Fetal anomaly suspected', valueType: 'BOOLEAN' }, { calm: true }) === 'false'
       && ctx.tdValue(r2, { displayName: 'Last menstrual period known', valueType: 'BOOLEAN' }, { calm: true }) === null);
+    // Cold Chain on play (2026-11-26): 440 visits dropped — points on stages without coordinates (E1074),
+    // equal "sending"/"receiving" text, minimum above maximum.
+    const dv = [{ dataElement: 'mn', value: '9.5' }, { dataElement: 'mx', value: '3.1' }, { dataElement: 'cur', value: '5' }];
+    ctx.tdOrderMinMax([{ id: 'mn', displayName: 'Minimum temperature reading' }, { id: 'mx', displayName: 'Maximum temperature reading' }, { id: 'cur', displayName: 'Current temperature' }], dv);
+    const names = new Map([['ouA00000001', 'Connaught Hospital'], ['ouB00000001', 'Lumley Hospital']]);
+    const send = ctx.tdValue(r2, { displayName: 'Sending facility', valueType: 'TEXT' }, { facility: 'ouA00000001', otherFacility: 'ouB00000001', ouNames: names, seq: 1 });
+    const recv = ctx.tdValue(r2, { displayName: 'Receiving facility', valueType: 'TEXT' }, { facility: 'ouA00000001', otherFacility: 'ouB00000001', ouNames: names, seq: 1 });
+    const free = new Set(Array.from({ length: 20 }, () => ctx.tdValue(r2, { displayName: 'Comments', valueType: 'TEXT' }, { seq: 1 })));
+    const genSrc = String(ctx.executeManageTestData);
+    truthy('…a minimum/maximum pair is put in order; facility text fields get real names with the receiving one a different facility; free text is distinct; visit points only on stages whose feature type is POINT',
+      dv[0].value === '3.1' && dv[1].value === '9.5' && dv[2].value === '5' && send === 'Connaught Hospital' && recv === 'Lumley Hospital' && free.size > 10
+      && /st\.featureType === 'POINT'/.test(genSrc));
     const pd = ctx.tdFillDates(r2, [{ id: 'edd', displayName: 'Estimated due date', valueType: 'DATE' }, { id: 'lmp', displayName: 'Last menstrual period date', valueType: 'DATE' }], '2026-06-01', '2026-11-18');
     const days = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 86400000);
     truthy('…a pregnancy is dated from an LMP 8–28 weeks before the visit and a due date 280 days after it (5–14 days made the calculated gestational age 0 weeks)',
       days(pd.lmp, '2026-06-01') >= 56 && days(pd.lmp, '2026-06-01') <= 196 && days(pd.lmp, pd.edd) === 280);
+  }
+
+  // 17b. Test-data delete only ever removes records the generator made and nobody touched (user rule, 2026-11-26).
+  {
+    const R = ctx.tdNotDeletableReason;
+    const run = { marker: 'dhis2-ai-test-data', prefix: 'ZZ TEST', at: '2026-11-26T08:00:00Z' };
+    const gen = (extra = {}) => ({ trackedEntity: 'teGen000001', attributes: [{ attribute: 'a', value: 'ZZ TEST Cold Chain 1' }], enrollments: [{ enrollment: 'en', program: 'progTD00001', storedBy: 'dhis2-ai-test-data', events: [{ event: 'ev', storedBy: 'dhis2-ai-test-data' }] }], ...extra });
+    const legacyRun = { at: '2026-11-26T08:00:00Z' };
+    const legacy = (ev) => ({ attributes: [{ value: 'ZZ TEST Nadia' }], enrollments: [{ program: 'progTD00001', createdAt: '2026-11-26T07:59:00', updatedAt: '2026-11-26T07:59:00', events: [ev] }] });
+    truthy('test data: a record still exactly as generated may be deleted; one enrolled in another program, or with an enrollment/event a person saved (storedBy = their name), is kept',
+      R(gen(), 'progTD00001', run) === null
+      && /another program/.test(R(gen({ enrollments: [...gen().enrollments, { program: 'progReal0001', storedBy: 'nurse1', events: [] }] }), 'progTD00001', run) || '')
+      && /changed or added to by a person/.test(R(gen({ enrollments: [{ program: 'progTD00001', storedBy: 'dhis2-ai-test-data', events: [{ storedBy: 'dhis2-ai-test-data' }, { storedBy: 'admin' }] }] }), 'progTD00001', run) || ''));
+    truthy('…records generated before the marker: kept when a person saved them, updated later, created outside the run, or without the test name prefix',
+      R(legacy({ createdAt: '2026-11-26T07:59:10', updatedAt: '2026-11-26T07:59:10' }), 'progTD00001', legacyRun) === null
+      && /person/.test(R(legacy({ storedBy: 'admin', createdAt: '2026-11-26T07:59:10', updatedAt: '2026-11-26T07:59:10' }), 'progTD00001', legacyRun) || '')
+      && /person/.test(R(legacy({ createdAt: '2026-11-26T07:59:10', updatedAt: '2026-11-26T11:00:00' }), 'progTD00001', legacyRun) || '')
+      && /outside the generator/.test(R(legacy({ createdAt: '2026-10-01T10:00:00', updatedAt: '2026-10-01T10:00:00' }), 'progTD00001', legacyRun) || '')
+      && /prefix/.test(R({ ...legacy({ createdAt: '2026-11-26T07:59:10', updatedAt: '2026-11-26T07:59:10' }), attributes: [{ value: 'Real Name' }] }, 'progTD00001', legacyRun) || ''));
+    // 2.43 ignores a supplied storedBy (stores the importing user): the proof is the generator's own ids + the server-time window.
+    const run2 = { marker: 'dhis2-ai-test-data', prefix: 'ZZ TEST', user: 'admin', server_started: '2026-11-26T09:00:00.000', server_finished: '2026-11-26T09:02:00.000', items: { teNew000001: ['enNew000001', 'evNew000001'] } };
+    const fresh = (ev = {}) => ({ trackedEntity: 'teNew000001', attributes: [], enrollments: [{ enrollment: 'enNew000001', program: 'progTD00001', storedBy: 'admin', createdAt: '2026-11-26T09:01:00.000', updatedAt: '2026-11-26T09:01:00.000', events: [{ event: 'evNew000001', storedBy: 'admin', createdAt: '2026-11-26T09:01:00.000', updatedAt: '2026-11-26T09:01:00.000', ...ev }] }] });
+    const withExtra = fresh(); withExtra.enrollments[0].events.push({ event: 'evPerson001', storedBy: 'admin', createdAt: '2026-11-26T12:00:00.000', updatedAt: '2026-11-26T12:00:00.000' });
+    truthy('…on 2.43 (storedBy = the importing user): an untouched record is deletable; one with a visit the generator did not create, updated after the run, or saved by another user is kept',
+      R(fresh(), 'progTD00001', run2) === null
+      && /added after it was generated/.test(R(withExtra, 'progTD00001', run2) || '')
+      && /person/.test(R(fresh({ updatedAt: '2026-11-26T15:30:00.000' }), 'progTD00001', run2) || '')
+      && /person/.test(R(fresh({ storedBy: 'nurse1' }), 'progTD00001', run2) || '')
+      // live 2026-11-26: an edit seconds after the run (inside the old 10-minute margin) was deleted
+      && /person/.test(R(fresh({ updatedAt: '2026-11-26T09:02:00.400' }), 'progTD00001', run2) || ''));
+    const stamped2 = fresh(); stamped2.enrollments[0].storedBy = 'dhis2-ai-test-data';
+    truthy('…on 2.42 (marker kept): a record whose visit lost the marker to a later save is kept',
+      /person/.test(R(stamped2, 'progTD00001', run2) || ''));
+    // The whole delete against a stubbed server: a manifest that (tampered or stale) lists a real person.
+    const savedF = ctx.safeDhis2Fetch; const dd = ctx.__dhis2(); const keepWa = dd.writeAuth;
+    dd.writeAuth = { scope: 'broad', reason: 'verify' };
+    const deletedIds = []; let manifestWrite = null;
+    const tes = {
+      teGen000001: gen(),
+      teReal00001: { trackedEntity: 'teReal00001', attributes: [{ value: 'Amina Real' }], enrollments: [{ program: 'progTD00001', storedBy: 'nurse1', events: [{ storedBy: 'nurse1' }] }] },
+      teEdit00001: gen({ trackedEntity: 'teEdit00001', enrollments: [{ program: 'progTD00001', storedBy: 'dhis2-ai-test-data', events: [{ storedBy: 'admin' }] }] }),
+    };
+    for (const [id, t] of Object.entries(tes)) t.trackedEntity = id;
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (p.startsWith('programs/progTD00001')) return { id: 'progTD00001', displayName: 'TD', programType: 'WITH_REGISTRATION', trackedEntityType: { id: 'tetTD000001' }, organisationUnits: [], programStages: [], programTrackedEntityAttributes: [] };
+      if (p === 'dataStore') return ['dhis2-ai-extension-testdata'];
+      if (p === 'dataStore/dhis2-ai-extension-testdata') return ['progTD00001'];
+      if (p === 'dataStore/dhis2-ai-extension-testdata/progTD00001' && !o.method) return { program: 'progTD00001', runs: [{ ...run, trackedEntities: ['teGen000001', 'teReal00001', 'teEdit00001', 'teGone00001'] }] };
+      if (p === 'dataStore/dhis2-ai-extension-testdata/progTD00001') { manifestWrite = [o.method, o.body]; return {}; }
+      if (p.startsWith('tracker/trackedEntities?')) { const ids = (/trackedEntities=([^&]+)/.exec(p) || [])[1].split(','); return { trackedEntities: ids.filter((i) => tes[i]).map((i) => tes[i]) }; }
+      if (p.startsWith('tracker?') && /importStrategy=DELETE/.test(p)) { const ids = o.body.trackedEntities.map((t) => t.trackedEntity); deletedIds.push(...ids); for (const i of ids) delete tes[i]; return { stats: { deleted: ids.length } }; }
+      return {};
+    };
+    try {
+      const r = await ctx.executeTool('manage_test_data', { action: 'delete', program_id: 'progTD00001' });
+      truthy('…delete reads every listed record back and deletes only the untouched generated one: a real person planted in the manifest and an edited test record are kept and reported, and the manifest keeps only them',
+        JSON.stringify(deletedIds) === '["teGen000001"]' && r.deleted_people === 1 && r.already_gone === 1
+        && Object.values(r.kept_not_deleted || {}).reduce((a, b) => a + b, 0) === 2
+        && manifestWrite && manifestWrite[0] === 'PUT' && JSON.stringify(manifestWrite[1].runs[0].trackedEntities.sort()) === '["teEdit00001","teReal00001"]');
+      // A delete DHIS2 fails (play: HTTP 500, a program without its tracked entity type) keeps the ids listed.
+      const gen2 = gen(); gen2.trackedEntity = 'teGen000002'; tes.teGen000002 = gen2;
+      manifestWrite = null;
+      const sdf2 = ctx.safeDhis2Fetch;
+      ctx.safeDhis2Fetch = async (p, o = {}) => {
+        if (p === 'dataStore/dhis2-ai-extension-testdata/progTD00001' && !o.method) return { program: 'progTD00001', runs: [{ ...run, trackedEntities: ['teGen000002'] }] };
+        if (p.startsWith('tracker?') && /importStrategy=DELETE/.test(p)) return { _error: 'DHIS2 API 500: Cannot invoke "org.hisp.dhis.trackedentity.TrackedEntityType.getUid()" because the return value of "org.hisp.dhis.program.Program.getTrackedEntityType()" is null', _status: 500 };
+        if (p.startsWith('programs?filter=programType:eq:WITH_REGISTRATION')) return { programs: [{ id: 'progBroke01', displayName: 'Community Care and Referral' }] };
+        return sdf2(p, o);
+      };
+      const r500 = await ctx.executeTool('manage_test_data', { action: 'delete', program_id: 'progTD00001' });
+      ctx.safeDhis2Fetch = sdf2;
+      truthy('…a delete DHIS2 fails keeps those ids in the list (the tool still knows its records) and names the broken program that makes every tracker import fail',
+        r500.deleted_people === 0 && manifestWrite && manifestWrite[0] === 'PUT' && JSON.stringify(manifestWrite[1].runs[0].trackedEntities) === '["teGen000002"]'
+        && /Community Care and Referral/.test(r500._diagnosis || '') && /no tracked entity type/.test(r500._diagnosis || ''));
+      const raw1 = await ctx.executeTool('dhis2_query', { method: 'POST', path: 'tracker?async=false&importStrategy=DELETE', body: { trackedEntities: [{ trackedEntity: 'teReal00001' }] } });
+      const raw2 = await ctx.executeTool('dhis2_query', { method: 'DELETE', path: 'tracker/trackedEntities/teReal00001' });
+      const raw3 = await ctx.executeTool('dhis2_query', { method: 'PUT', path: 'dataStore/dhis2-ai-extension-testdata/progTD00001', body: { runs: [{ trackedEntities: ['teReal00001'] }] } });
+      truthy('…and dhis2_query cannot delete tracker records or rewrite the test-data manifest (nothing sent)',
+        raw1._scope === 'tracker_delete_refused' && (raw2._scope === 'tracker_delete_refused' || raw2._privacy_block) && raw3._scope === 'test_data_manifest_protected' && JSON.stringify(deletedIds) === '["teGen000001"]');
+    } finally { ctx.safeDhis2Fetch = savedF; dd.writeAuth = keepWa; }
   }
 
   // 25. "Step 1 of the build … Still missing from your brief" is a partial delivery, even ending in a plan.

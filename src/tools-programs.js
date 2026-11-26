@@ -6325,7 +6325,7 @@ async function executeManageProgramRules(args, ctxProgramId) {
           if (!sameForm.length) continue;
           const why = sameForm.some(sid => repeatableStageIds.has(sid)) ? 'its stage is repeatable' : (holders.length > 1 ? 'the data element is in several stages' : null);
           if (!why) continue;
-          probs.push(`Variable #{${name}} (${v.id}) reads the NEWEST event of the whole enrollment (DATAELEMENT_NEWEST_EVENT_PROGRAM), but this rule acts in the same form and ${why} — so it judges another visit's value, and an ASSIGN computed from it is refused on save (E1307). Fix: dhis2_query(method="PATCH", path="programRuleVariables/${v.id}", body:{ programRuleVariableSourceType:"DATAELEMENT_CURRENT_EVENT" }).`);
+          probs.push(`Variable #{${name}} (${v.id}) reads the NEWEST event of the whole enrollment (DATAELEMENT_NEWEST_EVENT_PROGRAM), but this rule acts in the same form and ${why} — so it judges another visit's value, and an ASSIGN computed from it is refused on save (E1307). Fix: manage_program_rules(action="fix_variables", program_id) fixes every variable like this in one call (do not patch them one by one).`);
         }
       }
 
@@ -6430,7 +6430,45 @@ async function executeManageProgramRules(args, ctxProgramId) {
       } : {}),
       summary: (ruleIssues.length + varIssues.length + crossRuleIssues.length) === 0
         ? `All ${allRules.length} rules and ${allVars.length} variables are structurally sound.`
-        : `Found ${ruleIssues.length} rule(s), ${varIssues.length} variable(s)${crossRuleIssues.length ? `, and ${crossRuleIssues.length} cross-rule contradiction(s)` : ''} with issues. ${crossRuleIssues.length ? 'Cross-rule contradictions make fields permanently hidden or hidden-and-mandatory — fix by DELETING the redundant "Show …" twin rule (there is no SHOW action in DHIS2; fields re-appear when the hide condition is false). ' : ''}${conditionFixHints.length ? 'Use bulk_fix_conditions to apply the suggested condition rewrites.' : 'Fix action targets / variable references via update/create/delete.'} NEVER use dhis2_query PUT/PATCH for program rule metadata — the one exception is a variable's source type, patched exactly as its issue says.`,
+        : `Found ${ruleIssues.length} rule(s), ${varIssues.length} variable(s)${crossRuleIssues.length ? `, and ${crossRuleIssues.length} cross-rule contradiction(s)` : ''} with issues. ${crossRuleIssues.length ? 'Cross-rule contradictions make fields permanently hidden or hidden-and-mandatory — fix by DELETING the redundant "Show …" twin rule (there is no SHOW action in DHIS2; fields re-appear when the hide condition is false). ' : ''}${conditionFixHints.length ? 'Use bulk_fix_conditions to apply the suggested condition rewrites.' : 'Fix action targets / variable references via update/create/delete.'} NEVER use dhis2_query PUT/PATCH/POST metadata for program rule metadata: variables that read another visit are fixed with manage_program_rules(action="fix_variables").`,
+    };
+  }
+
+  // ── fix_variables ──
+  // The audit's "reads the NEWEST event … in the same form" findings, fixed in ONE
+  // call: the Cold Chain thread spent 62 dhis2_query PATCH calls (after two HTTP 500s
+  // on a partial metadata import) and bumped the program version 62 times.
+  if (action === 'fix_variables') {
+    const _gate = requireWriteAuth('manage_program_rules', 'fix_variables', { program_id: programId });
+    if (_gate) return _gate;
+    if (!programId) return { _error: 'program_id required for fix_variables' };
+    const audit = await executeManageProgramRules({ action: 'audit', program_id: programId, deep: false }, ctxProgramId);
+    if (audit && audit._error) return audit;
+    const ids = new Set();
+    for (const r of (audit.rule_issues || [])) for (const t of (r.issues || [])) {
+      const m = /^Variable #\{[^}]+\} \(([A-Za-z][A-Za-z0-9]{10})\) reads the NEWEST event/.exec(t);
+      if (m) ids.add(m[1]);
+    }
+    if (!ids.size) return { success: true, action: 'fix_variables', fixed: 0, _note: 'No variable reads another visit\'s value: nothing to change.' };
+    const list = [...ids];
+    const backup = await ensureBackupOrBail({ operation: 'fix_variables', tool: 'manage_program_rules', action: 'fix_variables', reason: `Setting ${list.length} rule variable(s) to read the current event` },
+      list.map((id) => ({ object_type: 'programRuleVariables', object_id: id, role: 'primary' })), args);
+    if (!backup.ok) return backup.error || { _error: 'Backup failed; nothing was changed.' };
+    const fixed = []; const failed = [];
+    for (const id of list) {
+      const r = await safeDhis2Fetch(`programRuleVariables/${id}`, { method: 'PATCH', body: [{ op: 'replace', path: '/programRuleVariableSourceType', value: 'DATAELEMENT_CURRENT_EVENT' }] });
+      if (r && r._error) failed.push({ id, error: String(r._error).slice(0, 160) }); else fixed.push(id);
+    }
+    const after = await executeManageProgramRules({ action: 'audit', program_id: programId, deep: false }, ctxProgramId);
+    const left = (after.rule_issues || []).flatMap((r) => r.issues || []).filter((t) => /reads the NEWEST event/.test(t)).length;
+    return {
+      success: failed.length === 0,
+      action: 'fix_variables',
+      fixed: fixed.length,
+      ...(failed.length ? { failed } : {}),
+      still_flagged: left,
+      backup: backup.block,
+      summary: `${fixed.length} variable(s) now read the current event${failed.length ? `; ${failed.length} failed` : ''}. Re-audit: ${left} still flagged.`,
     };
   }
 
@@ -8171,7 +8209,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
   // PSDE id+compulsory included so HIDEALLFIELDS sugar can flip compulsory→false on
   // hidden DEs (DHIS2 New Tracker Capture refuses to visually hide a compulsory DE).
   const progResp = await safeDhis2Fetch(
-    `programs/${programId}?fields=id,programStages[id,displayName,programStageDataElements[id,compulsory,dataElement[id,displayName,valueType,optionSet[id]]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,valueType,optionSet[id]]],programRuleVariables[id,name,programRuleVariableSourceType,valueType,useCodeForOptionSet,dataElement[id,displayName],trackedEntityAttribute[id,displayName],programStage[id]]`, { noTruncate: true });
+    `programs/${programId}?fields=id,programStages[id,displayName,repeatable,programStageDataElements[id,compulsory,dataElement[id,displayName,valueType,optionSet[id]]]],programTrackedEntityAttributes[trackedEntityAttribute[id,displayName,valueType,optionSet[id]]],programRuleVariables[id,name,programRuleVariableSourceType,valueType,useCodeForOptionSet,dataElement[id,displayName],trackedEntityAttribute[id,displayName],programStage[id]]`, { noTruncate: true });
   if (progResp._error) {
     return { success: false, _error: `Could not load program ${programId}: ${progResp._error}`, phase: 'preflight' };
   }
@@ -8249,6 +8287,15 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
 
   const isDhis2Uid = (s) => /^[a-zA-Z][a-zA-Z0-9]{10}$/.test(s);
 
+  // (Same as fuzzyBySanitized below; the reference pass runs before that definition.)
+  const fuzzyBySanitizedEarly = (map, rawName) => {
+    const sk = String(sanitizeVariableName(rawName)).replace(/_/g, '');
+    if (!sk) return null;
+    const eq = [], pref = [];
+    for (const [k, entry] of map) { const ks = String(k).replace(/_/g, ''); if (ks === sk) eq.push(entry); else if (ks.startsWith(sk) || sk.startsWith(ks)) pref.push(entry); }
+    return eq.length === 1 ? eq[0] : (eq.length === 0 && pref.length === 1 ? pref[0] : null);
+  };
+
   // Stage references in actions may arrive as a stage NAME — resolve name → id.
   const stageNameToId = new Map();
   const validStageIdSet = new Set();
@@ -8262,9 +8309,91 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
     if (validStageIdSet.has(ref)) return ref;
     const byName = stageNameToId.get(String(ref).trim().toLowerCase());
     if (byName) return byName;
-    if (isDhis2Uid(String(ref))) return ref; // plausible UID from elsewhere — let the server validate
+    // A rule and its actions belong to ONE program: a stage id that is not one of
+    // its stages is a typo, never "a UID from elsewhere" (Cold Chain thread,
+    // 2026-11-26: aRfcBDWYYdt for aRfcBDWYYdj bounced a 7-rule batch at DHIS2).
+    // The reference pass below heals a unique one-character slip and refuses the rest.
     return undefined;
   };
+
+  // ── Reference pass: target aliases, one-character id slips, missing targets ──
+  // Every check here runs before any request: a failed batch costs a server round
+  // trip and, for a weak model, a retry with the same mistake.
+  const refHeals = [];
+  const refProblems = [];
+  {
+    const sameLenOneOff = (a, b) => {
+      if (a.length !== b.length || a === b) return false;
+      const diff = [];
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) { diff.push(i); if (diff.length > 2) return false; }
+      return diff.length === 1 || (diff.length === 2 && diff[1] === diff[0] + 1 && a[diff[0]] === b[diff[1]] && a[diff[1]] === b[diff[0]]);
+    };
+    const nearOne = (ref, ids) => { const hits = [...ids].filter((id) => sameLenOneOff(String(ref), id)); return hits.length === 1 ? hits[0] : null; };
+    const stageList = (progResp.programStages || []).map((ps) => ({ kind: 'programStage', id: ps.id, displayName: ps.displayName }));
+    const stageName = (id) => ((progResp.programStages || []).find((ps) => ps.id === id) || {}).displayName || id;
+    const lcTea = new Map([...teaByDisplayName.entries()].map(([k, v]) => [String(k).trim().toLowerCase(), v]));
+    // Target shapes weak models send: data_element / dataElement:{id} / target / field …
+    const TARGET_ALIASES = ['data_element', 'dataElement', 'data_element_uid', 'target', 'target_field', 'target_data_element', 'field', 'de', 'de_id', 'tracked_entity_attribute', 'trackedEntityAttribute', 'tracked_entity_attribute_id', 'attribute', 'attribute_id'];
+    const TARGET_REQUIRED = new Set(['ASSIGN', 'HIDEFIELD', 'SETMANDATORYFIELD', 'HIDEOPTION', 'HIDEOPTIONGROUP', 'SHOWOPTIONGROUP']);
+    for (const rule of (rules || [])) {
+      for (const act of (rule.actions || [])) {
+        if (!act || typeof act !== 'object') continue;
+        if (!act.data_element_id && !act.data_element_name && !act.tei_attribute_id && !act.tracked_entity_attribute_name) {
+          for (const k of TARGET_ALIASES) {
+            if (act[k] == null || act[k] === '') continue;
+            const raw = typeof act[k] === 'object' ? (act[k].id || act[k].name || act[k].displayName) : act[k];
+            if (!raw) continue;
+            const v = String(raw).trim();
+            if (isDhis2Uid(v)) { if (teaById.has(v)) act.tei_attribute_id = v; else act.data_element_id = v; }
+            else if (lcTea.has(v.toLowerCase())) act.tracked_entity_attribute_name = v;
+            else act.data_element_name = v;
+            break;
+          }
+        }
+        if (act.data_element_id && !deById.has(act.data_element_id)) {
+          if (teaById.has(act.data_element_id)) { act.tei_attribute_id = act.data_element_id; delete act.data_element_id; }
+          else {
+            const near = nearOne(act.data_element_id, deById.keys());
+            if (near) { refHeals.push({ rule: rule.name, field: 'action data_element_id', from: act.data_element_id, to: near, name: deById.get(near).displayName }); act.data_element_id = near; }
+            else refProblems.push({ rule: rule.name, reference: `${act.type || 'action'} target data element "${act.data_element_id}" is not in this program`, suggestions: [] });
+          }
+        }
+        if (act.tei_attribute_id && !teaById.has(act.tei_attribute_id)) {
+          const near = nearOne(act.tei_attribute_id, teaById.keys());
+          if (near) { refHeals.push({ rule: rule.name, field: 'action tei_attribute_id', from: act.tei_attribute_id, to: near, name: teaById.get(near).displayName }); act.tei_attribute_id = near; }
+          else refProblems.push({ rule: rule.name, reference: `${act.type || 'action'} target attribute "${act.tei_attribute_id}" is not on this program`, suggestions: [] });
+        }
+        const type = normalizeRuleActionType(act.type, act.content).type;
+        if (TARGET_REQUIRED.has(type) && !act.data_element_id && !act.data_element_name && !act.tei_attribute_id && !act.tracked_entity_attribute_name) {
+          // ASSIGN written the old way, with the target variable in content: "#{uptime_percent}".
+          const m = type === 'ASSIGN' ? /^\s*#\{([^}]+)\}\s*$/.exec(String(act.content || '')) : null;
+          const viaContent = m ? (deBySanitized.get(sanitizeVariableName(m[1])) || fuzzyBySanitizedEarly(deBySanitized, m[1])) : null;
+          if (viaContent) { act.data_element_id = viaContent.id; refHeals.push({ rule: rule.name, field: 'ASSIGN target', from: act.content, to: viaContent.id, name: viaContent.displayName }); }
+          else if (!m) refProblems.push({ rule: rule.name, reference: `${type} action has no target field (data_element_id or data_element_name${type === 'ASSIGN' ? ', or content "#{variable}" for a calculated variable' : ''})`, suggestions: [] });
+        }
+      }
+      for (const holder of [rule, ...(rule.actions || [])]) {
+        const ref = holder && holder.program_stage_id;
+        if (!ref || validStageIdSet.has(ref) || !isDhis2Uid(String(ref))) continue;
+        const near = nearOne(ref, validStageIdSet);
+        if (near) { refHeals.push({ rule: rule.name, field: holder === rule ? 'rule program_stage_id' : 'action program_stage_id', from: ref, to: near, name: stageName(near) }); holder.program_stage_id = near; }
+        else refProblems.push({ rule: rule.name, reference: `${holder === rule ? 'rule' : `${holder.type || 'action'} action`} stage "${ref}" is not a stage of this program`, suggestions: stageList });
+      }
+    }
+  }
+  if (refProblems.length) {
+    return {
+      success: false,
+      nothing_created: true,
+      phase: 'reference_check',
+      _error: `Program rule references are not in this program: ${refProblems.slice(0, 8).map((p) => `"${p.rule}": ${p.reference}`).join('; ')}${refProblems.length > 8 ? `; …and ${refProblems.length - 8} more` : ''}. NOTHING was created (no request was sent).`,
+      problems: refProblems,
+      program_stages: (progResp.programStages || []).map((ps) => `${ps.displayName} = ${ps.id}`),
+      _hint: 'Use the stage and data element ids of THIS program (listed above / get_program_info structure), or name targets with data_element_name. ASSIGN, HIDEFIELD and SETMANDATORYFIELD always need a target field. Resend the whole batch.',
+      _scope: 'incomplete_call',
+      _no_disable: true,
+    };
+  }
 
   // Fuzzy fallback for name lookups against a sanitized-name map: exact match
   // failed, so try underscore-insensitive equality, then a UNIQUE prefix match
@@ -8341,6 +8470,27 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       }
       const actStageId = resolveStageRefForAction(act);
       if (actStageId) actionStageIds.add(actStageId);
+    }
+    // The rule's own stage counts: a stage-scoped warning or error with no target
+    // field ("reading outside the device's range") runs in that stage's form. Without
+    // it every such variable read the NEWEST event of the enrollment, the audit then
+    // flagged 62 of them and the model patched them one call at a time (2026-11-26).
+    const ruleStageId = resolveStageRefForAction(rule);
+    if (ruleStageId) actionStageIds.add(ruleStageId);
+    // No stage anywhere, but everything the condition reads lives in one repeatable
+    // stage: the rule is about that form.
+    if (!actionStageIds.size) {
+      const common = [];
+      for (const ref of getProgramRuleExpressionRefs(String(rule.condition || '')).hash) {
+        const e = deBySanitized.get(String(ref).toLowerCase()) || deBySanitized.get(sanitizeVariableName(ref)) || fuzzyBySanitized(deBySanitized, ref);
+        if (!e) { common.length = 0; common.push(null); break; }
+        common.push(new Set(e.stageIds));
+      }
+      if (common.length && common[0]) {
+        const shared = [...common[0]].filter((sid) => common.every((set) => set && set.has(sid)));
+        const repeatable = new Set((progResp.programStages || []).filter((ps) => ps.repeatable).map((ps) => ps.id));
+        if (shared.length === 1 && repeatable.has(shared[0])) actionStageIds.add(shared[0]);
+      }
     }
     for (const sid of deEntry.stageIds) {
       if (actionStageIds.has(sid)) return { sourceType: 'DATAELEMENT_CURRENT_EVENT', stageId: null };
@@ -8731,6 +8881,7 @@ async function _buildAndPostProgramRules(programId, rules, dryRun) {
       programRules: allPRs.map(r => ({ id: r.id, name: r.name })),
       ...(stageScoped.length ? { stage_scoped_rules: stageScoped } : {}),
       ...(actionTypeFixes.length ? { action_type_fixes: actionTypeFixes } : {}),
+      ...(refHeals.length ? { id_corrections: refHeals.map((h) => `"${h.rule}": ${h.field} ${h.from} → ${h.to} (${h.name}), a one-character slip`) } : {}),
       programRuleVariables: allPRVs.map(v => ({ id: v.id, name: v.name, sourceType: v.programRuleVariableSourceType, dataElement: v.dataElement?.id, trackedEntityAttribute: v.trackedEntityAttribute?.id })),
       programRuleActions: allPRAs.map(a => ({ id: a.id, type: a.programRuleActionType })),
       auto_created_variables: autoCreated,
@@ -11037,6 +11188,11 @@ async function executeArchitectMetadata(args) {
 // answers with counts only (no record values reach the model).
 // ══════════════════════════════════════════════════════════════════════════════
 const TEST_DATA_NS = 'dhis2-ai-extension-testdata';
+// Stamped as storedBy on every enrollment and event the generator imports. DHIS2 keeps
+// it (verified 2.42.5.1) and replaces it with the user's name when a person saves the
+// record in Capture, so delete can tell a record still exactly as generated from one a
+// person has touched or added to.
+const TEST_DATA_MARKER = 'dhis2-ai-test-data';
 const TD_FIRST = ['Amal', 'Basel', 'Carmen', 'Dawit', 'Esra', 'Farid', 'Grace', 'Hana', 'Ibrahim', 'Joy', 'Karim', 'Lina', 'Musa', 'Nadia', 'Omar', 'Priya', 'Rami', 'Sara', 'Tariq', 'Yara'];
 const TD_LAST = ['Testa', 'Sample', 'Fiction', 'Demo', 'Example', 'Mock', 'Placeholder', 'Trial'];
 
@@ -11065,6 +11221,21 @@ function tdDateRank(name) {
   ];
   const hit = order.find(([re]) => re.test(n));
   return hit ? hit[1] : 3;
+}
+
+// Put pairs of numeric values named minimum/maximum (min/max, lowest/highest) of the
+// same thing in order, in place.
+function tdOrderMinMax(des, dataValues) {
+  const key = (n, re) => String(n || '').toLowerCase().replace(re, '#').replace(/\s+/g, ' ').trim();
+  const LOW = /\bminimum\b|\bmin\b|\blowest\b/; const HIGH = /\bmaximum\b|\bmax\b|\bhighest\b/;
+  const lows = des.filter((d) => LOW.test(String(d.displayName || '').toLowerCase()));
+  for (const lo of lows) {
+    const k = key(lo.displayName, LOW);
+    const hi = des.find((d) => d !== lo && HIGH.test(String(d.displayName || '').toLowerCase()) && key(d.displayName, HIGH) === k);
+    if (!hi) continue;
+    const a = dataValues.find((x) => x.dataElement === lo.id); const b = dataValues.find((x) => x.dataElement === hi.id);
+    if (a && b && Number.isFinite(Number(a.value)) && Number.isFinite(Number(b.value)) && Number(a.value) > Number(b.value)) [a.value, b.value] = [b.value, a.value];
+  }
 }
 
 function tdValue(rnd, el, ctx) {
@@ -11141,7 +11312,15 @@ function tdValue(rnd, el, ctx) {
       if (/address|street|village|residence|home/.test(name)) return `${1 + Math.floor(rnd() * 99)} Test Street, Testville`;
       if (/clinician|staff|reviewer|provider|nurse|doctor|responsible/.test(name)) return `${ctx.prefix} Clinician ${1 + Math.floor(rnd() * 9)}`;
       if (/number|id\b|identifier|code/.test(name)) return `ZZT-${ctx.seq}-${Math.floor(rnd() * 9000 + 1000)}`;
-      return 'Test value';
+      // "Sending facility" / "Receiving facility" as text: real names, and the receiving
+      // one is another facility ("must be different" refused 243 transfers, 2026-11-26).
+      if (/facility|site\b|health (?:centre|center|post)|clinic|hospital/.test(name) && ctx.ouNames) {
+        const other = /receiv|destination|to facility|transfer(?:red)? to|referred to|target|new facility/.test(name);
+        const nm = ctx.ouNames.get(other ? ctx.otherFacility : ctx.facility);
+        if (nm) return nm;
+      }
+      // Distinct free text, so a "must differ" rule between two text fields holds.
+      return `Test value ${Math.floor(rnd() * 900 + 100)}`;
     }
   }
 }
@@ -11172,7 +11351,7 @@ function tdFillDates(rnd, des, eventDate, today) {
 }
 
 async function tdProgram(pid) {
-  return safeDhis2Fetch(`programs/${pid}?fields=id,displayName,programType,onlyEnrollOnce,trackedEntityType[id],organisationUnits[id,displayName,geometry,parent[geometry]],programTrackedEntityAttributes[mandatory,trackedEntityAttribute[id,displayName,valueType,unique,generated,optionSet[options[code]]]],programStages[id,displayName,repeatable,sortOrder,programStageDataElements[compulsory,dataElement[id,displayName,valueType,optionSet[options[code]]]]]`, { noTruncate: true });
+  return safeDhis2Fetch(`programs/${pid}?fields=id,displayName,programType,onlyEnrollOnce,trackedEntityType[id],organisationUnits[id,displayName,geometry,parent[geometry]],programTrackedEntityAttributes[mandatory,trackedEntityAttribute[id,displayName,valueType,unique,generated,optionSet[options[code]]]],programStages[id,displayName,repeatable,sortOrder,featureType,programStageDataElements[compulsory,dataElement[id,displayName,valueType,optionSet[options[code]]]]]`, { noTruncate: true });
 }
 
 // Counts of the program's live records (people, episodes, visits, appointments).
@@ -11231,6 +11410,54 @@ function tdGroupErrors(report) {
   return { count: errs.length, by_reason: grouped, uids: new Set(errs.map((e) => e.uid).filter(Boolean)) };
 }
 
+// The server's clock ("2026-11-26T09:05:51.000", server-local like createdAt/updatedAt).
+async function tdServerNow() {
+  const r = await safeDhis2Fetch('system/info?fields=serverDate', { noTruncate: true });
+  return r && !r._error && r.serverDate ? String(r.serverDate) : null;
+}
+
+// Why a record listed as generated may NOT be deleted (null = still exactly as the
+// generator made it). Deleting a tracked entity cascades to all its enrollments and
+// events, so anything a person may own keeps it in place. Works on 2.42 and 2.43:
+// 2.43 ignores a supplied storedBy (it stores the importing user), so the proof is the
+// set of ids the generator created, the server-time window of its run, and updatedAt.
+function tdNotDeletableReason(te, pid, run) {
+  run = run || {};
+  const enrollments = te.enrollments || [];
+  if (enrollments.some((e) => e.program && e.program !== pid)) return 'enrolled in another program too';
+  const items = enrollments.flatMap((e) => [e, ...(e.events || [])]);
+  const ts = (v) => Date.parse(String(v || '').replace(' ', 'T').replace(/Z$/, '')) || 0;
+  const known = run.items && run.items[te.trackedEntity] ? new Set(run.items[te.trackedEntity]) : null;
+  if (known && items.some((x) => !known.has(x.event || x.enrollment))) return 'has an enrollment or visit added after it was generated';
+  if (items.some((x) => x.storedBy && x.storedBy !== TEST_DATA_MARKER && run.user && x.storedBy !== run.user)) return 'changed or added to by a person after it was generated';
+  // 2.42 keeps the marker on every generated item; a later save replaces or clears it on
+  // the item it touched, so a record with some stamped and some unstamped items was edited.
+  const stamped = items.filter((x) => x.storedBy === TEST_DATA_MARKER).length;
+  if (run.marker && stamped > 0 && stamped < items.length) return 'changed or added to by a person after it was generated';
+  if (run.server_finished) {
+    // server_finished is read on the server's clock AFTER every import finished, so any
+    // later update — even seconds later — is someone's change (a 10-minute margin let an
+    // edit made right after generation through, live test 2026-11-26).
+    const end = ts(run.server_finished);
+    const begin = ts(run.server_started || run.server_finished) - 5 * 60 * 1000;
+    if (items.some((x) => ts(x.updatedAt) > end)) return 'changed or added to by a person after it was generated';
+    if (items.some((x) => ts(x.createdAt) && (ts(x.createdAt) < begin || ts(x.createdAt) > end))) return 'created outside the generator\'s run';
+  } else {
+    // Generated before these records were kept: untouched since creation (no later
+    // update; no storedBy from a Capture save on 2.42) and created near the run (wide
+    // window: the run time was the browser's clock).
+    const at = Date.parse(run.at || '') || 0;
+    if (items.some((x) => x.storedBy && x.storedBy !== TEST_DATA_MARKER)) return 'changed or added to by a person after it was generated';
+    if (items.some((x) => ts(x.updatedAt) - ts(x.createdAt) > 10 * 60 * 1000)) return 'changed or added to by a person after it was generated';
+    if (at && items.some((x) => ts(x.createdAt) && Math.abs(ts(x.createdAt) - at) > 15 * 3600 * 1000)) return 'created outside the generator\'s run';
+  }
+  const prefix = String(run.prefix || 'ZZ TEST').toUpperCase();
+  const squash = prefix.replace(/\s+/g, '');
+  const marked = (te.attributes || []).some((a) => { const v = String(a.value || '').toUpperCase(); return v.startsWith(prefix) || v.startsWith(squash) || /^ZZT-/.test(v); });
+  if (!marked && !known) return 'does not carry the test name prefix';
+  return null;
+}
+
 async function executeManageTestData(args) {
   const action = String(args.action || '');
   if (!['generate', 'summary', 'test_invalid', 'delete'].includes(action)) return { _error: 'action must be generate, summary, test_invalid or delete.' };
@@ -11256,14 +11483,77 @@ async function executeManageTestData(args) {
 
   if (action === 'delete') {
     if (!manifest) return { success: true, deleted: 0, _note: 'No records generated by this tool are recorded for this program; nothing was deleted (records entered by people are never touched).' };
-    const ids = manifest.runs.flatMap((r) => r.trackedEntities || []);
-    let deleted = 0;
+    // The manifest is a list of ids in a dataStore namespace, and deleting a tracked
+    // entity cascades to its enrollments and events in EVERY program. So the list is
+    // never trusted alone: each record is read back and deleted only when it is still
+    // exactly what the generator made (see tdNotDeletableReason).
+    const idToRun = new Map();
+    for (const run of manifest.runs || []) for (const t of run.trackedEntities || []) if (/^[A-Za-z][A-Za-z0-9]{10}$/.test(String(t))) idToRun.set(String(t), run);
+    const ids = [...idToRun.keys()];
+    const tetId = prog.trackedEntityType?.id;
+    const verified = []; const gone = []; const kept = new Map();
+    const fields = 'trackedEntity,attributes[attribute,value],enrollments[enrollment,program,storedBy,createdAt,updatedAt,events[event,storedBy,createdAt,updatedAt]]';
     for (let i = 0; i < ids.length; i += 50) {
-      const r = await safeDhis2Fetch('tracker?async=false&importStrategy=DELETE&atomicMode=OBJECT', { method: 'POST', body: { trackedEntities: ids.slice(i, i + 50).map((t) => ({ trackedEntity: t })) } });
-      deleted += Number(r?.stats?.deleted || 0);
+      const chunk = ids.slice(i, i + 50);
+      // Without program=: every enrollment of the person, in every program.
+      const all = await safeDhis2Fetch(`tracker/trackedEntities?trackedEntities=${chunk.join(',')}&trackedEntityType=${tetId}&orgUnitMode=ACCESSIBLE&fields=${fields}&pageSize=50`, { noTruncate: true });
+      // With program=: the program's own attributes (where the test name prefix is).
+      const inProg = await safeDhis2Fetch(`tracker/trackedEntities?trackedEntities=${chunk.join(',')}&program=${pid}&orgUnitMode=ACCESSIBLE&fields=trackedEntity,attributes[attribute,value]&pageSize=50`, { noTruncate: true });
+      if (all?._error || inProg?._error) {
+        return { _error: `Could not read the generated records back to check them (${all?._error || inProg?._error}). Nothing was deleted: test records are deleted only after each one is checked.`, deleted_people: 0 };
+      }
+      const byId = new Map((all.trackedEntities || all.instances || []).map((t) => [t.trackedEntity, t]));
+      const attrsById = new Map((inProg.trackedEntities || inProg.instances || []).map((t) => [t.trackedEntity, t.attributes || []]));
+      for (const id of chunk) {
+        const te = byId.get(id);
+        if (!te) { gone.push(id); continue; }
+        const why = tdNotDeletableReason({ ...te, attributes: [...(te.attributes || []), ...(attrsById.get(id) || [])] }, pid, idToRun.get(id));
+        if (why) kept.set(why, [...(kept.get(why) || []), id]);
+        else verified.push(id);
+      }
     }
-    await safeDhis2Fetch(manifestPath, { method: 'DELETE' });
-    return { success: true, deleted_people: deleted, _note: 'Only the records this tool generated were deleted (DHIS2 keeps them soft-deleted until the maintenance job removes them).' };
+    let deleted = 0; const failed = [];
+    for (let i = 0; i < verified.length; i += 50) {
+      const r = await safeDhis2Fetch('tracker?async=false&importStrategy=DELETE&atomicMode=OBJECT', { method: 'POST', body: { trackedEntities: verified.slice(i, i + 50).map((t) => ({ trackedEntity: t })) } });
+      const n = Number(r?.stats?.deleted ?? r?._body?.stats?.deleted ?? 0);
+      deleted += n;
+      if (r?._error && !n) failed.push(String(r._error).slice(0, 400));
+    }
+    // The manifest keeps every listed record still on the server: the ones kept on
+    // purpose AND any whose delete failed. A failed delete (HTTP 500 on play, 2026-11-26)
+    // once dropped all 80 ids, and the tool then no longer knew its own records.
+    const stillThere = new Set();
+    for (let i = 0; i < verified.length; i += 50) {
+      const chunk = verified.slice(i, i + 50);
+      const back = await safeDhis2Fetch(`tracker/trackedEntities?trackedEntities=${chunk.join(',')}&trackedEntityType=${tetId}&orgUnitMode=ACCESSIBLE&fields=trackedEntity&pageSize=50`, { noTruncate: true });
+      if (!back || back._error) { chunk.forEach((id) => stillThere.add(id)); continue; }
+      for (const t of back.trackedEntities || back.instances || []) stillThere.add(t.trackedEntity);
+    }
+    let diagnosis = null;
+    if (failed.some((f) => /getTrackedEntityType|TrackedEntityType\.getUid/.test(f))) {
+      // DHIS2 loads every tracker program for an import; one with no tracked entity type
+      // makes EVERY tracker import fail with this NPE. Name it.
+      const broken = await safeDhis2Fetch('programs?filter=programType:eq:WITH_REGISTRATION&filter=trackedEntityType:null&fields=id,displayName,lastUpdated&paging=false', { noTruncate: true });
+      const list = (broken && broken.programs) || [];
+      diagnosis = list.length
+        ? `Server problem: tracker program(s) ${list.map((x) => `"${x.displayName}" (${x.id})`).join(', ')} have no tracked entity type, and DHIS2 fails EVERY tracker import or delete on this server with this error until that program is fixed (give it its tracked entity type back) or deleted. It is not caused by these records or by sharing.`
+        : 'Server problem: DHIS2 failed the delete with a NullPointerException about a program\'s tracked entity type (a tracker program is missing its type). It is not caused by these records.';
+    }
+    const keptIds = new Set([...[...kept.values()].flat(), ...stillThere]);
+    const runs = (manifest.runs || []).map((run) => ({ ...run, trackedEntities: (run.trackedEntities || []).filter((t) => keptIds.has(t)) })).filter((run) => run.trackedEntities.length);
+    if (runs.length) await safeDhis2Fetch(manifestPath, { method: 'PUT', body: { ...manifest, runs } });
+    else await safeDhis2Fetch(manifestPath, { method: 'DELETE' });
+    const keptSummary = Object.fromEntries([...kept.entries()].map(([why, list]) => [why, list.length]));
+    return {
+      success: failed.length === 0,
+      deleted_people: deleted,
+      checked: ids.length,
+      ...(gone.length ? { already_gone: gone.length } : {}),
+      ...(kept.size ? { kept_not_deleted: keptSummary } : {}),
+      ...(failed.length ? { failed, not_deleted_because_of_errors: stillThere.size } : {}),
+      ...(diagnosis ? { _diagnosis: diagnosis } : {}),
+      _note: `Only records this tool generated, read back and still exactly as generated, were deleted (DHIS2 keeps them soft-deleted until its maintenance job removes them).${kept.size ? ' The records listed under kept_not_deleted were left in place: a person has changed them, added to them, or enrolled them elsewhere. Tell the user; if they are still test records, they delete them in Capture.' : ''} Real records are never deleted by this tool.`,
+    };
   }
 
   const tetId = prog.trackedEntityType?.id;
@@ -11271,7 +11561,12 @@ async function executeManageTestData(args) {
   const stages = (prog.programStages || []).slice().sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
   const allOus = (prog.organisationUnits || []);
   const wanted = Array.isArray(args.facilities) && args.facilities.length ? args.facilities.map(String) : null;
-  const facilities = (wanted ? allOus.filter((o) => wanted.includes(o.id)) : allOus).slice(0, Math.max(1, Math.min(Number(args.facility_count) || 6, 50)));
+  // Default: every facility the program is assigned to when there are up to 12 (a
+  // default of 6 left 2 of the user's 8 facilities empty, and the model deleted and
+  // regenerated all 80 records to fix it — Cold Chain thread, 2026-11-26); else 6.
+  const defaultCount = allOus.length <= 12 ? allOus.length : 6;
+  const ouNames = new Map(allOus.map((o) => [o.id, o.displayName]));
+  const facilities = (wanted ? allOus.filter((o) => wanted.includes(o.id)) : allOus).slice(0, Math.max(1, Math.min(Number(args.facility_count) || defaultCount, 50)));
   if (!facilities.length) return { _error: `"${prog.displayName}" is assigned to none of the requested facilities. Assign it first (create_metadata / manage_metadata), then generate.` };
   const pointOf = (o) => { const g = o.geometry?.type === 'Point' ? o.geometry : null; return g ? g.coordinates : null; };
   const today = tdIso(Date.now());
@@ -11303,7 +11598,10 @@ async function executeManageTestData(args) {
   // The import runs the program's rules: fields a rule CALCULATES stay empty (the
   // server fills them; a different value is E1307) and fields a rule makes
   // REQUIRED are always filled (E1301).
-  const ruleActs = await safeDhis2Fetch(`programRuleActions?filter=programRule.program.id:eq:${pid}&fields=programRuleActionType,dataElement[id],trackedEntityAttribute[id]&paging=false`, { noTruncate: true });
+  // Through the program's rules: 2.43 answers 400 to a programRuleActions filter on
+  // programRule.program.id (Cold Chain rerun, 2026-11-26: two failed calls per generate).
+  const ruleActsByRule = await safeDhis2Fetch(`programRules?filter=program.id:eq:${pid}&fields=programRuleActions[programRuleActionType,dataElement[id],trackedEntityAttribute[id]]&paging=false`, { noTruncate: true });
+  const ruleActs = ruleActsByRule && !ruleActsByRule._error ? { programRuleActions: (ruleActsByRule.programRules || []).flatMap((r) => r.programRuleActions || []) } : ruleActsByRule;
   const assigned = new Set(); const required = new Set();
   for (const a of (ruleActs && ruleActs.programRuleActions) || []) {
     const id = a.dataElement?.id || a.trackedEntityAttribute?.id;
@@ -11329,6 +11627,13 @@ async function executeManageTestData(args) {
   const seed = Number(args.seed) || (Date.now() % 1e9);
   const rnd = tdRandom(seed);
   const prefix = String(args.name_prefix || 'ZZ TEST').slice(0, 20);
+  const runStarted = new Date().toISOString();
+  // The server's own clock and user: createdAt / updatedAt on the records are in server
+  // time, which need not be the browser's time zone.
+  const serverStarted = args.dry_run ? null : await tdServerNow();
+  const meUser = args.dry_run ? null : await safeDhis2Fetch('me?fields=username', { noTruncate: true });
+  const runUser = meUser && !meUser._error ? meUser.username || null : null;
+  const createdItems = {};
   const runTag = Number(seed).toString(36).slice(-4).toUpperCase();
 
   // Unique values: the attribute's own generator when it has one, else a run tag.
@@ -11349,7 +11654,7 @@ async function executeManageTestData(args) {
   for (let i = 0; i < people; i++) {
     const fac = facilities[i % facilities.length];
     const point = rnd() < noLocationShare ? null : (pointOf(fac) || pointOf(fac.parent || {}) || null);
-    const ctx = { prefix, today, seq: ++seq, facility: fac.id, otherFacility: facilities[(i + 1) % facilities.length].id, point };
+    const ctx = { prefix, today, seq: ++seq, facility: fac.id, otherFacility: facilities[(i + 1) % facilities.length].id, point, ouNames };
     const attributes = [];
     for (const a of teas) {
       if (a.unique) { attributes.push({ attribute: a.id, value: uniqueValues[a.id][i] }); continue; }
@@ -11395,20 +11700,24 @@ async function executeManageTestData(args) {
             dataValues.push({ dataElement: d.id, value });
             chosen += ` ${value}`;
           }
+          // A minimum never above its maximum ("Minimum reading cannot exceed maximum
+          // reading" refused 81 visits, 2026-11-26): pairs named minimum/maximum
+          // (min/max, lowest/highest) are put in order.
+          tdOrderMinMax(des, dataValues);
           // A cancelled / stopped / rejected answer comes with its reason.
           if (/cancel|stop|reject|declin|discontinu/i.test(chosen)) {
             for (const d of des) if (/reason/i.test(d.displayName) && /^(TEXT|LONG_TEXT)$/.test(d.valueType) && !d.optionSet && !dataValues.some((x) => x.dataElement === d.id)) dataValues.push({ dataElement: d.id, value: 'Fictional reason (test record).' });
           }
-          events.push({ event: generateDhis2Uid(), program: prog.id, programStage: st.id, orgUnit: evFac, status: 'COMPLETED', occurredAt: day, ...(point && rnd() < 0.5 ? { geometry: { type: 'Point', coordinates: [point[0], point[1]] } } : {}), dataValues });
+          events.push({ event: generateDhis2Uid(), program: prog.id, programStage: st.id, orgUnit: evFac, status: 'COMPLETED', occurredAt: day, storedBy: TEST_DATA_MARKER, ...(point && st.featureType === 'POINT' && rnd() < 0.5 ? { geometry: { type: 'Point', coordinates: [point[0], point[1]] } } : {}), dataValues });
         }
       }
       // Appointments: a missed one (past due) or a future one on a repeatable stage.
       const repeatStage = stages.find((s) => s.repeatable && s !== stages[0]);
       if (repeatStage && !completed) {
-        if (rnd() < missedShare) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, -(3 + Math.floor(rnd() * 20))), dataValues: [] });
-        else if (rnd() < 0.5) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, 5 + Math.floor(rnd() * 25)), dataValues: [] });
+        if (rnd() < missedShare) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, -(3 + Math.floor(rnd() * 20))), storedBy: TEST_DATA_MARKER, dataValues: [] });
+        else if (rnd() < 0.5) events.push({ event: generateDhis2Uid(), program: prog.id, programStage: repeatStage.id, orgUnit: encFac.id, status: 'SCHEDULE', scheduledAt: tdAddDays(today, 5 + Math.floor(rnd() * 25)), storedBy: TEST_DATA_MARKER, dataValues: [] });
       }
-      enrollments.push({ enrollment: generateDhis2Uid(), program: prog.id, orgUnit: encFac.id, status: completed ? 'COMPLETED' : 'ACTIVE', enrolledAt, occurredAt: enrolledAt, events });
+      enrollments.push({ enrollment: generateDhis2Uid(), program: prog.id, orgUnit: encFac.id, status: completed ? 'COMPLETED' : 'ACTIVE', enrolledAt, occurredAt: enrolledAt, storedBy: TEST_DATA_MARKER, events });
       cursor = tdAddDays(day > enrolledAt ? day : enrolledAt, 10 + Math.floor(rnd() * 40));
     }
     tes.push({ trackedEntity: generateDhis2Uid(), trackedEntityType: tetId, orgUnit: fac.id, attributes, enrollments, ...(point && teas.length === 0 ? {} : {}) });
@@ -11552,10 +11861,14 @@ async function executeManageTestData(args) {
     created.trackedEntities += Number(typeMap.TRACKED_ENTITY?.stats?.created || 0);
     created.enrollments += Number(typeMap.ENROLLMENT?.stats?.created || 0);
     created.events += Number(typeMap.EVENT?.stats?.created || 0);
-    for (const t of batch) if (!g.uids.has(t.trackedEntity)) createdTes.push(t.trackedEntity);
+    for (const t of batch) if (!g.uids.has(t.trackedEntity)) {
+      createdTes.push(t.trackedEntity);
+      createdItems[t.trackedEntity] = (t.enrollments || []).flatMap((e) => [e.enrollment, ...(e.events || []).map((ev) => ev.event)]);
+    }
     if (r && r._error && !Object.keys(typeMap).length && !g.count) return { _error: `Import failed: ${r._error}`, created_before_failure: created };
   }
-  const runs = [...(manifest?.runs || []), { at: new Date().toISOString(), seed, people, episodes, trackedEntities: createdTes }];
+  const serverFinished = await tdServerNow();
+  const runs = [...(manifest?.runs || []), { at: new Date().toISOString(), started: runStarted, server_started: serverStarted, server_finished: serverFinished, user: runUser, marker: TEST_DATA_MARKER, prefix, seed, people, episodes, trackedEntities: createdTes, items: createdItems }];
   const firstUnique = teas.find((a) => a.unique);
   await safeDhis2Fetch(manifestPath, { method: manifest ? 'PUT' : 'POST', body: { program: pid, runs, uniqueSample: firstUnique ? uniqueValues[firstUnique.id][0] : null } });
   const baseline = await tdSummary(prog);
@@ -11567,6 +11880,7 @@ async function executeManageTestData(args) {
     _rules_note: 'The import ran the program\'s rules: calculated fields took the server\'s value, rule-required fields were filled, and visits a rule still refused were simplified or left out (counts in rule_repairs).',
     ...(Object.keys(rejected).length ? { rejected_by_dhis2: rejected, _rejected_note: 'DHIS2 refused these objects (the import runs the program\'s rules); the rest were saved. Say so; do not hide it.' } : {}),
     facilities: facilities.map((o) => o.displayName),
+    facilities_used: `${facilities.length} of the ${allOus.length} facilities the program is assigned to`,
     names_start_with: prefix,
     seed,
     baseline: baseline._error ? undefined : baseline,
