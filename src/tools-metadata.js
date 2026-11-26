@@ -547,6 +547,14 @@ async function executeToolCall(name, args) {
       };
     }
 
+    // Custom CSS / JS (System Settings → Appearance): checked against the server
+    // before it is sent — an app must load it and every hook it names must exist
+    // (see customUiWriteRefusal). Custom JavaScript is never written.
+    if (method !== 'GET' && typeof customUiWriteRefusal === 'function') {
+      const uiRefusal = await customUiWriteRefusal(method, safePath, args.body);
+      if (uiRefusal) return uiRefusal;
+    }
+
     // Guard: writes to dataStore/capture/* and dataStore/settings/* are owned
     // by the Capture / Settings apps. Fabricating keys here (e.g. dataStore/capture/ruleEngine
     // with {useNew: true}) looks like a "fix" but can poison the app cache. If the key is
@@ -1297,6 +1305,12 @@ async function executeToolCall(name, args) {
       }
       const cdsr = completeRegistrationsRefusal(safePath);
       if (cdsr) return cdsr;
+      const stageItemHeal = healStageParamWithItem(safePath);
+      if (stageItemHeal.healed) {
+        console.log(`[dhis2_query] stage= given its data element → ${stageItemHeal.path}`);
+        safePath = stageItemHeal.path;
+        queryNotes.push(stageItemHeal.note);
+      }
       const stageHeal = await healBareStageDimension(safePath);
       if (stageHeal.refusal) return stageHeal.refusal;
       if (stageHeal.healed) {
@@ -1391,6 +1405,15 @@ async function executeToolCall(name, args) {
         safePath = bareDe.path;
         queryNotes.push(bareDe.note);
       }
+      // The same item twice (a date range as two filters) → 409 E7243. Joined.
+      const mergedPath = mergeRepeatedAnalyticsItems(safePath);
+      if (mergedPath !== safePath) {
+        const before = new Set(safePath.slice(safePath.indexOf('?') + 1).split('&'));
+        const joined = mergedPath.slice(mergedPath.indexOf('?') + 1).split('&').filter(x => !before.has(x)).map(x => { try { return decodeURIComponent(x); } catch { return x; } });
+        console.log(`[dhis2_query] Repeated analytics item joined → ${mergedPath}`);
+        safePath = mergedPath;
+        queryNotes.push(`Query corrected: one data item may appear only once in an analytics query (DHIS2 answers 409 E7243 "Duplicate stage dimension identifier"), so its conditions were joined into one parameter, which DHIS2 applies together (AND): ${joined.join(', ')}. A range on one item is written <stage>.<de>:GE:<from>:LE:<to>. Use that form in any app or plugin code too.`);
+      }
       const multiStage = eventAnalyticsMultiStageRefusal(safePath);
       if (multiStage) return multiStage;
       const peOuHeal = healAnalyticsPeriodAndOrgUnitParams(safePath);
@@ -1400,8 +1423,10 @@ async function executeToolCall(name, args) {
       if (peOuHeal.healed) {
         console.log(`[dhis2_query] Analytics periods / org unit completed → ${peOuHeal.path}`);
         safePath = peOuHeal.path;
-        queryNotes.push(...peOuHeal.notes);
       }
+      // Notes travel even when nothing was changed (the "last 12 months" default
+      // note was dropped before: it came with no change to the path).
+      if (Array.isArray(peOuHeal.notes)) queryNotes.push(...peOuHeal.notes);
       const dateHeal = healAnalyticsPeriodAndDates(safePath);
       if (dateHeal.healed) {
         console.log(`[dhis2_query] Dropped startDate/endDate next to a period → ${dateHeal.path}`);
@@ -1435,6 +1460,47 @@ async function executeToolCall(name, args) {
     // PUT / PATCH / DELETE on /<type>/<uid>. Bulk POST /metadata?importStrategy=DELETE
     // is already covered above. Skip when the existing redirect guards have
     // already returned (we'd never reach here in that case).
+    // System settings: the values before the change are backed up and can be
+    // restored (manage_backups restore). Transfer thread (2026-11-26): the
+    // custom CSS was written with no backup at all.
+    if (method !== 'GET' && !opts._backup_block && args.skip_backup !== true) {
+      const settingKeys = systemSettingsWriteKeys(method, safePath, args.body);
+      if (settingKeys && settingKeys.length) {
+        const sb = await backupSystemSettings(settingKeys, `${method} ${safePath.split('?')[0]}`);
+        if (!sb.ok) return sb.error;
+        opts._backup_block = sb.block;
+      }
+    }
+    // POST /metadata that CHANGES objects that already exist (the default
+    // CREATE_AND_UPDATE import): every object in the body that exists is
+    // snapshotted first. Only new objects → no backup (nothing to restore).
+    if (method === 'POST' && /^metadata(?:\.json)?(?:\?|$)/.test(safePath) && !/importStrategy=(?:DELETE|CREATE)(?:&|$)/i.test(safePath)
+        && !/importMode=VALIDATE|dryRun=true/i.test(safePath) && !opts._backup_block) {
+      let body = args.body;
+      if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = null; } }
+      const targets = [];
+      if (body && typeof body === 'object' && !Array.isArray(body)) {
+        for (const [type, arr] of Object.entries(body)) {
+          if (!Array.isArray(arr) || !/^[a-z][A-Za-z]+s$/.test(type)) continue;
+          for (const o of arr) if (o && typeof o.id === 'string' && /^[A-Za-z][A-Za-z0-9]{10}$/.test(o.id)) targets.push({ object_type: type, object_id: o.id, role: 'primary' });
+        }
+      }
+      if (targets.length) {
+        const mb = await ensureBackupOrBail(
+          { operation: 'metadata_import', tool: 'dhis2_query', action: 'POST metadata', reason: `Objects changed by a metadata import: ${targets.length} in the body` },
+          targets.slice(0, 1000),
+          args
+        );
+        if (!mb.ok) return mb.error;
+        const objs = (mb.backup && mb.backup.objects) || [];
+        if (mb.backup && objs.length && targets.length <= 1000 && objs.every((o) => o.not_found_at_snapshot)) {
+          // Every object is new: nothing to restore, so no backup is kept.
+          await safeDhis2Fetch(`dataStore/${encodeURIComponent(BACKUP_NAMESPACE)}/${encodeURIComponent(mb.backup.backup_key)}`, { method: 'DELETE' });
+        } else if (mb.block) {
+          opts._backup_block = mb.block;
+        }
+      }
+    }
     if ((method === 'PUT' || method === 'PATCH' || method === 'DELETE') && !opts._backup_block) {
       // Strip any query-string before pattern-matching the resource.
       const pathOnly = safePath.split('?')[0];
@@ -1457,6 +1523,15 @@ async function executeToolCall(name, args) {
         'eventCharts', 'eventReports', 'eventVisualizations',
         'charts', 'reportTables', // legacy (pre-2.34) analytics favorites
       ]);
+      // Any other metadata type the server's schema list knows (user roles,
+      // users, sections, legend sets …) is backed up too.
+      // Never people or patient records: user accounts and tracker data stay out
+      // of the backup namespace.
+      if (itemMatch && !backupableTypes.has(itemMatch[1]) && typeof resolveSchemaType === 'function'
+          && !/^(?:users|userCredentials|trackedEntityInstances|trackedEntities|events|enrollments|relationships|programInstances|programStageInstances|messageConversations|dataValues|dataValueSets|interpretations)$/.test(itemMatch[1])) {
+        const st = await resolveSchemaType(itemMatch[1]).catch(() => null);
+        if (st && st.plural === itemMatch[1]) backupableTypes.add(itemMatch[1]);
+      }
       if (itemMatch && backupableTypes.has(itemMatch[1])) {
         const itemBackup = await ensureBackupOrBail(
           { operation: method === 'DELETE' ? 'delete' : 'update', tool: 'dhis2_query', action: `${method} ${itemMatch[1]}/${itemMatch[2]}`, reason: `${method} via dhis2_query on ${itemMatch[1]}/${itemMatch[2]}` },
@@ -1538,6 +1613,14 @@ async function executeToolCall(name, args) {
           writeResult._hint = `${one[2]} is not in ${one[1]}: it is ${realType}/${one[2]} ("${io.displayName || ''}").${realType === 'visualizations' || realType === 'maps' ? ' To check its numbers, read its data items (manage_dashboards get lists them per tile) and query those.' : ''}`;
           writeResult._actual_type = realType;
         }
+      }
+    }
+    if (method === 'GET' && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult) && !writeResult._error) {
+      const dateNote = await eventDateFieldsNote(safePath).catch(() => null);
+      if (dateNote) writeResult._date_fields_note = dateNote;
+      if (/^analytics\/(?:events|enrollments)\/aggregate\//.test(safePath)) {
+        const pm = perMonthTotalsOfDateColumn(writeResult);
+        if (pm) writeResult._per_month = pm;
       }
     }
     if (queryNotes.length && writeResult && typeof writeResult === 'object' && !Array.isArray(writeResult)) {

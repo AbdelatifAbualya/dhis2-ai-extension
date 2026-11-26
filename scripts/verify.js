@@ -6274,6 +6274,339 @@ async function runArgumentShapeThreadChecks() {
   }
 }
 
+// Inpatient admissions app thread (2026-11-26, play 2.43.2.1): a month of
+// admissions written as two filters on Admission Date (GE + LE) is a 409 E7243
+// "Duplicate stage dimension identifier"; twelve such queries sent in one message
+// gave three 409s and nine blocks, the blocks were counted as nine retries,
+// dhis2_query was switched off and the organisationUnits read in the same message
+// was refused. Nothing was profiled and no app was built.
+async function runInpatientAdmissionsChecks() {
+  console.log('\nInpatient admissions thread: one item once per analytics query, parallel calls are one attempt:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const m = ctx.mergeRepeatedAnalyticsItems;
+  const P = 'analytics/events/aggregate/eBAyeGv0exc?stage=Zj7UnCAulEk&dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT';
+  const twoFilters = m(`${P}&filter=Zj7UnCAulEk.eMyVanycQSC:GE:2026-05-01&filter=Zj7UnCAulEk.eMyVanycQSC:LE:2026-05-31`);
+  truthy('two filters on one item become one chained filter (the form DHIS2 takes; 409 E7243 as sent)',
+    twoFilters === `${P}&filter=Zj7UnCAulEk.eMyVanycQSC:GE:2026-05-01:LE:2026-05-31`);
+  truthy('…a dimension next to a filter on the same item keeps the column and takes the condition; an encoded part is read too',
+    m('analytics/events/query/eBAyeGv0exc?dimension=ou:X&dimension=Zj7UnCAulEk.eMyVanycQSC&filter=Zj7UnCAulEk.eMyVanycQSC%3AGE%3A2026-05-01')
+      === 'analytics/events/query/eBAyeGv0exc?dimension=ou:X&dimension=Zj7UnCAulEk.eMyVanycQSC:GE:2026-05-01');
+  truthy('…a bare data element joins its stage-qualified form; an enrollment attribute range joins too',
+    m('analytics/events/query/p?filter=eMyVanycQSC:GE:2026-01-01&dimension=Zj7UnCAulEk.eMyVanycQSC:LE:2026-03-31')
+      === 'analytics/events/query/p?dimension=Zj7UnCAulEk.eMyVanycQSC:GE:2026-01-01:LE:2026-03-31'
+    && m('analytics/enrollments/aggregate/p?filter=A03MvHHogjR.UXz7xuGCEhU:GE:1000&filter=A03MvHHogjR.UXz7xuGCEhU:LE:3000')
+      === 'analytics/enrollments/aggregate/p?filter=A03MvHHogjR.UXz7xuGCEhU:GE:1000:LE:3000');
+  const untouched = [
+    `${P}&filter=Zj7UnCAulEk.eMyVanycQSC:GE:2026-05-01&filter=Zj7UnCAulEk.fWIAEtYVEGk:LE:2026-05-31`,
+    'analytics/events/query/p?dimension=J5jldMd8OHv:uIuxlbV1vRT;EYbopBOJWsW&dimension=J5jldMd8OHv:tDZVQ1WtwpA',
+    'analytics/events/query/p?filter=Zj7UnCAulEk.eMyVanycQSC:GE:2026-05-01&filter=edqlbukwRfQ.eMyVanycQSC:LE:2026-05-31',
+    'analytics?dimension=dx:a&filter=x:GE:1&filter=x:LE:2',
+  ];
+  truthy('…a "+" (space) in a value stays a space, and a bare element with a legend set is not folded into the plain item',
+    m('analytics/events/query/p?filter=Zj7UnCAulEk.K6uUAvq500H:LIKE:foo+bar&dimension=Zj7UnCAulEk.K6uUAvq500H').includes('LIKE:foo%20bar')
+    && m('analytics/events/query/p?dimension=eMyVanycQSC-Lgs1234567a&filter=Zj7UnCAulEk.eMyVanycQSC:GE:2020-01-01') === 'analytics/events/query/p?dimension=eMyVanycQSC-Lgs1234567a&filter=Zj7UnCAulEk.eMyVanycQSC:GE:2020-01-01');
+  truthy('…two different items, a repeated group-set dimension, the same element on two stages and other endpoints are left alone',
+    untouched.every((u) => m(u) === u));
+  const guard = ctx.buildCustomAppGuardJs({ needsWriteAccess: false });
+  truthy('generated apps join the same conditions in their request guard (fetch and XMLHttpRequest)',
+    /function mergeRepeatedAnalyticsItems/.test(guard) && /withEventAggregateCacheKey\(mergeRepeatedAnalyticsItems\(/.test(guard) && /fixedUrl = mergeRepeatedAnalyticsItems\(/.test(guard));
+  truthy('every internal GET goes through it as well', /mergeRepeatedAnalyticsItems\(normalizeTrackerQuery\(cleanPath/.test(vm.runInContext('safeDhis2Fetch.toString()', ctx)) || /mergeRepeatedAnalyticsItems\(normalizeTrackerQuery\(cleanPath/.test(require('fs').readFileSync(require('path').join(__dirname, '..', 'src', 'core.js'), 'utf8')));
+
+  const saved = { sdf: ctx.safeDhis2Fetch, exec: ctx.executeTool, fetch: ctx.fetch, broadcast: ctx.broadcast };
+  const sent = [];
+  ctx.safeDhis2Fetch = async (p) => {
+    sent.push(p);
+    if (p.startsWith('programs/eBAyeGv0exc')) return { id: 'eBAyeGv0exc', programType: 'WITHOUT_REGISTRATION', programStages: [{ id: 'Zj7UnCAulEk', programStageDataElements: [{ dataElement: { id: 'eMyVanycQSC' } }] }] };
+    if (p.startsWith('programs')) return { programs: [{ id: 'eBAyeGv0exc', programStages: [{ id: 'Zj7UnCAulEk' }] }] };
+    if (p.startsWith('analytics/')) return /eMyVanycQSC[^&]*&[^]*eMyVanycQSC/.test(p) ? { _error: 'DHIS2 API 409: Duplicate stage dimension identifier', _status: 409 } : { headers: [{ name: 'pe' }, { name: 'value' }], rows: [['202605', '4393']] };
+    return { _error: 'x' };
+  };
+  try {
+    const r = await ctx.executeTool('dhis2_query', { path: 'analytics/events/aggregate/eBAyeGv0exc', query_params: { stage: 'Zj7UnCAulEk', dimension: ['pe:LAST_12_MONTHS'], filter: ['ou:USER_ORGUNIT', 'Zj7UnCAulEk.eMyVanycQSC:GE:2026-05-01', 'Zj7UnCAulEk.eMyVanycQSC:LE:2026-05-31'], outputType: 'EVENT' } });
+    const out = sent.filter((p) => p.startsWith('analytics/'));
+    truthy('through dhis2_query: the joined query is sent, answers, and the result says how a range on one item is written',
+      !r._error && out.length && out.every((p) => /eMyVanycQSC:GE:2026-05-01:LE:2026-05-31/.test(p) && (p.match(/eMyVanycQSC/g) || []).length === 1)
+      && /E7243/.test(r._query_corrected || '') && /:GE:<from>:LE:<to>/.test(r._query_corrected || ''));
+  } finally { ctx.safeDhis2Fetch = saved.sdf; }
+
+  // Counting by event date when the stage records its own dates (Jul-Sep 2026 picked; admissions were 2018-2021).
+  {
+    const savedF = ctx.safeDhis2Fetch;
+    ctx.safeDhis2Fetch = async (p) => (p.startsWith('programStages/Zj7UnCAulEk') ? { programStageDataElements: [{ dataElement: { id: 'eMyVanycQSC', displayName: 'Admission Date', valueType: 'DATE' } }, { dataElement: { id: 'msodh3rEMJa', displayName: 'Discharge Date', valueType: 'DATE' } }, { dataElement: { id: 'K6uUAvq500H', displayName: 'Diagnosis', valueType: 'TEXT' } }] }
+      : p.startsWith('programs/') ? { programStages: [{ id: 'Zj7UnCAulEk' }] } : { _error: 'x' });
+    try {
+      const d0 = ctx.__dhis2(); d0.turnCounter = 9001;
+      const byEvent = await ctx.eventDateFieldsNote('analytics/events/aggregate/eBAyeGv0exc?dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT');
+      const again = await ctx.eventDateFieldsNote('analytics/events/aggregate/eBAyeGv0exc?dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT');
+      d0.turnCounter = 9002;
+      const byDate = await ctx.eventDateFieldsNote('analytics/events/aggregate/eBAyeGv0exc?stage=Zj7UnCAulEk&dimension=pe:LAST_12_MONTHS&filter=Zj7UnCAulEk.eMyVanycQSC:GE:2026-01-01:LE:2026-01-31');
+      const afterDate = await ctx.eventDateFieldsNote('analytics/events/aggregate/eBAyeGv0exc?dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT');
+      const noTime = await ctx.eventDateFieldsNote('analytics/events/aggregate/eBAyeGv0exc?stage=Zj7UnCAulEk&dimension=ou:USER_ORGUNIT');
+      truthy('a count by event date on a stage with its own date fields names them and both ways to count by them, once per turn; a query already on a date field or with no time is left alone',
+        /by EVENT date/.test(byEvent || '') && /Admission Date Zj7UnCAulEk\.eMyVanycQSC/.test(byEvent) && /Discharge Date/.test(byEvent) && !/Diagnosis/.test(byEvent)
+        && /:GE:<from>:LE:<to>/.test(byEvent) && again === null && byDate === null && /by EVENT date/.test(afterDate || '') && noTime === null);
+    } finally { ctx.safeDhis2Fetch = savedF; }
+    truthy('the privacy refusal tells a remote model that a build does not need patient rows, and not to stop a build to ask for a model switch',
+      /BUILDING an app, plugin, dashboard or line list never needs these rows/.test(vm.runInContext('enforcePatientDataPrivacyGate.toString()', ctx)) && /Do not stop a build/.test(vm.runInContext('enforcePatientDataPrivacyGate.toString()', ctx)));
+  }
+
+  // A range on a date field next to the event-date window (Q1 2020 admissions have 2025 event dates).
+  {
+    const h = ctx.healAnalyticsPeriodAndOrgUnitParams;
+    const F = 'filter=Zj7UnCAulEk.eMyVanycQSC:GE:2020-01-01:LE:2020-03-31';
+    const noTime = h(`analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd&stage=Zj7UnCAulEk&${F}`);
+    const same = h(`analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd&stage=Zj7UnCAulEk&startDate=2020-01-01&endDate=2020-03-31&${F}`);
+    const wide = h(`analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd&stage=Zj7UnCAulEk&startDate=1900-01-01&endDate=2100-12-31&${F}`);
+    const plain = h('analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd&stage=Zj7UnCAulEk');
+    truthy('a date-field range with no time opens the event-date window (DHIS2 answered no rows, 13,426 with it); the same quarter as event dates gets the drop-out note; a wide window or no date field gets neither',
+      /startDate=1900-01-01&endDate=2100-12-31/.test(noTime.path) && /window was opened/.test(noTime.notes.join(' '))
+      && same.path.includes('startDate=2020-01-01') && /EVENT date is outside the window/.test(same.notes.join(' '))
+      && !wide.notes.length && !/1900/.test(plain.path) && /last 12 months/.test(plain.notes.join(' ')));
+    const wideOk = h(`analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd&stage=Zj7UnCAulEk&startDate=2000-01-01&endDate=${new Date().getFullYear()}-11-26&${F}`);
+    truthy('…a deliberately wide window (2000 to this year) gets no note', !wideOk.notes.length);
+    const rows = [['2018-01-07 00:00:00.0', 'ImspTQPwCqd', '1'], ['2019-11-02 00:00:00.0', 'ImspTQPwCqd', '5'], ...Array.from({ length: 14 }, (_, k) => [`2020-0${1 + (k % 3)}-${String(10 + k).padStart(2, '0')} 00:00:00.0`, 'ImspTQPwCqd', '100']), ['', 'ImspTQPwCqd', '9']];
+    const pm = ctx.perMonthTotalsOfDateColumn({ headers: [{ name: 'Zj7UnCAulEk.msodh3rEMJa' }, { name: 'ou' }, { name: 'value' }], rows });
+    truthy('counts grouped by a date field get per-month totals (the first months are not hidden by the 2020 bulk), with records that have no date apart',
+      pm && pm.first_month === '2018-01' && pm.per_month['2019-11'] === 5 && pm.per_month['2020-01'] === 500 && pm.without_a_date === 9
+      && ctx.perMonthTotalsOfDateColumn({ headers: [{ name: 'pe' }, { name: 'value' }], rows: rows.map((r) => [r[0], r[2]]) }) === null);
+    truthy('…and the notes reach the model even when the path is unchanged', /if \(Array\.isArray\(peOuHeal\.notes\)\) queryNotes\.push/.test(require('fs').readFileSync(require('path').join(__dirname, '..', 'src', 'tools-metadata.js'), 'utf8')));
+  }
+
+  {
+    const st = ctx.healStageParamWithItem('analytics/events/aggregate/eBAyeGv0exc?dimension=ou:ImspTQPwCqd;LEVEL-2&stage=Zj7UnCAulEk.eMyVanycQSC&startDate=2024-01-01');
+    const ok1 = ctx.healStageParamWithItem('analytics/events/aggregate/eBAyeGv0exc?stage=Zj7UnCAulEk&dimension=Zj7UnCAulEk.eMyVanycQSC');
+    truthy('stage=<stage>.<dataElement> (409 "Program stage is specified but does not exist") is sent as stage=<stage>, with how to count by the element; a plain stage is left alone',
+      st.healed && /&stage=Zj7UnCAulEk&/.test(st.path) && /dimension=Zj7UnCAulEk\.eMyVanycQSC/.test(st.note) && !ok1.healed);
+    const sp = vm.runInContext('buildSystemPrompt.toString()', ctx) + require('fs').readFileSync(require('path').join(__dirname, '..', 'src', 'registry.js'), 'utf8');
+    truthy('on a cloud model the prompt and the app manual say the privacy block covers only the model\'s reads, so a requested record-level app is built in full (Haiku shipped an "aggregate-only version")',
+      /This limits only YOUR reads: an app or plugin you build reads the records/.test(sp) && /never ship an "aggregate-only version"/.test(sp));
+  }
+
+  {
+    const kitMeta = vm.runInContext('typeof CUSTOM_APP_KIT_META !== "undefined" ? CUSTOM_APP_KIT_META : null', ctx) || (ctx.__kitMeta || null);
+    const lintOf = (src) => { try { return ctx.lintCustomAppCode({ 'app.jsx': ctx.compileCustomAppFile('app.jsx', src).code }, 'app', kitMeta).warnings.map((w) => w.message).join(' | '); } catch (e) { return `threw ${e.message}`; } };
+    const typed = lintOf("const { useState } = React; const App = () => { const [ou, setOu] = useState(''); return <label>Facility or district (UID) <input value={ou} onChange={(e) => setOu(e.target.value.trim())} /></label>; };");
+    const tree = lintOf("const { useState } = React; const { OrganisationUnitTree } = D2UI; const App = () => { const [paths, setPaths] = useState([]); return <OrganisationUnitTree roots={['ImspTQPwCqd']} selected={paths} onChange={(u) => setPaths(u.selected)} />; };");
+    const header = lintOf("const A = () => { const cols = [{ label: 'Facility', key: 'id' }]; return <p title=\"District\">{cols.length}</p>; };");
+    truthy('an app where the org unit is TYPED as an id gets a warning naming OrganisationUnitTree and the several-units form; a tree picker and a plain "Facility" table column do not',
+      /chosen by typing its id/.test(typed) && /one or more/.test(typed) && !/chosen by typing its id/.test(tree) && !/chosen by typing its id/.test(header));
+  }
+
+  // The loop: twelve failing analytics queries and one organisationUnits read in ONE message.
+  const d = ctx.__dhis2();
+  const savedD = { base: d.baseUrl, connected: d.connected, apiVersion: d.apiVersion, pageContext: d.pageContext };
+  Object.assign(d, { baseUrl: 'https://dhis.invalid', connected: true, apiVersion: 43, pageContext: { appType: 'Dashboard' } });
+  vm.runInContext(`_cachedApiKey = 'verify-key'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' }; conversationHistory = [];`, ctx);
+  const enc = new TextEncoder();
+  const sse = (obj) => `data: ${JSON.stringify({ choices: [{ index: 0, ...obj }] })}\n\n`;
+  const months = Array.from({ length: 12 }, (_, i) => `2026-${String(i + 1).padStart(2, '0')}`);
+  const batch = [
+    ...months.map((mo, i) => ({ index: i, id: `q${i}`, type: 'function', function: { name: 'dhis2_query', arguments: JSON.stringify({ path: `analytics/events/aggregate/eBAyeGv0exc?stage=Zj7UnCAulEk&dimension=pe:LAST_12_MONTHS&filter=ou:USER_ORGUNIT&filter=Zj7UnCAulEk.fWIAEtYVEGk:EQ:${mo}` }) } })),
+    { index: 12, id: 'q12', type: 'function', function: { name: 'dhis2_query', arguments: JSON.stringify({ path: 'organisationUnits?filter=level:eq:2&fields=id,name' }) } },
+  ];
+  const script = [
+    sse({ delta: { tool_calls: batch }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'tool_calls' }),
+    sse({ delta: { content: 'Here is what I found.' }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'stop' }),
+  ];
+  const events = []; const ran = []; let n = 0;
+  ctx.broadcast = (x) => events.push(x);
+  ctx.executeTool = async (name, args) => {
+    ran.push(args.path);
+    return /^analytics/.test(args.path) ? { _error: 'DHIS2 API 409: Query item or filter is invalid', _status: 409, _url: args.path } : { organisationUnits: [{ id: 'aaaaaaaaaaa', name: 'District' }] };
+  };
+  ctx.fetch = async (url) => {
+    if (!String(url).startsWith('https://llm.invalid')) return new Response('{"version":"2.43"}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const body = script[Math.min(n++, script.length - 1)];
+    return new Response(new ReadableStream({ start(c) { c.enqueue(enc.encode(`${body}data: [DONE]\n\n`)); c.close(); } }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  };
+  const savedWarn = console.warn; const savedLog = console.log; console.warn = () => {}; console.log = () => {};
+  try {
+    await ctx.runAgenticLoop('How many admissions per month are there in program eBAyeGv0exc (stage Zj7UnCAulEk, admission date fWIAEtYVEGk)?', null, false);
+  } catch (e) { /* judged below */ } finally { console.warn = savedWarn; console.log = savedLog; }
+  ctx.executeTool = saved.exec; ctx.fetch = saved.fetch; ctx.broadcast = saved.broadcast;
+  Object.assign(d, savedD);
+  vm.runInContext(`_cachedApiKey = null; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG }; conversationHistory = [];`, ctx);
+  const done = events.filter((e) => e.type === 'AI_TOOL_DONE' && e.tool === 'dhis2_query');
+  truthy(`twelve calls in one message are one attempt: the lane stops after three errors, dhis2_query stays on, and the unrelated organisationUnits read in the same message runs [ran ${ran.length}, disabled ${done.filter((e) => /disabled|switched off/.test(e.summary || '')).length}]`,
+    ran.filter((p) => /^analytics/.test(p)).length === 3 && ran.some((p) => /^organisationUnits/.test(p))
+    && !done.some((e) => /disabled|switched off/.test(e.summary || '')));
+}
+
+// Transfer thread (2026-11-26, local 2.42.5.1): asked to hide Capture's Transfer
+// action, the model wrote custom CSS with eleven guessed selectors ("I could not
+// verify the selectors … It may hide nothing … I can't promise which"), offered
+// it, applied it on "yes", and took no backup. The user's rule: the assistant
+// never tries what it does not know works — in general, not for this case.
+async function runNoGuessChecks() {
+  console.log('\nNo guesses: unverified changes are neither offered nor made; system settings and metadata imports are backed up:');
+  const truthy = (label, got) => (got ? ok(label) : bad(`${label} => ${JSON.stringify(got)}`));
+  const P = ctx.unverifiedChangePhrase;
+  const proposal = 'Proposed change. I could not verify the selectors. I can\'t read Capture\'s compiled JS bundle through the API, so I don\'t know its exact data-test attribute. It may hide nothing, or it may hide the item — I can\'t promise which until you look. If you want it, reply "yes, apply the CSS".';
+  const flagged = [
+    proposal,
+    'I guessed the option code for "Referred", so this may or may not work.',
+    'These are plausible endpoints for the import; try it and see.',
+    'This may or may not work on 2.40.',
+    'I\'m guessing the attribute name here.',
+  ];
+  const honest = [
+    '**Not verified on live data**\n- Q1 2020 totals. Patient-level reads are blocked on this model, so no figure the app shows has been checked against records.',
+    'These test the logic, not live data. I have not cross-checked these against an independent count.',
+    'I could not verify that the app works on real records: please click through these three steps.',
+    'I never guess selectors: the hook below was read from the app code.',
+    'The install check passed. What I could not verify: the plugin running inside a real form with real values.',
+    // Independent review (2026-11-26): ordinary build talk that the first version blocked.
+    'To avoid guessing the IDs, let me look them up.',
+    'Instead of guessing the field names, I\'ll read the structure.',
+    'I don\'t want to guess the UIDs.',
+    'That would be guessing, so let me check the schema.',
+    'This may not work on 2.40, so I\'ll check the version first.',
+    'I can\'t guarantee that the analytics tables are up to date.',
+    'Let me preview the app to see if it works.',
+    'I couldn\'t check the tracked entity attributes yet.',
+    'I won\'t guess the selectors.',
+  ];
+  truthy('guessing language about a change is caught in any domain (selectors, option codes, endpoints, settings, attribute names)', flagged.every((t) => P(t)));
+  truthy('…honest reporting of what was not checked, and "never guess", are not', honest.every((t) => !P(t)));
+  const haikuOptions = '**Options:**\n1. **Hide the whole stage with a program rule** (`HIDEPROGRAMSTAGE`). This is the verified route, but in the new Capture app it only disables adding events.\n2. **Try a CSS-only custom form on the Transfer stage.** This would write a custom form to the stage. It would not remove the dashboard button, so it may not solve your problem.\n\nWhich would you like?';
+  const buildReport = '**Please test by hand**\n1. Kenya, 1 January to 31 March 2020: compare the admissions card with a daily admissions count.\n2. Click **No discharge date**: each row should carry the flag.\n\n**Not verified on live data**\n- **District plus facility counting.** Records are de-duplicated by event ID in the code, but this has not been tested on live data.\n\n**Options:**\n1. **Build an aggregate-only version now.** It would show monthly counts. It would not include a median.';
+  truthy('an offered OPTION that is itself hedged ("Try a CSS-only custom form … may not solve your problem") is caught; test steps, limits and a plain option are not',
+    /Try a/.test(ctx.unverifiedOptionIn(haikuOptions) || '') && ctx.unverifiedOptionIn(buildReport) === null && /guessing/.test(ctx.unverifiedChangePhrase('Writing CSS without checking would be guessing.') || ''));
+  truthy('…the Transfer proposal is an offer to the user; a build report is not', ctx.offersChangeToUser(proposal) && !ctx.offersChangeToUser(honest[0]));
+  truthy('"place it" / "place the plugin" authorise the write the chatbot asked for; "the plugin was placed in the wrong section" stays a report',
+    ['place it', 'place the plugin in the Installation summary section', 'yes place it'].every((t) => ctx.classifyWriteAuthorization(t).scope !== 'read_only')
+    && ctx.classifyWriteAuthorization('the plugin was placed in the wrong section, why?').scope === 'read_only');
+  truthy('only SHORT approvals count as a yes to the previous proposal ("yes", "yes place it", "go ahead", "ok"); "try again" and longer requests are new requests',
+    ['yes', 'yes place it', 'go ahead', 'ok', 'yes, apply the CSS'].every((t) => ctx.approvesPreviousProposal(t))
+    && !['add a chart of admissions by month to the dashboard', 'try again', 'ok now make a line list of the cases by district', 'please add the indicator to the dashboard and the map'].some((t) => ctx.approvesPreviousProposal(t)));
+  truthy('a normal next-steps list ("1. Try adding a map …") is not an unverified option',
+    ctx.unverifiedOptionIn('Next steps you could take:\n1. Try adding a map of cases by district.\n2. Add a line list.') === null);
+
+  // Custom CSS / JS: what the write is, and the refusals when no app loads it.
+  const W = ctx.customUiWriteOf;
+  truthy('custom CSS/JS writes are recognised in every form (settings map, settings/<key>, files/style), clearing is not one',
+    W('POST', 'systemSettings', { keyCustomCss: 'a{}' })?.kind === 'css' && W('POST', 'systemSettings/keyCustomJs', 'alert(1)')?.kind === 'js'
+    && W('POST', 'files/style', '.x{}')?.kind === 'css' && W('POST', 'systemSettings', { keyCustomCss: '' }) === null && W('GET', 'systemSettings/keyCustomCss') === null
+    && W('POST', 'systemSettings', { keyApplicationTitle: 'x' }) === null);
+  truthy('hooks are read from selectors, not from declarations',
+    JSON.stringify(ctx.cssHookTokens('/* c */ [data-test="widget-enrollment-actions-transfer"], li[data-test*="transfer" i], #main .menu-item > a { display: none; color: #fff }').sort())
+      === JSON.stringify(['main', 'menu-item', 'transfer', 'widget-enrollment-actions-transfer'].sort()));
+  const savedF = ctx.safeDhis2Fetch; const savedFetch = ctx.fetch; const saved_exec = ctx.executeTool; const saved_bc = ctx.broadcast;
+  const pages = { 'https://dhis.invalid/dhis-web-capture': '<html><script src="./assets/main.js"></script></html>', 'https://dhis.invalid/api/apps/legacy': '<html><link href="../api/files/style"><script src="app.js"></script></html>' };
+  const code = { 'https://dhis.invalid/dhis-web-capture/assets/main.js': 'dataTest:"widget-enrollment-actions-transfer"', 'https://dhis.invalid/api/apps/legacy/app.js': 'className:"menu-item"' };
+  let appList = [{ key: 'capture', baseUrl: 'https://dhis.invalid/dhis-web-capture' }];
+  ctx.safeDhis2Fetch = async (p) => (p === 'apps' ? appList : { _error: 'x' });
+  ctx.fetch = async (url) => {
+    const u = String(url).replace(/\/index\.html\?redirect=false$/, '');
+    const t = pages[u] ?? code[url];
+    return t == null ? new Response('nf', { status: 404 }) : new Response(t, { status: 200 });
+  };
+  try {
+    const none = await ctx.customUiWriteRefusal('POST', 'systemSettings', { keyCustomCss: '[data-test="widget-enrollment-actions-transfer"] { display: none }' });
+    truthy('a stylesheet no app loads is refused — even with the RIGHT selector — and the refusal says to offer nothing unverified',
+      none && none._scope === 'unverified_change' && /no app on this server loads the custom CSS/.test(none._error) && /Do not offer this/.test(none._hint));
+    const js = await ctx.customUiWriteRefusal('POST', 'systemSettings/keyCustomJs', 'document.title = 1');
+    truthy('custom JavaScript is never written', js && /never writes it/.test(js._error));
+    appList = [...appList, { key: 'legacy', baseUrl: 'https://dhis.invalid/api/apps/legacy' }];
+    const guessed = await ctx.customUiWriteRefusal('POST', 'systemSettings', { keyCustomCss: '.menu-item, [data-test="transfer-menu-item"] { display: none }' });
+    const real = await ctx.customUiWriteRefusal('POST', 'systemSettings', { keyCustomCss: '.menu-item { color: red }' });
+    truthy('when an app does load it, a hook that exists in no such app is refused by name; one that exists goes through',
+      guessed && /transfer-menu-item/.test(guessed._error) && !/menu-item,/.test(guessed._error) && real === null);
+    const cleared = await ctx.customUiWriteRefusal('POST', 'systemSettings', { keyCustomCss: '' });
+    truthy('clearing the custom CSS is always allowed', cleared === null);
+  } finally { ctx.safeDhis2Fetch = savedF; ctx.fetch = savedFetch; }
+
+  // System settings backup and restore.
+  truthy('the settings a write changes are read from its path or body',
+    JSON.stringify(ctx.systemSettingsWriteKeys('POST', 'systemSettings', { keyCustomCss: 'x', keyStyle: 'y' })) === '["keyCustomCss","keyStyle"]'
+    && JSON.stringify(ctx.systemSettingsWriteKeys('DELETE', 'systemSettings/keyCustomCss')) === '["keyCustomCss"]' && ctx.systemSettingsWriteKeys('GET', 'systemSettings') === null);
+  const store = {}; const writes = [];
+  ctx.safeDhis2Fetch = async (p, o = {}) => {
+    if (/^dataStore\/dhis2-ai-extension-backups\//.test(p) && o.method === 'POST') { store[decodeURIComponent(p.split('/').pop())] = o.body; return { ok: true }; }
+    if (/^dataStore\/dhis2-ai-extension-backups\//.test(p)) return store[decodeURIComponent(p.split('/').pop())] || { _error: 'nf', _status: 404 };
+    if (p === 'systemSettings/keyCustomCss' && !o.method) return { keyCustomCss: '' };
+    if (p === 'systemSettings/keyStyle' && !o.method) return { _error: 'nf', _status: 404 };
+    if (o.method) { writes.push(`${o.method} ${p} ${JSON.stringify(o.body || '')}`); return { ok: true }; }
+    return { _error: 'x' };
+  };
+  try {
+    const b = await ctx.backupSystemSettings(['keyCustomCss', 'keyStyle'], 'POST systemSettings');
+    const saved = store[b.block?.key];
+    truthy('a system-settings write is backed up first (old values, a missing one as null) with a restore hint',
+      b.ok && saved && saved.system_settings.values.keyCustomCss === '' && saved.system_settings.values.keyStyle === null && /manage_backups\(action="restore"/.test(b.block.restore_hint));
+    const r = await ctx.restoreFromBackup(b.block.key);
+    truthy('…and manage_backups restore puts the old values back (a setting that did not exist is removed)',
+      r.success && writes.some((w) => /^POST systemSettings \{"keyCustomCss":""\}/.test(w)) && writes.some((w) => /^DELETE systemSettings\/keyStyle/.test(w)));
+  } finally { ctx.safeDhis2Fetch = savedF; }
+  {
+    const st2 = {}; const w2 = [];
+    ctx.safeDhis2Fetch = async (p, o = {}) => {
+      if (/^dataStore\/dhis2-ai-extension-backups\//.test(p) && o.method === 'POST') { st2[decodeURIComponent(p.split('/').pop())] = o.body; return { ok: true }; }
+      if (/^dataStore\/dhis2-ai-extension-backups\//.test(p)) return st2[decodeURIComponent(p.split('/').pop())] || { _error: 'nf', _status: 404 };
+      if (p === 'systemSettings/keyEmailPassword' && !o.method) return { keyEmailPassword: '' };
+      if (o.method) { w2.push(`${o.method} ${p}`); return { ok: true }; }
+      return { _error: 'x' };
+    };
+    try {
+      const b2 = await ctx.backupSystemSettings(['keyEmailPassword'], 'POST systemSettings');
+      const r2 = await ctx.restoreFromBackup(b2.block.key);
+      truthy('a confidential setting (reads back empty) is never "restored" or removed from its unreadable backup', r2.success && r2.skipped.includes('keyEmailPassword') && !w2.some((w) => /keyEmailPassword/.test(w)));
+    } finally { ctx.safeDhis2Fetch = savedF; }
+    vm.runInContext('lastUserText = "Please save this CSS: .login-banner { color: red }";', ctx);
+    const mine = await ctx.customUiWriteRefusal('POST', 'systemSettings', { keyCustomCss: '.login-banner { color: red }' });
+    vm.runInContext('lastUserText = "";', ctx);
+    truthy('a stylesheet the user pasted themselves is theirs to save (no check)', mine === null);
+  }
+  const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'src', 'tools-metadata.js'), 'utf8');
+  truthy('user accounts and tracker records are never snapshotted into the backup namespace', /users\|userCredentials\|trackedEntityInstances/.test(src));
+  truthy('dhis2_query backs up system settings, objects a POST /metadata changes (new-only imports keep no backup), and any metadata type the schema list knows',
+    /systemSettingsWriteKeys\(method, safePath, args\.body\)/.test(src) && /operation: 'metadata_import'/.test(src) && /every\(\(o\) => o\.not_found_at_snapshot\)/.test(src) && /resolveSchemaType\(itemMatch\[1\]\)/.test(src));
+
+  // The loop: a "yes" to an unverified proposal runs nothing; an answer offering one is sent back.
+  const d = ctx.__dhis2();
+  const savedD = { base: d.baseUrl, connected: d.connected, apiVersion: d.apiVersion, pageContext: d.pageContext, writeAuth: d.writeAuth };
+  Object.assign(d, { baseUrl: 'https://dhis.invalid', connected: true, apiVersion: 42, pageContext: { appType: 'Capture' } });
+  vm.runInContext(`_cachedApiKey = 'verify-key'; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG, providerType: 'fireworks', apiBaseUrl: 'https://llm.invalid/v1', modelId: 'm' };`, ctx);
+  const enc = new TextEncoder();
+  const sse = (obj) => `data: ${JSON.stringify({ choices: [{ index: 0, ...obj }] })}\n\n`;
+  const call = (name, a) => sse({ delta: { tool_calls: [{ index: 0, id: `c${Math.random().toString(36).slice(2, 7)}`, type: 'function', function: { name, arguments: JSON.stringify(a) } }] }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'tool_calls' });
+  const say = (t) => sse({ delta: { content: t }, finish_reason: null }) + sse({ delta: {}, finish_reason: 'stop' });
+  const turn = async (script, userText, history) => {
+    vm.runInContext(`conversationHistory = ${JSON.stringify(history || [])};`, ctx);
+    const events = []; const ran = []; const requests = []; let n = 0;
+    ctx.broadcast = (x) => events.push(x);
+    ctx.executeTool = async (name, a) => { ran.push(`${name} ${a.method || a.action || ''} ${a.path || ''}`); return { success: true }; };
+    ctx.fetch = async (url, o) => {
+      if (!String(url).startsWith('https://llm.invalid')) return new Response('{"version":"2.42"}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      requests.push(JSON.parse(o.body));
+      const body = script[Math.min(n++, script.length - 1)];
+      return new Response(new ReadableStream({ start(c) { c.enqueue(enc.encode(`${body}data: [DONE]\n\n`)); c.close(); } }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    const sl = console.log; const sw = console.warn; console.log = () => {}; console.warn = () => {};
+    let res = null; try { res = await ctx.runAgenticLoop(userText, null, false); } catch (e) { res = { thrown: String(e) }; } finally { console.log = sl; console.warn = sw; }
+    return { res, events, ran, requests };
+  };
+  const POSTCSS = { method: 'POST', path: 'systemSettings', body: { keyCustomCss: '.x{display:none}' } };
+  try {
+    const hist = [{ role: 'user', content: 'try it with css now' }, { role: 'assistant', content: proposal }];
+    const yes = await turn([call('dhis2_query', POSTCSS), say('I did not apply it: it could not be verified.')], 'yes', hist);
+    truthy('"yes" to a proposal the model called unverified runs nothing: the write is refused in code',
+      !yes.ran.some((r) => /^dhis2_query POST/.test(r)) && yes.events.some((e) => e.type === 'AI_TOOL_DONE' && /described as unverified/.test(e.summary || '')));
+    const fine = await turn([call('dhis2_query', { method: 'POST', path: 'systemSettings', body: { keyApplicationTitle: 'Cold chain' } }), say('Done.')], 'yes', [{ role: 'user', content: 'rename the application title to Cold chain' }, { role: 'assistant', content: 'I will set the application title to "Cold chain". Shall I?' }]);
+    truthy('…a "yes" to a proposal with no guess in it runs as before', fine.ran.some((r) => /^dhis2_query POST systemSettings/.test(r)));
+    const offer = await turn([say(proposal), say('There is no verified way to hide it: I checked the program schema and the roles, and none controls it.')], 'can you hide the transfer option here?', []);
+    truthy('an answer offering an unverified change is sent back once and rewritten without it',
+      offer.events.some((e) => e.type === 'AI_THINKING' && /Removing unverified suggestions/.test(e.label || '')) && /no verified way/.test(offer.res?.text || '')
+      && offer.requests.length === 2 && offer.requests[1].messages.some((m) => m.role === 'system' && /never present a guess as an option/.test(m.content)));
+    const sp = vm.runInContext('buildSystemPrompt.toString()', ctx) + require('fs').readFileSync(require('path').join(__dirname, '..', 'src', 'registry.js'), 'utf8');
+    truthy('the system prompt carries the no-guess rule for changes and for facts', /HARD RULE — NO GUESSES/.test(sp) && /is stated only when a tool result in this conversation shows it/.test(sp));
+  } finally {
+    ctx.executeTool = saved_exec; ctx.fetch = savedFetch; ctx.broadcast = saved_bc;
+    Object.assign(d, savedD);
+    vm.runInContext(`_cachedApiKey = null; _cachedProviderConfig = { ...DEFAULT_PROVIDER_CONFIG }; conversationHistory = [];`, ctx);
+  }
+}
+
 // setImmediate: a few checks are async (promise-returning safety gates); they
 // resolve on the microtask queue, so the verdict must run after it drains.
 setImmediate(async () => {
@@ -6301,6 +6634,8 @@ setImmediate(async () => {
   if (loaded) await runDataQualityThreadChecks().catch((e) => bad(`data-quality thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runArgumentShapeThreadChecks().catch((e) => bad(`argument-shape thread checks threw: ${e && e.stack || e}`));
   if (loaded) await runComplexBuildsChecks().catch((e) => bad(`complex-builds checks threw: ${e && e.stack || e}`));
+  if (loaded) await runInpatientAdmissionsChecks().catch((e) => bad(`Inpatient admissions checks threw: ${e && e.stack || e}`));
+  if (loaded) await runNoGuessChecks().catch((e) => bad(`no-guess checks threw: ${e && e.stack || e}`));
   console.log('');
   if (loaded && !screenshotChecksDone) bad('screenshot checks never finished — a SCREENSHOT_* handler did not answer');
   if (loaded && !hardeningChecksDone) bad('hardening checks never finished — a handler did not answer');

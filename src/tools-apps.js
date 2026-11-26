@@ -1066,6 +1066,15 @@ function lintCustomAppCode(compiled, kind, kitMeta, pluginType) {
   if (/analytics\/(?:events|enrollments)\/aggregate/.test(allCode) && /\brows\b/.test(allBare) && !/\bheaders\b(?!\s*:\s*\{)/.test(allBare)) {
     errors.push({ message: 'analytics/events|enrollments/aggregate rows are read by position, but these endpoints have no fixed column order (enrollments: [value, ou, pe]; events: [ou, pe, value]; ou and pe swap between requests). row[row.length - 1] or row[0] then gives 0 or wrong numbers with no error. Read every column by name: const col = (r, name) => r.headers.findIndex((h) => h.name === name); r.rows.map((row) => ({ pe: row[col(r, \'pe\')], value: Number(row[col(r, \'value\')]) }));' });
   }
+  // An org unit chosen by TYPING its id: Inpatient admissions app with Haiku
+  // (2026-11-26) had a text box "Facility or district (UID)" holding one unit,
+  // where the user asked to "choose one or more facilities". Nobody knows the ids,
+  // and one box cannot hold several.
+  if (!/\bOrganisationUnitTree\b/.test(allBare)
+      && (/["'`][^"'`\n]{0,60}\b(?:org(?:anisation|anization)?\s*unit|facilit(?:y|ies)|district|region)s?\b[^"'`\n]{0,30}(?:\((?:UIDs?|ids?|IDs?)\)|\b(?:UIDs?)\b)[^"'`\n]*["'`]/.test(allCode)
+        || /\bset(?:Ou|Ous|OrgUnit|OrgUnits|Facility|Facilities|District|Unit)\s*\(\s*(?:e|ev|event)\.target\.value/.test(allBare))) {
+    warnings.push({ message: 'The org unit is chosen by typing its id into a text box. Users do not know ids, and one box holds one unit. Use OrganisationUnitTree (roots from me.organisationUnits): singleSelection for one unit; for "one or more", leave singleSelection out, keep the checked units\' paths in state (selected={paths}), query each unit and merge the records by their id so a district and one of its facilities count each record once.' });
+  }
   // Event analytics counts SCHEDULED visits unless a status is given (verified
   // 2.42.5: biopsy stage 10 without eventStatus, 7 with ACTIVE,COMPLETED, 3 with
   // SCHEDULE). A scorecard plugin showed "Biopsies 10" where 7 were done, every
@@ -1389,6 +1398,8 @@ function buildCustomAppGuardJs(spec) {
   ${normalizeTrackerQuery.toString().replace(/\n/g, '\n  ')}
   // Yes/No values are 1/0 in analytics: EQ:true is a 409 (see healAnalyticsBooleanFilter).
   ${healAnalyticsBooleanFilter.toString().replace(/\n/g, '\n  ')}
+  // One item at most once per analytics query: a range is <item>:GE:a:LE:b (see mergeRepeatedAnalyticsItems).
+  ${mergeRepeatedAnalyticsItems.toString().replace(/\n/g, '\n  ')}
   // The install check (manage_custom_app) opens the app with ?__ai_check=1: records
   // stay closed, requests are logged by path, status and DHIS2's own message.
   var CHECK = /[?&]__ai_check=1(?:&|$)/.test(String(window.location && window.location.search));
@@ -1450,7 +1461,7 @@ function buildCustomAppGuardJs(spec) {
         return Promise.reject(new Error('Not sent: writes are closed during the install check.'));
       }
       if (method === 'GET') {
-        var keyed = withEventAggregateCacheKey(healAnalyticsBooleanFilter(normalizeTrackerQuery(url, API_VERSION)));
+        var keyed = withEventAggregateCacheKey(mergeRepeatedAnalyticsItems(healAnalyticsBooleanFilter(normalizeTrackerQuery(url, API_VERSION))));
         if (CHECK) return checkedFetch(this, keyed, input, init);
         if (keyed !== url) return nativeFetch.call(this, typeof input === 'object' && input.url ? new Request(keyed, input) : keyed, init);
       }
@@ -1465,7 +1476,7 @@ function buildCustomAppGuardJs(spec) {
       if (!sameOrigin(url)) throw refuse('requests may only go to this DHIS2 server');
       if (READ_ONLY && !/^(GET|HEAD)$/i.test(String(method))) throw refuse('this app is read-only (' + method + ')');
       if (/^GET$/i.test(String(method))) {
-        var fixedUrl = healAnalyticsBooleanFilter(normalizeTrackerQuery(url, API_VERSION));
+        var fixedUrl = mergeRepeatedAnalyticsItems(healAnalyticsBooleanFilter(normalizeTrackerQuery(url, API_VERSION)));
         if (CHECK) fixedUrl = customAppRecordsClosed(fixedUrl) || (window.location.href.split('?')[0] + '?not-opened');
         if (fixedUrl !== url) { var xhrArgs = Array.prototype.slice.call(arguments); xhrArgs[1] = fixedUrl; return nativeOpen.apply(this, xhrArgs); }
       }
