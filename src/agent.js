@@ -672,6 +672,17 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
   let orphanNudged = false; // one push per turn when objects saved this turn are on none of its dashboards
   let askedInsteadNudged = false; // one push per turn when a build request ends with questions and nothing built
   let anyToolCallThisTurn = false; // at least one tool call was emitted this turn (marks the turn as mid-task)
+  let turnAssistantText = ''; // everything the model wrote this turn, for the no-guess guard
+  const unverifiedRefusals = new Map(); // tool → writes refused as unverified this turn
+  let unverifiedOfferNudged = false; // one push per turn when the answer offers a change it calls unverified
+  // The proposal the user is approving with a short "yes" / "go ahead" / "try it".
+  const approvedProposalText = (() => {
+    if (!approvesPreviousProposal(userText)) return '';
+    const prev = [...conversationHistory].reverse().find((m) => m && m.role === 'assistant' && typeof m.content === 'string' && m.content.trim());
+    // Only a previous answer that PROPOSED a change: an honest "not verified on
+    // live data" in a build report does not block the next request.
+    return prev && offersChangeToUser(prev.content) ? prev.content : '';
+  })();
 
   // ── Mechanical circuit breaker for deterministic retry loops ────────────────
   // The repeated-failure guard (preflightCheckCall) only ASKS the model to stop
@@ -806,6 +817,10 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
     }
 
     const msg = result.choices[0].message;
+    // The no-guess guard reads only what the model wrote in THIS message: a hedge
+    // it then resolved with tool reads ("to avoid guessing the ids, let me look
+    // them up") must not block every later write of the turn.
+    turnAssistantText = typeof msg?.content === 'string' ? msg.content : '';
     // 'length' = the response was cut off by the max output token limit. The
     // empty-response and corrupted-arguments paths below use this to give the
     // model DETERMINISTIC-failure guidance (a same-size retry will be cut at
@@ -826,6 +841,13 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
 
     if (allToolCalls.length > 0) {
       anyToolCallThisTurn = true;
+      // Tools already blocked in THIS message. Calls sent side by side were
+      // written before the model saw any result, so they are one attempt, not
+      // repeated ones (Inpatient admissions thread, 2026-11-26: twelve monthly
+      // queries in one message — three 409s, then nine blocks counted as nine
+      // retries switched dhis2_query off, and the unrelated organisationUnits
+      // read in the same message was refused).
+      const blockedThisMessage = new Set();
       for (const tc of allToolCalls) {
         const toolName = tc.function?.name;
         let args;
@@ -995,6 +1017,24 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
         }
 
         let toolResult;
+        // ── No guesses: a write the model itself called unverified is not run ──
+        if (isChangeCall(tc.function.name, args)) {
+          const phrase = unverifiedChangePhrase(turnAssistantText) || unverifiedChangePhrase(approvedProposalText);
+          if (phrase) {
+            toolResult = unverifiedChangeRefusal(phrase);
+            // Re-sent three times: the tool goes for the rest of the turn.
+            const nRef = (unverifiedRefusals.get(tc.function.name) || 0) + 1;
+            unverifiedRefusals.set(tc.function.name, nRef);
+            if (nRef >= 3 && !disabledToolNames.has(tc.function.name)) {
+              disabledToolNames.add(tc.function.name);
+              toolResult._tool_disabled_this_turn = tc.function.name;
+            }
+            console.warn(`[AgenticLoop] Refused ${tc.function.name}: the change was described as unverified ("${phrase}")`);
+            broadcast({ type: 'AI_TOOL_DONE', tool: tc.function.name, success: false, outcome: 'harness_blocked', summary: `Not done: the change was described as unverified ("${phrase}")`, details: { scope: 'unverified_change' } });
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult) });
+            continue;
+          }
+        }
         // ── Circuit breaker: a tool disabled earlier this turn is gone from the
         //    wire schema, but guard against a model that re-emits the call anyway
         //    (hallucinated tool) — never execute it; return the stop directive.
@@ -1051,7 +1091,9 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
               || preflightStop._scope === 'http_error_limit_reached'
               || preflightStop._scope === 'no_progress_repeat');
             if (isLoopBlock) {
-              const n = (toolBlockCounts.get(tc.function.name) || 0) + 1;
+              const firstInMessage = !blockedThisMessage.has(tc.function.name);
+              blockedThisMessage.add(tc.function.name);
+              const n = (toolBlockCounts.get(tc.function.name) || 0) + (firstInMessage ? 1 : 0);
               toolBlockCounts.set(tc.function.name, n);
               // dhis2_query is blocked one endpoint at a time, and the rest of the
               // task usually still needs it: it goes only after twice as many blocks.
@@ -1465,6 +1507,23 @@ async function _runAgenticLoopInner(userText, imageBase64, browseWeb = false) {
             : `Your reply announced what you are about to do but contained NO tool call — nothing was executed and the task is NOT finished. Never end a reply with a promise of future work. Emit the announced tool call NOW; when the whole task is genuinely done, end with a past-tense summary of what was created (names + IDs).`,
         });
         continue;
+      }
+
+      // f) The answer offers the user a change it calls unverified ("may hide
+      //    nothing", "I was guessing"): sent back once to be rewritten without it.
+      {
+        const hedged = !unverifiedOfferNudged && i < 46 ? unverifiedChangePhrase(text) : null;
+        const phrase = unverifiedOfferNudged || i >= 46 ? null : ((hedged && offersChangeToUser(text)) ? hedged : unverifiedOptionIn(text));
+        if (phrase) {
+          unverifiedOfferNudged = true;
+          console.warn(`[AgenticLoop] Answer offers an unverified change ("${phrase}") — asking for a rewrite`);
+          broadcast({ type: 'AI_THINKING', iteration: i + 1, label: 'Removing unverified suggestions' });
+          messages.push({
+            role: 'system',
+            content: `Your answer offers the user a change you yourself describe as unverified ("${phrase}"). Never offer, suggest or make a change you have not verified will do what the user wants, and never present a guess as an option. Verify it now with tools if you can (read the actual setting, schema, app code or data; validate; read back). Otherwise rewrite the answer: what you checked (with the tool results), what is true, and that you know no verified way to do this — no "try it and see" options. Statements about how DHIS2 behaves need a tool result behind them; otherwise say you have not checked.`,
+          });
+          continue;
+        }
       }
 
       // d) An explicit build request ended with nothing built and questions the

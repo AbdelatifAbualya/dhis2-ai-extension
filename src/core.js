@@ -242,6 +242,10 @@ const WRITE_AUTH_IMPERATIVE_RE = new RegExp(
   // had to ask leave for what it was just told (live 2026-11-02). Imperative
   // position only: "the map moved" and "when I move it, it fails" stay reports.
   + '|replace|move|swap|put|sort|reorder|rearrange|resize|shrink|enlarge|widen|duplicate|clone|copy|convert'
+  // "place it" / "place the plugin": the chatbot itself asked the user to reply
+  // "place it", then refused it as read-only (Installation summary thread,
+  // 2026-11-26). Imperative only: "the plugin was placed wrong" stays a report.
+  + '|place|unplace'
   + '|use\\s+[^.!?\\n]*\\binstead\\b|turn\\s+(?:it|this|that|these|those|the)\\b[^.!?\\n]*\\binto\\b|do\\s+the\\s+same\\b)\\b',
   'i'
 );
@@ -2222,6 +2226,95 @@ function looksLikeAskingInsteadOfBuilding(text) {
   return notBuilt && asks && !blocker;
 }
 
+// ── No guesses: a change the assistant itself calls unverified is not made ────
+// Transfer thread (2026-11-26): the model wrote "I could not verify the
+// selectors … It may hide nothing, or it may hide the item — I can't promise
+// which", offered it anyway, and applied it when the user said "yes". The user's
+// rule: the assistant never tries something it does not know works. This is not
+// about CSS: any write, in any tool, that the assistant's own words this turn
+// (or the proposal the user is now approving) describe as a guess, untested or
+// possibly without effect is refused in code, and a final answer that OFFERS
+// such a change is sent back once to be rewritten. Only clear guessing language
+// counts — reporting what could not be checked ("not verified on live data") is
+// honesty, not a guess, and is left alone.
+const UNVERIFIED_CHANGE_RES = [
+  /\b(?:I(?:'m| am| was| were)|we(?:'re| are)|these are|this is|it's|it is)\s+(?:just\s+|only\s+|partly\s+)?guess(?:ing|es)\b/i,
+  /\b(?:best|educated|rough|blind)\s+guess\b/i,
+  /\bguess(?:ed|ing)?\s+(?:at\s+)?(?:the\s+|which\s+|a\s+)?(?:selectors?|hooks?|css classes|data-test)\b/i,
+  /\bI\s+guessed\b/i,
+  /\b(?:would|will)\s+be\s+(?:just\s+|pure\s+)?(?:guess(?:ing|work)|a guess)\b(?![^.\n]{0,40}\b(?:so|instead)\b)/i,
+  /\b(?:may|might|could|will possibly)\s+(?:hide|change|do|fix|affect|apply to)\s+nothing\b/i,
+  /\bmay or may not\s+(?:work|apply|hide|take effect|do anything|fix|change)\b/i,
+  /\b(?:can(?:'t|not)|could(?:n't| not)|unable to)\s+(?:promise|guarantee)\s+(?:which|whether it|that it (?:will )?(?:work|hide|fix|apply)|it (?:will )?(?:work|hide|fix|apply)|this (?:will )?(?:work|hides?|fix(?:es)?|appl(?:y|ies)))\b/i,
+  /\b(?:can(?:'t|not)|could(?:n't| not)|unable to|did(?:n't| not))\s+(?:verify|confirm|check|test)\s+(?:the\s+|its\s+|their\s+|whether\s+|that\s+|if\s+)?[^.\n]{0,40}?\b(?:selectors?|hooks?|data-test|css class(?:es)?)\b/i,
+  /\b(?:try|apply) (?:it|this|that) and see\b|\btrial and error\b/i,
+  /\bplausible\s+(?:hooks?|selectors?|names?|ids?|values?|keys?|endpoints?|parameters?|attributes?|settings?)\b/i,
+  /\bunverified\s+(?:selectors?|hooks?|workaround|approach|fix|guess|settings?|parameters?|keys?)\b/i,
+  /\bin theory (?:this|it) should (?:work|hide|fix)\b/i,
+];
+function unverifiedChangePhrase(text) {
+  const t = String(text || '');
+  for (const re of UNVERIFIED_CHANGE_RES) {
+    const m = t.match(re);
+    if (!m) continue;
+    // "never guess", "not a guess", "I am not guessing" are the opposite.
+    // "won't guess", "to avoid guessing", "instead of guessing", "rather than a
+    // guess", "without guessing", "don't want to guess" are the opposite.
+    const before = t.slice(Math.max(0, m.index - 30), m.index);
+    // The negation must belong to the guess itself: "without checking would be
+    // guessing" is still a guess.
+    if (/(?:\b(?:not|never|no|nor)\s+(?:\w+\s+)?|n't\s+(?:\w+\s+){0,2}|\b(?:avoid(?:ing|s)?|instead of|rather than|without|stop)\s+)$/i.test(before)) continue;
+    return m[0];
+  }
+  return null;
+}
+// The answer offers the user a change to approve or try.
+function offersChangeToUser(text) {
+  return /\b(?:reply|answer|say|type)\s+["“'«]?(?:yes|apply|go|ok|do it)|\bshall I\b|\bdo you want me to\b|\bwant me to (?:apply|try|write|set|add|change|post|save)\b|\bif you want (?:it|this|me to)\b|\bI can (?:apply|try|write|set|add|post|save|change)\b|\boptions?\b[^.\n]{0,40}\b(?:route|workaround|approach)\b|\b(?:route|workaround)\b[^.\n]{0,60}\b(?:hide|change|apply|write)\b/i.test(String(text || ''));
+}
+// A short approval of the previous proposal ("yes", "go ahead", "try it with css now").
+// Only a SHORT approval (five words at most, starting with one): "try again" or
+// "ok now make a line list of …" is a new request, not a yes to the proposal.
+function approvesPreviousProposal(userText) {
+  const t = String(userText || '').trim();
+  return t.split(/\s+/).length <= 5 && /^(?:please\s+)?(?:yes|yep|yeah|ok(?:ay)?|sure|go ahead|do it|apply(?: it| the)?|proceed|confirm(?:ed)?|please do)\b/i.test(t);
+}
+// A call that changes something: a write tool's write action, or a raw
+// dhis2_query that is not a GET (it is not on the write-tool list).
+function isChangeCall(toolName, args) {
+  if (toolName === 'dhis2_query') return !/^(?:GET|HEAD)$/i.test(String(args?.method || 'GET'));
+  return isRealWriteCall(toolName, args);
+}
+// An OPTION the answer offers that is itself hedged: "2. Try a CSS-only custom
+// form … it may not solve your problem" (Transfer thread with Haiku, round 1:
+// the answer said writing CSS "would be guessing", then offered it anyway).
+// Only list items that propose doing something are read; an option that states
+// a real limit ("it only disables adding events") is not a hedge.
+const OPTION_HEDGE_RE = /\b(?:may not (?:work|solve|fix|help|hide|remove|apply|take effect)|might not (?:work|solve|fix|help|hide|remove|apply|take effect)|could work|might work|may work|not (?:verified|confirmed|tested) (?:that|whether|if|to)|unverified|untested|guess(?:ing|work)?|experimental|no guarantee|in theory|hit[- ]or[- ]miss)\b/i;
+const OPTION_ACTION_RE = /\b(?:try|add|write|create|apply|set|hide|use|change|install|put|inject|edit|override|insert|replace|remove|disable)\b/i;
+function unverifiedOptionIn(text) {
+  const lines = String(text || '').split('\n');
+  let inOptions = false;
+  for (const line of lines) {
+    if (/\b(?:options?|alternatives?|choices|what (?:can|could) be done|you could|routes?)\b[^.\n]{0,30}:?\s*$/i.test(line.replace(/[*_#]/g, '').trim())) { inOptions = true; continue; }
+    const item = line.match(/^\s*(?:\d+[.)]|[-*•])\s+(.*)$/);
+    if (!item) { if (!line.trim()) continue; if (!/^\s{2,}/.test(line)) inOptions = inOptions && /^\s*$/.test(line); continue; }
+    const body = item[1];
+    const isOption = inOptions || /^\**\s*(?:option|try|alternative)\b/i.test(body);
+    if (!isOption || !OPTION_ACTION_RE.test(body)) continue;
+    const m = body.match(OPTION_HEDGE_RE);
+    if (m) return `${m[0]} — "${body.replace(/\*+/g, '').slice(0, 90)}"`;
+  }
+  return null;
+}
+function unverifiedChangeRefusal(phrase) {
+  return {
+    _error: `Not done: this change was described as unverified ("${phrase}"). The assistant does not make, offer or try changes it has not verified will do what the user wants.`,
+    _hint: 'Verify it first with tools if you can (read the actual setting, schema, app code or data; a dry run or validation; read the result back). If nothing can verify it, do NOT make it and do NOT offer it as an option: tell the user plainly what you checked (with the tool results), what you found to be true, and that you know no verified way to do this. Statements about how DHIS2 behaves need a tool result behind them; otherwise say you have not checked.',
+    _scope: 'unverified_change',
+  };
+}
+
 function looksLikeUnfinishedAnnouncement(text) {
   const t = String(text || '').trim();
   if (!t || t.length > 2000) return false;
@@ -2622,6 +2715,7 @@ function healAnalyticsPeriodAndOrgUnitParams(path) {
   const periodVals = [...new Set(periodParams.flatMap(x => kv(x)[1].split(/[;,]/).map(s => s.trim()).filter(Boolean)))];
   const isBarePe = (x) => /^(?:dimension|filter)$/i.test(kv(x)[0]) && /^pe:?$/i.test(kv(x)[1].trim());
   const hasPeItems = parts.some(x => /^(?:dimension|filter)$/i.test(kv(x)[0]) && /^pe:\S/i.test(kv(x)[1].trim()));
+  const periodGiven = parts.some(isBarePe) || periodVals.length > 0;
   if (parts.some(isBarePe)) {
     if (!periodVals.length) {
       return {
@@ -2639,6 +2733,39 @@ function healAnalyticsPeriodAndOrgUnitParams(path) {
     const hasDates = parts.some(x => /^(?:startDate|endDate)$/i.test(kv(x)[0]));
     if (!hasPeItems && !hasDates) parts.push(`filter=pe:${periodVals.join(';')}`);
     notes.push(`Query corrected: DHIS2 analytics has no "${kv(periodParams[0])[0]}" parameter (${isAgg ? '409' : 'it is ignored and the last 12 months are answered instead'}); ${hasPeItems || hasDates ? 'it was dropped — the pe dimension or the dates already set the period' : `the periods were sent as filter=pe:${periodVals.join(';')} (one total; dimension=pe:… gives one row per period)`}.`);
+  }
+  // A condition on a DATE field of the stage (admission, discharge …) next to the
+  // EVENT-date window: DHIS2 applies both, so a record whose field is in range but
+  // whose event date is not is left out, and an event query with no time at all
+  // answers the last 12 months by event date. Inpatient admissions thread
+  // (2026-11-26, play 2.43.2.1): admissions in Q1 2020 have event dates in 2025;
+  // with no time, and with startDate/endDate = the same quarter, the answer was
+  // "no rows" both times; with startDate=1900-01-01&endDate=2100-12-31, 13,426.
+  const fieldDates = [];
+  if (isEvEn) {
+    for (const x of parts) {
+      const [k, v] = kv(x);
+      if (!/^(?:dimension|filter)$/i.test(k) || !/^(?:[A-Za-z][A-Za-z0-9]{10}\.)?[A-Za-z][A-Za-z0-9]{10}:/.test(v)) continue;
+      for (const m of v.matchAll(/:(?:GE|GT|LE|LT|EQ|IN):(\d{4}-\d{2}-\d{2})/gi)) fieldDates.push(m[1]);
+    }
+  }
+  const hasTime = hasPeItems || parts.some(x => /^(?:startDate|endDate)$/i.test(kv(x)[0]));
+  if (periodGiven) {
+    // handled above
+  } else if (fieldDates.length && !hasTime) {
+    parts.push('startDate=1900-01-01', 'endDate=2100-12-31');
+    notes.push('Query corrected: the date range is on a field of the record, and an event query with no time answers only the last 12 months by EVENT date, leaving out records whose event date is older (for these, no rows at all). The event-date window was opened (startDate=1900-01-01&endDate=2100-12-31) so the field\'s own range decides. Do the same in app or plugin code.');
+  } else if (fieldDates.length && hasTime) {
+    const sd = (parts.find(x => /^startDate$/i.test(kv(x)[0])) || '').split('=')[1] || '';
+    const ed = (parts.find(x => /^endDate$/i.test(kv(x)[0])) || '').split('=')[1] || '';
+    const lo = fieldDates.slice().sort()[0];
+    const hi = fieldDates.slice().sort().pop();
+    // Any finite window can leave records out, even one equal to the field's
+    // range; one from 2000 (or earlier) to this year is wide enough to be quiet.
+    const thisYear = `${new Date().getFullYear()}-01-01`;
+    if (hasPeItems || !sd || !ed || sd > '2000-01-01' || ed < thisYear) {
+      notes.push(`Note: this query has a date condition on a field of the record (${lo}${hi !== lo ? ` to ${hi}` : ''}) AND an event-date window (${hasPeItems ? 'pe' : `startDate ${sd || '-'} / endDate ${ed || '-'}`}). DHIS2 applies both, so records whose field is in range but whose EVENT date is outside the window are left out — an empty or low answer may be that, not a lack of data. To count by the field alone, send startDate=1900-01-01&endDate=2100-12-31 instead of the period.`);
+    }
   } else if (!hasPeItems && !parts.some(x => /^(?:startDate|endDate)$/i.test(kv(x)[0]))) {
     if (isAgg) {
       return {
@@ -3508,6 +3635,219 @@ async function ensureBackupOrBail(opMeta, targets, toolArgs) {
   return { ok: true, block: buildBackupResultBlock(snap, false), backup: snap };
 }
 
+// ── System settings: backups, and custom CSS / JS that is checked first ─────
+// Transfer thread (2026-11-26, local 2.42.5.1): asked to hide Capture's
+// "Transfer" enrollment action, the model saved System Settings → Custom CSS
+// with eleven GUESSED selectors, saying itself it could not verify them, and
+// took no backup. Facts checked in the server's own files that day:
+//   • none of the eleven exists in Capture 106.2.2's code; the real hook is
+//     data-test="widget-enrollment-actions-transfer", rendered for every
+//     enrollment with no authority or program setting around it;
+//   • no app loads the custom CSS at all: no app page (66 apps on 2.42.5.1, 48
+//     on 2.43.2.1) and neither Capture's code nor the global shell's references
+//     /api/files/style. Saving it changes nothing on screen.
+// A custom CSS write is now checked against the server before it is sent: an
+// app must load it, and every hook it names must exist in such an app's code.
+// Custom JavaScript runs for every user on every page that loads it, so the
+// assistant never writes it. Every system-settings write is backed up first.
+const CUSTOM_UI_SETTING_KEYS = { keyCustomCss: 'css', keyCustomJs: 'js' };
+
+function systemSettingsWriteKeys(method, path, body) {
+  const m = String(method || 'GET').toUpperCase();
+  if (m === 'GET') return null;
+  const pathOnly = String(path || '').split('?')[0].replace(/\.json$/, '');
+  const one = pathOnly.match(/^systemSettings\/([A-Za-z0-9_]+)$/);
+  if (one) return [one[1]];
+  if (pathOnly !== 'systemSettings') return null;
+  let b = body;
+  if (typeof b === 'string') { try { b = JSON.parse(b); } catch { b = null; } }
+  if (b && typeof b === 'object' && !Array.isArray(b)) return Object.keys(b);
+  const q = new URLSearchParams(String(path).split('?')[1] || '');
+  return q.get('key') ? [q.get('key')] : [];
+}
+
+// { kind: 'css' | 'js', text } when the write sets custom CSS or JS to something
+// non-empty (clearing it is always allowed).
+function customUiWriteOf(method, path, body) {
+  const m = String(method || 'GET').toUpperCase();
+  if (m !== 'POST' && m !== 'PUT' && m !== 'PATCH') return null;
+  const pathOnly = String(path || '').split('?')[0].replace(/\.json$/, '');
+  const q = new URLSearchParams(String(path).split('?')[1] || '');
+  let b = body;
+  if (typeof b === 'string') { const t = b.trim(); if (/^[{[]/.test(t)) { try { b = JSON.parse(t); } catch { /* text */ } } }
+  const textOf = (v) => (v == null ? '' : typeof v === 'string' ? v : (typeof v === 'object' && typeof v.value === 'string' ? v.value : JSON.stringify(v)));
+  if (/^files\/(?:style|script)$/.test(pathOnly)) {
+    const kind = pathOnly.endsWith('script') ? 'js' : 'css';
+    const text = textOf(b) || q.get('value') || '';
+    return text.trim() ? { kind, text } : null;
+  }
+  const one = pathOnly.match(/^systemSettings\/(keyCustomCss|keyCustomJs)$/);
+  if (one) {
+    const text = textOf(b) || q.get('value') || '';
+    return text.trim() ? { kind: CUSTOM_UI_SETTING_KEYS[one[1]], text } : null;
+  }
+  if (pathOnly === 'systemSettings' && b && typeof b === 'object') {
+    for (const k of Object.keys(CUSTOM_UI_SETTING_KEYS)) {
+      if (typeof b[k] === 'string' && b[k].trim()) return { kind: CUSTOM_UI_SETTING_KEYS[k], text: b[k] };
+    }
+  }
+  return null;
+}
+
+// The hooks a stylesheet names: data-test / data-testid values, ids and classes.
+function cssHookTokens(css) {
+  const src = String(css || '').replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\{[^}]*\}/g, ' ');
+  const out = new Set();
+  for (const m of src.matchAll(/\[\s*data-test(?:id)?\s*[~|^$*]?=\s*["']?([^"'\]\s]+)["']?/gi)) out.add(m[1]);
+  for (const m of src.matchAll(/#(-?[A-Za-z_][\w-]*)/g)) out.add(m[1]);
+  for (const m of src.matchAll(/\.(-?[A-Za-z_][\w-]*)/g)) out.add(m[1]);
+  return [...out];
+}
+
+async function _fetchServerText(url, ms) {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), ms || 8000) : null;
+  try {
+    const r = await fetch(url, { credentials: 'include', cache: 'no-store', ...(ctrl ? { signal: ctrl.signal } : {}) });
+    return r.ok ? await r.text() : null;
+  } catch { return null; } finally { if (timer) clearTimeout(timer); }
+}
+
+// Which apps on this server load the custom CSS (or JS): their page links
+// /api/files/style (/api/files/script), or one of the scripts it starts with does.
+async function appsLoadingCustomUi(kind) {
+  const deadline = Date.now() + 45000; // a slow server must not hold the turn for minutes
+  const list = await safeDhis2Fetch('apps', { noTruncate: true });
+  const apps = (Array.isArray(list) ? list : []).filter((a) => a && a.key && a.baseUrl).slice(0, 150);
+  const re = kind === 'js' ? /files\/script/ : /files\/style/;
+  const loading = []; let checked = 0;
+  let timedOut = false;
+  for (let i = 0; i < apps.length; i += 12) {
+    if (Date.now() > deadline) { timedOut = true; break; }
+    await Promise.all(apps.slice(i, i + 12).map(async (a) => {
+      const base = String(a.baseUrl).replace(/\/+$/, '');
+      // The page the app really opens with (plugin-only apps have no index.html).
+      const page = String(a.launchUrl || a.pluginLaunchUrl || `${base}/index.html`).split('?')[0];
+      const html = await _fetchServerText(`${page}?redirect=false`);
+      if (html == null) return;
+      checked++;
+      const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) => m[1]).filter((u) => !/^https?:/i.test(u)).slice(0, 2);
+      const texts = await Promise.all(scripts.map((src) => _fetchServerText(`${base}/${src.replace(/^\.?\//, '')}`, 8000)));
+      const code = [html, ...texts.filter(Boolean)].join('\n');
+      if (re.test(code)) loading.push({ key: a.key, code });
+    }));
+  }
+  return { checked, total: apps.length, loading, timedOut };
+}
+
+async function customUiWriteRefusal(method, path, body) {
+  const w = customUiWriteOf(method, path, body);
+  if (!w) return null;
+  // The user's OWN stylesheet or script, pasted in this message, is theirs to save.
+  const said = String(typeof lastUserText === 'string' ? lastUserText : '').replace(/\s+/g, ' ');
+  const text = String(w.text).replace(/\s+/g, ' ').trim();
+  if (text.length >= 8 && said.includes(text)) return null;
+  const common = 'Do not offer this, or any other change you have not verified does what the user wants, as an option ("try it and see" is not an option). Tell the user plainly what was checked and that you know no supported way to do it on this server; if they want to look into it themselves, say what they would need to find.';
+  if (w.kind === 'js') {
+    return {
+      _error: 'Not saved: custom JavaScript runs for every user on every page that loads it, so the assistant never writes it.',
+      _hint: `If the user wants custom JavaScript, they add code they have reviewed themselves in System Settings → Appearance. ${common}`,
+      _scope: 'unverified_change',
+    };
+  }
+  const found = await appsLoadingCustomUi('css');
+  if (!found.loading.length && found.timedOut) {
+    return {
+      _error: `Not saved: the check of which apps load the custom CSS did not finish in time (${found.checked} of ${found.total} app pages read, none loads it), so it is not known to work.`,
+      _hint: common,
+      _scope: 'unverified_change',
+    };
+  }
+  if (!found.loading.length) {
+    return {
+      _error: `Not saved: no app on this server loads the custom CSS. Of ${found.checked} app pages read${found.total > found.checked ? ` (${found.total} apps installed)` : ''}, none links /api/files/style in its page or the scripts it starts with, so this stylesheet would change nothing on screen — in Capture or any other app.`,
+      _hint: common,
+      _scope: 'unverified_change',
+      _checked_apps: found.checked,
+    };
+  }
+  const tokens = cssHookTokens(w.text);
+  const missing = tokens.filter((t) => !found.loading.some((a) => a.code.includes(t)));
+  if (missing.length) {
+    return {
+      _error: `Not saved: ${missing.length} of the ${tokens.length} hook(s) this stylesheet targets exist in no app that loads the custom CSS (${found.loading.map((a) => a.key).join(', ')}): ${missing.slice(0, 12).join(', ')}${missing.length > 12 ? ' …' : ''}.`,
+      _hint: `Selectors must name hooks that exist in the app's code; guessed ones hide nothing, or the wrong thing. ${common}`,
+      _scope: 'unverified_change',
+    };
+  }
+  return null;
+}
+
+// Backup of the system settings a write will change (values before), restorable
+// with manage_backups restore.
+const CONFIDENTIAL_SETTING_RE = /password|secret|token|apikey|api_key|credential/i;
+async function backupSystemSettings(keys, action) {
+  const values = {};
+  for (const k of [...new Set(keys)].slice(0, 50)) {
+    const r = await safeDhis2Fetch(`systemSettings/${encodeURIComponent(k)}`, { noTruncate: true });
+    if (r && r._error && r._status !== 404) {
+      dhis2.lastBackupFailure = { tool: 'dhis2_query', turn: dhis2.turnCounter || 0 };
+      return { ok: false, error: { _error: `Could not back up system setting ${k} before changing it: ${r._error}`, _requires_user_confirmation: true, _backup_failure: true, _bypass_argument: 'skip_backup:true', _hint: 'Nothing was changed. Retry with skip_backup:true only if the user accepts changing it without a backup.' } };
+    }
+    values[k] = !r || r._error ? null : (Object.prototype.hasOwnProperty.call(r, k) ? r[k] : (typeof r === 'string' ? r : (r.value !== undefined ? r.value : null)));
+  }
+  const backupKey = buildBackupKey('system_settings');
+  const entry = {
+    version: BACKUP_KEY_VERSION,
+    created_at: new Date().toISOString(),
+    retention_days: BACKUP_RETENTION_DAYS,
+    operation: 'system_settings_update',
+    tool: 'dhis2_query',
+    action,
+    reason: `System settings before ${action}: ${Object.keys(values).join(', ')}`,
+    origin_server: dhis2.baseUrl || null,
+    objects: [],
+    system_settings: { values },
+  };
+  const put = await safeDhis2Fetch(`dataStore/${encodeURIComponent(BACKUP_NAMESPACE)}/${encodeURIComponent(backupKey)}`, { method: 'POST', body: entry });
+  if (put && put._error) {
+    dhis2.lastBackupFailure = { tool: 'dhis2_query', turn: dhis2.turnCounter || 0 };
+    return { ok: false, error: { _error: `Could not save the backup of ${Object.keys(values).join(', ')}: ${put._error}`, _requires_user_confirmation: true, _backup_failure: true, _bypass_argument: 'skip_backup:true', _hint: 'Nothing was changed. Retry with skip_backup:true only if the user accepts changing it without a backup.' } };
+  }
+  return {
+    ok: true,
+    block: {
+      key: backupKey,
+      namespace: BACKUP_NAMESPACE,
+      settings: Object.keys(values),
+      restore_hint: `manage_backups(action="restore", backup_key="${backupKey}")`,
+      expires_in_days: BACKUP_RETENTION_DAYS,
+    },
+  };
+}
+
+async function restoreSystemSettingsFromBackup(backupKey, entry) {
+  const values = (entry && entry.system_settings && entry.system_settings.values) || {};
+  const keys = Object.keys(values);
+  if (!keys.length) return { _error: `Backup ${backupKey} holds no system settings.` };
+  const restored = []; const failed = []; const skipped = [];
+  for (const k of keys) {
+    const v = values[k];
+    // A confidential setting (passwords, secrets, tokens) reads back empty, so its
+    // backed-up value is not the real one: never restore or remove it from that.
+    if (CONFIDENTIAL_SETTING_RE.test(k) && (v === null || v === undefined || v === '')) { skipped.push(k); continue; }
+    const r = v === null || v === undefined
+      ? await safeDhis2Fetch(`systemSettings/${encodeURIComponent(k)}`, { method: 'DELETE' })
+      : await safeDhis2Fetch('systemSettings', { method: 'POST', body: { [k]: v } });
+    if (r && r._error && !(v == null && r._status === 404)) failed.push(`${k}: ${r._error}`);
+    else restored.push(k);
+  }
+  const skipNote = skipped.length ? ` Not restored (confidential, unreadable through the API, set it again in System Settings): ${skipped.join(', ')}.` : '';
+  return failed.length
+    ? { _error: `Restored ${restored.length} of ${keys.length} setting(s); failed: ${failed.join('; ')}.${skipNote}`, restored, skipped }
+    : { success: true, restored, skipped, message: `System settings restored to their values before the change: ${restored.join(', ') || 'none'}.${skipNote}` };
+}
+
 // Restore the "before" snapshots in a backup key via /metadata with
 // importStrategy=CREATE_AND_UPDATE. Each object in the backup is re-posted
 // to its original type bucket. Tombstones (null snapshot) are skipped.
@@ -3532,6 +3872,7 @@ async function restoreFromBackup(backupKey) {
   if (entry?.capture_config && typeof restoreCaptureConfigFromBackup === 'function') {
     return await restoreCaptureConfigFromBackup(backupKey, entry);
   }
+  if (entry?.system_settings) return await restoreSystemSettingsFromBackup(backupKey, entry);
   const objects = Array.isArray(entry?.objects) ? entry.objects : [];
   if (objects.length === 0) return { _error: `Backup ${backupKey} contains no objects.` };
 
@@ -4058,7 +4399,7 @@ async function safeDhis2Fetch(path, options = {}) {
     };
   }
   // Internal counts and pages used the older names: see normalizeTrackerQuery.
-  if (String(options?.method || 'GET').toUpperCase() === 'GET') cleanPath = normalizeTrackerQuery(cleanPath, dhis2.apiVersion);
+  if (String(options?.method || 'GET').toUpperCase() === 'GET') cleanPath = mergeRepeatedAnalyticsItems(normalizeTrackerQuery(cleanPath, dhis2.apiVersion));
   const qIdx = cleanPath.indexOf('?');
   let fullUrl;
   if (qIdx !== -1) {
@@ -5861,6 +6202,181 @@ function completeRegistrationsRefusal(path) {
     _hint: `Example: completeDataSetRegistrations?dataSet=<uid>&period=202510&orgUnit=<uid>&children=true lists who completed. For completeness and timeliness NUMBERS use analytics reporting rates instead: ${REPORTING_RATE_SYNTAX}`,
     _scope: 'complete_registrations_incomplete',
   };
+}
+
+// stage=<stage>.<dataElement> on event analytics is a 409 "Program stage is
+// specified but does not exist" (Inpatient admissions thread, round 3,
+// 2026-11-26, play 2.43.2.1). The stage parameter takes the stage id alone; the
+// data element was most likely meant as a dimension to count by.
+function healStageParamWithItem(path) {
+  const p = String(path || '');
+  const q = p.indexOf('?');
+  if (q < 0 || !/^analytics\/(?:events|enrollments)\//.test(p)) return { path: p, healed: false };
+  let item = null;
+  const parts = p.slice(q + 1).split('&').map((x) => {
+    const m = x.match(/^stage=([A-Za-z][A-Za-z0-9]{10})(?:\.|%2E)([A-Za-z][A-Za-z0-9]{10})$/i);
+    if (!m) return x;
+    item = `${m[1]}.${m[2]}`;
+    return `stage=${m[1]}`;
+  });
+  if (!item) return { path: p, healed: false };
+  return {
+    path: `${p.slice(0, q)}?${parts.join('&')}`,
+    healed: true,
+    note: `Query corrected: stage= takes the program stage id alone (stage=${item.split('.')[0]}; with the data element DHIS2 answers 409 "Program stage is specified but does not exist"). To count by ${item.split('.')[1]}, add dimension=${item} (one row per value) or filter=${item}:GE:<from>:LE:<to>.`,
+  };
+}
+
+// One data item may appear only ONCE in an event or enrollment analytics query.
+// A date range written as two filters on the same item,
+//   filter=<stage>.<de>:GE:2026-05-01&filter=<stage>.<de>:LE:2026-05-31
+// is a 409 E7243 "Duplicate stage dimension identifier" (verified 2.43.2.1 and
+// dev 2026-11-26; also dimension=<item> next to filter=<item>:…, and attributes on
+// analytics/enrollments). DHIS2's form chains the conditions on one item, and
+// applies them all: <item>:GE:2026-05-01:LE:2026-05-31 (verified: 4,393 events,
+// the same as the two bounds intersected, in either order). Inpatient
+// admissions thread (2026-11-26): three 409s closed the analytics lane and the
+// whole profiling step failed. A bare data element repeated next to its
+// stage-qualified form is the same item. Conditions are joined only when every
+// part is <OPERATOR>:<value>, so a group-set or category dimension
+// (<set>:<a>;<b>) is never touched. ES5, because the generated apps' request
+// guard carries it too.
+function mergeRepeatedAnalyticsItems(pathOrUrl) {
+  var s = String(pathOrUrl || '');
+  var q = s.indexOf('?');
+  if (q === -1 || !/analytics\/(?:events|enrollments)\//.test(s.slice(0, q))) return s;
+  var OPS = /^(?:EQ|NE|NEQ|IEQ|GT|GE|LT|LE|LIKE|ILIKE|NLIKE|NILIKE|IN|NIN|SW|EW|NULL|NNULL|!NULL|!EQ|!ILIKE)$/i;
+  var ITEM = /^((?:[A-Za-z][A-Za-z0-9]{10}\.)?([A-Za-z][A-Za-z0-9]{10})(?:-[A-Za-z][A-Za-z0-9]{10})?)((?::.*)?)$/;
+  var parts = s.slice(q + 1).split('&');
+  var found = [];
+  for (var i = 0; i < parts.length; i++) {
+    var m = parts[i].match(/^(dimension|filter)=(.*)$/i);
+    if (!m) continue;
+    var val;
+    try { val = decodeURIComponent(m[2].replace(/\+/g, ' ')); } catch (e) { val = m[2]; }
+    var im = val.match(ITEM);
+    if (!im) continue;
+    var conds = [];
+    if (im[3]) {
+      var segs = im[3].slice(1).split(':');
+      if (segs.length % 2 !== 0) continue;
+      var ok = true;
+      for (var j = 0; j < segs.length; j += 2) {
+        if (!OPS.test(segs[j])) { ok = false; break; }
+        conds.push(segs[j].toUpperCase() + ':' + segs[j + 1]);
+      }
+      if (!ok) continue;
+    }
+    found.push({ at: i, kind: m[1], item: im[1], de: im[2], conds: conds });
+  }
+  if (found.length < 2) return s;
+  // A bare data element joins its stage-qualified form when there is exactly one.
+  for (var a = 0; a < found.length; a++) {
+    // (a bare item with a legend set, de-<legendSet>, is a different item)
+    if (found[a].item.indexOf('.') !== -1 || found[a].item !== found[a].de) continue;
+    var qual = {};
+    for (var b = 0; b < found.length; b++) {
+      if (found[b].item.indexOf('.') !== -1 && found[b].de === found[a].de) qual[found[b].item] = true;
+    }
+    var names = Object.keys(qual);
+    if (names.length === 1) found[a].item = names[0];
+  }
+  var groups = {};
+  var order = [];
+  for (var k = 0; k < found.length; k++) {
+    if (!groups[found[k].item]) { groups[found[k].item] = []; order.push(found[k].item); }
+    groups[found[k].item].push(found[k]);
+  }
+  var drop = {};
+  var changed = false;
+  for (var g = 0; g < order.length; g++) {
+    var list = groups[order[g]];
+    if (list.length < 2) continue;
+    changed = true;
+    var kind = 'filter';
+    var all = [];
+    for (var n = 0; n < list.length; n++) {
+      if (/^dimension$/i.test(list[n].kind)) kind = 'dimension';
+      for (var c = 0; c < list[n].conds.length; c++) if (all.indexOf(list[n].conds[c]) === -1) all.push(list[n].conds[c]);
+      if (n > 0) drop[list[n].at] = true;
+    }
+    var joined = order[g] + (all.length ? ':' + all.join(':') : '');
+    parts[list[0].at] = kind + '=' + encodeURIComponent(joined).replace(/%3A/gi, ':').replace(/%3B/gi, ';');
+  }
+  if (!changed) return s;
+  var out = [];
+  for (var x = 0; x < parts.length; x++) if (!drop[x]) out.push(parts[x]);
+  return s.slice(0, q + 1) + out.join('&');
+}
+
+// Counts grouped by a DATE field come back one row per date (708 rows for the
+// Inpatient discharge dates). Haiku summed them in its head and told the user
+// "discharge dates begin on 1 January 2020" when 18 lay in 2018-2019 (Inpatient
+// thread, round 4, 2026-11-26). The result now carries the per-month totals.
+function perMonthTotalsOfDateColumn(result) {
+  if (!result || !Array.isArray(result.headers) || !Array.isArray(result.rows) || result.rows.length < 13) return null;
+  const vi = result.headers.findIndex((h) => h && h.name === 'value');
+  if (vi < 0) return null;
+  const di = result.headers.findIndex((h, i) => i !== vi && h && /^(?:[A-Za-z][A-Za-z0-9]{10}\.)?[A-Za-z][A-Za-z0-9]{10}$/.test(h.name || '')
+    && result.rows.slice(0, 20).every((r) => r[i] === '' || r[i] == null || /^\d{4}-\d{2}-\d{2}/.test(String(r[i]))));
+  if (di < 0) return null;
+  const months = {}; let noValue = 0;
+  for (const r of result.rows) {
+    const n = Number(r[vi]) || 0;
+    const d = String(r[di] || '');
+    if (!/^\d{4}-\d{2}/.test(d)) { noValue += n; continue; }
+    const k = d.slice(0, 7);
+    months[k] = (months[k] || 0) + n;
+  }
+  const keys = Object.keys(months).sort();
+  if (!keys.length) return null;
+  const out = {};
+  for (const k of keys) out[k] = months[k];
+  return { column: result.headers[di].name, per_month: out, ...(noValue ? { without_a_date: noValue } : {}), first_month: keys[0], last_month: keys[keys.length - 1], note: 'Totals per month of the date field, added up from every row by the extension (other columns summed). Read periods from these, not from the first rows.' };
+}
+
+// Event analytics counts by the EVENT date (pe, startDate/endDate). A stage that
+// records dates of its own (admission, discharge, onset, delivery) may hold quite
+// different ones: on play 2.43.2.1 the Inpatient program's events are dated
+// 2025-2026 while their Admission Date values are 2018-2021. Inpatient admissions
+// thread (2026-11-26): asked for "a three-month period with data, admissions by
+// admission date", the model counted events per month and picked Jul-Sep 2026,
+// when no admission falls in it. When a query is timed by event date only and the
+// stage has DATE fields, the result names them and the two ways to count by them
+// (both verified live). Once per stage per turn.
+const _stageDateFieldsCache = new Map();
+async function eventDateFieldsNote(path) {
+  const p = String(path || '');
+  const m = p.match(/^analytics\/events\/(?:aggregate|query)\/([A-Za-z][A-Za-z0-9]{10})(?:\.json)?\?(.*)$/);
+  if (!m) return null;
+  const qs = m[2];
+  const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
+  const parts = qs.split('&').map(dec);
+  if (!parts.some((x) => /^(?:dimension|filter)=pe:/i.test(x) || /^(?:startDate|endDate)=/i.test(x))) return null;
+  let stage = (parts.find((x) => /^stage=/i.test(x)) || '').slice(6);
+  if (!/^[A-Za-z][A-Za-z0-9]{10}$/.test(stage)) {
+    const r = await safeDhis2Fetch(`programs/${m[1]}?fields=programStages[id]`, { noTruncate: true });
+    const ids = ((r && !r._error && r.programStages) || []).map((x) => x.id);
+    if (ids.length !== 1) return null;
+    stage = ids[0];
+  }
+  const turn = dhis2.turnCounter || 0;
+  const seen = _stageDateFieldsCache.get(stage);
+  let fields = seen && seen.fields;
+  if (!fields) {
+    const r = await safeDhis2Fetch(`programStages/${stage}?fields=programStageDataElements[dataElement[id,displayName,valueType]]`, { noTruncate: true });
+    if (!r || r._error) return null;
+    fields = (r.programStageDataElements || []).map((x) => x.dataElement).filter((d) => d && /^(?:DATE|DATETIME|AGE)$/.test(d.valueType));
+  }
+  if (!seen) _stageDateFieldsCache.set(stage, { fields, turn: -1 });
+  if (!fields.length) return null;
+  // A query already on a date field does not use up this turn's note.
+  if (fields.some((d) => parts.some((x) => /^(?:dimension|filter)=/i.test(x) && x.includes(d.id)))) return null;
+  if (seen && seen.turn === turn) return null;
+  _stageDateFieldsCache.set(stage, { fields, turn });
+  const list = fields.slice(0, 6).map((d) => `${d.displayName} ${stage}.${d.id}`).join(', ');
+  const ex = `${stage}.${fields[0].id}`;
+  return `These counts are by EVENT date. This stage also records dates of its own (${list}), and their values can lie in quite different periods. To count by one of them (e.g. admissions by admission date): dimension=${ex} gives one row per date value (add startDate=2000-01-01&endDate=<today> so no event date leaves records out, then add the rows up per month), or filter=${ex}:GE:<from>:LE:<to> gives one count per range.`;
 }
 
 // Yes/No values are 1 and 0 in analytics: `<de>:EQ:true` is a 409 "Expression
