@@ -2156,8 +2156,15 @@ function looksLikePartialDelivery(text) {
     const h = String(m[1] || m[2] || '').replace(/\*\*/g, '').trim().toLowerCase();
     if (/^(?:not (?:yet )?(?:built|done|met|implemented|included|finished|verified)|what is (?:missing|not)|parts? not built|still missing|missing from (?:your|the) (?:request|brief))\b/.test(h)) return true;
     if (/\bwith gaps\b|\bgaps against\b/.test(h)) return true;
+    // "## Immunization Scorecard: v1.1.0 installed, but two requested parts are
+    // still not built" (Haiku, 2026-11-25): a heading that says parts are not built.
+    if (/\b(?:parts?|items?|features?|requirements?)\b[^.]{0,40}\b(?:still )?not (?:yet )?(?:built|done|implemented)\b|\bstill not (?:built|done|implemented)\b/.test(h)) return true;
     if (/^(?:what )?changed from (?:your|the) request\b/.test(h) && /\bnot built\b/i.test(t)) return true;
   }
+  // A bulleted part whose bold lead-in says it is not built: "- **Numerator and
+  // denominator on hover or click: not built.**" — even when the answer ends by
+  // asking whether to build it (the user already asked for it).
+  if (/(?:^|\n)\s*[-*•]\s*\*\*[^*\n]{3,160}?:\s*not (?:yet )?(?:built|done|implemented)\.?\*\*/i.test(t)) return true;
   if (/\?\s*$/.test(t.slice(-300))) return false;
   return /\b(?:not (?:built|done|implemented|included|added|finished|created) yet|only partly (?:done|built)|(?:the request is )?(?:only )?partially (?:done|built|complete(?:d)?)|still to (?:do|build)|parts? (?:i )?(?:did not|didn't|have not|haven't) (?:build|built|add|added|do|done)|remaining (?:parts|items|features) (?:to build|not built))\b/i.test(t);
 }
@@ -2196,8 +2203,18 @@ function looksLikeUnfinishedAnnouncement(text) {
   const gerundSentenceStart =
     /(^|[.!:]\s+|\n\s*)(now\s+|next[,:]?\s+|first[,:]?\s+)?(creating|adding|building|setting\s+up|configuring|generating|updating|proceeding|starting)\b/i;
   const firstPersonPromise =
-    /\b(i(?:'|’)ll|i\s+will|let\s+me|i(?:'|’)m\s+(?:now\s+)?going\s+to|about\s+to|proceeding\s+to)\s+(?:now\s+)?(?:start|begin|create|add|build|set\s+up|configure|generate|update|proceed|continue)\b/i;
-  return gerundSentenceStart.test(tail) || firstPersonPromise.test(tail);
+    /\b(i(?:'|’)ll|i\s+will|let\s+me|i(?:'|’)m\s+(?:now\s+)?going\s+to|about\s+to|proceeding\s+to)\s+(?:now\s+)?(?:start|begin|create|add|build|set\s+up|configure|generate|update|proceed|continue|run|check|verify|test|load|fetch|read|query|fix|install|place|compute|calculate|compare|refresh|review|rebuild|retry|look)\b/i;
+  // An offer to the user ("If you want, I'll add a map") is not unfinished work.
+  const offer = (s) => /\b(if|would|could|want|wish|prefer|once\s+you|when\s+you|unless|shall)\b/i.test(s);
+  const split = (s) => s.split(/(?<=[.!])\s+|\n+/);
+  if (gerundSentenceStart.test(tail) || split(tail).some((s) => firstPersonPromise.test(s) && !offer(s))) return true;
+  // "Next I'll run the data checks on the live program before reporting any
+  // figures." ended the Child Vaccination app turn with no counts (Haiku,
+  // 2026-11-25): the promise sat in the MIDDLE of the reply, before the link.
+  // A sentence that schedules the assistant's own next step is a promise of
+  // unfinished work anywhere in a short reply, unless it is an offer to the user.
+  return split(t).some((s) => /^\s*(?:[-*•]\s*)?(?:next|now|then|first|after that)[,:]?\s+(?:i(?:'|’)ll|i\s+will|let\s+me|i(?:'|’)m\s+going\s+to|i\s+am\s+going\s+to)\s+[a-z]/i.test(s)
+    && !offer(s));
 }
 
 function extractVisualizationIdFromInput(input) {
@@ -3926,22 +3943,41 @@ function normalizeTrackerQuery(pathOrUrl, apiVersion) {
 // indicators/<id> answered. "Not found" from a list query is then no evidence. One
 // probe per server for 5 minutes: the user's own org unit (read from /me) looked up
 // through a list query.
+// The breakage is per object type: on play 2.43.2.1 (2026-11-25) org units,
+// indicators and programs listed fine while dataElements, dataElementGroups and
+// categoryOptionCombos listed NOTHING (dataElements?fields=id → total 0) though
+// dataElements/<id> answered. The data-element half made the app id check call
+// seven real data elements "invented", search_metadata say "does not exist", and
+// every line list with a data-element column save unreadable ("Not a valid
+// dimension"). So each probe takes an id the server hands out through a nested
+// read and looks it up through its own list endpoint. `types` lists the broken ones.
 const _listQueryHealth = new Map();
+const LIST_QUERY_PROBES = [
+  { type: 'organisationUnits', source: 'me?fields=organisationUnits[id]', pick: (r) => ((r.organisationUnits || [])[0] || {}).id, why: 'the user\'s own org unit' },
+  { type: 'dataElements', source: 'programStages?fields=programStageDataElements[dataElement[id]]&pageSize=1', pick: (r) => ((((r.programStages || [])[0] || {}).programStageDataElements || [])[0] || {}).dataElement?.id, why: 'a data element of a program stage' },
+  { type: 'dataElements', source: 'dataSets?fields=dataSetElements[dataElement[id]]&pageSize=1', pick: (r) => ((((r.dataSets || [])[0] || {}).dataSetElements || [])[0] || {}).dataElement?.id, why: 'a data element of a data set' },
+  { type: 'categoryOptionCombos', source: 'categoryCombos?fields=categoryOptionCombos[id]&pageSize=1', pick: (r) => ((((r.categoryCombos || [])[0] || {}).categoryOptionCombos || [])[0] || {}).id, why: 'an option combination of a category combination' },
+];
 async function serverListQueriesBroken() {
   const key = String(dhis2.baseUrl || '');
   const hit = _listQueryHealth.get(key);
   if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.value;
-  let value = { broken: false };
-  try {
-    const me = await safeDhis2Fetch('me?fields=organisationUnits[id]', { noTruncate: true });
-    const root = me && !me._error && ((me.organisationUnits || [])[0] || {}).id;
-    if (root) {
-      const r = await safeDhis2Fetch(`organisationUnits?filter=id:eq:${root}&fields=id&paging=false`, { noTruncate: true });
-      if (r && !r._error && Array.isArray(r.organisationUnits) && r.organisationUnits.length === 0) {
-        value = { broken: true, probe: `organisationUnits?filter=id:eq:${root} answered no rows although ${root} is the user's own org unit` };
+  const broken = []; const probes = []; const tested = new Set();
+  for (const p of LIST_QUERY_PROBES) {
+    if (tested.has(p.type)) continue;
+    try {
+      const src = await safeDhis2Fetch(p.source, { noTruncate: true });
+      const id = src && !src._error ? p.pick(src) : null;
+      if (!id) continue;
+      tested.add(p.type);
+      const r = await safeDhis2Fetch(`${p.type}?filter=id:eq:${id}&fields=id&paging=false`, { noTruncate: true });
+      if (r && !r._error && Array.isArray(r[p.type]) && r[p.type].length === 0) {
+        broken.push(p.type);
+        probes.push(`${p.type}?filter=id:eq:${id} answered no rows although ${id} is ${p.why}`);
       }
-    }
-  } catch { /* cannot tell: treat as healthy */ }
+    } catch { /* cannot tell for this type: treat as healthy */ }
+  }
+  const value = broken.length ? { broken: true, types: broken, probe: probes.join('; ') } : { broken: false, types: [] };
   _listQueryHealth.set(key, { at: Date.now(), value });
   return value;
 }

@@ -2219,7 +2219,14 @@ async function executeToolCall(name, args) {
       if (type === 'programs' && resp[type].length) {
         clearNamedTargetsFoundIn(resp[type].map(o => o.displayName));
       }
-      if (nameFilter && resp[type].length === 0) {
+      // A server whose list queries for this type answer nothing (play 2.43.2.1,
+      // 2026-11-25: every dataElements list was empty) makes "0 found" no
+      // evidence: never arm the missing-name stop on it, and say how to get ids.
+      const health = resp[type].length === 0 && typeof serverListQueriesBroken === 'function' ? await serverListQueriesBroken() : null;
+      if (health && (health.types || []).includes(type)) {
+        resp._hint = `No ${type} listed, but this server's ${type} list queries answer nothing even for objects that exist (${health.probe}). A 0 here is NOT evidence that "${nameFilter || type}" is missing. Get ${type} ids another way: get_program_info (stage data elements), the data set's dataSetElements, an indicator's formula, or a direct read dhis2_query ${type}/<id>. Tell the user this server's ${type} search is broken (a server problem, not theirs).`;
+        resp._server_problem = `list queries for ${type} return nothing on this server`;
+      } else if (nameFilter && resp[type].length === 0) {
         noteMissingNamedTarget(type, nameFilter);
         resp._hint = `No ${type} match "${nameFilter}" on this instance. If the user asked for this object BY NAME, it does NOT exist — STOP, tell the user, list the closest existing names, and ask how to proceed. NEVER silently substitute a similar object and build the user's request on it. (Only if the user explicitly asked you to CREATE this object is an empty result here expected — then proceed with creation.)`;
       }
@@ -5763,7 +5770,12 @@ function dashTileNeeds(info, levelCounts = {}) {
   if (t === 'MAP') return { kind: 'map', wide: false, h: 20, name };
   if (t === 'EVENT_REPORT' || (t === 'EVENT_VISUALIZATION' && (!vt || vt === 'LINE_LIST' || vt === 'PIVOT_TABLE'))) return { kind: 'list', wide: true, h: 24, name };
   if (t === 'REPORT_TABLE') return { kind: 'table', wide: true, h: 20, name };
-  if (t !== 'VISUALIZATION' && t !== 'CHART' && t !== 'EVENT_VISUALIZATION' && t !== 'EVENT_CHART') return { kind: 'app', wide: false, h: 20, name };
+  // A dashboard plugin is a whole widget (a scorecard of 14 rows, a map with a
+  // table, a 21-day grid) and the Dashboard app never resizes its tile to the
+  // content: at half width and 20 rows (400 px) the Immunization Scorecard showed
+  // six of its 14 rows and hid its numerator/denominator panel (2026-11-25). Full
+  // width and 32 rows unless a size is asked for.
+  if (t !== 'VISUALIZATION' && t !== 'CHART' && t !== 'EVENT_VISUALIZATION' && t !== 'EVENT_CHART') return { kind: 'app', wide: true, h: 32, name };
   if (vt === 'SINGLE_VALUE') return { kind: 'kpi', wide: false, h: DASH_TILE_MIN.kpi[1], name };
   // Empty rows hidden: the unit count says nothing about the rows actually drawn.
   const rows = info.hideEmptyRows ? Math.min(10, dashAxisCount(info.rows, levelCounts)) : dashAxisCount(info.rows, levelCounts);

@@ -2245,7 +2245,7 @@ Actions: list / get / create / update / delete / validate.
 - delete: remove a saved line list (refuses while a dashboard still shows it; auto-backup first).
 COLUMN/FILTER SPEC — each entry is a string or object:
 - Org units: { dimension:"ou", org_units:["USER_ORGUNIT" | "LEVEL-4" | "<ouUid>" | "OU_GROUP-<uid>", …] } (required somewhere: every line list needs an org-unit boundary).
-- Time: { dimension:"event_date"|"enrollment_date"|"incident_date"|"scheduled_date"|"last_updated", periods:["LAST_12_MONTHS","2026Q1","202605", …] } (EVENT/ENROLLMENT lists need one; time dims differ per output_type).
+- Time: { dimension:"event_date"|"enrollment_date"|"incident_date"|"scheduled_date"|"last_updated", periods:["LAST_12_MONTHS","2026Q1","202605", …] } (EVENT/ENROLLMENT lists need one; time dims differ per output_type). A date range is one item "2021-01-01_2026-09-16" (start_end, inclusive); "enrolled before 16 Sep 2026" = { dimension:"enrollment_date", filter:{operator:"LT", value:"2026-09-16"} } (becomes that range; a fixed date, so say it does not move with time).
 - Data element / attribute / program indicator: pass the UID or EXACT display name — the type and (for DEs) the stage are auto-resolved; add program_stage_id only when a DE lives in several stages. Optional filter: {operator:"IN"|"EQ"|"NE"|"GT"|"GE"|"LT"|"LE"|"LIKE", value | values:[…]} — option-set values are auto-mapped NAME→CODE, booleans to 1/0.
 - Repeated events (ENROLLMENT output + repeatable stage only): add repeated_events:{ most_recent:2, oldest:2 } (or repetition_indexes:[1,2,-1,0]; 1=first, 0=latest, -1=second-latest) to a DE column to show one column per event occurrence.
 - Statuses: { dimension:"event_status"|"program_status", statuses:["ACTIVE","COMPLETED",…] }.
@@ -3634,6 +3634,8 @@ The app's content security policy blocks outside tile servers (OpenStreetMap, Go
 - A details panel beside a long list: lay them side by side on a wide screen (CSS grid with the panel sticky) or scroll the panel into view on opening. Under a 50-row table it opened 3,000 px below the click, and it looked as if nothing happened.
 - Say what the filter really does: with no end date the label is "no end date", not "to today" (the same screen listed 2027 registrations).
 - A download's file name carries the registration id, never a person's name: it stays in the Downloads folder and in the browser's history.
+- An expected-visit schedule (ANC contacts, vaccine doses, follow-ups): a point is done when a visit falls in its window; it is overdue only when its window has passed AND the episode is still open. Once the episode ends (delivery, completion, transfer, death, enrollment status COMPLETED) nothing is overdue and running clocks (gestational age, days on treatment, age at visit) stop at the end date: the Pregnancy Journey Card showed "gestational age 54 weeks" and eight overdue contacts for a delivered pregnancy (2026-11-25). Put a closed episode in D2_SELF_TEST.
+- "As of a date" with one row per person: pick each person's latest enrollment ON OR BEFORE that date, not the latest overall. The Child Vaccination app kept a child's 2027 enrollment, then left the child out as "registered after today" though the 2026 one counted (2026-11-25). Put a person with two enrollments on either side of the date in D2_SELF_TEST.
 
 ### Install check (runtime_check in the create and update results)
 After installing, the tool opens the app in a hidden frame of the user's DHIS2 tab with records closed: a list asks for an empty window, so DHIS2 validates the whole request and returns nothing; one record, SQL-view rows and writes are not sent. No record is fetched, so this is allowed even when the user says not to read records. You get each request's path, status and DHIS2's message, script errors, the page's text, and rendered. It then opens each tab (role="tab") in turn, so the queries of every tab are checked too (tabs_opened).
@@ -4021,6 +4023,15 @@ function detectSqlViewIntent(t) {
 // userText may be the routing text (current message + the request it
 // continues, see buildRoutingText); currentText is the message itself, which
 // alone decides the read-only save-diagnosis strip.
+// Fictional / test records for a tracker program, in the words users use.
+const TEST_DATA_NOUN = '(?:people|persons|patients|records|data|enrol+ments?|episodes|clients|cases|pregnanc(?:y|ies)|women|men|mothers|children|babies|infants|newborns|households|families|beneficiaries|participants|individuals|registrations|visits)';
+function detectTestDataIntent(text) {
+  const t = String(text || '');
+  return new RegExp(`\\b(?:fictional|fake|dummy|synthetic|made[- ]up|demo|sample|test)\\s+(?:[a-z-]+\\s+){0,2}${TEST_DATA_NOUN}\\b`, 'i').test(t)
+    || new RegExp(`\\b(?:create|generate|add|seed|make|load|populate)\\s+(?:(?:about|around|roughly|approximately|some|a\\s+few|several|~?\\d+)\\s+)*(?:fictional\\s+|test\\s+|fake\\s+|dummy\\s+|synthetic\\s+|sample\\s+)*${TEST_DATA_NOUN}\\b`, 'i').test(t)
+    || /\btest\s+invalid\s+records\b|\bbaseline\s+totals?\b/i.test(t);
+}
+
 function getContextualTools(ctx, userText, browseWeb, currentText = null) {
   const appType = (ctx?.appType || '');
   const combinedText = String(userText || '').toLowerCase();
@@ -4414,7 +4425,10 @@ function getContextualTools(ctx, userText, browseWeb, currentText = null) {
   }
 
   // ── Test / demo records for a tracker program ──
-  if (/\b(?:fictional|fake|dummy|synthetic|demo|sample|test)\s+(?:people|persons|patients|records|data|enrol+ments?|episodes|clients|cases)\b|\b(?:create|generate|add|seed)\s+(?:some\s+|\d+\s+)?(?:fictional\s+|test\s+)?(?:people|patients|enrol+ments|episodes|records)\b|\btest\s+invalid\s+records\b|\bbaseline\s+totals?\b/i.test(combinedText)) {
+  // "add about 30 fictional test pregnancies" matched nothing (the quantity word and
+  // the noun were unknown), so the model hand-wrote tracker imports through
+  // dhis2_query: four rule rejections, 16 of 30 saved (Haiku, 2026-11-25).
+  if (detectTestDataIntent(combinedText)) {
     selected.add('manage_test_data');
   }
 
